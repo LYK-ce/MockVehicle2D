@@ -1,0 +1,22 @@
+[build-system]
+requires = ["setuptools>=68.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "mockvehicle2d"
+version = "0.1.0"
+description = "2D vehicle simulator for Pictor WebSocket protocol testing and collision detection"
+requires-python = ">=3.10"
+dependencies = [
+    "websockets",
+]
+
+[project.optional-dependencies]
+visual = ["pygame"]
+dev = ["pytest"]
+
+[project.scripts]
+mockvehicle2d = "mockvehicle2d.cli.main:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]

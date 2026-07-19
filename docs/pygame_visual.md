@@ -35,12 +35,14 @@
 ## 文件结构
 
 ```
-test_tool/
-├── mock_map_grid.py       ← 地图数据 (已有)
-├── mock_collision.py      ← 碰撞检测 (已有)
-├── mock_vehicle.py        ← WebSocket server (已有)
-├── test_collision.py      ← 测试 (已有)
-└── mock_visual.py         ← 🆕 Pygame 可视化入口
+MockVehicle2D/
+├── src/mockvehicle2d/
+│   ├── map_grid.py         ← 地图数据 (已有)
+│   ├── collision.py        ← 碰撞检测 (已有)
+│   ├── server.py           ← WebSocket server (已有)
+│   └── visual.py           ← 🆕 Pygame 可视化入口
+├── tests/
+│   └── test_collision.py   ← 测试 (已有)
 ```
 
 ## 模块设计

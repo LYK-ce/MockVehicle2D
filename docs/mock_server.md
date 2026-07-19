@@ -29,14 +29,19 @@ MockVehicle2D 模拟小车行为：生成 2D 栅格地图、发送位姿、响�
 
 ```
 MockVehicle2D/
-├── mock_vehicle.py        ← WebSocket Server 入口
-├── mock_map_grid.py       ← MapGrid 栅格地图数据结构
-├── mock_collision.py      ← Bresenham 线段 + AABB 圆形碰撞检测
-├── mock_visual.py         ← Pygame 可视化测试
-├── test_collision.py      ← 碰撞检测测试 (60 条断言)
-└── docs/
-    ├── mock_server.md     ← 本文档
-    └── pygame_visual.md   ← Pygame 可视化设计
+├── src/mockvehicle2d/
+│   ├── server.py           ← WebSocket Server 入口
+│   ├── map_grid.py         ← MapGrid 栅格地图数据结构
+│   ├── collision.py        ← Bresenham 线段 + AABB 圆形碰撞检测
+│   └── visual.py           ← Pygame 可视化测试
+├── tests/
+│   └── test_collision.py   ← 碰撞检测测试 (60 条断言)
+├── docs/
+│   ├── mock_server.md      ← 本文档
+│   └── pygame_visual.md    ← Pygame 可视化设计
+├── pyproject.toml
+├── LICENSE
+└── README.md
 ```
 
 ---
@@ -44,19 +49,19 @@ MockVehicle2D/
 ## 模块架构
 
 ```
-mock_vehicle.py (WebSocket Server)
+mockvehicle2d serve (WebSocket Server)
   │
   ├── 地图生成: voxel 数组 → map_full
   │
   ├── 位姿发送: 每秒 pose
   │
   └── 碰撞检测 (可集成):
-        ├── mock_map_grid.py  → MapGrid
-        └── mock_collision.py → is_circle_passable / raycast
+        ├── map_grid.py  → MapGrid
+        └── collision.py → is_circle_passable / raycast
 
-mock_visual.py (Pygame 可视化)
-  ├── import mock_map_grid
-  ├── import mock_collision
+mockvehicle2d visual (Pygame 可视化)
+  ├── import mockvehicle2d.map_grid
+  ├── import mockvehicle2d.collision
   └── CharacterBody2D 模拟: W/S/A/D 驾驶 + 碰撞反馈
 ```
 
@@ -142,7 +147,7 @@ cell [gx, gx+1] × [gy, gy+1] 到圆心 (cx, cy) 的最近点:
 ## 测试
 
 ```bash
-python test_collision.py
+mockvehicle2d test
 ```
 
 | 模块 | 测试组 | 断言数 | 覆盖 |

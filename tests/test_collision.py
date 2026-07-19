@@ -15,14 +15,11 @@ test_collision.py — 碰撞检测测试用例
   cd test_tool && python test_collision.py
 """
 
-import sys
-import os
 import math
+import sys
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-
-from mock_map_grid import MapGrid
-from mock_collision import raycast, is_circle_passable, CollisionResult
+from mockvehicle2d.map_grid import MapGrid
+from mockvehicle2d.collision import raycast, is_circle_passable, CollisionResult
 
 
 PASS = 0

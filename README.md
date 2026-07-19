@@ -5,31 +5,45 @@
 ## 快速开始
 
 ```bash
-# 安装依赖
-pip install pygame websockets
+# 一键安装（创建 .venv + 安装依赖）
+source bootstrap.sh
+
+# 然后激活环境
+source .venv/bin/activate
 
 # 运行测试
-python test_collision.py
+mockvehicle2d test
 
 # 启动 WebSocket Mock Server
-python mock_vehicle.py
+mockvehicle2d serve
 
 # 启动 Pygame 可视化
-python mock_visual.py
+mockvehicle2d visual
+
+# 或通过 Python 模块运行
+python -m mockvehicle2d test
 ```
+
+> **注意**：依赖安装在项目本地的 `.venv/` 中，不会污染系统 Python。
 
 ## 文件结构
 
 ```
 MockVehicle2D/
-├── mock_map_grid.py       ← MapGrid 类，2D 栅格地图 (bytearray, O(1))
-├── mock_collision.py      ← 碰撞检测：Bresenham 线段 + AABB vs Circle
-├── mock_vehicle.py        ← WebSocket Server，模拟小车发送 map_full / pose
-├── mock_visual.py         ← Pygame 可视化，W/S/A/D 驾驶，实时碰撞反馈
-├── test_collision.py      ← 测试套件，60 条断言全部通过
-└── docs/
-    ├── mock_server.md     ← 本文档
-    └── pygame_visual.md   ← Pygame 可视化设计文档
+├── src/mockvehicle2d/
+│   ├── cli.py              ← 统一 CLI 入口 (argparse)
+│   ├── map_grid.py         ← MapGrid 类，2D 栅格地图 (bytearray, O(1))
+│   ├── collision.py        ← 碰撞检测：Bresenham 线段 + AABB vs Circle
+│   ├── server.py           ← WebSocket Server，模拟小车发送 map_full / pose
+│   └── visual.py           ← Pygame 可视化，W/S/A/D 驾驶，实时碰撞反馈
+├── tests/
+│   └── test_collision.py   ← 测试套件，60 条断言全部通过
+├── docs/
+│   ├── mock_server.md
+│   └── pygame_visual.md
+├── pyproject.toml
+├── LICENSE
+└── README.md
 ```
 
 ## 车辆参数
@@ -59,7 +73,7 @@ AABB vs Circle 圆形碰撞
 ## 测试
 
 ```bash
-python test_collision.py
+mockvehicle2d test
 ```
 
 | 模块 | 测试组 | 断言数 |

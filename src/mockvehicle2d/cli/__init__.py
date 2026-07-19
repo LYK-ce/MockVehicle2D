@@ -1,0 +1,1 @@
+"""MockVehicle2D CLI."""

@@ -15,7 +15,7 @@ import math
 from dataclasses import dataclass
 from typing import Optional
 
-from mock_map_grid import MapGrid
+from mockvehicle2d.map_grid import MapGrid
 
 
 @dataclass

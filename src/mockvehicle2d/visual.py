@@ -14,8 +14,8 @@ import sys
 
 import pygame
 
-from mock_map_grid import MapGrid
-from mock_collision import is_circle_passable
+from mockvehicle2d.map_grid import MapGrid
+from mockvehicle2d.collision import is_circle_passable
 
 # ── 配置 ────────────────────────────────────────────────
 
