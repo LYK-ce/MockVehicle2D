@@ -64,7 +64,7 @@ mock_visual.py (Pygame 可视化)
 
 ## 通信协议
 
-遵循 [Pictor WebSocket 协议](https://github.com/LYK-ce/Pictor/blob/main/docs/websocket_protocol.md)。
+遵循 [WebSocket 通信协议](websocket_protocol.md)。
 
 | 方向 | 消息 | 状态 |
 |------|------|------|
