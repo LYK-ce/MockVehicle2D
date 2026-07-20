@@ -44,7 +44,7 @@ class ScanConfig:
         count = self.sample_count()
         return {
             "min_angle": self.min_angle,
-            "max_angle": self.max_angle,
+            "max_angle": self.min_angle + (count - 1) * self.angle_increment,
             "angle_increment": self.angle_increment,
             "time_increment": self.scan_time / count,
             "scan_time": self.scan_time,
@@ -77,8 +77,8 @@ def _first_wall_range(
     step_y = 1 if direction_y > 0 else -1
     delta_x = abs(1 / direction_x) if direction_x else math.inf
     delta_y = abs(1 / direction_y) if direction_y else math.inf
-    next_x = ((cell_x + 1 - x) if direction_x > 0 else (x - cell_x)) * delta_x
-    next_y = ((cell_y + 1 - y) if direction_y > 0 else (y - cell_y)) * delta_y
+    next_x = ((cell_x + 1 - x) if direction_x > 0 else (x - cell_x)) * delta_x if direction_x else math.inf
+    next_y = ((cell_y + 1 - y) if direction_y > 0 else (y - cell_y)) * delta_y if direction_y else math.inf
 
     while True:
         if math.isclose(next_x, next_y, abs_tol=1e-12):

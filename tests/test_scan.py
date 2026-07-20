@@ -21,6 +21,13 @@ class GridScanTest(unittest.TestCase):
         self.assertAlmostEqual(point.range, 2.5)
         self.assertEqual(point.intensity, 1.0)
 
+    def test_axis_aligned_boundary_ray_hits_forward_wall(self) -> None:
+        grid = MapGrid.from_wall_set(16, 16, {(11, 10)})
+        point = scan_grid(grid, 10.0, 10.0, 0.0, ScanConfig(0.0, 0.0, 1.0, 0.1, 0.05, 12.0))[0]
+        self.assertIsNotNone(point.range)
+        self.assertTrue(math.isfinite(point.range))
+        self.assertAlmostEqual(point.range, 1.0)
+
     def test_no_return_is_not_a_max_range_obstacle(self) -> None:
         grid = MapGrid.from_wall_set(5, 5, set())
         point = scan_grid(grid, 2.5, 2.5, 0.0, ScanConfig(0.0, 0.0, 1.0, 0.1, 0.05, 8.0))[0]
@@ -43,6 +50,17 @@ class GridScanTest(unittest.TestCase):
         self.assertIsNone(point.range)
         self.assertEqual(config.as_dict()["point_count"], 2)
         self.assertEqual(config.as_dict()["no_return"], {"range": None, "intensity": 0.0})
+
+    def test_metadata_max_angle_matches_last_sample(self) -> None:
+        config = ScanConfig(0.0, 1.0, 0.6, 0.1, 0.05, 8.0)
+        metadata = config.as_dict()
+        points = scan_grid(MapGrid.from_wall_set(2, 2, set()), 0.5, 0.5, 0.0, config)
+        self.assertEqual(metadata["point_count"], 2)
+        self.assertAlmostEqual(metadata["max_angle"], 0.6)
+        self.assertAlmostEqual(metadata["max_angle"], points[-1].angle)
+        default_metadata = ScanConfig().as_dict()
+        self.assertEqual(default_metadata["point_count"], 360)
+        self.assertAlmostEqual(default_metadata["max_angle"], ScanConfig().max_angle)
 
 
 def main() -> int:
