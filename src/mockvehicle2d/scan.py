@@ -51,7 +51,7 @@ class ScanConfig:
             "min_angle": self.min_angle,
             "max_angle": self.min_angle + (count - 1) * self.angle_increment,
             "angle_increment": self.angle_increment,
-            "time_increment": 1 / self.range_sample_rate_hz,
+            "time_increment": self.scan_time / count,
             "scan_time": self.scan_time,
             "min_range": self.min_range,
             "max_range": self.max_range,

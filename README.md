@@ -97,4 +97,4 @@ mockvehicle2d test
 | 上行 | `map_delta` | ⏸️ |
 | 下行 (Pictor→Server) | `cmd` | ⏸️ |
 
-`scan` 默认使用 Tmini 轮廓：360°、0.02–12 m、4000 Hz 测距、6 Hz 扫描、667 条均匀射线。有效回波按 0.01 m 量化；无回波为 `range: 0.0, intensity: 0.0`，不能当作障碍物。
+`scan` 默认使用 Tmini 轮廓：360°、0.02–12 m、名义 4000 Hz 测距、名义 6 Hz 扫描、667 条均匀射线。有效回波按 0.01 m 量化；无回波为 `range: 0.0, intensity: 0.0`，不能当作障碍物。

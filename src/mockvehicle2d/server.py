@@ -6,6 +6,7 @@ mock_vehicle.py — 2D 小车模拟器
 
 import asyncio
 import json
+import math
 import signal
 import time
 
@@ -16,12 +17,24 @@ HOST = "0.0.0.0"
 PORT = 9090
 
 
+def _advance_x(x: float, last_motion_at: float, now: float, velocity_x: float) -> tuple[float, float]:
+    elapsed = max(0.0, now - last_motion_at)
+    return x + velocity_x * elapsed, max(last_motion_at, now)
+
+
+def _next_deadline(deadline: float, now: float, period: float) -> float:
+    if now < deadline:
+        return deadline
+    return deadline + (math.floor((now - deadline) / period) + 1) * period
+
+
 async def handler(websocket):
     addr = websocket.remote_address
     print(f"[+] client connected: {addr}")
 
     x = 10.0
     y = 10.0
+    velocity_x = 0.5
     pose_count = 0
 
     # 先发地图
@@ -38,9 +51,19 @@ async def handler(websocket):
     await websocket.send(map_msg)
     print(f"[✓] map_full sent")
     grid = MapGrid.from_voxels(voxels)
+    last_motion_at = time.monotonic()
+    next_deadline = last_motion_at
 
     try:
         while True:
+            now = time.monotonic()
+            if now < next_deadline:
+                await asyncio.sleep(next_deadline - now)
+                now = time.monotonic()
+            if pose_count:
+                x, last_motion_at = _advance_x(x, last_motion_at, now, velocity_x)
+            else:
+                last_motion_at = now
             msg = json.dumps({
                 "type": "pose",
                 "ts": time.time(),
@@ -48,15 +71,14 @@ async def handler(websocket):
                 "y": y,
                 "z": 0.0,
                 "yaw": 0.0,
-                "vx": 0.5,
+                "vx": velocity_x,
                 "vy": 0.0,
             })
             await websocket.send(msg)
             await websocket.send(json.dumps(scan_message(grid, x, y, 0.0, time.time(), TMINI_SCAN_CONFIG)))
-            x += 0.5 * TMINI_SCAN_CONFIG.scan_time
             pose_count += 1
             print(f"[→] pose #{pose_count}: x={x:.1f} y={y:.1f}")
-            await asyncio.sleep(TMINI_SCAN_CONFIG.scan_time)
+            next_deadline = _next_deadline(next_deadline, time.monotonic(), TMINI_SCAN_CONFIG.scan_time)
 
     except Exception as e:
         print(f"[!] error: {e}")

@@ -62,7 +62,7 @@ class GridScanTest(unittest.TestCase):
         self.assertEqual(default_metadata["range_sample_rate_hz"], 4000)
         self.assertEqual(default_metadata["scan_rate_hz"], 6)
         self.assertAlmostEqual(default_metadata["scan_time"], 1 / 6)
-        self.assertAlmostEqual(default_metadata["time_increment"], 1 / 4000)
+        self.assertAlmostEqual(default_metadata["time_increment"] * default_metadata["point_count"], default_metadata["scan_time"])
         self.assertEqual(default_metadata["min_range"], 0.02)
         self.assertEqual(default_metadata["max_range"], 12.0)
         self.assertAlmostEqual(default_metadata["max_angle"], TMINI_SCAN_CONFIG.max_angle)

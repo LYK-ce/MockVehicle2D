@@ -14,7 +14,7 @@ sys.path.insert(0, str(REPO_ROOT / "src"))
 from tests.test_collision import main as collision_main
 from mockvehicle2d.map_grid import MapGrid
 from mockvehicle2d.scan import scan_message
-from mockvehicle2d.server import handler
+from mockvehicle2d.server import _advance_x, _next_deadline, handler
 
 
 class _StopAfterScanSocket:
@@ -49,7 +49,16 @@ class ScanMessageTest(unittest.TestCase):
         websocket = _StopAfterScanSocket()
         asyncio.run(handler(websocket))
         self.assertEqual([message["type"] for message in websocket.messages], ["map_full", "pose", "scan"])
+        self.assertEqual(websocket.messages[1]["x"], 10.0)
         self.assertEqual(websocket.messages[-1]["config"]["model"], "ydlidar_tmini")
+
+    def test_timing_integrates_elapsed_time_and_skips_stale_deadlines(self) -> None:
+        x, last_motion_at = _advance_x(10.0, 100.0, 100.5, 0.5)
+        deadline = _next_deadline(100.0, 100.5, 1 / 6)
+        self.assertAlmostEqual(x, 10.25)
+        self.assertEqual(last_motion_at, 100.5)
+        self.assertGreater(deadline, 100.5)
+        self.assertAlmostEqual(deadline, 100.0 + 4 / 6)
 
 
 def main() -> int:
