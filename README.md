@@ -34,10 +34,13 @@ MockVehicle2D/
 │   ├── cli.py              ← 统一 CLI 入口 (argparse)
 │   ├── map_grid.py         ← MapGrid 类，2D 栅格地图 (bytearray, O(1))
 │   ├── collision.py        ← 碰撞检测：Bresenham 线段 + AABB vs Circle
-│   ├── server.py           ← WebSocket Server，模拟小车发送 map_full / pose
+│   ├── server.py           ← WebSocket Server，模拟小车发送 map_full / pose / scan
+│   ├── scan.py             ← YDLidar 风格二维角度/距离/强度扫描
 │   └── visual.py           ← Pygame 可视化，W/S/A/D 驾驶，实时碰撞反馈
 ├── tests/
-│   └── test_collision.py   ← 测试套件，60 条断言全部通过
+│   ├── test_collision.py   ← 碰撞检测测试套件
+│   ├── test_scan.py        ← 二维扫描几何测试
+│   └── test_server_scan.py ← scan WebSocket 帧测试
 ├── docs/
 │   ├── mock_server.md
 │   └── pygame_visual.md
@@ -90,5 +93,6 @@ mockvehicle2d test
 |------|------|------|
 | 上行 (Server→Pictor) | `map_full` | ✅ |
 | 上行 | `pose` | ✅ |
+| 上行 | `scan` | ✅ |
 | 上行 | `map_delta` | ⏸️ |
 | 下行 (Pictor→Server) | `cmd` | ⏸️ |

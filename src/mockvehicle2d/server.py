@@ -12,6 +12,9 @@ import time
 import websockets
 from websockets.asyncio.server import serve
 
+from mockvehicle2d.map_grid import MapGrid
+from mockvehicle2d.scan import scan_message
+
 HOST = "0.0.0.0"
 PORT = 9090
 
@@ -37,6 +40,7 @@ async def handler(websocket):
     print(f"[→] sending map_full ({len(map_msg)} bytes, {len(voxels)} cells)")
     await websocket.send(map_msg)
     print(f"[✓] map_full sent")
+    grid = MapGrid.from_voxels(voxels)
 
     try:
         while True:
@@ -51,6 +55,7 @@ async def handler(websocket):
                 "vy": 0.0,
             })
             await websocket.send(msg)
+            await websocket.send(json.dumps(scan_message(grid, x, y, 0.0, time.time())))
             x += 0.5
             pose_count += 1
             print(f"[→] pose #{pose_count}: x={x:.1f} y={y:.1f}")

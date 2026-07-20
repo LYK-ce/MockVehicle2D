@@ -27,7 +27,7 @@ def _cmd_visual(_args):
 
 
 def _cmd_test(_args):
-    """Run collision detection tests."""
+    """Run collision detection and local scan tests."""
     import os
 
     # Add repo root to path so tests/ is importable (src/ layout)
@@ -35,9 +35,11 @@ def _cmd_test(_args):
     if repo_root not in sys.path:
         sys.path.insert(0, repo_root)
 
-    from tests.test_collision import main as test_main
+    from tests.test_collision import main as collision_main
+    from tests.test_scan import main as scan_main
+    from tests.test_server_scan import main as server_scan_main
 
-    sys.exit(test_main())
+    sys.exit(collision_main() or scan_main() or server_scan_main())
 
 
 def main():

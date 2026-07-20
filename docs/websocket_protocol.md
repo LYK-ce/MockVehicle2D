@@ -45,6 +45,48 @@
 
 ---
 
+### scan — 本地二维激光扫描
+
+每次 `pose` 后发送一帧 YDLidar 风格的局部扫描。它只表示小车相对坐标系中的障碍物距离，**不**提供定位、点云、SLAM 或全局地图。
+
+```json
+{
+    "type": "scan",
+    "ts": 1717800000.124,
+    "frame_id": "laser",
+    "config": {
+        "min_angle": -3.141593,
+        "max_angle": 3.124139,
+        "angle_increment": 0.017453,
+        "time_increment": 0.000278,
+        "scan_time": 0.1,
+        "min_range": 0.05,
+        "max_range": 12.0,
+        "point_count": 360,
+        "angle_unit": "rad",
+        "range_unit": "m",
+        "angle_direction": "clockwise_from_forward",
+        "no_return": {"range": null, "intensity": 0.0}
+    },
+    "points": [
+        {"angle": 0.0, "range": 2.5, "intensity": 1.0},
+        {"angle": 0.017453, "range": null, "intensity": 0.0}
+    ]
+}
+```
+
+`angle` 的单位是弧度，`range` 的单位是米，字段形式与 YDLidar SDK 的 `LaserPoint` 对齐。`yaw=0`、`angle=0` 指向世界 `+x`；在本模拟器的 `+y` 向下栅格中，正角度朝 `+y` 增长（从上方看顺时针）。
+
+无回波统一编码为 `range: null, intensity: 0.0`，包括最大量程外、离开已知栅格或未知空间；它**不是**距离为 `max_range` 的障碍物。首个墙体命中使用其栅格边界距离，强度固定为 `1.0`。扫描是确定性射线投射，没有噪声或反射率模型。
+
+| 字段 | 类型 | 说明 |
+|------|------|------|
+| `frame_id` | string | 固定为小车本地 `laser` 坐标系 |
+| `config` | object | 一帧的 LaserScan 配置与无回波约定 |
+| `points` | array | 按角度递增排列的 `{angle, range, intensity}` 读数 |
+
+---
+
 ### map_full — 全量地图
 
 连接建立或重连后发送完整地图。
@@ -115,6 +157,7 @@
 上行 (小车 → PC)          下行 (PC → 小车)
 ─────────────────         ─────────────────
 pose                       cmd
+scan
 map_full
 map_delta
 ```

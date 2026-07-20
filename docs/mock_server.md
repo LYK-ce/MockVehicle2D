@@ -8,7 +8,7 @@ MockVehicle2D 模拟小车行为：生成 2D 栅格地图、发送位姿、响�
 ```
 ┌──────────────────────┐         WebSocket          ┌──────────────────────┐
 │     Pictor (Godot)   │ ←─────────────────────────→ │   MockVehicle2D      │
-│   WebSocketClient    │    map_full / pose / cmd    │   mock_vehicle.py    │
+│   WebSocketClient    │ map_full / pose / scan / cmd│   mock_vehicle.py    │
 └──────────────────────┘                             └──────────────────────┘
 ```
 
@@ -31,11 +31,14 @@ MockVehicle2D 模拟小车行为：生成 2D 栅格地图、发送位姿、响�
 MockVehicle2D/
 ├── src/mockvehicle2d/
 │   ├── server.py           ← WebSocket Server 入口
+│   ├── scan.py             ← YDLidar 风格二维激光扫描
 │   ├── map_grid.py         ← MapGrid 栅格地图数据结构
 │   ├── collision.py        ← Bresenham 线段 + AABB 圆形碰撞检测
 │   └── visual.py           ← Pygame 可视化测试
 ├── tests/
-│   └── test_collision.py   ← 碰撞检测测试 (60 条断言)
+│   ├── test_collision.py   ← 碰撞检测测试 (60 条断言)
+│   ├── test_scan.py        ← 二维扫描几何测试
+│   └── test_server_scan.py ← scan WebSocket 帧测试
 ├── docs/
 │   ├── mock_server.md      ← 本文档
 │   └── pygame_visual.md    ← Pygame 可视化设计
@@ -54,6 +57,8 @@ mockvehicle2d serve (WebSocket Server)
   ├── 地图生成: voxel 数组 → map_full
   │
   ├── 位姿发送: 每秒 pose
+  │
+  ├── 本地激光: 每秒 scan（二维角度/距离/强度）
   │
   └── 碰撞检测 (可集成):
         ├── map_grid.py  → MapGrid
@@ -75,6 +80,7 @@ mockvehicle2d visual (Pygame 可视化)
 |------|------|------|
 | 上行 (Server → Pictor) | `map_full` | ✅ 已实现 |
 | 上行 | `pose` | ✅ 已实现 |
+| 上行 | `scan` | ✅ 已实现 |
 | 上行 | `map_delta` | ⏸️ 暂不实现 |
 | 下行 (Pictor → Server) | `cmd` | ⏸️ 暂不实现 |
 
@@ -165,10 +171,12 @@ mockvehicle2d test
 |------|------|
 | 地图生成 (map_full) | ✅ |
 | 位姿发送 (pose) | ✅ |
+| 本地二维激光 (scan) | ✅ |
 | MapGrid 栅格地图 | ✅ |
 | Bresenham 线段碰撞 | ✅ |
 | AABB vs Circle 碰撞 | ✅ |
 | 碰撞检测测试 | ✅ 60/60 |
+| 二维扫描测试 | ✅ |
 | Pygame 可视化 | ✅ |
 | 路径规划 (A*) | ⏸️ |
 | cmd 命令接收 | ⏸️ |
