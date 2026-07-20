@@ -4,7 +4,7 @@ cli.py — Unified CLI entry point for MockVehicle2D.
 Usage:
     mockvehicle2d serve       Start WebSocket mock server
     mockvehicle2d visual      Launch Pygame visualization
-    mockvehicle2d test        Run collision detection test suite
+    mockvehicle2d test        Run collision and Tmini scan tests
 """
 
 import argparse
@@ -49,9 +49,9 @@ def main():
     )
     sub = parser.add_subparsers(dest="command", required=True)
 
-    sub.add_parser("serve", help="Start WebSocket mock server on ws://0.0.0.0:9090")
+    sub.add_parser("serve", help="Start WebSocket mock server with YDLidar Tmini scans on ws://0.0.0.0:9090")
     sub.add_parser("visual", help="Launch Pygame visualization (W/S/A/D driving)")
-    sub.add_parser("test", help="Run collision detection test suite")
+    sub.add_parser("test", help="Run collision and Tmini scan tests")
 
     args = parser.parse_args()
 

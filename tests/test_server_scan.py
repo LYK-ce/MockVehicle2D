@@ -1,5 +1,7 @@
-"""Wire-format check for the WebSocket scan frame."""
+"""Wire-format and send-order checks for the WebSocket scan frame."""
 
+import asyncio
+import json
 from pathlib import Path
 import sys
 import unittest
@@ -12,6 +14,19 @@ sys.path.insert(0, str(REPO_ROOT / "src"))
 from tests.test_collision import main as collision_main
 from mockvehicle2d.map_grid import MapGrid
 from mockvehicle2d.scan import scan_message
+from mockvehicle2d.server import handler
+
+
+class _StopAfterScanSocket:
+    remote_address = ("test", 0)
+
+    def __init__(self) -> None:
+        self.messages: list[dict[str, object]] = []
+
+    async def send(self, payload: str) -> None:
+        self.messages.append(json.loads(payload))
+        if len(self.messages) == 3:
+            raise RuntimeError("stop after first scan")
 
 
 class ScanMessageTest(unittest.TestCase):
@@ -23,11 +38,18 @@ class ScanMessageTest(unittest.TestCase):
         message = scan_message(grid, 1.5, 1.5, 0.0, 1717800000.124)
         self.assertEqual(message["type"], "scan")
         self.assertEqual(message["frame_id"], "laser")
-        self.assertEqual(message["config"]["no_return"], {"range": None, "intensity": 0.0})
+        self.assertEqual(message["config"]["model"], "ydlidar_tmini")
+        self.assertEqual(message["config"]["no_return"], {"range": 0.0, "intensity": 0.0})
         self.assertEqual(len(message["points"]), message["config"]["point_count"])
         forward = next(point for point in message["points"] if abs(point["angle"]) < 1e-9)
         self.assertAlmostEqual(forward["range"], 2.5)
         self.assertEqual(forward["intensity"], 1.0)
+
+    def test_server_sends_tmini_scan_immediately_after_pose(self) -> None:
+        websocket = _StopAfterScanSocket()
+        asyncio.run(handler(websocket))
+        self.assertEqual([message["type"] for message in websocket.messages], ["map_full", "pose", "scan"])
+        self.assertEqual(websocket.messages[-1]["config"]["model"], "ydlidar_tmini")
 
 
 def main() -> int:

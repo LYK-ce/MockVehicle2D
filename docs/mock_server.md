@@ -56,9 +56,9 @@ mockvehicle2d serve (WebSocket Server)
   │
   ├── 地图生成: voxel 数组 → map_full
   │
-  ├── 位姿发送: 每秒 pose
+  ├── 位姿发送: 6 Hz pose
   │
-  ├── 本地激光: 每秒 scan（二维角度/距离/强度）
+  ├── 本地激光: 6 Hz Tmini scan（二维角度/距离/强度）
   │
   └── 碰撞检测 (可集成):
         ├── map_grid.py  → MapGrid

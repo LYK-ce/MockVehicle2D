@@ -47,7 +47,7 @@
 
 ### scan — 本地二维激光扫描
 
-每次 `pose` 后发送一帧 YDLidar 风格的局部扫描。它只表示小车相对坐标系中的障碍物距离，**不**提供定位、点云、SLAM 或全局地图。
+每次 `pose` 后发送一帧 **YDLidar Tmini** 风格的局部扫描；Server 按 6 Hz 发送这对消息。它只表示小车相对坐标系中的障碍物距离，**不**提供定位、点云、SLAM 或全局地图。
 
 ```json
 {
@@ -55,29 +55,32 @@
     "ts": 1717800000.124,
     "frame_id": "laser",
     "config": {
-        "min_angle": -3.141593,
-        "max_angle": 3.124139,
-        "angle_increment": 0.017453,
-        "time_increment": 0.000278,
-        "scan_time": 0.1,
-        "min_range": 0.05,
+        "min_angle": 0.0,
+        "max_angle": 6.273765,
+        "angle_increment": 0.00942,
+        "time_increment": 0.00025,
+        "scan_time": 0.166667,
+        "min_range": 0.02,
         "max_range": 12.0,
-        "point_count": 360,
+        "point_count": 667,
+        "model": "ydlidar_tmini",
+        "range_sample_rate_hz": 4000,
+        "scan_rate_hz": 6,
         "angle_unit": "rad",
         "range_unit": "m",
         "angle_direction": "clockwise_from_forward",
-        "no_return": {"range": null, "intensity": 0.0}
+        "no_return": {"range": 0.0, "intensity": 0.0}
     },
     "points": [
         {"angle": 0.0, "range": 2.5, "intensity": 1.0},
-        {"angle": 0.017453, "range": null, "intensity": 0.0}
+        {"angle": 0.00942, "range": 0.0, "intensity": 0.0}
     ]
 }
 ```
 
 `angle` 的单位是弧度，`range` 的单位是米，字段形式与 YDLidar SDK 的 `LaserPoint` 对齐。`yaw=0`、`angle=0` 指向世界 `+x`；在本模拟器的 `+y` 向下栅格中，正角度朝 `+y` 增长（从上方看顺时针）。
 
-无回波统一编码为 `range: null, intensity: 0.0`，包括最大量程外、离开已知栅格或未知空间；它**不是**距离为 `max_range` 的障碍物。首个墙体命中使用其栅格边界距离，强度固定为 `1.0`。扫描是确定性射线投射，没有噪声或反射率模型。
+默认配置模拟 Tmini 的 `ydlidar_tmini` 元数据：360°、0.02–12 m、4000 Hz 测距、6 Hz 扫描、667 个均匀射线。有效墙体回波按 0.01 m 确定性量化，强度固定为 `1.0`。无回波统一编码为 `range: 0.0, intensity: 0.0`，包括最大量程外、离开已知栅格或未知空间；它**不是**障碍物。扫描没有噪声或反射率模型。
 
 | 字段 | 类型 | 说明 |
 |------|------|------|

@@ -1,4 +1,4 @@
-"""Deterministic 2D grid scans with YDLidar-compatible point units."""
+"""Deterministic 2D grid scans using the YDLidar Tmini measurement profile."""
 
 from dataclasses import dataclass
 import math
@@ -11,10 +11,10 @@ class LaserPoint:
     """One YDLidar-style return: radians, metres, and unitless intensity."""
 
     angle: float
-    range: float | None
+    range: float
     intensity: float
 
-    def as_dict(self) -> dict[str, float | None]:
+    def as_dict(self) -> dict[str, float]:
         return {"angle": self.angle, "range": self.range, "intensity": self.intensity}
 
 
@@ -22,43 +22,52 @@ class LaserPoint:
 class ScanConfig:
     """LaserScan metadata for one deterministic planar sweep."""
 
-    min_angle: float = -math.pi
-    max_angle: float = math.pi - math.radians(1)
-    angle_increment: float = math.radians(1)
-    scan_time: float = 0.1
-    min_range: float = 0.05
+    min_angle: float = 0.0
+    max_angle: float = 2 * math.pi * 666 / 667
+    angle_increment: float = 2 * math.pi / 667
+    scan_time: float = 1 / 6
+    min_range: float = 0.02
     max_range: float = 12.0
+    model: str = "ydlidar_tmini"
+    range_sample_rate_hz: int = 4000
+    scan_rate_hz: int = 6
 
     def __post_init__(self) -> None:
         if self.max_angle < self.min_angle:
             raise ValueError("max_angle must be greater than or equal to min_angle")
         if self.angle_increment <= 0 or self.scan_time <= 0:
             raise ValueError("angle_increment and scan_time must be positive")
+        if self.range_sample_rate_hz <= 0 or self.scan_rate_hz <= 0:
+            raise ValueError("scan rates must be positive")
         if self.min_range < 0 or self.max_range <= self.min_range:
             raise ValueError("range limits must satisfy 0 <= min_range < max_range")
 
     def sample_count(self) -> int:
         return int(math.floor((self.max_angle - self.min_angle) / self.angle_increment + 1e-9)) + 1
 
-    def as_dict(self) -> dict[str, float | int | str | dict[str, float | None]]:
+    def as_dict(self) -> dict[str, float | int | str | dict[str, float]]:
         count = self.sample_count()
         return {
             "min_angle": self.min_angle,
             "max_angle": self.min_angle + (count - 1) * self.angle_increment,
             "angle_increment": self.angle_increment,
-            "time_increment": self.scan_time / count,
+            "time_increment": 1 / self.range_sample_rate_hz,
             "scan_time": self.scan_time,
             "min_range": self.min_range,
             "max_range": self.max_range,
             "point_count": count,
+            "model": self.model,
+            "range_sample_rate_hz": self.range_sample_rate_hz,
+            "scan_rate_hz": self.scan_rate_hz,
             "angle_unit": "rad",
             "range_unit": "m",
             "angle_direction": "clockwise_from_forward",
-            "no_return": {"range": None, "intensity": 0.0},
+            "no_return": {"range": 0.0, "intensity": 0.0},
         }
 
 
-DEFAULT_SCAN_CONFIG = ScanConfig()
+TMINI_SCAN_CONFIG = ScanConfig()
+DEFAULT_SCAN_CONFIG = TMINI_SCAN_CONFIG
 
 
 def _first_wall_range(
@@ -73,6 +82,10 @@ def _first_wall_range(
         return config.min_range
 
     direction_x, direction_y = math.cos(world_angle), math.sin(world_angle)
+    if math.isclose(direction_x, 0.0, abs_tol=1e-12):
+        direction_x = 0.0
+    if math.isclose(direction_y, 0.0, abs_tol=1e-12):
+        direction_y = 0.0
     step_x = 1 if direction_x > 0 else -1
     step_y = 1 if direction_y > 0 else -1
     delta_x = abs(1 / direction_x) if direction_x else math.inf
@@ -116,14 +129,18 @@ def scan_grid(
     positive angles turn toward +y, i.e. clockwise when viewed from above.
     """
 
-    return [
-        LaserPoint(
-            angle=config.min_angle + index * config.angle_increment,
-            range=(distance := _first_wall_range(grid, x, y, yaw + config.min_angle + index * config.angle_increment, config)),
-            intensity=1.0 if distance is not None else 0.0,
+    points = []
+    for index in range(config.sample_count()):
+        angle = config.min_angle + index * config.angle_increment
+        distance = _first_wall_range(grid, x, y, yaw + angle, config)
+        points.append(
+            LaserPoint(
+                angle,
+                round(distance, 2) if distance is not None else 0.0,
+                1.0 if distance is not None else 0.0,
+            )
         )
-        for index in range(config.sample_count())
-    ]
+    return points
 
 
 def scan_message(

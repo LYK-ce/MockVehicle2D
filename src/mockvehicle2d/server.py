@@ -9,11 +9,8 @@ import json
 import signal
 import time
 
-import websockets
-from websockets.asyncio.server import serve
-
 from mockvehicle2d.map_grid import MapGrid
-from mockvehicle2d.scan import scan_message
+from mockvehicle2d.scan import TMINI_SCAN_CONFIG, scan_message
 
 HOST = "0.0.0.0"
 PORT = 9090
@@ -55,11 +52,11 @@ async def handler(websocket):
                 "vy": 0.0,
             })
             await websocket.send(msg)
-            await websocket.send(json.dumps(scan_message(grid, x, y, 0.0, time.time())))
-            x += 0.5
+            await websocket.send(json.dumps(scan_message(grid, x, y, 0.0, time.time(), TMINI_SCAN_CONFIG)))
+            x += 0.5 * TMINI_SCAN_CONFIG.scan_time
             pose_count += 1
             print(f"[→] pose #{pose_count}: x={x:.1f} y={y:.1f}")
-            await asyncio.sleep(1.0)
+            await asyncio.sleep(TMINI_SCAN_CONFIG.scan_time)
 
     except Exception as e:
         print(f"[!] error: {e}")
@@ -67,6 +64,8 @@ async def handler(websocket):
 
 
 async def main():
+    from websockets.asyncio.server import serve
+
     stop = asyncio.Event()
 
     def _sig_handler(signum, frame):

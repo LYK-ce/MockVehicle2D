@@ -35,7 +35,7 @@ MockVehicle2D/
 │   ├── map_grid.py         ← MapGrid 类，2D 栅格地图 (bytearray, O(1))
 │   ├── collision.py        ← 碰撞检测：Bresenham 线段 + AABB vs Circle
 │   ├── server.py           ← WebSocket Server，模拟小车发送 map_full / pose / scan
-│   ├── scan.py             ← YDLidar 风格二维角度/距离/强度扫描
+│   ├── scan.py             ← YDLidar Tmini 二维角度/距离/强度扫描
 │   └── visual.py           ← Pygame 可视化，W/S/A/D 驾驶，实时碰撞反馈
 ├── tests/
 │   ├── test_collision.py   ← 碰撞检测测试套件
@@ -96,3 +96,5 @@ mockvehicle2d test
 | 上行 | `scan` | ✅ |
 | 上行 | `map_delta` | ⏸️ |
 | 下行 (Pictor→Server) | `cmd` | ⏸️ |
+
+`scan` 默认使用 Tmini 轮廓：360°、0.02–12 m、4000 Hz 测距、6 Hz 扫描、667 条均匀射线。有效回波按 0.01 m 量化；无回波为 `range: 0.0, intensity: 0.0`，不能当作障碍物。
