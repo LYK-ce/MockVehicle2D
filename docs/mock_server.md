@@ -8,7 +8,7 @@ MockVehicle2D 模拟小车行为：生成 2D 栅格地图、发送位姿、响�
 ```
 ┌──────────────────────┐         WebSocket          ┌──────────────────────┐
 │     Pictor (Godot)   │ ←─────────────────────────→ │   MockVehicle2D      │
-│   WebSocketClient    │ map_full / pose / scan / cmd│   mock_vehicle.py    │
+│   WebSocketClient    │ hello / map / pose / scan / cmd│ MockVehicle2D       │
 └──────────────────────┘                             └──────────────────────┘
 ```
 
@@ -55,6 +55,7 @@ MockVehicle2D/
 ```
 mockvehicle2d serve (WebSocket Server)
   │
+  ├── 连接握手: hello(vehicle_id)
   ├── 地图生成: voxel 数组 → map_full
   │
   ├── cmd 接收: 严格校验 → cmd_ack / error → 故障停车
@@ -81,6 +82,7 @@ mockvehicle2d visual (Pygame 可视化)
 
 | 方向 | 消息 | 状态 |
 |------|------|------|
+| 上行 (Server → Pictor) | `hello` | ✅ 已实现 |
 | 上行 (Server → Pictor) | `map_full` | ✅ 已实现 |
 | 上行 | `pose` | ✅ 已实现 |
 | 上行 | `scan` | ✅ 已实现 |
@@ -156,6 +158,7 @@ cell [gx, gx+1] × [gy, gy+1] 到圆心 (cx, cy) 的最近点:
 
 ```bash
 mockvehicle2d serve \
+  --vehicle-id mock_vehicle_01 \
   --linear-speed 0.5 \
   --angular-speed 90 \
   --vehicle-radius 0.5 \
@@ -163,6 +166,8 @@ mockvehicle2d serve \
 ```
 
 角速度参数单位为度/秒。规范命令为 `{"type":"cmd","seq":0,"cmd":"forward"}`；也兼容精确 legacy 格式 `{"cmd":"forward"}`。新命令生效前先把旧命令积分到接收时刻。非法消息、看门狗超时、碰撞或连接结束都会停车。
+
+Pictor 连接 `ws://127.0.0.1:9090` 后，首帧为 `hello`，随后为 `map_full → pose → scan`。`hello` 不携带地址；Pictor 使用自己实际连接的 URL。
 
 每个 6 Hz deadline 只推进一次共用状态，再以相同 `seq` 和 Unix `ts` 顺序发送 `pose`、`scan`。命令接收和全部发送都在同一个连接协程内串行执行；每轮先处理已到期遥测，命令洪泛不会永久饿死遥测。
 
@@ -187,6 +192,7 @@ mockvehicle2d test
 
 | 功能 | 状态 |
 |------|------|
+| Pictor hello 握手 | ✅ |
 | 地图生成 (map_full) | ✅ |
 | 位姿发送 (pose) | ✅ |
 | 本地二维激光 (scan) | ✅ |
@@ -200,4 +206,4 @@ mockvehicle2d test
 | 实际时间运动、看门狗和防穿墙 | ✅ |
 | 寻路算法 | ⏸️ 暂不选型 |
 
-`map_full` 和 `pose` 的 `source` 为 `simulator_ground_truth`，只用于仿真验收与可视化，不是 Tmini 或真实定位输出。当前没有实现任何寻路算法、相机、定位误差、雷达噪声或 `map_delta`。
+`map_full` 和 `pose` 的 `source` 为 `simulator_ground_truth`，只用于仿真验收与可视化；只有 `scan` 是模拟的 Tmini 本地观测。当前没有实现任何寻路算法、相机、定位误差、雷达噪声或 `map_delta`。

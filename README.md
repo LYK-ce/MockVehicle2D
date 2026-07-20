@@ -15,7 +15,7 @@ source .venv/bin/activate
 mockvehicle2d test
 
 # 启动可控 WebSocket Mock Server
-mockvehicle2d serve
+mockvehicle2d serve --vehicle-id mock_vehicle_01
 
 # 校准模拟车（角速度单位为度/秒）
 mockvehicle2d serve --linear-speed 0.5 --angular-speed 90 --vehicle-radius 0.5 --command-timeout 1.0
@@ -94,8 +94,12 @@ mockvehicle2d test
 
 遵循 [WebSocket 通信协议](docs/websocket_protocol.md)。
 
+启动 Server 后，在 Pictor 中连接 `ws://127.0.0.1:9090`。连接首帧固定为
+`{"type":"hello","vehicle_id":"mock_vehicle_01"}`，随后依次发送 `map_full → pose → scan`。
+
 | 方向 | 消息 | 状态 |
 |------|------|------|
+| 上行 (Server→Pictor) | `hello` | ✅ |
 | 上行 (Server→Pictor) | `map_full` | ✅ |
 | 上行 | `pose` | ✅ |
 | 上行 | `scan` | ✅ |
@@ -106,4 +110,4 @@ mockvehicle2d test
 
 控制器发送 `{"type":"cmd","seq":1,"cmd":"forward"}` 后，Server 立即返回 `cmd_ack`，并从同一个车辆状态按顺序发送 `pose` 与 `scan`。超过 `--command-timeout` 未收到有效命令、收到非法命令或连接断开时，车辆自动停止；碰撞时停在最后一个安全位置。
 
-`map_full` 与 `pose` 标有 `source: "simulator_ground_truth"`，仅供仿真验收和可视化，不能作为真实 Tmini 或真实定位输出输入未来导航算法。当前没有实现寻路、相机、定位误差、雷达噪声或 `map_delta`。
+`map_full` 与 `pose` 标有 `source: "simulator_ground_truth"`，仅供仿真验收和可视化；只有 `scan` 是模拟的 Tmini 本地观测。未来导航算法不能把真值消息当作真实传感器输入。当前没有实现寻路、相机、定位误差、雷达噪声或 `map_delta`。

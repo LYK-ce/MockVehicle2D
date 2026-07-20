@@ -16,7 +16,7 @@ from tests.test_collision import main as collision_main
 from mockvehicle2d.collision import is_circle_passable
 from mockvehicle2d.map_grid import MapGrid
 from mockvehicle2d.scan import scan_message
-from mockvehicle2d.server import _next_deadline, generate_map, handler, telemetry_messages
+from mockvehicle2d.server import _next_deadline, generate_map, handler, telemetry_messages, validate_vehicle_id
 from mockvehicle2d.vehicle import Vehicle
 
 
@@ -28,7 +28,7 @@ class _StopAfterScanSocket:
 
     async def send(self, payload: str) -> None:
         self.messages.append(json.loads(payload))
-        if len(self.messages) == 3:
+        if len(self.messages) == 4:
             raise RuntimeError("stop after first scan")
 
 
@@ -41,7 +41,7 @@ class _CommandSocket:
 
     async def send(self, payload: str) -> None:
         self.messages.append(json.loads(payload))
-        if len(self.messages) == 4:
+        if len(self.messages) == 5:
             raise RuntimeError("stop after command reply")
 
     async def recv(self) -> str:
@@ -65,7 +65,7 @@ class _IdleTimeoutSocket:
 
     async def send(self, payload: str) -> None:
         self.messages.append(json.loads(payload))
-        if len(self.messages) == 5:
+        if len(self.messages) == 6:
             raise RuntimeError("stop after telemetry following idle timeout")
 
     async def recv(self) -> str:
@@ -91,15 +91,24 @@ class ScanMessageTest(unittest.TestCase):
 
     def test_server_sends_tmini_scan_immediately_after_pose(self) -> None:
         websocket = _StopAfterScanSocket()
-        asyncio.run(handler(websocket))
-        self.assertEqual([message["type"] for message in websocket.messages], ["map_full", "pose", "scan"])
-        self.assertEqual(websocket.messages[1]["x"], 10.0)
-        self.assertEqual(websocket.messages[0]["source"], "simulator_ground_truth")
+        asyncio.run(handler(websocket, vehicle_id="pictor_test-1"))
+        self.assertEqual(
+            [message["type"] for message in websocket.messages], ["hello", "map_full", "pose", "scan"]
+        )
+        self.assertEqual(websocket.messages[0], {"type": "hello", "vehicle_id": "pictor_test-1"})
+        self.assertEqual(websocket.messages[2]["x"], 10.0)
         self.assertEqual(websocket.messages[1]["source"], "simulator_ground_truth")
-        self.assertEqual(websocket.messages[1]["command"], "stop")
-        self.assertEqual(websocket.messages[1]["seq"], websocket.messages[2]["seq"])
-        self.assertEqual(websocket.messages[1]["ts"], websocket.messages[2]["ts"])
+        self.assertEqual(websocket.messages[2]["source"], "simulator_ground_truth")
+        self.assertEqual(websocket.messages[2]["command"], "stop")
+        self.assertEqual(websocket.messages[2]["seq"], websocket.messages[3]["seq"])
+        self.assertEqual(websocket.messages[2]["ts"], websocket.messages[3]["ts"])
         self.assertEqual(websocket.messages[-1]["config"]["model"], "ydlidar_tmini")
+
+    def test_vehicle_id_is_safe_for_pictor_names_and_logs(self) -> None:
+        self.assertEqual(validate_vehicle_id("mock.Vehicle_01-test"), "mock.Vehicle_01-test")
+        for invalid in ("", "a" * 65, "vehicle/01", "vehicle 01", "小车"):
+            with self.subTest(invalid=invalid), self.assertRaises(ValueError):
+                validate_vehicle_id(invalid)
 
     def test_timing_integrates_elapsed_time_and_skips_stale_deadlines(self) -> None:
         deadline = _next_deadline(100.0, 100.5, 1 / 6)
@@ -123,12 +132,16 @@ class ScanMessageTest(unittest.TestCase):
     def test_handler_sends_immediate_ack_or_error_without_parallel_sender(self) -> None:
         accepted = _CommandSocket('{"type":"cmd","seq":3,"cmd":"forward"}')
         asyncio.run(handler(accepted))
-        self.assertEqual([message["type"] for message in accepted.messages], ["map_full", "pose", "scan", "cmd_ack"])
+        self.assertEqual(
+            [message["type"] for message in accepted.messages], ["hello", "map_full", "pose", "scan", "cmd_ack"]
+        )
         self.assertEqual(accepted.messages[-1]["seq"], 3)
 
         rejected = _CommandSocket('{"type":"pose","seq":4,"cmd":"forward"}')
         asyncio.run(handler(rejected))
-        self.assertEqual([message["type"] for message in rejected.messages], ["map_full", "pose", "scan", "error"])
+        self.assertEqual(
+            [message["type"] for message in rejected.messages], ["hello", "map_full", "pose", "scan", "error"]
+        )
         self.assertEqual(rejected.messages[-1]["seq"], 4)
 
     def test_idle_receive_timeout_continues_telemetry_without_sleeping(self) -> None:
@@ -142,7 +155,7 @@ class ScanMessageTest(unittest.TestCase):
 
         self.assertEqual(
             [message["type"] for message in websocket.messages],
-            ["map_full", "pose", "scan", "pose", "scan"],
+            ["hello", "map_full", "pose", "scan", "pose", "scan"],
         )
 
 

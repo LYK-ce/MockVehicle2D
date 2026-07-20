@@ -5,6 +5,7 @@ import asyncio
 import json
 import math
 import random
+import re
 import signal
 import time
 
@@ -15,9 +16,11 @@ from mockvehicle2d.vehicle import COMMANDS, Vehicle
 
 HOST = "0.0.0.0"
 PORT = 9090
+DEFAULT_VEHICLE_ID = "mock_vehicle_01"
 SPAWN_X = 10.0
 SPAWN_Y = 10.0
 MAX_JSON_INTEGER_DIGITS = 4300
+VEHICLE_ID_PATTERN = re.compile(r"[A-Za-z0-9._-]{1,64}")
 
 
 class CommandMessageError(ValueError):
@@ -25,6 +28,12 @@ class CommandMessageError(ValueError):
         super().__init__(message)
         self.code = code
         self.seq = seq
+
+
+def validate_vehicle_id(value: str) -> str:
+    if not VEHICLE_ID_PATTERN.fullmatch(value):
+        raise ValueError("vehicle id must be 1-64 ASCII letters, digits, dots, underscores, or hyphens")
+    return value
 
 
 def _next_deadline(deadline: float, now: float, period: float) -> float:
@@ -152,6 +161,7 @@ def telemetry_messages(
 async def handler(
     websocket,
     *,
+    vehicle_id: str = DEFAULT_VEHICLE_ID,
     linear_speed: float = 0.5,
     angular_speed: float = math.pi / 2,
     radius: float = 0.5,
@@ -160,6 +170,7 @@ async def handler(
     _wall_time=time.time,
 ) -> None:
     """Serve one client; all receives and sends stay serialized in this coroutine."""
+    vehicle_id = validate_vehicle_id(vehicle_id)
     addr = websocket.remote_address
     print(f"[+] client connected: {addr}")
     started_at = _monotonic()
@@ -177,6 +188,7 @@ async def handler(
     next_deadline = started_at
 
     try:
+        await websocket.send(json.dumps({"type": "hello", "vehicle_id": vehicle_id}))
         map_message = {
             "type": "map_full",
             "ts": _wall_time(),
@@ -215,6 +227,7 @@ async def handler(
 
 async def main(
     *,
+    vehicle_id: str = DEFAULT_VEHICLE_ID,
     linear_speed: float = 0.5,
     angular_speed: float = math.pi / 2,
     radius: float = 0.5,
@@ -222,6 +235,7 @@ async def main(
 ) -> None:
     from websockets.asyncio.server import serve
 
+    vehicle_id = validate_vehicle_id(vehicle_id)
     stop = asyncio.Event()
 
     def _sig_handler(_signum, _frame):
@@ -234,6 +248,7 @@ async def main(
     async def configured_handler(websocket):
         await handler(
             websocket,
+            vehicle_id=vehicle_id,
             linear_speed=linear_speed,
             angular_speed=angular_speed,
             radius=radius,

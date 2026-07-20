@@ -20,12 +20,22 @@ def _positive_float(value: str) -> float:
     return number
 
 
+def _vehicle_id(value: str) -> str:
+    from mockvehicle2d.server import validate_vehicle_id
+
+    try:
+        return validate_vehicle_id(value)
+    except ValueError as error:
+        raise argparse.ArgumentTypeError(str(error)) from error
+
+
 def _cmd_serve(args):
     """Start the WebSocket mock server."""
     from mockvehicle2d.server import main as server_main
 
     asyncio.run(
         server_main(
+            vehicle_id=args.vehicle_id,
             linear_speed=args.linear_speed,
             angular_speed=math.radians(args.angular_speed),
             radius=args.vehicle_radius,
@@ -66,6 +76,7 @@ def main():
     sub = parser.add_subparsers(dest="command", required=True)
 
     serve = sub.add_parser("serve", help="Start controllable WebSocket server with YDLidar Tmini scans")
+    serve.add_argument("--vehicle-id", type=_vehicle_id, default="mock_vehicle_01", metavar="ID")
     serve.add_argument("--linear-speed", type=_positive_float, default=0.5, metavar="MPS")
     serve.add_argument("--angular-speed", type=_positive_float, default=90.0, metavar="DEG_PER_SECOND")
     serve.add_argument("--vehicle-radius", type=_positive_float, default=0.5, metavar="METRES")

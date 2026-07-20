@@ -18,6 +18,23 @@
 
 ## 上行：小车 → PC
 
+### hello — 连接握手
+
+每次连接建立后的第一条业务消息。接收端据此确认协议已就绪，再处理后续地图和遥测。
+
+```json
+{
+    "type": "hello",
+    "vehicle_id": "mock_vehicle_01"
+}
+```
+
+`vehicle_id` 可由 `mockvehicle2d serve --vehicle-id ID` 设置，只允许 1–64 个 ASCII 字母、数字、`.`、`_` 或 `-`。消息不携带 `address`：接收端应使用自己实际连接的 WebSocket URL，Server 不伪造客户端视角的地址。
+
+连接初始顺序固定为 `hello → map_full → pose → scan`。
+
+---
+
 ### pose — 车辆位姿
 
 实时发送车辆位置、朝向和速度。
@@ -106,7 +123,7 @@
 
 ### map_full — 全量地图
 
-连接建立或重连后发送完整地图。
+连接建立或重连后，在 `hello` 之后发送完整地图。
 
 ```json
 {
@@ -209,11 +226,12 @@
 ```
 上行 (小车 → PC)          下行 (PC → 小车)
 ─────────────────         ─────────────────
-pose                       cmd
-scan
+hello                      cmd
 map_full
+pose
+scan
 cmd_ack / error
 map_delta
 ```
 
-当前只实现车辆控制与稳定遥测闭环；没有实现寻路、相机、真实定位、传感器噪声或 `map_delta`。
+`map_full` 和 `pose` 是 `simulator_ground_truth`，只有 `scan` 是模拟的 Tmini 本地观测。当前只实现车辆控制与稳定遥测闭环；没有实现寻路、相机、真实定位、传感器噪声或 `map_delta`。
