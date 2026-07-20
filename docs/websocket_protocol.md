@@ -26,22 +26,34 @@
 {
     "type": "pose",
     "ts": 1717800000.123,
+    "seq": 12,
+    "source": "simulator_ground_truth",
     "x": 1.5,
     "y": 3.2,
     "z": 0.0,
     "yaw": 0.785,
     "vx": 0.5,
-    "vy": 0.0
+    "vy": 0.0,
+    "omega": 0.0,
+    "collision": false,
+    "command": "forward"
 }
 ```
 
 | 字段 | 类型 | 单位 | 说明 |
 |------|------|------|------|
 | `ts` | f64 | 秒 | Unix 时间戳 |
+| `seq` | u64 | — | 遥测帧序号；紧随其后的 `scan` 使用相同值 |
+| `source` | string | — | 固定为 `simulator_ground_truth` |
 | `x`, `y` | f32 | 米 | 2D 世界坐标 |
 | `z` | f32 | 米 | 高度 |
 | `yaw` | f32 | 弧度 | 偏航角 |
 | `vx`, `vy` | f32 | 米/秒 | 2D 速度分量 |
+| `omega` | f32 | 弧度/秒 | 实际角速度；左旋为负，右旋为正 |
+| `collision` | bool | — | 最近一次平移是否被碰撞截停 |
+| `command` | string | — | 当前有效命令；看门狗超时后为 `stop` |
+
+`pose` 是仿真器内部真值，只用于协议、控制闭环和可视化验收。它不是 Tmini 输出，也不代表真实小车已经具备定位能力。
 
 ---
 
@@ -52,7 +64,8 @@
 ```json
 {
     "type": "scan",
-    "ts": 1717800000.124,
+    "ts": 1717800000.123,
+    "seq": 12,
     "frame_id": "laser",
     "config": {
         "min_angle": 0.0,
@@ -85,6 +98,7 @@
 | 字段 | 类型 | 说明 |
 |------|------|------|
 | `frame_id` | string | 固定为小车本地 `laser` 坐标系 |
+| `seq` | u64 | 与同一状态快照的 `pose.seq` 相同 |
 | `config` | object | 一帧的 LaserScan 配置与无回波约定 |
 | `points` | array | 按角度递增排列的 `{angle, range, intensity}` 读数 |
 
@@ -98,6 +112,7 @@
 {
     "type": "map_full",
     "ts": 1717800000.200,
+    "source": "simulator_ground_truth",
     "voxels": [
         {"gx": 0, "gy": 0, "gz": 0, "state": 0, "conf": 0.95},
         {"gx": 1, "gy": 0, "gz": 0, "state": 1, "conf": 0.80}
@@ -108,6 +123,7 @@
 | 字段 | 类型 | 说明 |
 |------|------|------|
 | `ts` | f64 | Unix 时间戳 |
+| `source` | string | 固定为 `simulator_ground_truth`；不是车辆传感器输出 |
 | `voxels` | array | 全量体素列表 |
 | `gx`, `gy` | i32 | 2D 网格坐标 |
 | `gz` | i32 | 高度层 |
@@ -138,11 +154,17 @@
 
 ### cmd — 控制命令
 
+规范格式：
+
 ```json
 {
+    "type": "cmd",
+    "seq": 42,
     "cmd": "forward"
 }
 ```
+
+`seq` 必须是非负整数。为兼容旧客户端，也接受字段严格为 `{"cmd":"forward"}` 的 legacy 格式，其确认消息中 `seq` 为 `null`。二进制帧、非 JSON、非对象、错误 `type`、额外字段、非法 `seq` 或未知 `cmd` 都会立即停车并返回 `error`。
 
 | 命令 | 说明 |
 |------|------|
@@ -151,6 +173,34 @@
 | `spin_left` | 左旋 |
 | `spin_right` | 右旋 |
 | `stop` | 停止（松手时发送） |
+
+默认运动参数：前进/后退 `±0.5 m/s`；在 `+y` 向下、正 yaw 顺时针的坐标约定中，左旋/右旋为 `∓90°/s`。连续 `1.0 s` 未收到有效非停止命令时，看门狗令车辆停止。这些值可通过 `mockvehicle2d serve` 参数校准。
+
+### cmd_ack — 命令确认
+
+```json
+{
+    "type": "cmd_ack",
+    "ts": 1717800000.400,
+    "seq": 42,
+    "cmd": "forward",
+    "accepted": true
+}
+```
+
+### error — 命令错误
+
+```json
+{
+    "type": "error",
+    "ts": 1717800000.500,
+    "seq": 42,
+    "code": "invalid_cmd",
+    "message": "unsupported cmd"
+}
+```
+
+无法安全提取序号时 `seq` 为 `null`。错误输入总是先触发安全停车。
 
 ---
 
@@ -162,5 +212,8 @@
 pose                       cmd
 scan
 map_full
+cmd_ack / error
 map_delta
 ```
+
+当前只实现车辆控制与稳定遥测闭环；没有实现寻路、相机、真实定位、传感器噪声或 `map_delta`。
