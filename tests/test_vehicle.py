@@ -10,6 +10,7 @@ import unittest
 REPO_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO_ROOT / "src"))
 
+from mockvehicle2d.collision import is_circle_passable, is_swept_circle_passable
 from mockvehicle2d.map_grid import MapGrid
 from mockvehicle2d.server import CommandMessageError, handle_command_message, parse_command_message
 from mockvehicle2d.vehicle import Vehicle
@@ -71,6 +72,40 @@ class VehicleTest(unittest.TestCase):
         self.assertEqual(vehicle.command, "stop")
         self.assertEqual(vehicle.velocities(), (0.0, 0.0, 0.0))
 
+    def test_swept_circle_catches_wall_corner_between_safe_endpoints(self) -> None:
+        grid = MapGrid.from_wall_set(10, 10, {(5, 5)})
+        start = (4.561612, 4.738388)
+        end = (start[0] + 0.25 / math.sqrt(2), start[1] - 0.25 / math.sqrt(2))
+        midpoint = ((start[0] + end[0]) / 2, (start[1] + end[1]) / 2)
+        self.assertTrue(is_circle_passable(grid, *start, 0.5))
+        self.assertTrue(is_circle_passable(grid, *end, 0.5))
+        self.assertFalse(is_circle_passable(grid, *midpoint, 0.5))
+        self.assertTrue(is_swept_circle_passable(grid, 4.5, 4.0, 4.5, 7.0, 0.5))
+        vehicle = Vehicle(*start, yaw=-math.pi / 4, linear_speed=0.25, command_timeout=2.0, now=0.0)
+
+        vehicle.apply_command(grid, "forward", 0.0)
+        vehicle.advance(grid, 1.0)
+
+        self.assertEqual((vehicle.x, vehicle.y), start)
+        self.assertTrue(vehicle.collision)
+        clear = Vehicle(2.0, 2.0, linear_speed=0.25, command_timeout=2.0, now=0.0)
+        clear.apply_command(grid, "forward", 0.0)
+        clear.advance(grid, 1.0)
+        self.assertAlmostEqual(clear.x, 2.25)
+        self.assertAlmostEqual(clear.y, 2.0)
+
+    def test_repeated_command_does_not_clear_collision_without_motion(self) -> None:
+        grid = MapGrid.from_wall_set(10, 10, {(4, y) for y in range(10)})
+        vehicle = Vehicle(3.5, 5.5, now=0.0)
+
+        vehicle.apply_command(grid, "forward", 0.0)
+        vehicle.apply_command(grid, "forward", 0.5)
+
+        self.assertTrue(vehicle.collision)
+        vehicle.apply_command(grid, "backward", 0.5)
+        vehicle.advance(grid, 0.75)
+        self.assertFalse(vehicle.collision)
+
     def test_canonical_and_legacy_commands_are_acknowledged(self) -> None:
         vehicle = self.vehicle()
         ack = handle_command_message(
@@ -111,6 +146,17 @@ class VehicleTest(unittest.TestCase):
         for raw in invalid:
             with self.subTest(raw=raw), self.assertRaises(CommandMessageError):
                 parse_command_message(raw)
+
+    def test_oversized_json_integer_fails_safe(self) -> None:
+        vehicle = self.vehicle()
+        vehicle.apply_command(self.grid, "forward", 0.0)
+        raw = '{"type":"cmd","seq":' + "1" * 5000 + ',"cmd":"forward"}'
+
+        error = handle_command_message(raw, vehicle, self.grid, 0.25, 13.0)
+
+        self.assertEqual(error["type"], "error")
+        self.assertEqual(error["code"], "invalid_json")
+        self.assertEqual(vehicle.command, "stop")
 
 
 def main() -> int:

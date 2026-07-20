@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import math
 
-from mockvehicle2d.collision import is_circle_passable
+from mockvehicle2d.collision import is_swept_circle_passable
 from mockvehicle2d.map_grid import MapGrid
 
 
@@ -57,8 +57,6 @@ class Vehicle:
         self.advance(grid, now)
         self.command = command
         self._command_deadline = now + self.command_timeout if command != "stop" else None
-        if command != "stop":
-            self.collision = False
 
     def stop(self) -> None:
         self.command = "stop"
@@ -100,14 +98,14 @@ class Vehicle:
         return 0.0, 0.0
 
     def _translate(self, grid: MapGrid, distance: float) -> bool:
-        # ponytail: fixed substeps suit the 1 m grid; use swept collision if maps become continuous.
+        # Substeps retain a nearby last-safe pose; every segment is checked continuously.
         max_step = max(0.01, min(0.25, self.radius / 2))
         steps = max(1, math.ceil(abs(distance) / max_step))
         step = distance / steps
         for _ in range(steps):
             x = self.x + step * math.cos(self.yaw)
             y = self.y + step * math.sin(self.yaw)
-            if not is_circle_passable(grid, x, y, self.radius):
+            if not is_swept_circle_passable(grid, self.x, self.y, x, y, self.radius):
                 return False
             self.x, self.y = x, y
         self.collision = False

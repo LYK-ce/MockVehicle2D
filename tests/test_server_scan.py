@@ -5,6 +5,7 @@ import json
 from pathlib import Path
 import sys
 import unittest
+from unittest.mock import patch
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -45,6 +46,31 @@ class _CommandSocket:
 
     async def recv(self) -> str:
         return self.command
+
+
+class _Clock:
+    def __init__(self) -> None:
+        self.now = 0.0
+
+    def monotonic(self) -> float:
+        return self.now
+
+
+class _IdleTimeoutSocket:
+    remote_address = ("test", 0)
+
+    def __init__(self, clock: _Clock) -> None:
+        self.clock = clock
+        self.messages: list[dict[str, object]] = []
+
+    async def send(self, payload: str) -> None:
+        self.messages.append(json.loads(payload))
+        if len(self.messages) == 5:
+            raise RuntimeError("stop after telemetry following idle timeout")
+
+    async def recv(self) -> str:
+        self.clock.now += 1 / 6
+        raise asyncio.TimeoutError
 
 
 class ScanMessageTest(unittest.TestCase):
@@ -104,6 +130,20 @@ class ScanMessageTest(unittest.TestCase):
         asyncio.run(handler(rejected))
         self.assertEqual([message["type"] for message in rejected.messages], ["map_full", "pose", "scan", "error"])
         self.assertEqual(rejected.messages[-1]["seq"], 4)
+
+    def test_idle_receive_timeout_continues_telemetry_without_sleeping(self) -> None:
+        class LegacyAsyncioTimeoutError(Exception):
+            pass
+
+        clock = _Clock()
+        websocket = _IdleTimeoutSocket(clock)
+        with patch.object(asyncio, "TimeoutError", LegacyAsyncioTimeoutError):
+            asyncio.run(handler(websocket, _monotonic=clock.monotonic, _wall_time=lambda: 123.0))
+
+        self.assertEqual(
+            [message["type"] for message in websocket.messages],
+            ["map_full", "pose", "scan", "pose", "scan"],
+        )
 
 
 def main() -> int:

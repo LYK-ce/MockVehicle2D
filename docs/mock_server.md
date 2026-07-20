@@ -144,7 +144,7 @@ cell [gx, gx+1] × [gy, gy+1] 到圆心 (cx, cy) 的最近点:
 ## 碰撞行为
 
 ```
-移动指令 → 按实际 dt 切分小步 → is_circle_passable()
+移动指令 → 按实际 dt 切分小步 → is_swept_circle_passable()
   ├─ True  → 更新 pose 并继续
   └─ False → 停在最后安全点，command=stop, collision=true
 ```

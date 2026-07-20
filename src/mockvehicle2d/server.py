@@ -17,6 +17,7 @@ HOST = "0.0.0.0"
 PORT = 9090
 SPAWN_X = 10.0
 SPAWN_Y = 10.0
+MAX_JSON_INTEGER_DIGITS = 4300
 
 
 class CommandMessageError(ValueError):
@@ -39,13 +40,19 @@ def _safe_seq(message: object) -> int | None:
     return seq if isinstance(seq, int) and not isinstance(seq, bool) and seq >= 0 else None
 
 
+def _bounded_json_int(value: str) -> int:
+    if len(value.lstrip("-")) > MAX_JSON_INTEGER_DIGITS:
+        raise ValueError("JSON integer is too long")
+    return int(value)
+
+
 def parse_command_message(raw: object) -> tuple[str, int | None]:
     """Validate canonical commands and the exact legacy ``{"cmd": ...}`` form."""
     if not isinstance(raw, str):
         raise CommandMessageError("invalid_json_text", "command must be a JSON text message")
     try:
-        message = json.loads(raw)
-    except (json.JSONDecodeError, UnicodeError) as error:
+        message = json.loads(raw, parse_int=_bounded_json_int)
+    except (ValueError, RecursionError) as error:
         raise CommandMessageError("invalid_json", "command is not valid JSON text") from error
     if not isinstance(message, dict):
         raise CommandMessageError("invalid_message", "command JSON must be an object")
@@ -149,11 +156,13 @@ async def handler(
     angular_speed: float = math.pi / 2,
     radius: float = 0.5,
     command_timeout: float = 1.0,
+    _monotonic=time.monotonic,
+    _wall_time=time.time,
 ) -> None:
     """Serve one client; all receives and sends stay serialized in this coroutine."""
     addr = websocket.remote_address
     print(f"[+] client connected: {addr}")
-    started_at = time.monotonic()
+    started_at = _monotonic()
     voxels, grid = generate_map(radius=radius)
     vehicle = Vehicle(
         SPAWN_X,
@@ -170,7 +179,7 @@ async def handler(
     try:
         map_message = {
             "type": "map_full",
-            "ts": time.time(),
+            "ts": _wall_time(),
             "source": "simulator_ground_truth",
             "voxels": voxels,
         }
@@ -179,23 +188,23 @@ async def handler(
         await websocket.send(payload)
 
         while True:
-            now = time.monotonic()
+            now = _monotonic()
             if now >= next_deadline:
                 vehicle.advance(grid, now)
-                timestamp = time.time()
+                timestamp = _wall_time()
                 pose, scan = telemetry_messages(vehicle, grid, frame_sequence, timestamp)
                 await websocket.send(json.dumps(pose))
                 await websocket.send(json.dumps(scan))
                 print(f"[→] pose #{frame_sequence}: x={vehicle.x:.2f} y={vehicle.y:.2f} cmd={vehicle.command}")
                 frame_sequence += 1
-                next_deadline = _next_deadline(next_deadline, time.monotonic(), TMINI_SCAN_CONFIG.scan_time)
+                next_deadline = _next_deadline(next_deadline, _monotonic(), TMINI_SCAN_CONFIG.scan_time)
                 continue
 
             try:
                 raw = await asyncio.wait_for(websocket.recv(), timeout=next_deadline - now)
-            except TimeoutError:
+            except asyncio.TimeoutError:
                 continue
-            reply = handle_command_message(raw, vehicle, grid, time.monotonic(), time.time())
+            reply = handle_command_message(raw, vehicle, grid, _monotonic(), _wall_time())
             await websocket.send(json.dumps(reply))
     except Exception as error:
         print(f"[!] connection ended: {error}")
