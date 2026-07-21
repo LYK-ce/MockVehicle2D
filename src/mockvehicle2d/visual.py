@@ -10,12 +10,11 @@ mock_visual.py — Mock Server Pygame 可视化测试
 
 import math
 import random
-import sys
 
 import pygame
 
 from mockvehicle2d.map_grid import MapGrid
-from mockvehicle2d.vehicle import Vehicle
+from mockvehicle2d.vehicle import Vehicle, command_from_axes
 
 # ── 配置 ────────────────────────────────────────────────
 
@@ -135,16 +134,7 @@ def main():
         backward = keys[pygame.K_s] or keys[pygame.K_DOWN]
         left = keys[pygame.K_a] or keys[pygame.K_LEFT]
         right = keys[pygame.K_d] or keys[pygame.K_RIGHT]
-        if forward:
-            command = "forward_left" if left else "forward_right" if right else "forward"
-        elif backward:
-            command = "backward_left" if left else "backward_right" if right else "backward"
-        elif left:
-            command = "spin_left"
-        elif right:
-            command = "spin_right"
-        else:
-            command = "stop"
+        command = command_from_axes(forward, backward, left, right)
         vehicle.apply_command(grid, command, simulation_time)
 
         # ── 渲染 ──

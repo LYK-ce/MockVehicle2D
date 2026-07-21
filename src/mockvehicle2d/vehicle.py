@@ -23,6 +23,16 @@ COMMANDS = frozenset(
 )
 
 
+def command_from_axes(forward: bool, backward: bool, left: bool, right: bool) -> str:
+    """Convert held directional inputs into one canonical command."""
+    linear = int(bool(forward)) - int(bool(backward))
+    turn = int(bool(right)) - int(bool(left))
+    if linear:
+        command = "forward" if linear > 0 else "backward"
+        return command + ("_right" if turn > 0 else "_left" if turn < 0 else "")
+    return "spin_right" if turn > 0 else "spin_left" if turn < 0 else "stop"
+
+
 class Vehicle:
     """A circular differential-drive vehicle in the simulator's screen coordinates."""
 
@@ -115,6 +125,11 @@ class Vehicle:
         return 0.0, 0.0
 
     def _move(self, grid: MapGrid, distance: float, rotation: float) -> bool:
+        if distance == 0:
+            self.yaw = math.atan2(math.sin(self.yaw + rotation), math.cos(self.yaw + rotation))
+            self.collision = False
+            return True
+
         # Short chords retain a nearby last-safe pose while approximating an arc.
         max_step = max(0.01, min(0.25, self.radius / 2))
         steps = max(

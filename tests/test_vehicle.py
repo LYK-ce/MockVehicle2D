@@ -13,7 +13,7 @@ sys.path.insert(0, str(REPO_ROOT / "src"))
 from mockvehicle2d.collision import is_circle_passable, is_swept_circle_passable
 from mockvehicle2d.map_grid import MapGrid
 from mockvehicle2d.server import CommandMessageError, handle_command_message, parse_command_message
-from mockvehicle2d.vehicle import Vehicle
+from mockvehicle2d.vehicle import Vehicle, command_from_axes
 
 
 class VehicleTest(unittest.TestCase):
@@ -88,6 +88,21 @@ class VehicleTest(unittest.TestCase):
         self.assertLess(right.x, 5.0)
         self.assertLess(right.y, 5.0)
         self.assertGreater(right.yaw, 0.0)
+
+    def test_opposite_input_axes_cancel(self) -> None:
+        self.assertEqual(command_from_axes(True, True, False, False), "stop")
+        self.assertEqual(command_from_axes(True, True, True, False), "spin_left")
+        self.assertEqual(command_from_axes(True, False, True, True), "forward")
+
+    def test_large_pure_rotation_is_normalized_without_translation(self) -> None:
+        vehicle = self.vehicle(angular_speed=1_000_000.0, command_timeout=2.0)
+        vehicle.apply_command(self.grid, "spin_right", 0.0)
+
+        vehicle.advance(self.grid, 1.0)
+
+        self.assertEqual((vehicle.x, vehicle.y), (5.0, 5.0))
+        self.assertAlmostEqual(vehicle.yaw, math.atan2(math.sin(1_000_000.0), math.cos(1_000_000.0)))
+        self.assertEqual(vehicle.command, "spin_right")
 
     def test_watchdog_integrates_only_until_timeout(self) -> None:
         vehicle = self.vehicle(command_timeout=1.0)
