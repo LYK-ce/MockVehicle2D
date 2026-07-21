@@ -1,5 +1,6 @@
 """Wire-format and send-order checks for the WebSocket scan frame."""
 
+import argparse
 import asyncio
 import json
 from pathlib import Path
@@ -13,10 +14,11 @@ sys.path.insert(0, str(REPO_ROOT))
 sys.path.insert(0, str(REPO_ROOT / "src"))
 
 from tests.test_collision import main as collision_main
+from mockvehicle2d.cli.main import _port
 from mockvehicle2d.collision import is_circle_passable
 from mockvehicle2d.map_grid import MapGrid
 from mockvehicle2d.scan import scan_message
-from mockvehicle2d.server import _next_deadline, generate_map, handler, telemetry_messages, validate_vehicle_id
+from mockvehicle2d.server import _next_deadline, generate_map, handler, main as server_main, telemetry_messages, validate_vehicle_id
 from mockvehicle2d.vehicle import Vehicle
 
 
@@ -73,7 +75,40 @@ class _IdleTimeoutSocket:
         raise asyncio.TimeoutError
 
 
+class _ImmediateEvent:
+    def set(self) -> None:
+        pass
+
+    async def wait(self) -> None:
+        pass
+
+
+class _ServerContext:
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, _exc_type, _exc, _traceback) -> None:
+        pass
+
+
 class ScanMessageTest(unittest.TestCase):
+    def test_cli_port_bounds_and_custom_server_port(self) -> None:
+        self.assertEqual((_port("1"), _port("65535")), (1, 65535))
+        for invalid in ("", "0", "65536", "1.5", "not-a-port"):
+            with self.subTest(invalid=invalid), self.assertRaises(argparse.ArgumentTypeError):
+                _port(invalid)
+
+        async def run_server() -> None:
+            with (
+                patch("mockvehicle2d.server.asyncio.Event", return_value=_ImmediateEvent()),
+                patch("mockvehicle2d.server.signal.signal"),
+                patch("websockets.asyncio.server.serve", return_value=_ServerContext()) as serve,
+            ):
+                await server_main(port=19090)
+                self.assertEqual(serve.call_args.args[1:], ("0.0.0.0", 19090))
+
+        asyncio.run(run_server())
+
     def test_existing_collision_suite_still_passes(self) -> None:
         self.assertEqual(collision_main(), 0)
 

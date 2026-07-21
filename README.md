@@ -6,7 +6,7 @@
 
 ```bash
 # 一键安装（创建 .venv + 安装依赖）
-source bootstrap.sh
+bash bootstrap.sh
 
 # 然后激活环境
 source .venv/bin/activate
@@ -16,6 +16,9 @@ mockvehicle2d test
 
 # 启动可控 WebSocket Mock Server
 mockvehicle2d serve --vehicle-id mock_vehicle_01
+
+# 9090 被占用时改用其他端口，并在 Pictor 中输入相同端口
+mockvehicle2d serve --port 19090 --vehicle-id mock_vehicle_01
 
 # 校准模拟车（角速度单位为度/秒）
 mockvehicle2d serve --linear-speed 0.5 --angular-speed 90 --vehicle-radius 0.5 --command-timeout 1.0
@@ -94,7 +97,8 @@ mockvehicle2d test
 
 遵循 [WebSocket 通信协议](docs/websocket_protocol.md)。
 
-启动 Server 后，在 Pictor 中连接 `ws://127.0.0.1:9090`。连接首帧固定为
+启动 Server 后，在 Pictor 中连接 `ws://127.0.0.1:9090`；使用 `--port 19090` 时，
+Pictor 也应连接 `ws://127.0.0.1:19090`。连接首帧固定为
 `{"type":"hello","vehicle_id":"mock_vehicle_01"}`，随后依次发送 `map_full → pose → scan`。
 
 | 方向 | 消息 | 状态 |

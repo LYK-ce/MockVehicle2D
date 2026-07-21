@@ -20,6 +20,16 @@ def _positive_float(value: str) -> float:
     return number
 
 
+def _port(value: str) -> int:
+    try:
+        port = int(value)
+    except ValueError as error:
+        raise argparse.ArgumentTypeError("port must be an integer from 1 to 65535") from error
+    if not 1 <= port <= 65535:
+        raise argparse.ArgumentTypeError("port must be an integer from 1 to 65535")
+    return port
+
+
 def _vehicle_id(value: str) -> str:
     from mockvehicle2d.server import validate_vehicle_id
 
@@ -35,6 +45,7 @@ def _cmd_serve(args):
 
     asyncio.run(
         server_main(
+            port=args.port,
             vehicle_id=args.vehicle_id,
             linear_speed=args.linear_speed,
             angular_speed=math.radians(args.angular_speed),
@@ -76,6 +87,7 @@ def main():
     sub = parser.add_subparsers(dest="command", required=True)
 
     serve = sub.add_parser("serve", help="Start controllable WebSocket server with YDLidar Tmini scans")
+    serve.add_argument("--port", type=_port, default=9090, metavar="PORT")
     serve.add_argument("--vehicle-id", type=_vehicle_id, default="mock_vehicle_01", metavar="ID")
     serve.add_argument("--linear-speed", type=_positive_float, default=0.5, metavar="MPS")
     serve.add_argument("--angular-speed", type=_positive_float, default=90.0, metavar="DEG_PER_SECOND")

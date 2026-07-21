@@ -227,6 +227,7 @@ async def handler(
 
 async def main(
     *,
+    port: int = PORT,
     vehicle_id: str = DEFAULT_VEHICLE_ID,
     linear_speed: float = 0.5,
     angular_speed: float = math.pi / 2,
@@ -255,8 +256,8 @@ async def main(
             command_timeout=command_timeout,
         )
 
-    async with serve(configured_handler, HOST, PORT):
-        print(f"Mock Vehicle Server listening on ws://{HOST}:{PORT}")
+    async with serve(configured_handler, HOST, port):
+        print(f"Mock Vehicle Server listening on ws://{HOST}:{port}")
         print("Waiting for a controller connection...\n")
         await stop.wait()
 

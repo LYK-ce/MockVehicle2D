@@ -158,6 +158,7 @@ cell [gx, gx+1] × [gy, gy+1] 到圆心 (cx, cy) 的最近点:
 
 ```bash
 mockvehicle2d serve \
+  --port 9090 \
   --vehicle-id mock_vehicle_01 \
   --linear-speed 0.5 \
   --angular-speed 90 \
@@ -167,7 +168,7 @@ mockvehicle2d serve \
 
 角速度参数单位为度/秒。规范命令为 `{"type":"cmd","seq":0,"cmd":"forward"}`；也兼容精确 legacy 格式 `{"cmd":"forward"}`。新命令生效前先把旧命令积分到接收时刻。非法消息、看门狗超时、碰撞或连接结束都会停车。
 
-Pictor 连接 `ws://127.0.0.1:9090` 后，首帧为 `hello`，随后为 `map_full → pose → scan`。`hello` 不携带地址；Pictor 使用自己实际连接的 URL。
+Pictor 连接 `ws://127.0.0.1:9090` 后，首帧为 `hello`，随后为 `map_full → pose → scan`。若端口被占用，可启动 `mockvehicle2d serve --port 19090`，并让 Pictor 连接 `ws://127.0.0.1:19090`。`hello` 不携带地址；Pictor 使用自己实际连接的 URL。
 
 每个 6 Hz deadline 只推进一次共用状态，再以相同 `seq` 和 Unix `ts` 顺序发送 `pose`、`scan`。命令接收和全部发送都在同一个连接协程内串行执行；每轮先处理已到期遥测，命令洪泛不会永久饿死遥测。
 
