@@ -8,7 +8,7 @@
 | 数据格式 | JSON 文本消息 |
 | 编码 | UTF-8 |
 | 角色 | 小车 = Server，PC = Client |
-| 默认端口 | 9090 |
+| 默认端口 | 9001 |
 
 每条消息为单行 JSON，顶层必有 `type` 字段。
 
@@ -16,24 +16,45 @@
 
 ---
 
+## 连接流程
+
+连接分两层：
+
+| 阶段 | 触发条件 | 含义 |
+|------|---------|------|
+| WebSocket 握手完成 | TCP 升级为 WS | 物理通道建立 |
+| `hello` 包收到 | 小车发送身份 | **正式建立连接** |
+
+Pictor 仅在收到 `hello` 后才认为连接可用，之后才开始处理 `pose`、`map_*` 等业务消息。
+`hello` 之前收到的任何消息将被丢弃。
+
+```
+小车 ── TCP 握手 ──→ PC       (物理层)
+小车 ── hello ──→ PC          ← 必须第一帧，业务层连接建立
+小车 ── map_full ──→ PC
+小车 ── pose ──→ PC
+```
+
+---
+
 ## 上行：小车 → PC
 
-### hello — 连接握手
+### hello — 注册身份
 
-每次连接建立后的第一条业务消息。接收端据此确认协议已就绪，再处理后续地图和遥测。
+连接建立后立即发送，声明车辆 ID。
 
 ```json
 {
     "type": "hello",
-    "vehicle_id": "mock_vehicle_01"
+    "vehicle_id": "car_0",
+    "address": "ws://192.168.1.10:9090"
 }
 ```
 
-`vehicle_id` 可由 `mockvehicle2d serve --vehicle-id ID` 设置，只允许 1–64 个 ASCII 字母、数字、`.`、`_` 或 `-`。消息不携带 `address`：接收端应使用自己实际连接的 WebSocket URL，Server 不伪造客户端视角的地址。
-
-连接初始顺序固定为 `hello → map_full → pose → scan`。
-
----
+| 字段 | 类型 | 说明 |
+|------|------|------|
+| `vehicle_id` | string | 车辆唯一标识 |
+| `address` | string | 本连接地址，用于匹配 |
 
 ### pose — 车辆位姿
 
@@ -119,8 +140,6 @@
 | `config` | object | 一帧的 LaserScan 配置与无回波约定 |
 | `points` | array | 按角度递增排列的 `{angle, range, intensity}` 读数 |
 
----
-
 ### map_full — 全量地图
 
 连接建立或重连后，在 `hello` 之后发送完整地图。
@@ -146,8 +165,6 @@
 | `gz` | i32 | 高度层 |
 | `state` | u8 | 0=可通行 1=不可通行 |
 | `conf` | f32 | 置信度 0.0~1.0 |
-
----
 
 ### map_delta — 增量地图
 
