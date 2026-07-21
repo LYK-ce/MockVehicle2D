@@ -53,6 +53,42 @@ class VehicleTest(unittest.TestCase):
         self.assertAlmostEqual(right.yaw, math.pi / 4)
         self.assertAlmostEqual(right.velocities()[2], math.pi / 2)
 
+    def test_combined_commands_drive_arcs_and_can_switch_to_straight(self) -> None:
+        vehicle = self.vehicle()
+        vehicle.apply_command(self.grid, "forward_right", 0.0)
+        vehicle.advance(self.grid, 0.5)
+
+        self.assertGreater(vehicle.x, 5.0)
+        self.assertGreater(vehicle.y, 5.0)
+        self.assertAlmostEqual(vehicle.yaw, math.pi / 4)
+        vx, vy, omega = vehicle.velocities()
+        self.assertGreater(vx, 0.0)
+        self.assertGreater(vy, 0.0)
+        self.assertGreater(omega, 0.0)
+
+        vehicle.apply_command(self.grid, "forward", 0.5)
+        x, y = vehicle.x, vehicle.y
+        vehicle.advance(self.grid, 0.7)
+        self.assertGreater(vehicle.x, x)
+        self.assertGreater(vehicle.y, y)
+        self.assertEqual(vehicle.command, "forward")
+        self.assertEqual(vehicle.velocities()[2], 0.0)
+
+    def test_backward_combined_commands_follow_turn_signs(self) -> None:
+        left = self.vehicle()
+        left.apply_command(self.grid, "backward_left", 0.0)
+        left.advance(self.grid, 0.5)
+        self.assertLess(left.x, 5.0)
+        self.assertGreater(left.y, 5.0)
+        self.assertLess(left.yaw, 0.0)
+
+        right = self.vehicle()
+        right.apply_command(self.grid, "backward_right", 0.0)
+        right.advance(self.grid, 0.5)
+        self.assertLess(right.x, 5.0)
+        self.assertLess(right.y, 5.0)
+        self.assertGreater(right.yaw, 0.0)
+
     def test_watchdog_integrates_only_until_timeout(self) -> None:
         vehicle = self.vehicle(command_timeout=1.0)
         vehicle.apply_command(self.grid, "forward", 0.0)
@@ -71,6 +107,19 @@ class VehicleTest(unittest.TestCase):
         self.assertTrue(vehicle.collision)
         self.assertEqual(vehicle.command, "stop")
         self.assertEqual(vehicle.velocities(), (0.0, 0.0, 0.0))
+
+    def test_arc_collision_stops_at_last_safe_pose(self) -> None:
+        grid = MapGrid.from_wall_set(20, 20, {(4, y) for y in range(20)})
+        vehicle = Vehicle(2.5, 5.5, linear_speed=2.0, command_timeout=2.0, now=0.0)
+        vehicle.apply_command(grid, "forward_right", 0.0)
+        vehicle.advance(grid, 1.0)
+
+        self.assertGreater(vehicle.x, 2.5)
+        self.assertLessEqual(vehicle.x, 3.5)
+        self.assertGreater(vehicle.y, 5.5)
+        self.assertGreater(vehicle.yaw, 0.0)
+        self.assertTrue(vehicle.collision)
+        self.assertEqual(vehicle.command, "stop")
 
     def test_swept_circle_catches_wall_corner_between_safe_endpoints(self) -> None:
         grid = MapGrid.from_wall_set(10, 10, {(5, 5)})
@@ -118,6 +167,14 @@ class VehicleTest(unittest.TestCase):
         legacy = handle_command_message('{"cmd":"stop"}', vehicle, self.grid, 0.1, 12.6)
         self.assertEqual(legacy["type"], "cmd_ack")
         self.assertIsNone(legacy["seq"])
+
+        self.assertEqual(
+            parse_command_message('{"type":"cmd","seq":8,"cmd":"forward_right"}'),
+            ("forward_right", 8),
+        )
+        self.assertEqual(parse_command_message('{"cmd":"backward_left"}'), ("backward_left", None))
+        with self.assertRaises(CommandMessageError):
+            parse_command_message('{"type":"cmd","seq":9,"cmd":"forward_up"}')
 
     def test_invalid_command_stops_and_returns_safe_sequence(self) -> None:
         vehicle = self.vehicle()

@@ -8,7 +8,19 @@ from mockvehicle2d.collision import is_swept_circle_passable
 from mockvehicle2d.map_grid import MapGrid
 
 
-COMMANDS = frozenset({"forward", "backward", "spin_left", "spin_right", "stop"})
+COMMANDS = frozenset(
+    {
+        "forward",
+        "forward_left",
+        "forward_right",
+        "backward",
+        "backward_left",
+        "backward_right",
+        "spin_left",
+        "spin_right",
+        "stop",
+    }
+)
 
 
 class Vehicle:
@@ -71,12 +83,9 @@ class Vehicle:
         elapsed = motion_until - self._last_update
         if elapsed > 0:
             linear, angular = self._command_velocities()
-            if linear and not self._translate(grid, linear * elapsed):
+            if (linear or angular) and not self._move(grid, linear * elapsed, angular * elapsed):
                 self.collision = True
                 self.stop()
-            elif angular:
-                self.yaw = math.atan2(math.sin(self.yaw + angular * elapsed), math.cos(self.yaw + angular * elapsed))
-                self.collision = False
 
         self._last_update = now
         if self._command_deadline is not None and now >= self._command_deadline:
@@ -89,24 +98,39 @@ class Vehicle:
     def _command_velocities(self) -> tuple[float, float]:
         if self.command == "forward":
             return self.linear_speed, 0.0
+        if self.command == "forward_left":
+            return self.linear_speed, -self.angular_speed
+        if self.command == "forward_right":
+            return self.linear_speed, self.angular_speed
         if self.command == "backward":
             return -self.linear_speed, 0.0
+        if self.command == "backward_left":
+            return -self.linear_speed, -self.angular_speed
+        if self.command == "backward_right":
+            return -self.linear_speed, self.angular_speed
         if self.command == "spin_left":
             return 0.0, -self.angular_speed
         if self.command == "spin_right":
             return 0.0, self.angular_speed
         return 0.0, 0.0
 
-    def _translate(self, grid: MapGrid, distance: float) -> bool:
-        # Substeps retain a nearby last-safe pose; every segment is checked continuously.
+    def _move(self, grid: MapGrid, distance: float, rotation: float) -> bool:
+        # Short chords retain a nearby last-safe pose while approximating an arc.
         max_step = max(0.01, min(0.25, self.radius / 2))
-        steps = max(1, math.ceil(abs(distance) / max_step))
-        step = distance / steps
+        steps = max(
+            1,
+            math.ceil(abs(distance) / max_step),
+            math.ceil(abs(rotation) / (math.pi / 18)),
+        )
+        step_distance = distance / steps
+        step_rotation = rotation / steps
         for _ in range(steps):
-            x = self.x + step * math.cos(self.yaw)
-            y = self.y + step * math.sin(self.yaw)
-            if not is_swept_circle_passable(grid, self.x, self.y, x, y, self.radius):
+            mid_yaw = self.yaw + step_rotation / 2
+            x = self.x + step_distance * math.cos(mid_yaw)
+            y = self.y + step_distance * math.sin(mid_yaw)
+            if step_distance and not is_swept_circle_passable(grid, self.x, self.y, x, y, self.radius):
                 return False
             self.x, self.y = x, y
+            self.yaw = math.atan2(math.sin(self.yaw + step_rotation), math.cos(self.yaw + step_rotation))
         self.collision = False
         return True

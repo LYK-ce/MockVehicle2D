@@ -146,7 +146,7 @@ cell [gx, gx+1] × [gy, gy+1] 到圆心 (cx, cy) 的最近点:
 ## 碰撞行为
 
 ```
-移动指令 → 按实际 dt 切分小步 → is_swept_circle_passable()
+直线或弧线指令 → 按实际 dt 切分短线段 → is_swept_circle_passable()
   ├─ True  → 更新 pose 并继续
   └─ False → 停在最后安全点，command=stop, collision=true
 ```
@@ -166,7 +166,7 @@ mockvehicle2d serve \
   --command-timeout 1.0
 ```
 
-角速度参数单位为度/秒。规范命令为 `{"type":"cmd","seq":0,"cmd":"forward"}`；也兼容精确 legacy 格式 `{"cmd":"forward"}`。新命令生效前先把旧命令积分到接收时刻。非法消息、看门狗超时、碰撞或连接结束都会停车。
+角速度参数单位为度/秒。规范命令为 `{"type":"cmd","seq":0,"cmd":"forward"}`；W+D 等组合输入发送 `forward_right`，同时使用线速度和角速度。也兼容精确 legacy 格式 `{"cmd":"forward"}`。新命令生效前先把旧命令积分到接收时刻。非法消息、看门狗超时、碰撞或连接结束都会停车。
 
 Pictor 连接 `ws://127.0.0.1:9090` 后，首帧为 `hello`，随后为 `map_full → pose → scan`。若端口被占用，可启动 `mockvehicle2d serve --port 19090`，并让 Pictor 连接 `ws://127.0.0.1:19090`。`hello` 不携带地址；Pictor 使用自己实际连接的 URL。
 

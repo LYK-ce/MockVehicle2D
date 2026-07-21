@@ -131,13 +131,17 @@ def main():
 
         # ── 输入 ──
         keys = pygame.key.get_pressed()
-        if keys[pygame.K_w] or keys[pygame.K_UP]:
-            command = "forward"
-        elif keys[pygame.K_s] or keys[pygame.K_DOWN]:
-            command = "backward"
-        elif keys[pygame.K_a] or keys[pygame.K_LEFT]:
+        forward = keys[pygame.K_w] or keys[pygame.K_UP]
+        backward = keys[pygame.K_s] or keys[pygame.K_DOWN]
+        left = keys[pygame.K_a] or keys[pygame.K_LEFT]
+        right = keys[pygame.K_d] or keys[pygame.K_RIGHT]
+        if forward:
+            command = "forward_left" if left else "forward_right" if right else "forward"
+        elif backward:
+            command = "backward_left" if left else "backward_right" if right else "backward"
+        elif left:
             command = "spin_left"
-        elif keys[pygame.K_d] or keys[pygame.K_RIGHT]:
+        elif right:
             command = "spin_right"
         else:
             command = "stop"
