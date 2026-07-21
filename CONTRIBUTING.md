@@ -5,7 +5,7 @@
 ```bash
 git clone git@github.com:LYK-ce/MockVehicle2D.git
 cd MockVehicle2D
-source bootstrap.sh
+bash bootstrap.sh
 source .venv/bin/activate
 mockvehicle2d test          # verify everything works
 ```

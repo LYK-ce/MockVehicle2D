@@ -23,7 +23,7 @@
 │                                                     │
 │  ┌─────────────────────────────────────────────┐    │
 │  │ 状态栏: Pose(5.3,2.7) Yaw:45° Collision:NO  │    │
-│  │ [W/S/A/D] 移动 [Q/E] 转向 [R] 重置 [ESC] 退出 │    │
+│  │ [W/S/↑/↓] 移动 [A/D/←/→] 转向（可组合）[R] 重置│    │
 │  └─────────────────────────────────────────────┘    │
 └─────────────────────────────────────────────────────┘
 ```
@@ -57,7 +57,7 @@ main()
   │
   └── 主循环 (60fps):
       ├── 处理事件 (键盘/退出)
-      ├── 更新车辆 (移动 + 碰撞检测)
+      ├── 更新共用 Vehicle (实际 dt + 碰撞检测)
       ├── 渲染地图 (Tile 网格)
       ├── 渲染车辆 (圆 + 方向线)
       └── 渲染 UI (状态栏)
@@ -67,12 +67,10 @@ main()
 
 | 按键 | 动作 | 说明 |
 |------|------|------|
-| W / ↑ | 前进 | 沿 yaw 方向移动 0.2m |
-| S / ↓ | 后退 | 反方向移动 0.2m |
-| A | 左旋 | yaw += 5° |
-| D | 右旋 | yaw -= 5° |
-| Q | 左平移 | 垂直于 yaw 向左移动 |
-| E | 右平移 | 垂直于 yaw 向右移动 |
+| W / ↑ | 前进 | 沿 yaw 方向以 0.5 m/s 移动 |
+| S / ↓ | 后退 | 反方向以 0.5 m/s 移动 |
+| A / ← | 左旋 | yaw 以 −90°/s 变化 |
+| D / → | 右旋 | yaw 以 +90°/s 变化 |
 | R | 重置 | 回到起点 |
 | ESC | 退出 | — |
 
@@ -134,16 +132,7 @@ def world_to_screen(wx: float, wy: float) -> tuple[int, int]:
 
 ```python
 # 每帧更新
-def update_vehicle(keys, dt):
-    # 1. 根据按键计算目标 pose
-    new_x, new_y, new_yaw = compute_target(vehicle, keys, dt)
-
-    # 2. 碰撞检测
-    if is_circle_passable(grid, new_x, new_y, R):
-        vehicle.x, vehicle.y, vehicle.yaw = new_x, new_y, new_yaw
-        vehicle.colliding = False
-    else:
-        vehicle.colliding = True  # 不移动，变红
+vehicle.apply_command(grid, command_from_keys(keys), simulation_time)
 ```
 
 ## 与现有代码的关系
@@ -151,13 +140,13 @@ def update_vehicle(keys, dt):
 ```
 mock_visual.py
   ├── import mock_map_grid     → MapGrid 类
-  ├── import mock_collision    → is_circle_passable()
-  └── 独立运行，不依赖 WebSocket
+  ├── import vehicle           → 与 WebSocket Server 共用运动/碰撞逻辑
+  └── 独立运行，不与 Server 跨进程同步
 ```
 
-- **不影响** `mock_vehicle.py` (WebSocket server)
+- 与 WebSocket Server 共享 `vehicle.py` 的运动、看门狗和碰撞语义
 - **不影响** `test_collision.py` (测试)
-- 共享 `mock_map_grid.py` 和 `mock_collision.py`
+- 共享 `map_grid.py`、`collision.py` 和 `vehicle.py`
 - 纯本地可视化工具，与 Pictor Godot 项目无关
 
 ## 实施步骤

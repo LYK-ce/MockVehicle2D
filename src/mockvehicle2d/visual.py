@@ -10,12 +10,11 @@ mock_visual.py — Mock Server Pygame 可视化测试
 
 import math
 import random
-import sys
 
 import pygame
 
 from mockvehicle2d.map_grid import MapGrid
-from mockvehicle2d.collision import is_circle_passable
+from mockvehicle2d.vehicle import Vehicle, command_from_axes
 
 # ── 配置 ────────────────────────────────────────────────
 
@@ -24,8 +23,8 @@ MAP_H = 24
 CELL = 25                # px/cell
 WALL_DENSITY = 0.10      # 10% 墙密度
 R = 0.5                  # 车辆半径 (m)
-MOVE_SPEED = 0.2         # 每帧移动距离 (m)
-TURN_SPEED = math.radians(5)  # 每帧转向角度
+MOVE_SPEED = 0.5         # m/s
+TURN_SPEED = math.pi / 2  # rad/s
 
 # 窗口
 PANEL_H = 40             # 底部状态栏高度
@@ -64,43 +63,6 @@ def generate_map() -> MapGrid:
     return MapGrid.from_wall_set(MAP_W, MAP_H, walls)
 
 
-# ── 车辆 ────────────────────────────────────────────────
-
-class Vehicle:
-    def __init__(self, x: float, y: float, yaw: float = 0.0):
-        self.x = x
-        self.y = y
-        self.yaw = yaw      # rad, 0 = 右
-        self.hit = False
-
-    def reset(self):
-        self.x, self.y = 2.5, 2.5
-        self.yaw = 0.0
-        self.hit = False
-
-    def try_move(self, grid: MapGrid, distance: float) -> bool:
-        """沿 yaw 前进 distance，碰撞则不动"""
-        nx = self.x + distance * math.cos(self.yaw)
-        ny = self.y + distance * math.sin(self.yaw)
-        if is_circle_passable(grid, nx, ny, R):
-            self.x, self.y = nx, ny
-            self.hit = False
-            return True
-        self.hit = True
-        return False
-
-    def try_strafe(self, grid: MapGrid, distance: float) -> bool:
-        """垂直于 yaw 平移"""
-        nx = self.x + distance * math.cos(self.yaw + math.pi / 2)
-        ny = self.y + distance * math.sin(self.yaw + math.pi / 2)
-        if is_circle_passable(grid, nx, ny, R):
-            self.x, self.y = nx, ny
-            self.hit = False
-            return True
-        self.hit = True
-        return False
-
-
 # ── 渲染 ────────────────────────────────────────────────
 
 def draw_map(screen: pygame.Surface, grid: MapGrid):
@@ -116,8 +78,8 @@ def draw_map(screen: pygame.Surface, grid: MapGrid):
 
 def draw_vehicle(screen: pygame.Surface, v: Vehicle):
     sx, sy = world_to_screen(v.x, v.y)
-    r_px = int(R * CELL)
-    color = C_VEHICLE_HIT if v.hit else C_VEHICLE
+    r_px = int(v.radius * CELL)
+    color = C_VEHICLE_HIT if v.collision else C_VEHICLE
     pygame.draw.circle(screen, color, (int(sx), int(sy)), r_px)
 
     # 方向线
@@ -130,8 +92,8 @@ def draw_status(screen: pygame.Surface, v: Vehicle, font: pygame.font.Font):
     y = MAP_H * CELL + 5
     texts = [
         f"Pose: ({v.x:.1f}, {v.y:.1f})  Yaw: {math.degrees(v.yaw):.0f}°",
-        f"Collision: {'YES 🔴' if v.hit else 'NO'}",
-        "[W/S] 前进/后退  [A/D] 转向  [Q/E] 平移  [R] 重置  [ESC] 退出",
+        f"Command: {v.command}  Collision: {'YES 🔴' if v.collision else 'NO'}",
+        "[W/S/↑/↓] 前进/后退  [A/D/←/→] 转向  [R] 重置  [ESC] 退出",
     ]
     for i, txt in enumerate(texts):
         surf = font.render(txt, True, C_TEXT)
@@ -148,11 +110,13 @@ def main():
     font = pygame.font.SysFont("monospace", 14)
 
     grid = generate_map()
-    vehicle = Vehicle(2.5, 2.5, yaw=0.0)
+    vehicle = Vehicle(2.5, 2.5, yaw=0.0, linear_speed=MOVE_SPEED, angular_speed=TURN_SPEED, radius=R)
+    simulation_time = 0.0
 
     running = True
     while running:
         dt = clock.tick(FPS) / 1000.0
+        simulation_time += dt
 
         # ── 事件 ──
         for event in pygame.event.get():
@@ -162,22 +126,16 @@ def main():
                 if event.key == pygame.K_ESCAPE:
                     running = False
                 if event.key == pygame.K_r:
-                    vehicle.reset()
+                    vehicle.reset(2.5, 2.5, 0.0, simulation_time)
 
         # ── 输入 ──
         keys = pygame.key.get_pressed()
-        if keys[pygame.K_w] or keys[pygame.K_UP]:
-            vehicle.try_move(grid, MOVE_SPEED)
-        if keys[pygame.K_s] or keys[pygame.K_DOWN]:
-            vehicle.try_move(grid, -MOVE_SPEED)
-        if keys[pygame.K_a]:
-            vehicle.yaw -= TURN_SPEED
-        if keys[pygame.K_d]:
-            vehicle.yaw += TURN_SPEED
-        if keys[pygame.K_q]:
-            vehicle.try_strafe(grid, -MOVE_SPEED)
-        if keys[pygame.K_e]:
-            vehicle.try_strafe(grid, MOVE_SPEED)
+        forward = keys[pygame.K_w] or keys[pygame.K_UP]
+        backward = keys[pygame.K_s] or keys[pygame.K_DOWN]
+        left = keys[pygame.K_a] or keys[pygame.K_LEFT]
+        right = keys[pygame.K_d] or keys[pygame.K_RIGHT]
+        command = command_from_axes(forward, backward, left, right)
+        vehicle.apply_command(grid, command, simulation_time)
 
         # ── 渲染 ──
         screen.fill(C_BG)
