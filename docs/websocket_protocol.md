@@ -8,7 +8,7 @@
 | 数据格式 | JSON 文本消息 |
 | 编码 | UTF-8 |
 | 角色 | 小车 = Server，PC = Client |
-| 默认端口 | 9001 |
+| 默认端口 | 9090 |
 
 每条消息为单行 JSON，顶层必有 `type` 字段。
 
@@ -74,7 +74,13 @@ Pictor 仅在收到 `hello` 后才认为连接可用，之后才开始处理 `po
     "vy": 0.0,
     "omega": 0.0,
     "collision": false,
-    "command": "forward"
+    "command": "forward",
+    "control_mode": "autonomous",
+    "navigation": {
+        "status": "active",
+        "goal": {"x_m": 8.0, "y_m": 3.5},
+        "reason": null
+    }
 }
 ```
 
@@ -90,8 +96,11 @@ Pictor 仅在收到 `hello` 后才认为连接可用，之后才开始处理 `po
 | `omega` | f32 | 弧度/秒 | 实际角速度；左旋为负，右旋为正 |
 | `collision` | bool | — | 最近一次平移是否被碰撞截停 |
 | `command` | string | — | 当前有效命令；看门狗超时后为 `stop` |
+| `control_mode` | string | — | `navigation.status=active` 时为 `autonomous`，否则为 `manual` |
+| `navigation` | object | — | `status`、当前或最后一个 `goal`，以及终止 `reason` |
 
 `pose` 是仿真器内部真值，只用于协议、控制闭环和可视化验收。它不是 Tmini 输出，也不代表真实小车已经具备定位能力。
+`navigation.status` 为 `idle`、`active`、`reached`、`blocked` 或 `cancelled`；结束后仍保留目标与原因，便于客户端确认结果。
 
 ---
 
@@ -227,6 +236,33 @@ Pictor 仅在收到 `hello` 后才认为连接可用，之后才开始处理 `po
 
 `linear_mps` 和 `angular_rps` 必须是有限 JSON 数字，布尔值不算数字；绝对值分别不得超过 Server 的 `--linear-speed` 和 `--angular-speed` 配置。字段必须严格为示例中的四项。`0, 0` 等价于停车；非零速度沿用与 `cmd` 相同的看门狗、运动积分和碰撞停车。确认仍使用 `cmd_ack`，其中 `cmd` 为 `"drive"`。
 
+### goto — 局部坐标目标
+
+```json
+{
+    "type": "goto",
+    "seq": 44,
+    "x_m": 12.0,
+    "y_m": 8.5
+}
+```
+
+`x_m`、`y_m` 是模拟器 `local odom` 坐标中的有限 JSON 数字，字段必须严格为以上四项。当前控制器使用 `pose.source=simulator_ground_truth` 作为定位输入，先对准目标，再沿直线前进并在接近目标时减速；它不做 A*、绕障或道路边缘判断。到达后状态为 `reached`；运动碰撞后立即停车并变为 `blocked`。
+
+新的 `goto` 会替换旧目标。任何 `cmd` 或 `drive`（包括 `stop`），以及任何非法输入，都会永久取消当前目标；除非客户端重新发送 `goto`，否则不会恢复自动行驶。连接断开也会停车并取消活动目标。
+
+确认消息独立为：
+
+```json
+{
+    "type": "goto_ack",
+    "ts": 1717800000.400,
+    "seq": 44,
+    "goal": {"x_m": 12.0, "y_m": 8.5},
+    "accepted": true
+}
+```
+
 ### cmd_ack — 命令确认
 
 ```json
@@ -260,12 +296,12 @@ Pictor 仅在收到 `hello` 后才认为连接可用，之后才开始处理 `po
 ```
 上行 (小车 → PC)          下行 (PC → 小车)
 ─────────────────         ─────────────────
-hello                      cmd / drive
+hello                      cmd / drive / goto
 map_full
 pose
 scan
-cmd_ack / error
+cmd_ack / goto_ack / error
 map_delta
 ```
 
-`map_full` 和 `pose` 是 `simulator_ground_truth`，只有 `scan` 是模拟的 Tmini 本地观测。当前只实现车辆控制与稳定遥测闭环；没有实现寻路、相机、真实定位、传感器噪声或 `map_delta`。
+`map_full` 和 `pose` 是 `simulator_ground_truth`，只有 `scan` 是模拟的 Tmini 本地观测。当前仅增加了无绕障的直达目标控制；没有实现路径规划、道路边缘安全、相机、真实定位、传感器噪声或 `map_delta`。

@@ -41,6 +41,7 @@ MockVehicle2D/
 │   ├── map_grid.py         ← MapGrid 类，2D 栅格地图 (bytearray, O(1))
 │   ├── collision.py        ← 碰撞检测：Bresenham 线段 + AABB vs Circle
 │   ├── vehicle.py          ← Server/Pygame 共用的运动、碰撞与指令看门狗
+│   ├── navigation.py       ← local odom 直达目标控制与状态
 │   ├── server.py           ← WebSocket Server，接收 cmd 并发送 map_full / pose / scan
 │   ├── scan.py             ← YDLidar Tmini 二维角度/距离/强度扫描
 │   └── visual.py           ← Pygame 可视化，支持 W+D 等组合驾驶与实时碰撞反馈
@@ -48,6 +49,7 @@ MockVehicle2D/
 │   ├── test_collision.py   ← 碰撞检测测试套件
 │   ├── test_scan.py        ← 二维扫描几何测试
 │   ├── test_vehicle.py     ← 指令、运动、看门狗和防穿墙测试
+│   ├── test_goto.py        ← goto 协议、状态、接管和碰撞测试
 │   └── test_server_scan.py ← scan WebSocket 帧测试
 ├── docs/
 │   ├── mock_server.md
@@ -108,10 +110,12 @@ Pictor 也应连接 `ws://127.0.0.1:19090`。连接首帧固定为
 | 上行 | `pose` | ✅ |
 | 上行 | `scan` | ✅ |
 | 上行 | `map_delta` | ⏸️ |
-| 下行 (Pictor→Server) | `cmd` / `drive` | ✅ |
+| 下行 (Pictor→Server) | `cmd` / `drive` / `goto` | ✅ |
 
 `scan` 默认使用 Tmini 轮廓：360°、0.02–12 m、名义 4000 Hz 测距、名义 6 Hz 扫描、667 条均匀射线。有效回波按 0.01 m 量化；无回波为 `range: 0.0, intensity: 0.0`，不能当作障碍物。
 
 控制器可发送离散命令 `{"type":"cmd","seq":1,"cmd":"forward"}`，也可发送连续速度 `{"type":"drive","seq":2,"linear_mps":0.25,"angular_rps":-0.4}`；Server 都立即返回 `cmd_ack`。`drive` 的绝对值上限分别由 `--linear-speed` 和 `--angular-speed` 配置。超过 `--command-timeout` 未收到有效非零命令、收到非法命令或连接断开时，车辆自动停止；碰撞时停在最后一个安全位置。旧 `cmd` 格式保持兼容并与 `drive` 使用同一运动、碰撞和看门狗逻辑。
 
-`map_full` 与 `pose` 标有 `source: "simulator_ground_truth"`，仅供仿真验收和可视化；只有 `scan` 是模拟的 Tmini 本地观测。未来导航算法不能把真值消息当作真实传感器输入。当前没有实现寻路、相机、定位误差、雷达噪声或 `map_delta`。
+发送 `{"type":"goto","seq":3,"x_m":12.0,"y_m":8.5}` 可让模拟车在本地 `odom` 坐标中直达目标，Server 返回 `goto_ack`，并在 `pose.control_mode` 与 `pose.navigation` 中持续报告模式、状态、目标和结束原因。当前定位输入是 `simulator_ground_truth`；控制器只会先转向、直线前进和接近目标减速，碰撞时报告 `blocked`，不会规划绕行。任何手动 `cmd`/`drive` 或非法输入都会取消活动目标且不会自动恢复。
+
+`map_full` 与 `pose` 标有 `source: "simulator_ground_truth"`，仅供仿真验收和可视化；只有 `scan` 是模拟的 Tmini 本地观测。未来真实导航不能把真值消息当作传感器输入。当前只有无绕障的直达目标控制，没有路径规划、道路边缘安全、相机、定位误差、雷达噪声或 `map_delta`。

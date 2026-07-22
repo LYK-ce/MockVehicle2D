@@ -10,6 +10,7 @@ import signal
 import time
 
 from mockvehicle2d.map_grid import MapGrid
+from mockvehicle2d.navigation import GotoController
 from mockvehicle2d.scan import TMINI_SCAN_CONFIG, scan_message
 from mockvehicle2d.vehicle import COMMANDS, Vehicle
 
@@ -127,24 +128,77 @@ def parse_drive_message(
     return _parse_drive_object(_decode_message(raw), linear_limit, angular_limit)
 
 
+def _parse_goto_object(message: dict[str, object]) -> tuple[float, float, int]:
+    seq = _safe_seq(message)
+    if message.get("type") != "goto":
+        raise CommandMessageError("invalid_type", "type must be goto", seq)
+    if "seq" not in message:
+        raise CommandMessageError("missing_seq", "goto command requires seq", None)
+    if seq is None:
+        raise CommandMessageError("invalid_seq", "seq must be a non-negative integer", None)
+    if set(message) != {"type", "seq", "x_m", "y_m"}:
+        raise CommandMessageError("invalid_fields", "goto command has missing or unexpected fields", seq)
+
+    values = (message["x_m"], message["y_m"])
+    if any(isinstance(value, bool) or not isinstance(value, (int, float)) for value in values):
+        raise CommandMessageError("invalid_goto", "goto coordinates must be JSON numbers", seq)
+    try:
+        x_m, y_m = (float(value) for value in values)
+    except OverflowError as error:
+        raise CommandMessageError("invalid_goto", "goto coordinates must be finite", seq) from error
+    if not math.isfinite(x_m) or not math.isfinite(y_m):
+        raise CommandMessageError("invalid_goto", "goto coordinates must be finite", seq)
+    return x_m, y_m, seq
+
+
+def parse_goto_message(raw: object) -> tuple[float, float, int]:
+    """Validate one local-odometry go-to-goal command."""
+    return _parse_goto_object(_decode_message(raw))
+
+
 def handle_command_message(
-    raw: object, vehicle: Vehicle, grid: MapGrid, monotonic_now: float, wall_timestamp: float
+    raw: object,
+    vehicle: Vehicle,
+    grid: MapGrid,
+    monotonic_now: float,
+    wall_timestamp: float,
+    navigation: GotoController | None = None,
 ) -> dict[str, object]:
     """Advance the prior command, then acknowledge or fail-safe stop."""
     try:
         message = _decode_message(raw)
+        if message.get("type") == "goto":
+            x_m, y_m, seq = _parse_goto_object(message)
+            if navigation is None:
+                raise CommandMessageError("goto_unavailable", "goto controller is unavailable", seq)
+            vehicle.advance(grid, monotonic_now)
+            vehicle.stop()
+            navigation.start(x_m, y_m)
+            return {
+                "type": "goto_ack",
+                "ts": wall_timestamp,
+                "seq": seq,
+                "goal": {"x_m": x_m, "y_m": y_m},
+                "accepted": True,
+            }
         if message.get("type") == "drive":
             linear_mps, angular_rps, seq = _parse_drive_object(
                 message, vehicle.linear_speed, vehicle.angular_speed
             )
+            if navigation is not None:
+                navigation.cancel("manual_override")
             vehicle.apply_drive(grid, linear_mps, angular_rps, monotonic_now)
             command = "drive"
         else:
             command, seq = _parse_command_object(message)
+            if navigation is not None:
+                navigation.cancel("manual_override")
             vehicle.apply_command(grid, command, monotonic_now)
     except CommandMessageError as error:
         vehicle.advance(grid, monotonic_now)
         vehicle.stop()
+        if navigation is not None:
+            navigation.cancel("invalid_command")
         return {
             "type": "error",
             "ts": wall_timestamp,
@@ -181,7 +235,11 @@ def generate_map(size: int = 256, seed: int = 42, radius: float = 0.5) -> tuple[
 
 
 def telemetry_messages(
-    vehicle: Vehicle, grid: MapGrid, sequence: int, timestamp: float
+    vehicle: Vehicle,
+    grid: MapGrid,
+    sequence: int,
+    timestamp: float,
+    navigation: GotoController | None = None,
 ) -> tuple[dict[str, object], dict[str, object]]:
     """Build a pose/scan pair from one state snapshot and wall-clock timestamp."""
     vx, vy, omega = vehicle.velocities()
@@ -199,6 +257,12 @@ def telemetry_messages(
         "omega": omega,
         "collision": vehicle.collision,
         "command": vehicle.command,
+        "control_mode": navigation.control_mode if navigation is not None else "manual",
+        "navigation": (
+            navigation.snapshot()
+            if navigation is not None
+            else {"status": "idle", "goal": None, "reason": None}
+        ),
     }
     scan = scan_message(grid, vehicle.x, vehicle.y, vehicle.yaw, timestamp, TMINI_SCAN_CONFIG)
     scan["seq"] = sequence
@@ -231,6 +295,7 @@ async def handler(
         command_timeout=command_timeout,
         now=started_at,
     )
+    navigation = GotoController()
     frame_sequence = 0
     next_deadline = started_at
 
@@ -249,9 +314,9 @@ async def handler(
         while True:
             now = _monotonic()
             if now >= next_deadline:
-                vehicle.advance(grid, now)
+                navigation.update(vehicle, grid, now)
                 timestamp = _wall_time()
-                pose, scan = telemetry_messages(vehicle, grid, frame_sequence, timestamp)
+                pose, scan = telemetry_messages(vehicle, grid, frame_sequence, timestamp, navigation)
                 await websocket.send(json.dumps(pose))
                 await websocket.send(json.dumps(scan))
                 print(f"[→] pose #{frame_sequence}: x={vehicle.x:.2f} y={vehicle.y:.2f} cmd={vehicle.command}")
@@ -263,11 +328,14 @@ async def handler(
                 raw = await asyncio.wait_for(websocket.recv(), timeout=next_deadline - now)
             except asyncio.TimeoutError:
                 continue
-            reply = handle_command_message(raw, vehicle, grid, _monotonic(), _wall_time())
+            reply = handle_command_message(
+                raw, vehicle, grid, _monotonic(), _wall_time(), navigation
+            )
             await websocket.send(json.dumps(reply))
     except Exception as error:
         print(f"[!] connection ended: {error}")
     finally:
+        navigation.cancel("disconnected")
         vehicle.stop()
         print(f"[-] client disconnected: {addr}")
 
