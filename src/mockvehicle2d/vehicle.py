@@ -97,11 +97,12 @@ class Vehicle:
         self._angular_rps = 0.0
         self._command_deadline = None
 
-    def advance(self, grid: MapGrid, now: float) -> None:
-        """Integrate commanded motion through ``now`` using actual monotonic time."""
+    def advance(self, grid: MapGrid, now: float) -> bool:
+        """Integrate commanded motion through ``now`` and report a new collision."""
         if now < self._last_update:
             raise ValueError("monotonic time moved backwards")
 
+        collided = False
         motion_until = min(now, self._command_deadline) if self._command_deadline is not None else now
         elapsed = motion_until - self._last_update
         if elapsed > 0:
@@ -109,10 +110,12 @@ class Vehicle:
             if (linear or angular) and not self._move(grid, linear * elapsed, angular * elapsed):
                 self.collision = True
                 self.stop()
+                collided = True
 
         self._last_update = now
         if self._command_deadline is not None and now >= self._command_deadline:
             self.stop()
+        return collided
 
     def velocities(self) -> tuple[float, float, float]:
         linear, angular = self._command_velocities()
@@ -124,7 +127,8 @@ class Vehicle:
     def _apply_velocities(
         self, grid: MapGrid, linear_mps: float, angular_rps: float, now: float, command: str
     ) -> None:
-        self.advance(grid, now)
+        if self.advance(grid, now):
+            return
         if linear_mps == 0 and angular_rps == 0:
             self.stop()
             return

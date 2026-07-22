@@ -144,6 +144,19 @@ class VehicleTest(unittest.TestCase):
         self.assertEqual(vehicle.command, "stop")
         self.assertEqual(vehicle.velocities(), (0.0, 0.0, 0.0))
 
+    def test_new_drive_does_not_restart_after_prior_motion_collides(self) -> None:
+        grid = MapGrid.from_wall_set(20, 20, {(4, y) for y in range(20)})
+        vehicle = Vehicle(2.5, 5.5, command_timeout=5.0, now=0.0)
+        vehicle.apply_command(grid, "forward", 0.0)
+
+        vehicle.apply_drive(grid, 0.25, 0.0, 4.0)
+
+        self.assertTrue(vehicle.collision)
+        self.assertEqual((vehicle.command, vehicle.velocities()), ("stop", (0.0, 0.0, 0.0)))
+        stopped_at = (vehicle.x, vehicle.y, vehicle.yaw)
+        vehicle.advance(grid, 4.5)
+        self.assertEqual((vehicle.x, vehicle.y, vehicle.yaw), stopped_at)
+
     def test_substeps_stop_at_last_safe_position(self) -> None:
         grid = MapGrid.from_wall_set(20, 20, {(4, y) for y in range(20)})
         vehicle = Vehicle(2.5, 5.5, linear_speed=10.0, command_timeout=2.0, now=0.0)
