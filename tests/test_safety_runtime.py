@@ -165,6 +165,106 @@ class SafetyRuntimeTest(unittest.TestCase):
         self.assertEqual((vehicle.x, vehicle.y, vehicle.yaw), stopped_pose)
         self.assertEqual(safety.snapshot()["state"], "stopped")
 
+    def test_delayed_manual_tick_stops_outside_wall_without_collision(self) -> None:
+        grid = wall_grid(4)
+        vehicle = self.vehicle()
+        safety = LocalSafetyRuntime()
+        handle_command_message(
+            '{"type":"drive","seq":7,"linear_mps":0.5,"angular_rps":0}',
+            vehicle,
+            grid,
+            0.0,
+            12.0,
+            safety=safety,
+        )
+
+        result = safety.advance(vehicle, grid, 4.0, automatic=False)
+
+        self.assertFalse(result.collided)
+        self.assertTrue(result.stopped)
+        self.assertEqual(result.reason, "safety_obstacle")
+        self.assertFalse(vehicle.collision)
+        self.assertLessEqual(vehicle.x, 4.0 - vehicle.radius - 0.25 + 1e-9)
+        self.assertEqual(vehicle.body_velocities(), (0.0, 0.0))
+
+    def test_delayed_automatic_tick_stops_before_void_and_stays_blocked(self) -> None:
+        grid = MapGrid(20, 20)
+        grid.set_cell(4, 5, VOID)
+        vehicle = self.vehicle()
+        navigation = GotoController()
+        safety = LocalSafetyRuntime()
+        navigation.start(10.0, 5.5)
+        navigation.update(vehicle, grid, 0.0, safety)
+
+        navigation.update(vehicle, grid, 4.0, safety)
+
+        self.assertEqual((navigation.status, navigation.reason), ("blocked", "safety_edge"))
+        self.assertFalse(vehicle.collision)
+        self.assertLessEqual(vehicle.x, 4.0 - vehicle.radius - 0.25 + 1e-9)
+        stopped_pose = (vehicle.x, vehicle.y, vehicle.yaw)
+        grid.set_cell(4, 5, FREE)
+        navigation.update(vehicle, grid, 5.0, safety)
+        self.assertEqual((vehicle.x, vehicle.y, vehicle.yaw), stopped_pose)
+        self.assertEqual(navigation.status, "blocked")
+
+    def test_high_speed_goto_handoff_cannot_cross_wall(self) -> None:
+        grid = wall_grid(4)
+        vehicle = Vehicle(
+            2.0,
+            5.5,
+            radius=0.5,
+            linear_speed=5.0,
+            command_timeout=10.0,
+            now=0.0,
+        )
+        navigation = GotoController()
+        safety = LocalSafetyRuntime()
+        handle_command_message(
+            '{"type":"drive","seq":8,"linear_mps":5,"angular_rps":0}',
+            vehicle,
+            grid,
+            0.0,
+            12.0,
+            navigation,
+            safety,
+        )
+
+        handle_command_message(
+            '{"type":"goto","seq":9,"x_m":10,"y_m":5.5}',
+            vehicle,
+            grid,
+            1.0,
+            13.0,
+            navigation,
+            safety,
+        )
+
+        self.assertEqual((navigation.status, navigation.reason), ("blocked", "safety_obstacle"))
+        self.assertFalse(vehicle.collision)
+        self.assertLessEqual(vehicle.x, 4.0 - vehicle.radius - 0.25 + 1e-9)
+
+    def test_safe_advance_preserves_straight_reverse_rotation_and_watchdog(self) -> None:
+        grid = MapGrid(20, 20)
+        safety = LocalSafetyRuntime()
+
+        straight = Vehicle(5.0, 5.0, command_timeout=0.5, now=0.0)
+        straight.apply_drive(grid, 0.5, 0.0, 0.0)
+        result = safety.advance(straight, grid, 1.0, automatic=False)
+        self.assertFalse(result.collided)
+        self.assertAlmostEqual(straight.x, 5.25)
+        self.assertEqual(straight.command, "stop")
+
+        reverse = Vehicle(5.0, 5.0, command_timeout=1.0, now=0.0)
+        reverse.apply_drive(grid, -0.5, 0.0, 0.0)
+        safety.advance(reverse, grid, 0.4, automatic=False)
+        self.assertAlmostEqual(reverse.x, 4.8)
+
+        rotating = Vehicle(5.0, 5.0, command_timeout=1.0, now=0.0)
+        rotating.apply_drive(grid, 0.0, 0.5, 0.0)
+        safety.advance(rotating, grid, 0.4, automatic=False)
+        self.assertEqual((rotating.x, rotating.y), (5.0, 5.0))
+        self.assertAlmostEqual(rotating.yaw, 0.2)
+
     def test_pose_snapshot_and_generated_void_patch_are_observable(self) -> None:
         safety = LocalSafetyRuntime()
         pose, _scan = telemetry_messages(

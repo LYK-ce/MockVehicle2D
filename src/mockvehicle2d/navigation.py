@@ -45,12 +45,24 @@ class GotoController:
         now: float,
         safety: LocalSafetyRuntime | None = None,
     ) -> None:
-        collided = vehicle.advance(grid, now)
-        if self.status != "active":
+        was_active = self.status == "active"
+        if safety is None:
+            collided = vehicle.advance(grid, now)
+            safety_stop = None
+        else:
+            result = safety.advance(vehicle, grid, now, automatic=was_active)
+            collided = result.collided
+            safety_stop = result.reason if result.stopped else None
+        if not was_active:
             return
         if collided:
             self.status = "blocked"
             self.reason = "collision"
+            vehicle.stop()
+            return
+        if safety_stop is not None:
+            self.status = "blocked"
+            self.reason = safety_stop
             vehicle.stop()
             return
 
@@ -83,4 +95,4 @@ class GotoController:
                 vehicle.stop()
                 return
             linear_mps, angular_rps = decision.linear_mps, decision.angular_rps
-        vehicle.apply_drive(grid, linear_mps, angular_rps, now)
+        vehicle.install_drive(linear_mps, angular_rps, now)

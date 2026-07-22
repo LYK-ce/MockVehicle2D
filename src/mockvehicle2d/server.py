@@ -167,18 +167,32 @@ def handle_command_message(
     safety: LocalSafetyRuntime | None = None,
 ) -> dict[str, object]:
     """Advance the prior command, then acknowledge or fail-safe stop."""
+    if safety is None:
+        handoff_collided = vehicle.advance(grid, monotonic_now)
+        handoff_safety_stop = None
+    else:
+        handoff = safety.advance(
+            vehicle,
+            grid,
+            monotonic_now,
+            automatic=navigation is not None and navigation.status == "active",
+        )
+        handoff_collided = handoff.collided
+        handoff_safety_stop = handoff.reason if handoff.stopped else None
     try:
         message = _decode_message(raw)
         if message.get("type") == "goto":
             x_m, y_m, seq = _parse_goto_object(message)
             if navigation is None:
                 raise CommandMessageError("goto_unavailable", "goto controller is unavailable", seq)
-            handoff_collided = vehicle.advance(grid, monotonic_now)
             vehicle.stop()
             navigation.start(x_m, y_m)
             if handoff_collided:
                 navigation.status = "blocked"
                 navigation.reason = "collision"
+            elif handoff_safety_stop is not None:
+                navigation.status = "blocked"
+                navigation.reason = handoff_safety_stop
             return {
                 "type": "goto_ack",
                 "ts": wall_timestamp,
@@ -192,20 +206,29 @@ def handle_command_message(
             )
             if navigation is not None:
                 navigation.cancel("manual_override")
-            vehicle.apply_drive(grid, linear_mps, angular_rps, monotonic_now)
             if safety is not None:
-                safety.enforce_manual(vehicle, grid, (linear_mps, angular_rps))
+                decision = safety.enforce_manual(vehicle, grid, (linear_mps, angular_rps))
+            else:
+                decision = None
+            if not handoff_collided and (
+                decision is None or decision.state not in {"stopped", "fault"}
+            ):
+                vehicle.install_drive(linear_mps, angular_rps, monotonic_now)
             command = "drive"
         else:
             command, seq = _parse_command_object(message)
             if navigation is not None:
                 navigation.cancel("manual_override")
             velocities = vehicle.velocities_for_command(command)
-            vehicle.apply_command(grid, command, monotonic_now)
             if safety is not None:
-                safety.enforce_manual(vehicle, grid, velocities)
+                decision = safety.enforce_manual(vehicle, grid, velocities)
+            else:
+                decision = None
+            if not handoff_collided and (
+                decision is None or decision.state not in {"stopped", "fault"}
+            ):
+                vehicle.install_command(command, monotonic_now)
     except CommandMessageError as error:
-        vehicle.advance(grid, monotonic_now)
         vehicle.stop()
         if navigation is not None:
             navigation.cancel("invalid_command")
@@ -346,8 +369,6 @@ async def handler(
             now = _monotonic()
             if now >= next_deadline:
                 navigation.update(vehicle, grid, now, safety)
-                if navigation.status != "active":
-                    safety.enforce_manual(vehicle, grid)
                 timestamp = _wall_time()
                 pose, scan = telemetry_messages(
                     vehicle, grid, frame_sequence, timestamp, navigation, safety

@@ -75,11 +75,21 @@ class Vehicle:
 
     def apply_command(self, grid: MapGrid, command: str, now: float) -> None:
         """Advance the old command to ``now``, then install the new command."""
-        linear, angular = self.velocities_for_command(command)
-        self._apply_velocities(grid, linear, angular, now, command)
+        if not self.advance(grid, now):
+            self.install_command(command, now)
 
     def apply_drive(self, grid: MapGrid, linear_mps: float, angular_rps: float, now: float) -> None:
         """Advance to ``now``, then install bounded continuous velocities."""
+        if not self.advance(grid, now):
+            self.install_drive(linear_mps, angular_rps, now)
+
+    def install_command(self, command: str, now: float) -> None:
+        """Install a discrete command after the vehicle has already advanced to ``now``."""
+        linear, angular = self.velocities_for_command(command)
+        self._install_velocities(linear, angular, now, command)
+
+    def install_drive(self, linear_mps: float, angular_rps: float, now: float) -> None:
+        """Install bounded velocities after the vehicle has already advanced to ``now``."""
         values = (linear_mps, angular_rps)
         if any(isinstance(value, bool) or not isinstance(value, (int, float)) for value in values):
             raise ValueError("drive velocities must be numbers")
@@ -87,7 +97,7 @@ class Vehicle:
             raise ValueError("drive velocities must be finite")
         if abs(linear_mps) > self.linear_speed or abs(angular_rps) > self.angular_speed:
             raise ValueError("drive velocities exceed configured limits")
-        self._apply_velocities(grid, float(linear_mps), float(angular_rps), now, "drive")
+        self._install_velocities(float(linear_mps), float(angular_rps), now, "drive")
 
     def stop(self) -> None:
         self.command = "stop"
@@ -123,11 +133,19 @@ class Vehicle:
         """Return the currently commanded linear and angular velocities."""
         return self._linear_mps, self._angular_rps
 
-    def _apply_velocities(
-        self, grid: MapGrid, linear_mps: float, angular_rps: float, now: float, command: str
+    @property
+    def last_update(self) -> float:
+        return self._last_update
+
+    @property
+    def command_deadline(self) -> float | None:
+        return self._command_deadline
+
+    def _install_velocities(
+        self, linear_mps: float, angular_rps: float, now: float, command: str
     ) -> None:
-        if self.advance(grid, now):
-            return
+        if now != self._last_update:
+            raise ValueError("vehicle must be advanced to now before installing velocities")
         if linear_mps == 0 and angular_rps == 0:
             self.stop()
             return

@@ -57,10 +57,10 @@ class MapStateSafetyTest(unittest.TestCase):
 
 
 class SafetySensingTest(unittest.TestCase):
-    def test_obstacle_clearance_selects_travel_sector_and_ignores_no_return(self) -> None:
+    def test_obstacle_clearance_selects_travel_direction_and_ignores_no_return(self) -> None:
         points = [
             LaserPoint(0.0, 0.0, 0.0),
-            LaserPoint(math.radians(20), 1.4, 1.0),
+            LaserPoint(0.0, 1.4, 1.0),
             LaserPoint(math.pi / 2, 0.5, 1.0),
             LaserPoint(math.pi, 0.9, 1.0),
         ]
@@ -68,6 +68,21 @@ class SafetySensingTest(unittest.TestCase):
         self.assertAlmostEqual(nearest_obstacle_clearance(points, 0.5, 0.4), 1.0)
         self.assertAlmostEqual(nearest_obstacle_clearance(points, -0.5, 0.4), 0.5)
         self.assertIsNone(nearest_obstacle_clearance(points, 0.0, 0.4))
+
+    def test_obstacle_clearance_uses_the_full_circular_travel_corridor(self) -> None:
+        point = LaserPoint(math.radians(40), 0.6, 1.0)
+
+        clearance = nearest_obstacle_clearance([point], 0.5, 0.5)
+
+        self.assertIsNotNone(clearance)
+        self.assertLessEqual(clearance, HARD_STOP_CLEARANCE_M)
+        self.assertEqual(
+            SafetyGovernor()
+            .limit(0.5, 0.0, SafetyObservation(obstacle_clearance_m=clearance), False)
+            .state,
+            "stopped",
+        )
+        self.assertIsNone(nearest_obstacle_clearance([point], -0.5, 0.5))
 
     def test_edge_clearance_detects_void_out_of_bounds_and_vehicle_width(self) -> None:
         grid = MapGrid(8, 6)

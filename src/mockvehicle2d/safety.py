@@ -11,7 +11,7 @@ from mockvehicle2d.vehicle import Vehicle
 
 HARD_STOP_CLEARANCE_M = 0.25
 SLOW_ZONE_CLEARANCE_M = 1.0
-OBSTACLE_SECTOR_HALF_ANGLE_RAD = math.radians(30)
+SAFETY_ADVANCE_STEP_M = 0.05
 EDGE_LOOKAHEAD_M = 2.0
 EDGE_SAMPLE_STEP_M = 0.05
 
@@ -38,32 +38,36 @@ class SafetyDecision:
     reason: str | None
 
 
+@dataclass(frozen=True)
+class SafetyAdvanceResult:
+    collided: bool = False
+    stopped: bool = False
+    reason: str | None = None
+
+
 def nearest_obstacle_clearance(
     points: Iterable[LaserPoint],
     desired_linear_mps: float,
     vehicle_radius: float,
-    sector_half_angle_rad: float = OBSTACLE_SECTOR_HALF_ANGLE_RAD,
 ) -> float | None:
-    """Nearest positive Tmini return in the forward or reverse travel sector."""
+    """Nearest Tmini endpoint along the swept circular travel corridor."""
     if desired_linear_mps == 0:
         return None
     if not math.isfinite(desired_linear_mps) or not math.isfinite(vehicle_radius) or vehicle_radius < 0:
         raise ValueError("motion and radius must be finite; radius cannot be negative")
-    if not math.isfinite(sector_half_angle_rad) or not 0 < sector_half_angle_rad <= math.pi:
-        raise ValueError("sector half angle must be in (0, pi]")
 
-    center = 0.0 if desired_linear_mps > 0 else math.pi
-    ranges = (
-        point.range
-        for point in points
-        if math.isfinite(point.angle)
-        and math.isfinite(point.range)
-        and point.range > 0
-        and abs(math.atan2(math.sin(point.angle - center), math.cos(point.angle - center)))
-        <= sector_half_angle_rad
-    )
-    nearest = min(ranges, default=None)
-    return None if nearest is None else max(0.0, nearest - vehicle_radius)
+    direction = 1.0 if desired_linear_mps > 0 else -1.0
+    clearances = []
+    for point in points:
+        if not math.isfinite(point.angle) or not math.isfinite(point.range) or point.range <= 0:
+            continue
+        longitudinal = direction * point.range * math.cos(point.angle)
+        lateral = point.range * math.sin(point.angle)
+        if longitudinal <= 0 or abs(lateral) > vehicle_radius:
+            continue
+        footprint_front = math.sqrt(max(0.0, vehicle_radius**2 - lateral**2))
+        clearances.append(max(0.0, longitudinal - footprint_front))
+    return min(clearances, default=None)
 
 
 def nearest_edge_clearance(
@@ -216,6 +220,75 @@ class LocalSafetyRuntime:
         if decision.state in {"stopped", "fault"}:
             vehicle.stop()
         return decision
+
+    def advance(
+        self,
+        vehicle: Vehicle,
+        grid: MapGrid,
+        now: float,
+        *,
+        automatic: bool,
+    ) -> SafetyAdvanceResult:
+        """Advance held motion in fresh, clearance-bounded safety steps."""
+        if now < vehicle.last_update:
+            raise ValueError("monotonic time moved backwards")
+
+        deadline = vehicle.command_deadline
+        motion_until = min(now, deadline) if deadline is not None else now
+        while vehicle.last_update < motion_until:
+            linear_mps, angular_rps = vehicle.body_velocities()
+            if linear_mps == 0:
+                if angular_rps:
+                    decision = self.evaluate(vehicle, grid, 0.0, angular_rps, automatic=automatic)
+                    if decision.state == "fault":
+                        vehicle.stop()
+                        vehicle.advance(grid, now)
+                        return SafetyAdvanceResult(stopped=True, reason=decision.reason)
+                collided = vehicle.advance(grid, now)
+                return SafetyAdvanceResult(collided=collided)
+
+            decision = self.evaluate(
+                vehicle, grid, linear_mps, angular_rps, automatic=automatic
+            )
+            if decision.state in {"stopped", "fault"}:
+                vehicle.stop()
+                vehicle.advance(grid, now)
+                return SafetyAdvanceResult(stopped=True, reason=decision.reason)
+
+            nearest = min(
+                (
+                    (clearance, reason)
+                    for clearance, reason in (
+                        (self.observation.obstacle_clearance_m, "safety_obstacle"),
+                        (self.observation.edge_clearance_m, "safety_edge"),
+                    )
+                    if clearance is not None
+                ),
+                default=None,
+            )
+            step_distance = SAFETY_ADVANCE_STEP_M
+            if nearest is not None:
+                clearance, reason = nearest
+                step_distance = min(step_distance, max(0.0, clearance - HARD_STOP_CLEARANCE_M))
+                if step_distance <= 1e-12:
+                    self.decision = SafetyDecision(0.0, angular_rps, "stopped", reason)
+                    vehicle.stop()
+                    vehicle.advance(grid, now)
+                    return SafetyAdvanceResult(stopped=True, reason=reason)
+
+            step_time = min(
+                motion_until - vehicle.last_update,
+                step_distance / abs(linear_mps),
+            )
+            collided = vehicle.advance(grid, vehicle.last_update + step_time)
+            if collided:
+                vehicle.advance(grid, now)
+                return SafetyAdvanceResult(collided=True)
+
+        if vehicle.last_update < now:
+            collided = vehicle.advance(grid, now)
+            return SafetyAdvanceResult(collided=collided)
+        return SafetyAdvanceResult()
 
     def snapshot(self) -> dict[str, object]:
         return {
