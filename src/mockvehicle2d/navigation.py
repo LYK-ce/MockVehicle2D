@@ -5,6 +5,7 @@ from __future__ import annotations
 import math
 
 from mockvehicle2d.map_grid import MapGrid
+from mockvehicle2d.safety import LocalSafetyRuntime
 from mockvehicle2d.vehicle import Vehicle
 
 
@@ -37,7 +38,13 @@ class GotoController:
         goal = None if self.goal is None else {"x_m": self.goal[0], "y_m": self.goal[1]}
         return {"status": self.status, "goal": goal, "reason": self.reason}
 
-    def update(self, vehicle: Vehicle, grid: MapGrid, now: float) -> None:
+    def update(
+        self,
+        vehicle: Vehicle,
+        grid: MapGrid,
+        now: float,
+        safety: LocalSafetyRuntime | None = None,
+    ) -> None:
         collided = vehicle.advance(grid, now)
         if self.status != "active":
             return
@@ -66,4 +73,14 @@ class GotoController:
             if abs(heading_error) > self.turn_in_place_threshold_rad
             else min(vehicle.linear_speed, distance)
         )
+        if safety is not None:
+            decision = safety.evaluate(
+                vehicle, grid, linear_mps, angular_rps, automatic=True
+            )
+            if decision.state in {"stopped", "fault"}:
+                self.status = "blocked"
+                self.reason = decision.reason
+                vehicle.stop()
+                return
+            linear_mps, angular_rps = decision.linear_mps, decision.angular_rps
         vehicle.apply_drive(grid, linear_mps, angular_rps, now)

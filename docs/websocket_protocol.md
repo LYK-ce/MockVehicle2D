@@ -80,6 +80,12 @@ Pictor 仅在收到 `hello` 后才认为连接可用，之后才开始处理 `po
         "status": "active",
         "goal": {"x_m": 8.0, "y_m": 3.5},
         "reason": null
+    },
+    "safety": {
+        "state": "limited",
+        "reason": "safety_obstacle",
+        "obstacle_clearance_m": 0.7,
+        "edge_clearance_m": null
     }
 }
 ```
@@ -98,6 +104,7 @@ Pictor 仅在收到 `hello` 后才认为连接可用，之后才开始处理 `po
 | `command` | string | — | 当前有效命令；看门狗超时后为 `stop` |
 | `control_mode` | string | — | `navigation.status=active` 时为 `autonomous`，否则为 `manual` |
 | `navigation` | object | — | `status`、当前或最后一个 `goal`，以及终止 `reason` |
+| `safety` | object | — | 最新安全状态、原因、前进方向障碍净空和边缘净空；未发现时净空为 `null` |
 
 `pose` 是仿真器内部真值，只用于协议、控制闭环和可视化验收。它不是 Tmini 输出，也不代表真实小车已经具备定位能力。
 `navigation.status` 为 `idle`、`active`、`reached`、`blocked` 或 `cancelled`；结束后仍保留目标与原因，便于客户端确认结果。
@@ -247,7 +254,7 @@ Pictor 仅在收到 `hello` 后才认为连接可用，之后才开始处理 `po
 }
 ```
 
-`x_m`、`y_m` 是模拟器 `local odom` 坐标中的有限 JSON 数字，字段必须严格为以上四项。当前控制器使用 `pose.source=simulator_ground_truth` 作为定位输入，先对准目标，再沿直线前进并在接近目标时减速；它不做 A*、绕障或道路边缘判断。到达后状态为 `reached`；运动碰撞后立即停车并变为 `blocked`。
+`x_m`、`y_m` 是模拟器 `local odom` 坐标中的有限 JSON 数字，字段必须严格为以上四项。当前控制器使用 `pose.source=simulator_ground_truth` 作为定位输入，先对准目标，再沿直线前进并在接近目标时减速；它不做 A* 或绕障。到达后状态为 `reached`；碰撞、安全硬停止或安全输入故障都会立即停车并变为 `blocked`，且不会自行重启。
 
 新的 `goto` 会替换旧目标。任何 `cmd` 或 `drive`（包括 `stop`），以及任何非法输入，都会永久取消当前目标；除非客户端重新发送 `goto`，否则不会恢复自动行驶。连接断开也会停车并取消活动目标。
 
@@ -304,10 +311,12 @@ cmd_ack / goto_ack / error
 map_delta
 ```
 
-`map_full` 和 `pose` 是 `simulator_ground_truth`，只有 `scan` 是模拟的 Tmini 本地观测。当前仅增加了无绕障的直达目标控制；没有实现路径规划、相机、真实定位、传感器噪声或 `map_delta`。
+`map_full` 和 `pose` 是 `simulator_ground_truth`，只有 `scan` 是模拟的 Tmini 本地观测；边缘净空来自独立的模拟辅助传感器。当前仅有带安全门控的无绕障直达目标控制；没有实现路径规划、真实相机/下视传感器、真实定位、传感器噪声或 `map_delta`。
 
-## 安全数据约定（尚未接入运行循环）
+## 安全运行时
 
 水平安装的 Tmini 只对 `state=1` 的墙产生正距离回波；`range=0` 仍表示无回波，不能解释为障碍物。Tmini 不能检测地面落差，因此 `state=2` 和地图越界由模拟器独立的向下地面探测辅助量判断，不能宣称来自雷达。
 
-纯安全模型以车辆圆形 footprint 为边界输出障碍/边缘净空：净空 `<=0.25 m` 时停止平移，自动模式在 `0.25–1.0 m` 内线性降速；手动模式只执行硬停止。传感器故障同样停止平移，但保留原地旋转。未发现正雷达回波或有限前视范围内未发现边缘表示 clear，不表示更远区域已知。
+运行时以车辆圆形 footprint 为边界输出障碍/边缘净空：净空 `<=0.25 m` 时硬停止，自动模式在 `0.25–1.0 m` 内线性降低平移速度，手动模式不执行慢速区降速但仍执行硬停止。带平移的手动命令触发硬停止后会全部停车；客户端可发送新的反向或纯旋转命令重新评估并脱困。周期复检发现车辆继续接近危险时也会停车，停车状态不会自行恢复。
+
+`safety.state` 为 `clear`、`limited`、`stopped` 或 `fault`；对应原因目前为 `safety_obstacle`、`safety_edge` 或 `safety_sensor_fault`。安全输入故障采用 fail-safe：自动任务变为 `blocked`，手动命令也全部停车。未发现正雷达回波或有限前视范围内未发现边缘仅表示当前观测为 clear，不表示更远区域已知。生产模拟默认输入健康；`healthy=false` 只用于确定性故障测试。

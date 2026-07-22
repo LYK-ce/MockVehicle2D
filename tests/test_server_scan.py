@@ -135,6 +135,16 @@ class ScanMessageTest(unittest.TestCase):
         self.assertEqual(websocket.messages[1]["source"], "simulator_ground_truth")
         self.assertEqual(websocket.messages[2]["source"], "simulator_ground_truth")
         self.assertEqual(websocket.messages[2]["command"], "stop")
+        self.assertEqual(
+            websocket.messages[2]["safety"],
+            {
+                "state": "clear",
+                "reason": None,
+                "obstacle_clearance_m": None,
+                "edge_clearance_m": None,
+            },
+        )
+        self.assertTrue(any(voxel["state"] == 2 for voxel in websocket.messages[1]["voxels"]))
         self.assertEqual(websocket.messages[2]["seq"], websocket.messages[3]["seq"])
         self.assertEqual(websocket.messages[2]["ts"], websocket.messages[3]["ts"])
         self.assertEqual(websocket.messages[-1]["config"]["model"], "ydlidar_tmini")

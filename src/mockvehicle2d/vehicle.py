@@ -75,9 +75,7 @@ class Vehicle:
 
     def apply_command(self, grid: MapGrid, command: str, now: float) -> None:
         """Advance the old command to ``now``, then install the new command."""
-        if command not in COMMANDS:
-            raise ValueError(f"unsupported command: {command}")
-        linear, angular = self._velocities_for_command(command)
+        linear, angular = self.velocities_for_command(command)
         self._apply_velocities(grid, linear, angular, now, command)
 
     def apply_drive(self, grid: MapGrid, linear_mps: float, angular_rps: float, now: float) -> None:
@@ -106,7 +104,7 @@ class Vehicle:
         motion_until = min(now, self._command_deadline) if self._command_deadline is not None else now
         elapsed = motion_until - self._last_update
         if elapsed > 0:
-            linear, angular = self._command_velocities()
+            linear, angular = self.body_velocities()
             if (linear or angular) and not self._move(grid, linear * elapsed, angular * elapsed):
                 self.collision = True
                 self.stop()
@@ -118,10 +116,11 @@ class Vehicle:
         return collided
 
     def velocities(self) -> tuple[float, float, float]:
-        linear, angular = self._command_velocities()
+        linear, angular = self.body_velocities()
         return linear * math.cos(self.yaw), linear * math.sin(self.yaw), angular
 
-    def _command_velocities(self) -> tuple[float, float]:
+    def body_velocities(self) -> tuple[float, float]:
+        """Return the currently commanded linear and angular velocities."""
         return self._linear_mps, self._angular_rps
 
     def _apply_velocities(
@@ -137,7 +136,9 @@ class Vehicle:
         self._angular_rps = angular_rps
         self._command_deadline = now + self.command_timeout
 
-    def _velocities_for_command(self, command: str) -> tuple[float, float]:
+    def velocities_for_command(self, command: str) -> tuple[float, float]:
+        if command not in COMMANDS:
+            raise ValueError(f"unsupported command: {command}")
         if command == "forward":
             return self.linear_speed, 0.0
         if command == "forward_left":

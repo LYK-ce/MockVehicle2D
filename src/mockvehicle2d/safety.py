@@ -5,7 +5,8 @@ from dataclasses import dataclass
 import math
 
 from mockvehicle2d.map_grid import MapGrid
-from mockvehicle2d.scan import LaserPoint
+from mockvehicle2d.scan import LaserPoint, TMINI_SCAN_CONFIG, scan_grid
+from mockvehicle2d.vehicle import Vehicle
 
 
 HARD_STOP_CLEARANCE_M = 0.25
@@ -152,3 +153,74 @@ class SafetyGovernor:
             )
             return SafetyDecision(linear_mps * scale, angular_rps, "limited", reason)
         return SafetyDecision(linear_mps, angular_rps, "clear", None)
+
+
+class LocalSafetyRuntime:
+    """Sample local safety inputs, apply policy, and retain observable state."""
+
+    def __init__(self, *, healthy: bool = True) -> None:
+        self.healthy = healthy
+        self.observation = SafetyObservation(healthy=healthy)
+        self.decision = SafetyDecision(
+            0.0,
+            0.0,
+            "clear" if healthy else "fault",
+            None if healthy else "safety_sensor_fault",
+        )
+        self._governor = SafetyGovernor()
+
+    def evaluate(
+        self,
+        vehicle: Vehicle,
+        grid: MapGrid,
+        desired_linear_mps: float,
+        desired_angular_rps: float,
+        *,
+        automatic: bool,
+    ) -> SafetyDecision:
+        points = (
+            scan_grid(grid, vehicle.x, vehicle.y, vehicle.yaw, TMINI_SCAN_CONFIG)
+            if desired_linear_mps
+            else ()
+        )
+        self.observation = SafetyObservation(
+            obstacle_clearance_m=nearest_obstacle_clearance(
+                points, desired_linear_mps, vehicle.radius
+            ),
+            edge_clearance_m=nearest_edge_clearance(
+                grid,
+                vehicle.x,
+                vehicle.y,
+                vehicle.yaw,
+                desired_linear_mps,
+                vehicle_radius=vehicle.radius,
+            ),
+            healthy=self.healthy,
+        )
+        self.decision = self._governor.limit(
+            desired_linear_mps, desired_angular_rps, self.observation, automatic
+        )
+        return self.decision
+
+    def enforce_manual(
+        self,
+        vehicle: Vehicle,
+        grid: MapGrid,
+        desired: tuple[float, float] | None = None,
+    ) -> SafetyDecision:
+        """Apply hard manual safety; a stopped latch is changed only by a new command."""
+        velocities = vehicle.body_velocities() if desired is None else desired
+        if desired is None and velocities == (0.0, 0.0):
+            return self.decision
+        decision = self.evaluate(vehicle, grid, *velocities, automatic=False)
+        if decision.state in {"stopped", "fault"}:
+            vehicle.stop()
+        return decision
+
+    def snapshot(self) -> dict[str, object]:
+        return {
+            "state": self.decision.state,
+            "reason": self.decision.reason,
+            "obstacle_clearance_m": self.observation.obstacle_clearance_m,
+            "edge_clearance_m": self.observation.edge_clearance_m,
+        }

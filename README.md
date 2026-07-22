@@ -38,10 +38,11 @@ python -m mockvehicle2d test
 MockVehicle2D/
 ├── src/mockvehicle2d/
 │   ├── cli.py              ← 统一 CLI 入口 (argparse)
-│   ├── map_grid.py         ← MapGrid 类，2D 栅格地图 (bytearray, O(1))
+│   ├── map_grid.py         ← MapGrid 类，可通行/墙体/无地面三态栅格
 │   ├── collision.py        ← 碰撞检测：Bresenham 线段 + AABB vs Circle
 │   ├── vehicle.py          ← Server/Pygame 共用的运动、碰撞与指令看门狗
 │   ├── navigation.py       ← local odom 直达目标控制与状态
+│   ├── safety.py           ← Tmini/边缘观测、固定阈值与本地安全运行时
 │   ├── server.py           ← WebSocket Server，接收 cmd 并发送 map_full / pose / scan
 │   ├── scan.py             ← YDLidar Tmini 二维角度/距离/强度扫描
 │   └── visual.py           ← Pygame 可视化，支持 W+D 等组合驾驶与实时碰撞反馈
@@ -50,6 +51,8 @@ MockVehicle2D/
 │   ├── test_scan.py        ← 二维扫描几何测试
 │   ├── test_vehicle.py     ← 指令、运动、看门狗和防穿墙测试
 │   ├── test_goto.py        ← goto 协议、状态、接管和碰撞测试
+│   ├── test_safety.py      ← 纯安全感知与策略测试
+│   ├── test_safety_runtime.py ← 自动/手动安全运行时接入测试
 │   └── test_server_scan.py ← scan WebSocket 帧测试
 ├── docs/
 │   ├── mock_server.md
@@ -71,7 +74,7 @@ MockVehicle2D/
 
 ```
 MapGrid (bytearray)
-  cells[y * w + x]: 0 = 可通行, 1 = 墙
+  cells[y * w + x]: 0 = 可通行, 1 = 墙, 2 = 无地面/落差
   操作: O(1)
 
 Bresenham 线段碰撞
@@ -112,10 +115,12 @@ Pictor 也应连接 `ws://127.0.0.1:19090`。连接首帧固定为
 | 上行 | `map_delta` | ⏸️ |
 | 下行 (Pictor→Server) | `cmd` / `drive` / `goto` | ✅ |
 
-`scan` 默认使用 Tmini 轮廓：360°、0.02–12 m、名义 4000 Hz 测距、名义 6 Hz 扫描、667 条均匀射线。有效回波按 0.01 m 量化；无回波为 `range: 0.0, intensity: 0.0`，不能当作障碍物。
+`scan` 默认使用 Tmini 轮廓：360°、0.02–12 m、名义 4000 Hz 测距、名义 6 Hz 扫描、667 条均匀射线。有效回波按 0.01 m 量化；无回波为 `range: 0.0, intensity: 0.0`，不能当作障碍物。水平 Tmini 只返回墙体；确定性的 `state=2` 落差测试区会显示在 `map_full`，由模拟的向下地面探测输入负责安全判断。
 
 控制器可发送离散命令 `{"type":"cmd","seq":1,"cmd":"forward"}`，也可发送连续速度 `{"type":"drive","seq":2,"linear_mps":0.25,"angular_rps":-0.4}`；Server 都立即返回 `cmd_ack`。`drive` 的绝对值上限分别由 `--linear-speed` 和 `--angular-speed` 配置。超过 `--command-timeout` 未收到有效非零命令、收到非法命令或连接断开时，车辆自动停止；碰撞时停在最后一个安全位置。旧 `cmd` 格式保持兼容并与 `drive` 使用同一运动、碰撞和看门狗逻辑。
 
-发送 `{"type":"goto","seq":3,"x_m":12.0,"y_m":8.5}` 可让模拟车在本地 `odom` 坐标中直达目标，Server 返回 `goto_ack`，并在 `pose.control_mode` 与 `pose.navigation` 中持续报告模式、状态、目标和结束原因。当前定位输入是 `simulator_ground_truth`；控制器只会先转向、直线前进和接近目标减速，碰撞时报告 `blocked`，不会规划绕行。任何手动 `cmd`/`drive` 或非法输入都会取消活动目标且不会自动恢复。
+发送 `{"type":"goto","seq":3,"x_m":12.0,"y_m":8.5}` 可让模拟车在本地 `odom` 坐标中直达目标，Server 返回 `goto_ack`，并在 `pose.control_mode` 与 `pose.navigation` 中持续报告模式、状态、目标和结束原因。当前定位输入是 `simulator_ground_truth`；控制器只会先转向、直线前进和接近目标减速，不会规划绕行。自动行驶在障碍/边缘净空 `0.25–1.0 m` 内线性降速，净空 `<=0.25 m` 或安全输入故障时停车并报告 `blocked`；停止后不会自行恢复。任何手动 `cmd`/`drive` 或非法输入也会取消活动目标。
 
-`map_full` 与 `pose` 标有 `source: "simulator_ground_truth"`，仅供仿真验收和可视化；只有 `scan` 是模拟的 Tmini 本地观测。未来真实导航不能把真值消息当作传感器输入。当前只有无绕障的直达目标控制，没有路径规划、道路边缘安全、相机、定位误差、雷达噪声或 `map_delta`。
+`pose.safety` 持续报告 `{state, reason, obstacle_clearance_m, edge_clearance_m}`。手动驾驶不在慢速区降速，但仍执行硬停止和故障停车；新的安全方向命令可解除手动安全锁停，纯旋转允许用于脱困。Tmini 只负责正障碍距离，落差净空是模拟的辅助下视/相机输入，不能解释为雷达能力。
+
+`map_full` 与 `pose` 标有 `source: "simulator_ground_truth"`，仅供仿真验收和可视化；只有 `scan` 是模拟的 Tmini 本地观测，边缘输入也是模拟辅助量。未来真实导航不能把真值消息当作传感器输入。当前只有带本地安全门控的直达目标控制，没有路径规划、真实相机/下视传感器、真实定位、传感器噪声或 `map_delta`。

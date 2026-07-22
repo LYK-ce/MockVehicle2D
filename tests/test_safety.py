@@ -146,5 +146,12 @@ class SafetyGovernorTest(unittest.TestCase):
         self.assertEqual((clear.state, clear.reason), ("clear", None))
 
 
+def main() -> int:
+    suite = unittest.TestSuite()
+    for case in (MapStateSafetyTest, SafetySensingTest, SafetyGovernorTest):
+        suite.addTests(unittest.defaultTestLoader.loadTestsFromTestCase(case))
+    return 0 if unittest.TextTestRunner(verbosity=2).run(suite).wasSuccessful() else 1
+
+
 if __name__ == "__main__":
-    unittest.main()
+    raise SystemExit(main())

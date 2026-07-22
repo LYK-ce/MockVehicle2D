@@ -9,8 +9,9 @@ import re
 import signal
 import time
 
-from mockvehicle2d.map_grid import MapGrid
+from mockvehicle2d.map_grid import MapGrid, VOID
 from mockvehicle2d.navigation import GotoController
+from mockvehicle2d.safety import LocalSafetyRuntime
 from mockvehicle2d.scan import TMINI_SCAN_CONFIG, scan_message
 from mockvehicle2d.vehicle import COMMANDS, Vehicle
 
@@ -163,6 +164,7 @@ def handle_command_message(
     monotonic_now: float,
     wall_timestamp: float,
     navigation: GotoController | None = None,
+    safety: LocalSafetyRuntime | None = None,
 ) -> dict[str, object]:
     """Advance the prior command, then acknowledge or fail-safe stop."""
     try:
@@ -191,12 +193,17 @@ def handle_command_message(
             if navigation is not None:
                 navigation.cancel("manual_override")
             vehicle.apply_drive(grid, linear_mps, angular_rps, monotonic_now)
+            if safety is not None:
+                safety.enforce_manual(vehicle, grid, (linear_mps, angular_rps))
             command = "drive"
         else:
             command, seq = _parse_command_object(message)
             if navigation is not None:
                 navigation.cancel("manual_override")
+            velocities = vehicle.velocities_for_command(command)
             vehicle.apply_command(grid, command, monotonic_now)
+            if safety is not None:
+                safety.enforce_manual(vehicle, grid, velocities)
     except CommandMessageError as error:
         vehicle.advance(grid, monotonic_now)
         vehicle.stop()
@@ -231,8 +238,16 @@ def generate_map(size: int = 256, seed: int = 42, radius: float = 0.5) -> tuple[
         for gy in range(size):
             in_spawn = clear_min_x <= gx <= clear_max_x and clear_min_y <= gy <= clear_max_y
             is_wall = rng.random() < 0.05
+            is_void = size >= 32 and 24 <= gx <= 26 and 9 <= gy <= 12
+            state = VOID if is_void and not in_spawn else int(is_wall and not in_spawn)
             voxels.append(
-                {"gx": gx, "gy": gy, "gz": 0, "state": 1 if is_wall and not in_spawn else 0, "conf": 1.0}
+                {
+                    "gx": gx,
+                    "gy": gy,
+                    "gz": 0,
+                    "state": state,
+                    "conf": 1.0,
+                }
             )
     return voxels, MapGrid.from_voxels(voxels)
 
@@ -243,6 +258,7 @@ def telemetry_messages(
     sequence: int,
     timestamp: float,
     navigation: GotoController | None = None,
+    safety: LocalSafetyRuntime | None = None,
 ) -> tuple[dict[str, object], dict[str, object]]:
     """Build a pose/scan pair from one state snapshot and wall-clock timestamp."""
     vx, vy, omega = vehicle.velocities()
@@ -266,6 +282,16 @@ def telemetry_messages(
             if navigation is not None
             else {"status": "idle", "goal": None, "reason": None}
         ),
+        "safety": (
+            safety.snapshot()
+            if safety is not None
+            else {
+                "state": "clear",
+                "reason": None,
+                "obstacle_clearance_m": None,
+                "edge_clearance_m": None,
+            }
+        ),
     }
     scan = scan_message(grid, vehicle.x, vehicle.y, vehicle.yaw, timestamp, TMINI_SCAN_CONFIG)
     scan["seq"] = sequence
@@ -282,6 +308,7 @@ async def handler(
     command_timeout: float = 1.0,
     _monotonic=time.monotonic,
     _wall_time=time.time,
+    _safety_healthy: bool = True,
 ) -> None:
     """Serve one client; all receives and sends stay serialized in this coroutine."""
     vehicle_id = validate_vehicle_id(vehicle_id)
@@ -299,6 +326,7 @@ async def handler(
         now=started_at,
     )
     navigation = GotoController()
+    safety = LocalSafetyRuntime(healthy=_safety_healthy)
     frame_sequence = 0
     next_deadline = started_at
 
@@ -317,9 +345,13 @@ async def handler(
         while True:
             now = _monotonic()
             if now >= next_deadline:
-                navigation.update(vehicle, grid, now)
+                navigation.update(vehicle, grid, now, safety)
+                if navigation.status != "active":
+                    safety.enforce_manual(vehicle, grid)
                 timestamp = _wall_time()
-                pose, scan = telemetry_messages(vehicle, grid, frame_sequence, timestamp, navigation)
+                pose, scan = telemetry_messages(
+                    vehicle, grid, frame_sequence, timestamp, navigation, safety
+                )
                 await websocket.send(json.dumps(pose))
                 await websocket.send(json.dumps(scan))
                 print(f"[→] pose #{frame_sequence}: x={vehicle.x:.2f} y={vehicle.y:.2f} cmd={vehicle.command}")
@@ -332,7 +364,7 @@ async def handler(
             except asyncio.TimeoutError:
                 continue
             reply = handle_command_message(
-                raw, vehicle, grid, _monotonic(), _wall_time(), navigation
+                raw, vehicle, grid, _monotonic(), _wall_time(), navigation, safety
             )
             await websocket.send(json.dumps(reply))
     except Exception as error:
