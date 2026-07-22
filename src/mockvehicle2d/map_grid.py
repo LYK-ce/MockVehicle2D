@@ -7,7 +7,10 @@ MapGrid 使用 1D bytearray 存储，支持:
   - 包围盒遍历（用于圆形碰撞检测）
 """
 
-from typing import Optional
+FREE = 0
+WALL = 1
+VOID = 2
+CELL_STATES = frozenset((FREE, WALL, VOID))
 
 
 class MapGrid:
@@ -15,7 +18,8 @@ class MapGrid:
 
     cells[y * width + x]:
       0 = 可通行 (free)
-      1 = 不可通行 (wall)
+      1 = 障碍物 (wall)
+      2 = 无地面/落差 (void)
     """
 
     def __init__(self, width: int, height: int):
@@ -30,6 +34,8 @@ class MapGrid:
     def set_cell(self, x: int, y: int, state: int) -> None:
         if not self.in_bounds(x, y):
             raise IndexError(f"Cell ({x},{y}) out of bounds ({self.width}x{self.height})")
+        if type(state) is not int or state not in CELL_STATES:
+            raise ValueError(f"Invalid cell state: {state!r}")
         self._cells[y * self.width + x] = state
 
     def get_cell(self, x: int, y: int) -> int:
@@ -38,14 +44,21 @@ class MapGrid:
         return self._cells[y * self.width + x]
 
     def is_wall(self, x: int, y: int) -> bool:
-        return self.get_cell(x, y) == 1
+        return self.get_cell(x, y) == WALL
+
+    def is_void(self, x: int, y: int) -> bool:
+        return self.get_cell(x, y) == VOID
+
+    def has_ground(self, x: int, y: int) -> bool:
+        """Whether the cell is in bounds and represents physical ground."""
+        return self.in_bounds(x, y) and not self.is_void(x, y)
 
     def in_bounds(self, x: int, y: int) -> bool:
         return 0 <= x < self.width and 0 <= y < self.height
 
     def is_passable(self, x: int, y: int) -> bool:
-        """点是否可通行（在界内且非墙）"""
-        return self.in_bounds(x, y) and not self.is_wall(x, y)
+        """点是否可通行（只有界内 free 可通行）"""
+        return self.in_bounds(x, y) and self.get_cell(x, y) == FREE
 
     # ── 批量构造 ───────────────────────────────────────
 
@@ -72,11 +85,12 @@ class MapGrid:
         """从墙坐标集合构造（测试用）"""
         grid = cls(width, height)
         for x, y in walls:
-            grid.set_cell(x, y, 1)
+            grid.set_cell(x, y, WALL)
         return grid
 
     # ── 统计 ───────────────────────────────────────────
 
     def __repr__(self) -> str:
-        wall_count = sum(1 for c in self._cells if c == 1)
-        return f"MapGrid({self.width}x{self.height}, walls={wall_count})"
+        wall_count = self._cells.count(WALL)
+        void_count = self._cells.count(VOID)
+        return f"MapGrid({self.width}x{self.height}, walls={wall_count}, voids={void_count})"

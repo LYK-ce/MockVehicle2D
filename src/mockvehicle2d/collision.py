@@ -39,7 +39,7 @@ def raycast(grid: MapGrid, x1: int, y1: int, x2: int, y2: int) -> CollisionResul
 
     x, y = x1, y1
     while True:
-        if grid.is_wall(x, y):
+        if not grid.is_passable(x, y):
             return CollisionResult(hit=True, x=x, y=y)
         if x == x2 and y == y2:
             break
@@ -91,9 +91,7 @@ def is_circle_passable(grid: MapGrid, cx: float, cy: float, radius: float) -> bo
         for gx in range(x_min, x_max + 1):
             if not _cell_overlaps_circle(gx, gy, cx, cy, r2):
                 continue
-            if not grid.in_bounds(gx, gy):
-                return False
-            if grid.is_wall(gx, gy):
+            if not grid.is_passable(gx, gy):
                 return False
 
     return True
@@ -162,7 +160,7 @@ def is_swept_circle_passable(
     radius_squared = radius * radius
     for gy in range(math.floor(min(y1, y2) - radius), math.floor(max(y1, y2) + radius) + 1):
         for gx in range(math.floor(min(x1, x2) - radius), math.floor(max(x1, x2) + radius) + 1):
-            if grid.in_bounds(gx, gy) and not grid.is_wall(gx, gy):
+            if grid.is_passable(gx, gy):
                 continue
             if _segment_aabb_distance_squared(x1, y1, x2, y2, gx, gy, gx + 1, gy + 1) < radius_squared:
                 return False
@@ -184,7 +182,7 @@ def get_blocking_cells(grid: MapGrid, cx: float, cy: float, radius: float) -> li
         for gx in range(x_min, x_max + 1):
             if not _cell_overlaps_circle(gx, gy, cx, cy, r2):
                 continue
-            if not grid.in_bounds(gx, gy) or grid.is_wall(gx, gy):
+            if not grid.is_passable(gx, gy):
                 walls.append((gx, gy))
 
     return walls
