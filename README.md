@@ -108,10 +108,10 @@ Pictor 也应连接 `ws://127.0.0.1:19090`。连接首帧固定为
 | 上行 | `pose` | ✅ |
 | 上行 | `scan` | ✅ |
 | 上行 | `map_delta` | ⏸️ |
-| 下行 (Pictor→Server) | `cmd` | ✅ |
+| 下行 (Pictor→Server) | `cmd` / `drive` | ✅ |
 
 `scan` 默认使用 Tmini 轮廓：360°、0.02–12 m、名义 4000 Hz 测距、名义 6 Hz 扫描、667 条均匀射线。有效回波按 0.01 m 量化；无回波为 `range: 0.0, intensity: 0.0`，不能当作障碍物。
 
-控制器发送 `{"type":"cmd","seq":1,"cmd":"forward"}` 后，Server 立即返回 `cmd_ack`，并从同一个车辆状态按顺序发送 `pose` 与 `scan`。组合按键使用组合命令，例如 W+D 发送 `{"type":"cmd","seq":2,"cmd":"forward_right"}`，车辆同时平移和转向。超过 `--command-timeout` 未收到有效命令、收到非法命令或连接断开时，车辆自动停止；碰撞时停在最后一个安全位置。
+控制器可发送离散命令 `{"type":"cmd","seq":1,"cmd":"forward"}`，也可发送连续速度 `{"type":"drive","seq":2,"linear_mps":0.25,"angular_rps":-0.4}`；Server 都立即返回 `cmd_ack`。`drive` 的绝对值上限分别由 `--linear-speed` 和 `--angular-speed` 配置。超过 `--command-timeout` 未收到有效非零命令、收到非法命令或连接断开时，车辆自动停止；碰撞时停在最后一个安全位置。旧 `cmd` 格式保持兼容并与 `drive` 使用同一运动、碰撞和看门狗逻辑。
 
 `map_full` 与 `pose` 标有 `source: "simulator_ground_truth"`，仅供仿真验收和可视化；只有 `scan` 是模拟的 Tmini 本地观测。未来导航算法不能把真值消息当作真实传感器输入。当前没有实现寻路、相机、定位误差、雷达噪声或 `map_delta`。

@@ -62,26 +62,39 @@ class Vehicle:
         self.command_timeout = command_timeout
         self.command = "stop"
         self.collision = False
+        self._linear_mps = 0.0
+        self._angular_rps = 0.0
         self._last_update = now
         self._command_deadline: float | None = None
 
     def reset(self, x: float, y: float, yaw: float, now: float) -> None:
         self.x, self.y, self.yaw = x, y, yaw
-        self.command = "stop"
         self.collision = False
         self._last_update = now
-        self._command_deadline = None
+        self.stop()
 
     def apply_command(self, grid: MapGrid, command: str, now: float) -> None:
         """Advance the old command to ``now``, then install the new command."""
         if command not in COMMANDS:
             raise ValueError(f"unsupported command: {command}")
-        self.advance(grid, now)
-        self.command = command
-        self._command_deadline = now + self.command_timeout if command != "stop" else None
+        linear, angular = self._velocities_for_command(command)
+        self._apply_velocities(grid, linear, angular, now, command)
+
+    def apply_drive(self, grid: MapGrid, linear_mps: float, angular_rps: float, now: float) -> None:
+        """Advance to ``now``, then install bounded continuous velocities."""
+        values = (linear_mps, angular_rps)
+        if any(isinstance(value, bool) or not isinstance(value, (int, float)) for value in values):
+            raise ValueError("drive velocities must be numbers")
+        if any(isinstance(value, float) and not math.isfinite(value) for value in values):
+            raise ValueError("drive velocities must be finite")
+        if abs(linear_mps) > self.linear_speed or abs(angular_rps) > self.angular_speed:
+            raise ValueError("drive velocities exceed configured limits")
+        self._apply_velocities(grid, float(linear_mps), float(angular_rps), now, "drive")
 
     def stop(self) -> None:
         self.command = "stop"
+        self._linear_mps = 0.0
+        self._angular_rps = 0.0
         self._command_deadline = None
 
     def advance(self, grid: MapGrid, now: float) -> None:
@@ -106,21 +119,36 @@ class Vehicle:
         return linear * math.cos(self.yaw), linear * math.sin(self.yaw), angular
 
     def _command_velocities(self) -> tuple[float, float]:
-        if self.command == "forward":
+        return self._linear_mps, self._angular_rps
+
+    def _apply_velocities(
+        self, grid: MapGrid, linear_mps: float, angular_rps: float, now: float, command: str
+    ) -> None:
+        self.advance(grid, now)
+        if linear_mps == 0 and angular_rps == 0:
+            self.stop()
+            return
+        self.command = command
+        self._linear_mps = linear_mps
+        self._angular_rps = angular_rps
+        self._command_deadline = now + self.command_timeout
+
+    def _velocities_for_command(self, command: str) -> tuple[float, float]:
+        if command == "forward":
             return self.linear_speed, 0.0
-        if self.command == "forward_left":
+        if command == "forward_left":
             return self.linear_speed, -self.angular_speed
-        if self.command == "forward_right":
+        if command == "forward_right":
             return self.linear_speed, self.angular_speed
-        if self.command == "backward":
+        if command == "backward":
             return -self.linear_speed, 0.0
-        if self.command == "backward_left":
+        if command == "backward_left":
             return -self.linear_speed, -self.angular_speed
-        if self.command == "backward_right":
+        if command == "backward_right":
             return -self.linear_speed, self.angular_speed
-        if self.command == "spin_left":
+        if command == "spin_left":
             return 0.0, -self.angular_speed
-        if self.command == "spin_right":
+        if command == "spin_right":
             return 0.0, self.angular_speed
         return 0.0, 0.0
 

@@ -214,6 +214,19 @@ Pictor 仅在收到 `hello` 后才认为连接可用，之后才开始处理 `po
 
 默认运动参数：前进/后退 `±0.5 m/s`；在 `+y` 向下、正 yaw 顺时针的坐标约定中，左旋/右旋为 `∓90°/s`。组合命令同时应用对应线速度与角速度，形成弧线。连续 `1.0 s` 未收到有效非停止命令时，看门狗令车辆停止。这些值可通过 `mockvehicle2d serve` 参数校准。
 
+### drive — 连续速度控制
+
+```json
+{
+    "type": "drive",
+    "seq": 43,
+    "linear_mps": 0.25,
+    "angular_rps": -0.4
+}
+```
+
+`linear_mps` 和 `angular_rps` 必须是有限 JSON 数字，布尔值不算数字；绝对值分别不得超过 Server 的 `--linear-speed` 和 `--angular-speed` 配置。字段必须严格为示例中的四项。`0, 0` 等价于停车；非零速度沿用与 `cmd` 相同的看门狗、运动积分和碰撞停车。确认仍使用 `cmd_ack`，其中 `cmd` 为 `"drive"`。
+
 ### cmd_ack — 命令确认
 
 ```json
@@ -247,7 +260,7 @@ Pictor 仅在收到 `hello` 后才认为连接可用，之后才开始处理 `po
 ```
 上行 (小车 → PC)          下行 (PC → 小车)
 ─────────────────         ─────────────────
-hello                      cmd
+hello                      cmd / drive
 map_full
 pose
 scan

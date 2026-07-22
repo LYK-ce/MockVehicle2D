@@ -165,19 +165,25 @@ class ScanMessageTest(unittest.TestCase):
         self.assertTrue(is_circle_passable(grid, 10.0, 10.0, 0.5))
 
     def test_handler_sends_immediate_ack_or_error_without_parallel_sender(self) -> None:
-        accepted = _CommandSocket('{"type":"cmd","seq":3,"cmd":"forward"}')
+        accepted = _CommandSocket(
+            '{"type":"drive","seq":3,"linear_mps":0.25,"angular_rps":-0.4}'
+        )
         asyncio.run(handler(accepted))
         self.assertEqual(
             [message["type"] for message in accepted.messages], ["hello", "map_full", "pose", "scan", "cmd_ack"]
         )
         self.assertEqual(accepted.messages[-1]["seq"], 3)
+        self.assertEqual(accepted.messages[-1]["cmd"], "drive")
 
-        rejected = _CommandSocket('{"type":"pose","seq":4,"cmd":"forward"}')
+        rejected = _CommandSocket(
+            '{"type":"drive","seq":4,"linear_mps":0.51,"angular_rps":0}'
+        )
         asyncio.run(handler(rejected))
         self.assertEqual(
             [message["type"] for message in rejected.messages], ["hello", "map_full", "pose", "scan", "error"]
         )
         self.assertEqual(rejected.messages[-1]["seq"], 4)
+        self.assertEqual(rejected.messages[-1]["code"], "drive_out_of_range")
 
     def test_idle_receive_timeout_continues_telemetry_without_sleeping(self) -> None:
         class LegacyAsyncioTimeoutError(Exception):

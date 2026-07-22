@@ -55,8 +55,7 @@ def _bounded_json_int(value: str) -> int:
     return int(value)
 
 
-def parse_command_message(raw: object) -> tuple[str, int | None]:
-    """Validate canonical commands and the exact legacy ``{"cmd": ...}`` form."""
+def _decode_message(raw: object) -> dict[str, object]:
     if not isinstance(raw, str):
         raise CommandMessageError("invalid_json_text", "command must be a JSON text message")
     try:
@@ -65,7 +64,10 @@ def parse_command_message(raw: object) -> tuple[str, int | None]:
         raise CommandMessageError("invalid_json", "command is not valid JSON text") from error
     if not isinstance(message, dict):
         raise CommandMessageError("invalid_message", "command JSON must be an object")
+    return message
 
+
+def _parse_command_object(message: dict[str, object]) -> tuple[str, int | None]:
     seq = _safe_seq(message)
     if set(message) == {"cmd"}:
         command = message["cmd"]
@@ -88,12 +90,58 @@ def parse_command_message(raw: object) -> tuple[str, int | None]:
     return message["cmd"], seq
 
 
+def parse_command_message(raw: object) -> tuple[str, int | None]:
+    """Validate canonical commands and the exact legacy ``{"cmd": ...}`` form."""
+    return _parse_command_object(_decode_message(raw))
+
+
+def _parse_drive_object(
+    message: dict[str, object], linear_limit: float, angular_limit: float
+) -> tuple[float, float, int]:
+    seq = _safe_seq(message)
+    if message.get("type") != "drive":
+        raise CommandMessageError("invalid_type", "type must be drive", seq)
+    if "seq" not in message:
+        raise CommandMessageError("missing_seq", "drive command requires seq", None)
+    if seq is None:
+        raise CommandMessageError("invalid_seq", "seq must be a non-negative integer", None)
+    if set(message) != {"type", "seq", "linear_mps", "angular_rps"}:
+        raise CommandMessageError("invalid_fields", "drive command has missing or unexpected fields", seq)
+
+    linear_mps = message["linear_mps"]
+    angular_rps = message["angular_rps"]
+    values = (linear_mps, angular_rps)
+    if any(isinstance(value, bool) or not isinstance(value, (int, float)) for value in values):
+        raise CommandMessageError("invalid_drive", "drive velocities must be JSON numbers", seq)
+    if any(isinstance(value, float) and not math.isfinite(value) for value in values):
+        raise CommandMessageError("invalid_drive", "drive velocities must be finite", seq)
+    if abs(linear_mps) > linear_limit or abs(angular_rps) > angular_limit:
+        raise CommandMessageError("drive_out_of_range", "drive velocities exceed configured limits", seq)
+    return float(linear_mps), float(angular_rps), seq
+
+
+def parse_drive_message(
+    raw: object, linear_limit: float, angular_limit: float
+) -> tuple[float, float, int]:
+    """Validate one bounded continuous-velocity command."""
+    return _parse_drive_object(_decode_message(raw), linear_limit, angular_limit)
+
+
 def handle_command_message(
     raw: object, vehicle: Vehicle, grid: MapGrid, monotonic_now: float, wall_timestamp: float
 ) -> dict[str, object]:
     """Advance the prior command, then acknowledge or fail-safe stop."""
     try:
-        command, seq = parse_command_message(raw)
+        message = _decode_message(raw)
+        if message.get("type") == "drive":
+            linear_mps, angular_rps, seq = _parse_drive_object(
+                message, vehicle.linear_speed, vehicle.angular_speed
+            )
+            vehicle.apply_drive(grid, linear_mps, angular_rps, monotonic_now)
+            command = "drive"
+        else:
+            command, seq = _parse_command_object(message)
+            vehicle.apply_command(grid, command, monotonic_now)
     except CommandMessageError as error:
         vehicle.advance(grid, monotonic_now)
         vehicle.stop()
@@ -105,7 +153,6 @@ def handle_command_message(
             "message": str(error),
         }
 
-    vehicle.apply_command(grid, command, monotonic_now)
     return {
         "type": "cmd_ack",
         "ts": wall_timestamp,

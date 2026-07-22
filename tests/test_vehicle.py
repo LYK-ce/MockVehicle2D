@@ -12,7 +12,7 @@ sys.path.insert(0, str(REPO_ROOT / "src"))
 
 from mockvehicle2d.collision import is_circle_passable, is_swept_circle_passable
 from mockvehicle2d.map_grid import MapGrid
-from mockvehicle2d.server import CommandMessageError, handle_command_message, parse_command_message
+from mockvehicle2d.server import CommandMessageError, handle_command_message, parse_command_message, parse_drive_message
 from mockvehicle2d.vehicle import Vehicle, command_from_axes
 
 
@@ -112,6 +112,38 @@ class VehicleTest(unittest.TestCase):
         self.assertEqual(vehicle.command, "stop")
         self.assertEqual(vehicle.velocities(), (0.0, 0.0, 0.0))
 
+    def test_continuous_drive_handles_straight_arcs_and_watchdog(self) -> None:
+        straight = self.vehicle(command_timeout=1.0)
+        straight.apply_drive(self.grid, 0.25, 0.0, 0.0)
+        straight.advance(self.grid, 0.4)
+        self.assertAlmostEqual(straight.x, 5.1)
+        self.assertAlmostEqual(straight.y, 5.0)
+        self.assertEqual(straight.command, "drive")
+        straight.apply_drive(self.grid, 0.0, 0.0, 0.4)
+        self.assertEqual((straight.command, straight.velocities()), ("stop", (0.0, 0.0, 0.0)))
+        straight.apply_drive(self.grid, 0.25, 0.1, 0.4)
+        straight.reset(4.0, 4.0, 0.0, 0.5)
+        self.assertEqual((straight.command, straight.velocities()), ("stop", (0.0, 0.0, 0.0)))
+
+        arc = self.vehicle(command_timeout=1.0)
+        arc.apply_drive(self.grid, 0.4, 0.5, 0.0)
+        arc.advance(self.grid, 0.5)
+        self.assertGreater(arc.x, 5.0)
+        self.assertGreater(arc.y, 5.0)
+        self.assertAlmostEqual(arc.yaw, 0.25)
+        arc.advance(self.grid, 2.0)
+        self.assertEqual(arc.command, "stop")
+        self.assertEqual(arc.velocities(), (0.0, 0.0, 0.0))
+
+    def test_continuous_drive_collision_clears_velocity(self) -> None:
+        grid = MapGrid.from_wall_set(20, 20, {(4, y) for y in range(20)})
+        vehicle = Vehicle(2.5, 5.5, command_timeout=5.0, now=0.0)
+        vehicle.apply_drive(grid, 0.5, 0.2, 0.0)
+        vehicle.advance(grid, 4.0)
+        self.assertTrue(vehicle.collision)
+        self.assertEqual(vehicle.command, "stop")
+        self.assertEqual(vehicle.velocities(), (0.0, 0.0, 0.0))
+
     def test_substeps_stop_at_last_safe_position(self) -> None:
         grid = MapGrid.from_wall_set(20, 20, {(4, y) for y in range(20)})
         vehicle = Vehicle(2.5, 5.5, linear_speed=10.0, command_timeout=2.0, now=0.0)
@@ -190,6 +222,52 @@ class VehicleTest(unittest.TestCase):
         self.assertEqual(parse_command_message('{"cmd":"backward_left"}'), ("backward_left", None))
         with self.assertRaises(CommandMessageError):
             parse_command_message('{"type":"cmd","seq":9,"cmd":"forward_up"}')
+
+    def test_drive_message_is_bounded_and_acknowledged(self) -> None:
+        self.assertEqual(
+            parse_drive_message(
+                '{"type":"drive","seq":10,"linear_mps":-0.5,"angular_rps":1.5}', 0.5, 1.5
+            ),
+            (-0.5, 1.5, 10),
+        )
+        vehicle = self.vehicle()
+        ack = handle_command_message(
+            '{"type":"drive","seq":11,"linear_mps":0.25,"angular_rps":-0.4}',
+            vehicle,
+            self.grid,
+            0.0,
+            13.0,
+        )
+        self.assertEqual(
+            ack,
+            {"type": "cmd_ack", "ts": 13.0, "seq": 11, "cmd": "drive", "accepted": True},
+        )
+        self.assertEqual(vehicle.command, "drive")
+        self.assertEqual(vehicle.velocities(), (0.25, 0.0, -0.4))
+
+    def test_drive_parser_rejects_bool_nonfinite_bounds_and_bad_fields(self) -> None:
+        invalid = [
+            '{"type":"drive","seq":1,"linear_mps":true,"angular_rps":0}',
+            '{"type":"drive","seq":1,"linear_mps":NaN,"angular_rps":0}',
+            '{"type":"drive","seq":1,"linear_mps":0,"angular_rps":Infinity}',
+            '{"type":"drive","seq":1,"linear_mps":0.51,"angular_rps":0}',
+            '{"type":"drive","seq":1,"linear_mps":0,"angular_rps":-1.51}',
+            '{"type":"drive","seq":1,"linear_mps":' + "9" * 4000 + ',"angular_rps":0}',
+            '{"type":"drive","seq":true,"linear_mps":0,"angular_rps":0}',
+            '{"type":"drive","seq":1,"linear_mps":0}',
+            '{"type":"drive","seq":1,"linear_mps":0,"angular_rps":0,"extra":1}',
+        ]
+        for raw in invalid:
+            with self.subTest(raw=raw), self.assertRaises(CommandMessageError):
+                parse_drive_message(raw, 0.5, 1.5)
+
+        vehicle = self.vehicle()
+        vehicle.apply_drive(self.grid, 0.5, 0.0, 0.0)
+        error = handle_command_message(invalid[3], vehicle, self.grid, 0.2, 13.0)
+        self.assertEqual((error["type"], error["seq"], error["code"]), ("error", 1, "drive_out_of_range"))
+        self.assertAlmostEqual(vehicle.x, 5.1)
+        self.assertEqual(vehicle.command, "stop")
+        self.assertEqual(vehicle.velocities(), (0.0, 0.0, 0.0))
 
     def test_invalid_command_stops_and_returns_safe_sequence(self) -> None:
         vehicle = self.vehicle()
