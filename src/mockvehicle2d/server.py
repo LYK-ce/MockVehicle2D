@@ -171,9 +171,12 @@ def handle_command_message(
             x_m, y_m, seq = _parse_goto_object(message)
             if navigation is None:
                 raise CommandMessageError("goto_unavailable", "goto controller is unavailable", seq)
-            vehicle.advance(grid, monotonic_now)
+            handoff_collided = vehicle.advance(grid, monotonic_now)
             vehicle.stop()
             navigation.start(x_m, y_m)
+            if handoff_collided:
+                navigation.status = "blocked"
+                navigation.reason = "collision"
             return {
                 "type": "goto_ack",
                 "ts": wall_timestamp,

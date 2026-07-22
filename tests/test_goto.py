@@ -210,6 +210,38 @@ class GotoTest(unittest.TestCase):
         self.assertEqual(pose["control_mode"], "manual")
         self.assertEqual(pose["navigation"]["status"], "cancelled")
 
+    def test_goto_handoff_collision_blocks_replacement_goal(self) -> None:
+        grid = MapGrid.from_wall_set(30, 30, {(7, y) for y in range(30)})
+        vehicle = Vehicle(6.4, 5.0, command_timeout=0.25, now=0.0)
+        navigation = GotoController()
+        handle_command_message(
+            '{"type":"goto","seq":5,"x_m":10,"y_m":5}',
+            vehicle,
+            grid,
+            0.0,
+            12.0,
+            navigation,
+        )
+        navigation.update(vehicle, grid, 0.0)
+
+        ack = handle_command_message(
+            '{"type":"goto","seq":6,"x_m":4,"y_m":5}',
+            vehicle,
+            grid,
+            0.25,
+            12.25,
+            navigation,
+        )
+
+        self.assertEqual(ack["type"], "goto_ack")
+        self.assertEqual(navigation.goal, (4.0, 5.0))
+        self.assertEqual((navigation.status, navigation.reason), ("blocked", "collision"))
+        self.assertEqual(vehicle.velocities(), (0.0, 0.0, 0.0))
+        stopped_pose = (vehicle.x, vehicle.y, vehicle.yaw)
+        navigation.update(vehicle, grid, 0.3)
+        self.assertEqual((vehicle.x, vehicle.y, vehicle.yaw), stopped_pose)
+        self.assertEqual(vehicle.velocities(), (0.0, 0.0, 0.0))
+
     def test_websocket_goto_ack_precedes_autonomous_pose(self) -> None:
         clock = _Clock()
         websocket = _GotoSocket(clock)
