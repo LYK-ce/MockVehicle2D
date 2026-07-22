@@ -11,7 +11,9 @@ from mockvehicle2d.vehicle import Vehicle
 
 HARD_STOP_CLEARANCE_M = 0.25
 SLOW_ZONE_CLEARANCE_M = 1.0
-SAFETY_ADVANCE_STEP_M = 0.05
+MAX_TRANSLATION_STEP_M = 0.05
+MAX_ROTATION_STEP_RAD = math.radians(1)
+MAX_SAFETY_ADVANCE_STEPS = 10_000
 EDGE_LOOKAHEAD_M = 2.0
 EDGE_SAMPLE_STEP_M = 0.05
 
@@ -235,6 +237,7 @@ class LocalSafetyRuntime:
 
         deadline = vehicle.command_deadline
         motion_until = min(now, deadline) if deadline is not None else now
+        steps = 0
         while vehicle.last_update < motion_until:
             linear_mps, angular_rps = vehicle.body_velocities()
             if linear_mps == 0:
@@ -266,7 +269,7 @@ class LocalSafetyRuntime:
                 ),
                 default=None,
             )
-            step_distance = SAFETY_ADVANCE_STEP_M
+            step_distance = MAX_TRANSLATION_STEP_M
             if nearest is not None:
                 clearance, reason = nearest
                 step_distance = min(step_distance, max(0.0, clearance - HARD_STOP_CLEARANCE_M))
@@ -279,8 +282,27 @@ class LocalSafetyRuntime:
             step_time = min(
                 motion_until - vehicle.last_update,
                 step_distance / abs(linear_mps),
+                MAX_ROTATION_STEP_RAD / abs(angular_rps) if angular_rps else math.inf,
             )
-            collided = vehicle.advance(grid, vehicle.last_update + step_time)
+            next_update = vehicle.last_update + step_time
+            too_many_rotations = (
+                steps == 0
+                and abs(angular_rps) * (motion_until - vehicle.last_update)
+                > MAX_ROTATION_STEP_RAD * MAX_SAFETY_ADVANCE_STEPS
+            )
+            if (
+                too_many_rotations
+                or steps >= MAX_SAFETY_ADVANCE_STEPS
+                or next_update <= vehicle.last_update
+            ):
+                self.decision = SafetyDecision(
+                    0.0, angular_rps, "fault", "safety_sensor_fault"
+                )
+                vehicle.stop()
+                vehicle.advance(grid, now)
+                return SafetyAdvanceResult(stopped=True, reason="safety_sensor_fault")
+            steps += 1
+            collided = vehicle.advance(grid, next_update)
             if collided:
                 vehicle.advance(grid, now)
                 return SafetyAdvanceResult(collided=True)

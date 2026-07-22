@@ -10,7 +10,7 @@ import unittest
 REPO_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO_ROOT / "src"))
 
-from mockvehicle2d.map_grid import FREE, MapGrid, VOID
+from mockvehicle2d.map_grid import FREE, MapGrid, VOID, WALL
 from mockvehicle2d.navigation import GotoController
 from mockvehicle2d.safety import LocalSafetyRuntime
 from mockvehicle2d.server import generate_map, handle_command_message, telemetry_messages
@@ -187,6 +187,55 @@ class SafetyRuntimeTest(unittest.TestCase):
         self.assertLessEqual(vehicle.x, 4.0 - vehicle.radius - 0.25 + 1e-9)
         self.assertEqual(vehicle.body_velocities(), (0.0, 0.0))
 
+    def test_tight_arc_rechecks_wall_and_void_before_collision(self) -> None:
+        for state, reason in ((WALL, "safety_obstacle"), (VOID, "safety_edge")):
+            with self.subTest(reason=reason):
+                grid = MapGrid(20, 20)
+                grid.set_cell(2, 3, state)
+                vehicle = Vehicle(
+                    2.5,
+                    2.49,
+                    radius=0.5,
+                    command_timeout=2.0,
+                    now=0.0,
+                )
+                safety = LocalSafetyRuntime()
+                vehicle.apply_drive(grid, 0.02, math.pi / 2, 0.0)
+
+                result = safety.advance(vehicle, grid, 1.0, automatic=False)
+
+                self.assertFalse(result.collided)
+                self.assertTrue(result.stopped)
+                self.assertEqual(result.reason, reason)
+                self.assertFalse(vehicle.collision)
+                self.assertEqual(vehicle.body_velocities(), (0.0, 0.0))
+                stopped_pose = (vehicle.x, vehicle.y, vehicle.yaw)
+
+                grid.set_cell(2, 3, FREE)
+                safety.advance(vehicle, grid, 2.0, automatic=False)
+                self.assertEqual((vehicle.x, vehicle.y, vehicle.yaw), stopped_pose)
+                self.assertEqual(vehicle.body_velocities(), (0.0, 0.0))
+
+    def test_extreme_arc_fails_safe_without_iteration_runaway(self) -> None:
+        grid = MapGrid(20, 20)
+        vehicle = Vehicle(
+            5.0,
+            5.0,
+            angular_speed=1_000_000.0,
+            command_timeout=2.0,
+            now=0.0,
+        )
+        safety = LocalSafetyRuntime()
+        vehicle.apply_drive(grid, 0.02, 1_000_000.0, 0.0)
+
+        result = safety.advance(vehicle, grid, 1.0, automatic=False)
+
+        self.assertEqual((result.stopped, result.reason), (True, "safety_sensor_fault"))
+        self.assertEqual(safety.snapshot()["state"], "fault")
+        self.assertFalse(vehicle.collision)
+        self.assertEqual((vehicle.x, vehicle.y, vehicle.yaw), (5.0, 5.0, 0.0))
+        self.assertEqual(vehicle.body_velocities(), (0.0, 0.0))
+
     def test_delayed_automatic_tick_stops_before_void_and_stays_blocked(self) -> None:
         grid = MapGrid(20, 20)
         grid.set_cell(4, 5, VOID)
@@ -258,6 +307,16 @@ class SafetyRuntimeTest(unittest.TestCase):
         reverse.apply_drive(grid, -0.5, 0.0, 0.0)
         safety.advance(reverse, grid, 0.4, automatic=False)
         self.assertAlmostEqual(reverse.x, 4.8)
+
+        arc = Vehicle(5.0, 5.0, command_timeout=1.0, now=0.0)
+        arc.apply_drive(grid, 0.2, 0.5, 0.0)
+        safety.advance(arc, grid, 0.4, automatic=False)
+        self.assertGreater(arc.x, 5.0)
+        self.assertGreater(arc.y, 5.0)
+        self.assertAlmostEqual(arc.yaw, 0.2)
+        safety.advance(arc, grid, 2.0, automatic=False)
+        self.assertAlmostEqual(arc.yaw, 0.5)
+        self.assertEqual(arc.command, "stop")
 
         rotating = Vehicle(5.0, 5.0, command_timeout=1.0, now=0.0)
         rotating.apply_drive(grid, 0.0, 0.5, 0.0)
