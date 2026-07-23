@@ -23,6 +23,19 @@ class VehicleTest(unittest.TestCase):
     def vehicle(self, **kwargs) -> Vehicle:
         return Vehicle(5.0, 5.0, now=0.0, **kwargs)
 
+    @staticmethod
+    def motion_state(vehicle: Vehicle) -> tuple[object, ...]:
+        return (
+            vehicle.x,
+            vehicle.y,
+            vehicle.yaw,
+            vehicle.command,
+            vehicle.body_velocities(),
+            vehicle.command_deadline,
+            vehicle.last_update,
+            vehicle.collision,
+        )
+
     def test_forward_backward_and_actual_elapsed_time(self) -> None:
         forward = self.vehicle()
         forward.apply_command(self.grid, "forward", 0.0)
@@ -39,6 +52,27 @@ class VehicleTest(unittest.TestCase):
         self.assertAlmostEqual(forward.x, 5.3)
         forward.advance(self.grid, 0.8)
         self.assertAlmostEqual(forward.x, 5.2)
+
+    def test_invalid_replacement_command_does_not_advance_active_motion(self) -> None:
+        vehicle = self.vehicle()
+        vehicle.apply_command(self.grid, "forward", 0.0)
+        before = self.motion_state(vehicle)
+
+        with self.assertRaises(ValueError):
+            vehicle.apply_command(self.grid, "fly", 0.5)
+
+        self.assertEqual(self.motion_state(vehicle), before)
+
+    def test_invalid_replacement_command_is_not_hidden_by_handoff_collision(self) -> None:
+        grid = MapGrid.from_wall_set(20, 20, {(4, y) for y in range(20)})
+        vehicle = Vehicle(2.5, 5.5, command_timeout=5.0, now=0.0)
+        vehicle.apply_command(grid, "forward", 0.0)
+        before = self.motion_state(vehicle)
+
+        with self.assertRaises(ValueError):
+            vehicle.apply_command(grid, "fly", 4.0)
+
+        self.assertEqual(self.motion_state(vehicle), before)
 
     def test_left_and_right_follow_screen_coordinate_signs(self) -> None:
         left = self.vehicle()
@@ -134,6 +168,27 @@ class VehicleTest(unittest.TestCase):
         arc.advance(self.grid, 2.0)
         self.assertEqual(arc.command, "stop")
         self.assertEqual(arc.velocities(), (0.0, 0.0, 0.0))
+
+    def test_invalid_replacement_drive_does_not_advance_active_motion(self) -> None:
+        vehicle = self.vehicle()
+        vehicle.apply_drive(self.grid, 0.25, 0.0, 0.0)
+        before = self.motion_state(vehicle)
+
+        with self.assertRaises(ValueError):
+            vehicle.apply_drive(self.grid, 0.51, 0.0, 0.5)
+
+        self.assertEqual(self.motion_state(vehicle), before)
+
+    def test_invalid_replacement_drive_is_not_hidden_by_handoff_collision(self) -> None:
+        grid = MapGrid.from_wall_set(20, 20, {(4, y) for y in range(20)})
+        vehicle = Vehicle(2.5, 5.5, command_timeout=5.0, now=0.0)
+        vehicle.apply_drive(grid, 0.5, 0.0, 0.0)
+        before = self.motion_state(vehicle)
+
+        with self.assertRaises(ValueError):
+            vehicle.apply_drive(grid, 0.51, 0.0, 4.0)
+
+        self.assertEqual(self.motion_state(vehicle), before)
 
     def test_continuous_drive_collision_clears_velocity(self) -> None:
         grid = MapGrid.from_wall_set(20, 20, {(4, y) for y in range(20)})

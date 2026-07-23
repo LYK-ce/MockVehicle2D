@@ -75,13 +75,15 @@ class Vehicle:
 
     def apply_command(self, grid: MapGrid, command: str, now: float) -> None:
         """Advance the old command to ``now``, then install the new command."""
+        linear, angular = self.velocities_for_command(command)
         if not self.advance(grid, now):
-            self.install_command(command, now)
+            self._install_velocities(linear, angular, now, command)
 
     def apply_drive(self, grid: MapGrid, linear_mps: float, angular_rps: float, now: float) -> None:
         """Advance to ``now``, then install bounded continuous velocities."""
+        linear, angular = self._validated_drive_velocities(linear_mps, angular_rps)
         if not self.advance(grid, now):
-            self.install_drive(linear_mps, angular_rps, now)
+            self._install_velocities(linear, angular, now, "drive")
 
     def install_command(self, command: str, now: float) -> None:
         """Install a discrete command after the vehicle has already advanced to ``now``."""
@@ -90,6 +92,12 @@ class Vehicle:
 
     def install_drive(self, linear_mps: float, angular_rps: float, now: float) -> None:
         """Install bounded velocities after the vehicle has already advanced to ``now``."""
+        linear, angular = self._validated_drive_velocities(linear_mps, angular_rps)
+        self._install_velocities(linear, angular, now, "drive")
+
+    def _validated_drive_velocities(
+        self, linear_mps: float, angular_rps: float
+    ) -> tuple[float, float]:
         values = (linear_mps, angular_rps)
         if any(isinstance(value, bool) or not isinstance(value, (int, float)) for value in values):
             raise ValueError("drive velocities must be numbers")
@@ -97,7 +105,7 @@ class Vehicle:
             raise ValueError("drive velocities must be finite")
         if abs(linear_mps) > self.linear_speed or abs(angular_rps) > self.angular_speed:
             raise ValueError("drive velocities exceed configured limits")
-        self._install_velocities(float(linear_mps), float(angular_rps), now, "drive")
+        return float(linear_mps), float(angular_rps)
 
     def stop(self) -> None:
         self.command = "stop"
