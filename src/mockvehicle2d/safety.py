@@ -26,7 +26,11 @@ class SafetyObservation:
 
     def __post_init__(self) -> None:
         for clearance in (self.obstacle_clearance_m, self.edge_clearance_m):
-            if clearance is not None and (not math.isfinite(clearance) or clearance < 0):
+            if clearance is None:
+                continue
+            if isinstance(clearance, bool) or not isinstance(clearance, (int, float)):
+                raise ValueError("safety clearances must be finite and non-negative")
+            if not math.isfinite(clearance) or clearance < 0:
                 raise ValueError("safety clearances must be finite and non-negative")
         if type(self.healthy) is not bool:
             raise ValueError("healthy must be a bool")
