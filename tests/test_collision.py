@@ -27,7 +27,7 @@ FAIL = 0
 R = 0.5  # 车辆半径
 
 
-def test(name: str):
+def _section(name: str):
     print(f"\n{'─'*60}")
     print(f"  {name}")
     print(f"{'─'*60}")
@@ -52,7 +52,7 @@ def make_grid(width: int, height: int, walls: set) -> MapGrid:
 # ═══════════════════════════════════════════════════════
 
 def test_mapgrid_basic():
-    test("MapGrid — 基础 get/set")
+    _section("MapGrid — 基础 get/set")
     g = MapGrid(10, 10)
     check(g.get_cell(0, 0) == 0, "新 grid 全部为 0")
     g.set_cell(3, 4, 1)
@@ -63,7 +63,7 @@ def test_mapgrid_basic():
 
 
 def test_mapgrid_wall_check():
-    test("MapGrid — is_wall / is_passable")
+    _section("MapGrid — is_wall / is_passable")
     g = MapGrid(10, 10)
     g.set_cell(5, 5, 1)
     check(g.is_wall(5, 5) == True, "is_wall(5,5) → True")
@@ -75,7 +75,7 @@ def test_mapgrid_wall_check():
 
 
 def test_mapgrid_bounds():
-    test("MapGrid — in_bounds")
+    _section("MapGrid — in_bounds")
     g = MapGrid(10, 10)
     check(g.in_bounds(0, 0) == True, "(0,0) 在界内")
     check(g.in_bounds(9, 9) == True, "(9,9) 在界内")
@@ -84,7 +84,7 @@ def test_mapgrid_bounds():
 
 
 def test_mapgrid_from_voxels():
-    test("MapGrid — from_voxels 构造")
+    _section("MapGrid — from_voxels 构造")
     voxels = [
         {"gx": 0, "gy": 0, "state": 1},
         {"gx": 1, "gy": 2, "state": 1},
@@ -99,7 +99,7 @@ def test_mapgrid_from_voxels():
 
 
 def test_mapgrid_from_wall_set():
-    test("MapGrid — from_wall_set 构造")
+    _section("MapGrid — from_wall_set 构造")
     g = make_grid(10, 10, {(0, 0), (9, 9), (5, 5)})
     check(g.is_wall(0, 0) == True, "(0,0) 为墙")
     check(g.is_wall(9, 9) == True, "(9,9) 为墙")
@@ -108,13 +108,13 @@ def test_mapgrid_from_wall_set():
 
 
 def test_mapgrid_empty_voxels():
-    test("MapGrid — 空 voxel 数组")
+    _section("MapGrid — 空 voxel 数组")
     g = MapGrid.from_voxels([])
     check(g.width == 1, "空数组 → 1x1 grid")
 
 
 def test_mapgrid_oob_error():
-    test("MapGrid — 越界报错")
+    _section("MapGrid — 越界报错")
     g = MapGrid(5, 5)
     try:
         g.set_cell(10, 10, 1)
@@ -129,7 +129,7 @@ def test_mapgrid_oob_error():
 
 
 def test_mapgrid_large():
-    test("MapGrid — 大规模性能")
+    _section("MapGrid — 大规模性能")
     import time
     t0 = time.time()
     g = MapGrid(1000, 1000)
@@ -144,28 +144,28 @@ def test_mapgrid_large():
 # ═══════════════════════════════════════════════════════
 
 def test_raycast_horizontal_clear():
-    test("Raycast — 水平直线，无碰撞")
+    _section("Raycast — 水平直线，无碰撞")
     g = make_grid(10, 10, set())
     r = raycast(g, 0, 5, 9, 5)
     check(r.hit == False, "(0,5)→(9,5) 通过")
 
 
 def test_raycast_vertical_clear():
-    test("Raycast — 垂直直线，无碰撞")
+    _section("Raycast — 垂直直线，无碰撞")
     g = make_grid(10, 10, set())
     r = raycast(g, 3, 0, 3, 9)
     check(r.hit == False, "(3,0)→(3,9) 通过")
 
 
 def test_raycast_diagonal_clear():
-    test("Raycast — 对角线，无碰撞")
+    _section("Raycast — 对角线，无碰撞")
     g = make_grid(10, 10, set())
     r = raycast(g, 0, 0, 9, 9)
     check(r.hit == False, "(0,0)→(9,9) 通过")
 
 
 def test_raycast_wall_at_endpoint():
-    test("Raycast — 终点是墙")
+    _section("Raycast — 终点是墙")
     g = make_grid(10, 10, {(5, 5)})
     r = raycast(g, 0, 0, 5, 5)
     check(r.hit == True, "检测到碰撞")
@@ -173,7 +173,7 @@ def test_raycast_wall_at_endpoint():
 
 
 def test_raycast_wall_in_middle():
-    test("Raycast — 路径中间有墙")
+    _section("Raycast — 路径中间有墙")
     g = make_grid(10, 10, {(5, 3)})
     r = raycast(g, 0, 3, 9, 3)
     check(r.hit == True, "检测到碰撞")
@@ -181,7 +181,7 @@ def test_raycast_wall_in_middle():
 
 
 def test_raycast_wall_immediate():
-    test("Raycast — 起点就是墙")
+    _section("Raycast — 起点就是墙")
     g = make_grid(10, 10, {(0, 0)})
     r = raycast(g, 0, 0, 9, 9)
     check(r.hit == True, "检测到碰撞")
@@ -189,7 +189,7 @@ def test_raycast_wall_immediate():
 
 
 def test_raycast_single_cell():
-    test("Raycast — 起点=终点")
+    _section("Raycast — 起点=终点")
     g = make_grid(10, 10, set())
     r = raycast(g, 3, 3, 3, 3)
     check(r.hit == False, "空地, 通过")
@@ -199,14 +199,14 @@ def test_raycast_single_cell():
 
 
 def test_raycast_negative_direction():
-    test("Raycast — 负方向移动")
+    _section("Raycast — 负方向移动")
     g = make_grid(10, 10, {(3, 3)})
     r = raycast(g, 9, 9, 0, 0)
     check(r.hit == True, "(9,9)→(0,0) 途经 (3,3) 碰撞")
 
 
 def test_raycast_grazing():
-    test("Raycast — 紧贴墙经过")
+    _section("Raycast — 紧贴墙经过")
     g = make_grid(10, 5, {(5, 0)})
     r = raycast(g, 0, 1, 9, 1)
     check(r.hit == False, "从墙旁边经过，通过")
@@ -217,14 +217,14 @@ def test_raycast_grazing():
 # ═══════════════════════════════════════════════════════
 
 def test_circle_open_center():
-    test("圆形 r=0.5 — 空地中央")
+    _section("圆形 r=0.5 — 空地中央")
     g = make_grid(20, 20, set())
     check(is_circle_passable(g, 10.0, 10.0, R) == True,
           "(10,10) 空旷 → 通过")
 
 
 def test_circle_on_wall():
-    test("圆形 r=0.5 — 圆心所在格子是墙")
+    _section("圆形 r=0.5 — 圆心所在格子是墙")
     g = make_grid(20, 20, {(10, 10)})
     check(is_circle_passable(g, 10.0, 10.0, R) == False,
           "圆心在墙上 → 碰撞")
@@ -233,14 +233,14 @@ def test_circle_on_wall():
 
 
 def test_circle_beside_wall_safe():
-    test("圆形 r=0.5 — 贴着墙但未侵入")
+    _section("圆形 r=0.5 — 贴着墙但未侵入")
     g = make_grid(20, 20, {(6, 5)})
     check(is_circle_passable(g, 5.0, 5.0, R) == True,
           "墙在隔壁 cell, 距离 1 > 0.5 → 通过")
 
 
 def test_circle_near_boundary_collision():
-    test("圆形 r=0.5 — 越界检测")
+    _section("圆形 r=0.5 — 越界检测")
     g = make_grid(10, 10, set())
     # 圆心 x=0.3 → 圆覆盖 [-0.2, 0.8]
     # cell(-1,5) [−1,0]: closest=(0,5), dx=-0.3, d²=0.09 < 0.25 → 重叠且越界!
@@ -249,21 +249,21 @@ def test_circle_near_boundary_collision():
 
 
 def test_circle_near_boundary_safe():
-    test("圆形 r=0.5 — 靠近边界但安全")
+    _section("圆形 r=0.5 — 靠近边界但安全")
     g = make_grid(10, 10, set())
     check(is_circle_passable(g, 1.0, 5.0, R) == True,
           "圆心 x=1.0, 圆 [0.5,1.5] 全在界内 → 通过")
 
 
 def test_circle_on_cell_border():
-    test("圆形 r=0.5 — 圆心在 cell 边界上")
+    _section("圆形 r=0.5 — 圆心在 cell 边界上")
     g = make_grid(20, 20, {(5, 5)})
     check(is_circle_passable(g, 5.5, 5.0, R) == False,
           "圆心在 cell 边界, 邻格中心距离=0.5 → 碰撞")
 
 
 def test_circle_vehicle_near_wall():
-    test("圆形 r=0.5 — 车辆靠墙移动")
+    _section("圆形 r=0.5 — 车辆靠墙移动")
     g = make_grid(20, 20, {(4, 5)})
     # 圆心 (5,5), r=0.5 → 圆覆盖 [4.5, 5.5] × [4.5, 5.5]
     # cell(4,5) [4,5]×[5,6]: closest=(5,5), d=0 → 与圆重叠 → 碰撞!
@@ -276,7 +276,7 @@ def test_circle_vehicle_near_wall():
 
 
 def test_circle_corridor():
-    test("圆形 r=0.5 — 1格宽走廊")
+    _section("圆形 r=0.5 — 1格宽走廊")
     walls = {(3, y) for y in range(0, 20)} | {(5, y) for y in range(0, 20)}
     g = make_grid(20, 20, walls)
     # 圆心 (4,10) → 圆覆盖 [3.5, 4.5]，cell(3,10) [3,4] 重叠 → 撞墙
@@ -288,7 +288,7 @@ def test_circle_corridor():
 
 
 def test_circle_vertex():
-    test("圆形 r=0.5 — 圆心在 4 格顶点，邻格有墙")
+    _section("圆形 r=0.5 — 圆心在 4 格顶点，邻格有墙")
     g = make_grid(20, 20, {(5, 5)})
     # 圆心 (5.5, 5.5), r=0.5 → 圆覆盖 [5.0, 6.0]²
     # cell(5,5) [5,6]²: closest=(5.5,5.5), d=0 → 重叠墙!
@@ -323,7 +323,7 @@ class VehicleState:
 
 
 def test_yaw_east_clear():
-    test("航向角 — yaw=0 (东), 前方无障碍")
+    _section("航向角 — yaw=0 (东), 前方无障碍")
     g = make_grid(20, 20, set())
     v = VehicleState(5.0, 5.0, yaw=0.0)
     ok = v.try_move_forward(g, 1.0)
@@ -333,7 +333,7 @@ def test_yaw_east_clear():
 
 
 def test_yaw_diagonal():
-    test("航向角 — yaw=π/4 (东北)")
+    _section("航向角 — yaw=π/4 (东北)")
     g = make_grid(20, 20, set())
     v = VehicleState(5.0, 5.0, yaw=math.pi / 4)
     ok = v.try_move_forward(g, 1.0)
@@ -345,7 +345,7 @@ def test_yaw_diagonal():
 
 
 def test_yaw_toward_wall_blocked():
-    test("航向角 — 前方是墙，移动被拒绝")
+    _section("航向角 — 前方是墙，移动被拒绝")
     g = make_grid(20, 20, {(6, 5)})
     v = VehicleState(5.0, 5.0, yaw=0.0)
     ok = v.try_move_forward(g, 1.0)
@@ -355,7 +355,7 @@ def test_yaw_toward_wall_blocked():
 
 
 def test_yaw_parallel_to_wall():
-    test("航向角 — 沿墙平行移动")
+    _section("航向角 — 沿墙平行移动")
     g = make_grid(20, 20, {(6, y) for y in range(0, 20)})
     v = VehicleState(5.0, 5.0, yaw=math.pi / 2)  # 向北
     ok = v.try_move_forward(g, 1.0)

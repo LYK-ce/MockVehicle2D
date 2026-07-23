@@ -14,14 +14,17 @@ source .venv/bin/activate
 # 运行测试
 mockvehicle2d test
 
-# 启动可控 WebSocket Mock Server
+# 启动可控 WebSocket Mock Server（默认端口 19090）
 mockvehicle2d serve --vehicle-id mock_vehicle_01
 
-# 9090 被占用时改用其他端口，并在 Pictor 中输入相同端口
-mockvehicle2d serve --port 19090 --vehicle-id mock_vehicle_01
+# 端口被占用时改用其他端口，并在 Pictor 中输入相同端口
+mockvehicle2d serve --port 9090 --vehicle-id mock_vehicle_01
 
 # 校准模拟车（角速度单位为度/秒）
 mockvehicle2d serve --linear-speed 0.5 --angular-speed 90 --vehicle-radius 0.5 --command-timeout 1.0
+
+# A* 寻路（在 256×256 随机地图上规划路径）
+mockvehicle2d pathfind --start 10,10 --goal 200,200
 
 # 启动 Pygame 可视化
 mockvehicle2d visual
@@ -37,8 +40,13 @@ python -m mockvehicle2d test
 ```
 MockVehicle2D/
 ├── src/mockvehicle2d/
-│   ├── cli/main.py         ← 统一 CLI 入口 (argparse)
-│   ├── map_grid.py         ← MapGrid 类，可通行/墙体/无地面三态栅格
+│   ├── cli/                ← 统一 CLI 入口 (argparse)
+│   │   └── main.py
+│   ├── pathfinding/        ← A* 寻路 + 路径跟随
+│   │   ├── a_star.py
+│   │   ├── waypoint_follower.py
+│   │   └── __init__.py
+│   ├── map_grid.py         ← MapGrid 类，2D 栅格地图 (bytearray, O(1))
 │   ├── collision.py        ← 碰撞检测：Bresenham 线段 + AABB vs Circle
 │   ├── vehicle.py          ← Server/Pygame 共用的运动、碰撞与指令看门狗
 │   ├── navigation.py       ← local odom 直达目标控制与状态
@@ -48,6 +56,7 @@ MockVehicle2D/
 │   └── visual.py           ← Pygame 可视化，支持 W+D 等组合驾驶与实时碰撞反馈
 ├── tests/
 │   ├── test_collision.py   ← 碰撞检测测试套件
+│   ├── test_pathfinding.py ← A* 寻路 + 路径跟随测试
 │   ├── test_scan.py        ← 二维扫描几何测试
 │   ├── test_vehicle.py     ← 指令、运动、看门狗和防穿墙测试
 │   ├── test_goto.py        ← goto 协议、状态、接管和碰撞测试
@@ -56,6 +65,7 @@ MockVehicle2D/
 │   └── test_server_scan.py ← scan WebSocket 帧测试
 ├── docs/
 │   ├── mock_server.md
+│   ├── pathfinding.md
 │   ├── pygame_visual.md
 │   └── websocket_protocol.md
 ├── pyproject.toml
@@ -70,6 +80,21 @@ MockVehicle2D/
 | 形状 | 圆形 |
 | 半径 | 0.5 (直径 = 1 cell = 1m) |
 | 航向角 | yaw (弧度), 0 = +x |
+
+## 寻路
+
+车辆可从任意起点自动规划避障路径并导航到终点。
+
+```bash
+mockvehicle2d pathfind --start 10,10 --goal 200,200
+```
+
+| 组件 | 文件 | 说明 |
+|------|------|------|
+| A* 搜索 | `pathfinding/a_star.py` | 八连通，欧几里得启发式，对角线剪枝，1-cell 膨胀 |
+| 路径跟随 | `pathfinding/waypoint_follower.py` | 网格路径 → Vehicle cmd 序列，朝向跟踪 |
+
+算法详情参见 [寻路文档](docs/pathfinding.md)。
 
 ## 碰撞检测
 
@@ -96,8 +121,8 @@ AABB vs Circle 圆形碰撞
 
 遵循 [WebSocket 通信协议](docs/websocket_protocol.md)。
 
-启动 Server 后，在 Pictor 中连接 `ws://127.0.0.1:9090`；使用 `--port 19090` 时，
-Pictor 也应连接 `ws://127.0.0.1:19090`。连接首帧固定为
+启动 Server 后，在 Pictor 中连接 `ws://127.0.0.1:19090`；使用 `--port 9090` 时，
+Pictor 也应连接 `ws://127.0.0.1:9090`。连接首帧固定为
 `{"type":"hello","vehicle_id":"mock_vehicle_01"}`，随后依次发送 `map_full → pose → scan`。
 
 | 方向 | 消息 | 状态 |
@@ -117,4 +142,4 @@ Pictor 也应连接 `ws://127.0.0.1:19090`。连接首帧固定为
 
 `pose.safety` 持续报告 `{state, reason, obstacle_clearance_m, edge_clearance_m}`。障碍净空按圆形车体沿行驶方向扫过的完整走廊计算，不使用固定角度扇区；运行时把延迟时段拆成不超过 `0.05 m` 且不越过硬停止净空的小步，每步重新观测。手动驾驶不在慢速区降速，但仍执行硬停止和故障停车；新的安全方向命令可解除手动安全锁停，纯旋转允许用于脱困。Tmini 只负责正障碍距离，落差净空是模拟的辅助下视/相机输入，不能解释为雷达能力。
 
-`map_full` 与 `pose` 标有 `source: "simulator_ground_truth"`，仅供仿真验收和可视化；只有 `scan` 是模拟的 Tmini 本地观测，边缘输入也是模拟辅助量。未来真实导航不能把真值消息当作传感器输入。当前只有带本地安全门控的直达目标控制，没有路径规划、真实相机/下视传感器、真实定位、传感器噪声或 `map_delta`。
+`map_full` 与 `pose` 标有 `source: "simulator_ground_truth"`，仅供仿真验收和可视化；只有 `scan` 是模拟的 Tmini 本地观测。未来导航算法不能把真值消息当作真实传感器输入。当前没有实现相机、定位误差、雷达噪声或 `map_delta`。

@@ -30,3 +30,8 @@ Thumbs.db
 
 # Project
 *.log
+
+# Agents
+AGENTS.md
+.zgent/
+.agent-doc/
