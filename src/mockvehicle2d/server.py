@@ -179,6 +179,7 @@ def handle_command_message(
         )
         handoff_collided = handoff.collided
         handoff_safety_stop = handoff.reason if handoff.stopped else None
+    rejection_reason: str | None = None
     try:
         message = _decode_message(raw)
         if message.get("type") == "goto":
@@ -204,30 +205,25 @@ def handle_command_message(
             linear_mps, angular_rps, seq = _parse_drive_object(
                 message, vehicle.linear_speed, vehicle.angular_speed
             )
-            if navigation is not None:
-                navigation.cancel("manual_override")
-            if safety is not None:
-                decision = safety.enforce_manual(vehicle, grid, (linear_mps, angular_rps))
-            else:
-                decision = None
-            if not handoff_collided and (
-                decision is None or decision.state not in {"stopped", "fault"}
-            ):
-                vehicle.install_drive(linear_mps, angular_rps, monotonic_now)
             command = "drive"
         else:
             command, seq = _parse_command_object(message)
-            if navigation is not None:
-                navigation.cancel("manual_override")
-            velocities = vehicle.velocities_for_command(command)
-            if safety is not None:
-                decision = safety.enforce_manual(vehicle, grid, velocities)
-            else:
-                decision = None
-            if not handoff_collided and (
-                decision is None or decision.state not in {"stopped", "fault"}
-            ):
-                vehicle.install_command(command, monotonic_now)
+            linear_mps, angular_rps = vehicle.velocities_for_command(command)
+        if navigation is not None:
+            navigation.cancel("manual_override")
+        decision = (
+            safety.enforce_manual(vehicle, grid, (linear_mps, angular_rps))
+            if safety is not None
+            else None
+        )
+        if handoff_collided:
+            rejection_reason = "collision"
+        elif decision is not None and decision.state in {"stopped", "fault"}:
+            rejection_reason = decision.reason or "safety_rejected"
+        elif command == "drive":
+            vehicle.install_drive(linear_mps, angular_rps, monotonic_now)
+        else:
+            vehicle.install_command(command, monotonic_now)
     except CommandMessageError as error:
         vehicle.stop()
         if navigation is not None:
@@ -240,13 +236,16 @@ def handle_command_message(
             "message": str(error),
         }
 
-    return {
+    reply = {
         "type": "cmd_ack",
         "ts": wall_timestamp,
         "seq": seq,
         "cmd": command,
-        "accepted": True,
+        "accepted": rejection_reason is None,
     }
+    if rejection_reason is not None:
+        reply["reason"] = rejection_reason
+    return reply
 
 
 def generate_map(size: int = 256, seed: int = 42, radius: float = 0.5) -> tuple[list[dict[str, object]], MapGrid]:

@@ -282,6 +282,10 @@ Pictor 仅在收到 `hello` 后才认为连接可用，之后才开始处理 `po
 }
 ```
 
+`accepted` 只有在命令通过碰撞与安全门控并实际安装后才为 `true`。若命令被拒绝，
+Server 返回 `accepted: false`，并用 `reason` 报告 `collision`、
+`safety_obstacle`、`safety_edge` 或 `safety_sensor_fault`。
+
 ### error — 命令错误
 
 ```json

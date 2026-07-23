@@ -78,7 +78,14 @@ class SafetyRuntimeTest(unittest.TestCase):
         )
         self.assertEqual(
             ack,
-            {"type": "cmd_ack", "ts": 10.0, "seq": 1, "cmd": "drive", "accepted": True},
+            {
+                "type": "cmd_ack",
+                "ts": 10.0,
+                "seq": 1,
+                "cmd": "drive",
+                "accepted": False,
+                "reason": "safety_obstacle",
+            },
         )
         self.assertEqual(vehicle.body_velocities(), (0.0, 0.0))
         self.assertEqual((safety.snapshot()["state"], safety.snapshot()["reason"]), ("stopped", "safety_obstacle"))
@@ -96,13 +103,24 @@ class SafetyRuntimeTest(unittest.TestCase):
 
         faulted_vehicle = self.vehicle()
         faulted_safety = LocalSafetyRuntime(healthy=False)
-        handle_command_message(
+        faulted_ack = handle_command_message(
             '{"type":"drive","seq":6,"linear_mps":0.5,"angular_rps":0.2}',
             faulted_vehicle,
             MapGrid(20, 20),
             0.0,
             10.2,
             safety=faulted_safety,
+        )
+        self.assertEqual(
+            faulted_ack,
+            {
+                "type": "cmd_ack",
+                "ts": 10.2,
+                "seq": 6,
+                "cmd": "drive",
+                "accepted": False,
+                "reason": "safety_sensor_fault",
+            },
         )
         self.assertEqual(faulted_vehicle.body_velocities(), (0.0, 0.0))
         self.assertEqual(
@@ -140,6 +158,30 @@ class SafetyRuntimeTest(unittest.TestCase):
         )
         self.assertEqual(vehicle.body_velocities(), (0.0, -vehicle.angular_speed))
         self.assertEqual(safety.snapshot()["state"], "clear")
+
+    def test_discrete_manual_command_reports_safety_rejection(self) -> None:
+        vehicle = self.vehicle(2.3)
+        ack = handle_command_message(
+            '{"type":"cmd","seq":7,"cmd":"forward"}',
+            vehicle,
+            wall_grid(3),
+            0.0,
+            11.2,
+            safety=LocalSafetyRuntime(),
+        )
+
+        self.assertEqual(
+            ack,
+            {
+                "type": "cmd_ack",
+                "ts": 11.2,
+                "seq": 7,
+                "cmd": "forward",
+                "accepted": False,
+                "reason": "safety_obstacle",
+            },
+        )
+        self.assertEqual(vehicle.command, "stop")
 
     def test_manual_periodic_recheck_stops_and_does_not_resume(self) -> None:
         grid = wall_grid(4)

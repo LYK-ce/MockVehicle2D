@@ -152,10 +152,39 @@ class VehicleTest(unittest.TestCase):
         vehicle.apply_drive(grid, 0.25, 0.0, 4.0)
 
         self.assertTrue(vehicle.collision)
-        self.assertEqual((vehicle.command, vehicle.velocities()), ("stop", (0.0, 0.0, 0.0)))
+        self.assertEqual(
+            (vehicle.command, vehicle.velocities()),
+            ("stop", (0.0, 0.0, 0.0)),
+        )
         stopped_at = (vehicle.x, vehicle.y, vehicle.yaw)
         vehicle.advance(grid, 4.5)
         self.assertEqual((vehicle.x, vehicle.y, vehicle.yaw), stopped_at)
+
+    def test_handoff_collision_rejects_replacement_command(self) -> None:
+        grid = MapGrid.from_wall_set(20, 20, {(4, y) for y in range(20)})
+        vehicle = Vehicle(2.5, 5.5, command_timeout=5.0, now=0.0)
+        vehicle.apply_command(grid, "forward", 0.0)
+
+        ack = handle_command_message(
+            '{"type":"cmd","seq":12,"cmd":"backward"}',
+            vehicle,
+            grid,
+            4.0,
+            13.5,
+        )
+
+        self.assertEqual(
+            ack,
+            {
+                "type": "cmd_ack",
+                "ts": 13.5,
+                "seq": 12,
+                "cmd": "backward",
+                "accepted": False,
+                "reason": "collision",
+            },
+        )
+        self.assertEqual((vehicle.command, vehicle.velocities()), ("stop", (0.0, 0.0, 0.0)))
 
     def test_substeps_stop_at_last_safe_position(self) -> None:
         grid = MapGrid.from_wall_set(20, 20, {(4, y) for y in range(20)})
