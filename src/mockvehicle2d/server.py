@@ -15,7 +15,7 @@ from mockvehicle2d.vehicle import COMMANDS, Vehicle
 
 
 HOST = "0.0.0.0"
-PORT = 9090
+PORT = 19090
 DEFAULT_VEHICLE_ID = "mock_vehicle_01"
 SPAWN_X = 10.0
 SPAWN_Y = 10.0
@@ -238,13 +238,24 @@ async def main(
 
     vehicle_id = validate_vehicle_id(vehicle_id)
     stop = asyncio.Event()
+    _shutting_down = False
 
-    def _sig_handler(_signum, _frame):
-        print("\n[!] shutting down...")
-        stop.set()
+    def _sig_handler():
+        nonlocal _shutting_down
+        if not _shutting_down:
+            _shutting_down = True
+            print("\n[!] shutting down...")
+            stop.set()
+        else:
+            # Second Ctrl+C while already shutting down — force exit.
+            print("\n[!] forcing exit...")
+            import os as _os
 
-    signal.signal(signal.SIGINT, _sig_handler)
-    signal.signal(signal.SIGTERM, _sig_handler)
+            _os._exit(1)
+
+    loop = asyncio.get_running_loop()
+    for sig in (signal.SIGINT, signal.SIGTERM):
+        loop.add_signal_handler(sig, _sig_handler)
 
     async def configured_handler(websocket):
         await handler(
@@ -256,10 +267,14 @@ async def main(
             command_timeout=command_timeout,
         )
 
-    async with serve(configured_handler, HOST, port):
-        print(f"Mock Vehicle Server listening on ws://{HOST}:{port}")
-        print("Waiting for a controller connection...\n")
-        await stop.wait()
+    try:
+        async with serve(configured_handler, HOST, port):
+            print(f"Mock Vehicle Server listening on ws://{HOST}:{port}")
+            print("Waiting for a controller connection...\n")
+            await stop.wait()
+    finally:
+        for sig in (signal.SIGINT, signal.SIGTERM):
+            loop.remove_signal_handler(sig)
 
 
 if __name__ == "__main__":

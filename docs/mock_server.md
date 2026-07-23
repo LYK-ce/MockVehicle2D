@@ -18,7 +18,7 @@ MockVehicle2D 模拟小车行为：生成 2D 栅格地图、发送位姿、响�
 |------|------|
 | 语言 | Python 3.10+ |
 | 依赖 | `websockets` (WebSocket), `pygame` (可视化), 标准库 |
-| 默认端口 | 9090 |
+| 默认端口 | 19090 |
 | 地图规模 | 24×24 (pygame) / 256×256 (WebSocket) |
 | 车辆 | 圆形, r=0.5, 有航向角 yaw |
 | 每格含义 | 0 = 可通行, 1 = 不可通行 (wall) |
@@ -158,7 +158,7 @@ cell [gx, gx+1] × [gy, gy+1] 到圆心 (cx, cy) 的最近点:
 
 ```bash
 mockvehicle2d serve \
-  --port 9090 \
+  --port 19090 \
   --vehicle-id mock_vehicle_01 \
   --linear-speed 0.5 \
   --angular-speed 90 \
@@ -168,7 +168,7 @@ mockvehicle2d serve \
 
 角速度参数单位为度/秒。规范命令为 `{"type":"cmd","seq":0,"cmd":"forward"}`；W+D 等组合输入发送 `forward_right`，同时使用线速度和角速度。也兼容精确 legacy 格式 `{"cmd":"forward"}`。新命令生效前先把旧命令积分到接收时刻。非法消息、看门狗超时、碰撞或连接结束都会停车。
 
-Pictor 连接 `ws://127.0.0.1:9090` 后，首帧为 `hello`，随后为 `map_full → pose → scan`。若端口被占用，可启动 `mockvehicle2d serve --port 19090`，并让 Pictor 连接 `ws://127.0.0.1:19090`。`hello` 不携带地址；Pictor 使用自己实际连接的 URL。
+Pictor 连接 `ws://127.0.0.1:19090` 后，首帧为 `hello`，随后为 `map_full → pose → scan`。若端口被占用，可启动 `mockvehicle2d serve --port 9090`，并让 Pictor 连接 `ws://127.0.0.1:9090`。`hello` 不携带地址；Pictor 使用自己实际连接的 URL。
 
 每个 6 Hz deadline 只推进一次共用状态，再以相同 `seq` 和 Unix `ts` 顺序发送 `pose`、`scan`。命令接收和全部发送都在同一个连接协程内串行执行；每轮先处理已到期遥测，命令洪泛不会永久饿死遥测。
 
@@ -205,6 +205,6 @@ mockvehicle2d test
 | Pygame 可视化 | ✅ |
 | cmd 命令接收、确认和错误停车 | ✅ |
 | 实际时间运动、看门狗和防穿墙 | ✅ |
-| 寻路算法 | ⏸️ 暂不选型 |
+| 寻路算法 | ✅ |
 
-`map_full` 和 `pose` 的 `source` 为 `simulator_ground_truth`，只用于仿真验收与可视化；只有 `scan` 是模拟的 Tmini 本地观测。当前没有实现任何寻路算法、相机、定位误差、雷达噪声或 `map_delta`。
+`map_full` 和 `pose` 的 `source` 为 `simulator_ground_truth`，只用于仿真验收与可视化；只有 `scan` 是模拟的 Tmini 本地观测。当前没有实现相机、定位误差、雷达噪声或 `map_delta`。
