@@ -10,10 +10,8 @@ from unittest.mock import patch
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
-sys.path.insert(0, str(REPO_ROOT))
 sys.path.insert(0, str(REPO_ROOT / "src"))
 
-from tests.test_collision import main as collision_main
 from mockvehicle2d.cli.main import _port
 from mockvehicle2d.collision import is_circle_passable
 from mockvehicle2d.map_grid import MapGrid
@@ -109,9 +107,6 @@ class ScanMessageTest(unittest.TestCase):
 
         asyncio.run(run_server())
 
-    def test_existing_collision_suite_still_passes(self) -> None:
-        self.assertEqual(collision_main(), 0)
-
     def test_scan_message_contains_laserscan_metadata_and_points(self) -> None:
         grid = MapGrid.from_wall_set(8, 4, {(4, 1)})
         message = scan_message(grid, 1.5, 1.5, 0.0, 1717800000.124)
@@ -135,6 +130,16 @@ class ScanMessageTest(unittest.TestCase):
         self.assertEqual(websocket.messages[1]["source"], "simulator_ground_truth")
         self.assertEqual(websocket.messages[2]["source"], "simulator_ground_truth")
         self.assertEqual(websocket.messages[2]["command"], "stop")
+        self.assertEqual(
+            websocket.messages[2]["safety"],
+            {
+                "state": "clear",
+                "reason": None,
+                "obstacle_clearance_m": None,
+                "edge_clearance_m": None,
+            },
+        )
+        self.assertTrue(any(voxel["state"] == 2 for voxel in websocket.messages[1]["voxels"]))
         self.assertEqual(websocket.messages[2]["seq"], websocket.messages[3]["seq"])
         self.assertEqual(websocket.messages[2]["ts"], websocket.messages[3]["ts"])
         self.assertEqual(websocket.messages[-1]["config"]["model"], "ydlidar_tmini")
@@ -165,19 +170,25 @@ class ScanMessageTest(unittest.TestCase):
         self.assertTrue(is_circle_passable(grid, 10.0, 10.0, 0.5))
 
     def test_handler_sends_immediate_ack_or_error_without_parallel_sender(self) -> None:
-        accepted = _CommandSocket('{"type":"cmd","seq":3,"cmd":"forward"}')
+        accepted = _CommandSocket(
+            '{"type":"drive","seq":3,"linear_mps":0.25,"angular_rps":-0.4}'
+        )
         asyncio.run(handler(accepted))
         self.assertEqual(
             [message["type"] for message in accepted.messages], ["hello", "map_full", "pose", "scan", "cmd_ack"]
         )
         self.assertEqual(accepted.messages[-1]["seq"], 3)
+        self.assertEqual(accepted.messages[-1]["cmd"], "drive")
 
-        rejected = _CommandSocket('{"type":"pose","seq":4,"cmd":"forward"}')
+        rejected = _CommandSocket(
+            '{"type":"drive","seq":4,"linear_mps":0.51,"angular_rps":0}'
+        )
         asyncio.run(handler(rejected))
         self.assertEqual(
             [message["type"] for message in rejected.messages], ["hello", "map_full", "pose", "scan", "error"]
         )
         self.assertEqual(rejected.messages[-1]["seq"], 4)
+        self.assertEqual(rejected.messages[-1]["code"], "drive_out_of_range")
 
     def test_idle_receive_timeout_continues_telemetry_without_sleeping(self) -> None:
         class LegacyAsyncioTimeoutError(Exception):

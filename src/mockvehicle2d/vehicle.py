@@ -62,65 +62,141 @@ class Vehicle:
         self.command_timeout = command_timeout
         self.command = "stop"
         self.collision = False
+        self._linear_mps = 0.0
+        self._angular_rps = 0.0
         self._last_update = now
         self._command_deadline: float | None = None
 
     def reset(self, x: float, y: float, yaw: float, now: float) -> None:
         self.x, self.y, self.yaw = x, y, yaw
-        self.command = "stop"
         self.collision = False
         self._last_update = now
-        self._command_deadline = None
+        self.stop()
 
     def apply_command(self, grid: MapGrid, command: str, now: float) -> None:
         """Advance the old command to ``now``, then install the new command."""
-        if command not in COMMANDS:
-            raise ValueError(f"unsupported command: {command}")
-        self.advance(grid, now)
-        self.command = command
-        self._command_deadline = now + self.command_timeout if command != "stop" else None
+        linear, angular = self.velocities_for_command(command)
+        if not self.advance(grid, now):
+            self._install_velocities(linear, angular, now, command)
+
+    def apply_drive(self, grid: MapGrid, linear_mps: float, angular_rps: float, now: float) -> None:
+        """Advance to ``now``, then install bounded continuous velocities."""
+        linear, angular = self._validated_drive_velocities(linear_mps, angular_rps)
+        if not self.advance(grid, now):
+            self._install_velocities(linear, angular, now, "drive")
+
+    def install_command(self, command: str, now: float) -> None:
+        """Install a discrete command after the vehicle has already advanced to ``now``."""
+        linear, angular = self.velocities_for_command(command)
+        self._install_velocities(linear, angular, now, command)
+
+    def install_drive(self, linear_mps: float, angular_rps: float, now: float) -> None:
+        """Install bounded velocities after the vehicle has already advanced to ``now``."""
+        linear, angular = self._validated_drive_velocities(linear_mps, angular_rps)
+        self._install_velocities(linear, angular, now, "drive")
+
+    def _validated_drive_velocities(
+        self, linear_mps: float, angular_rps: float
+    ) -> tuple[float, float]:
+        values = (linear_mps, angular_rps)
+        if any(isinstance(value, bool) or not isinstance(value, (int, float)) for value in values):
+            raise ValueError("drive velocities must be numbers")
+        if any(isinstance(value, float) and not math.isfinite(value) for value in values):
+            raise ValueError("drive velocities must be finite")
+        if abs(linear_mps) > self.linear_speed or abs(angular_rps) > self.angular_speed:
+            raise ValueError("drive velocities exceed configured limits")
+        return float(linear_mps), float(angular_rps)
 
     def stop(self) -> None:
         self.command = "stop"
+        self._linear_mps = 0.0
+        self._angular_rps = 0.0
         self._command_deadline = None
 
-    def advance(self, grid: MapGrid, now: float) -> None:
-        """Integrate commanded motion through ``now`` using actual monotonic time."""
+    def advance(
+        self,
+        grid: MapGrid,
+        now: float,
+        *,
+        limited_velocities: tuple[float, float] | None = None,
+    ) -> bool:
+        """Integrate through ``now``, optionally using a safety-reduced velocity."""
         if now < self._last_update:
             raise ValueError("monotonic time moved backwards")
 
+        collided = False
         motion_until = min(now, self._command_deadline) if self._command_deadline is not None else now
         elapsed = motion_until - self._last_update
         if elapsed > 0:
-            linear, angular = self._command_velocities()
+            linear, angular = self.body_velocities()
+            if limited_velocities is not None:
+                limited_linear, limited_angular = limited_velocities
+                if (
+                    not all(math.isfinite(value) for value in limited_velocities)
+                    or abs(limited_linear) > abs(linear)
+                    or abs(limited_angular) > abs(angular)
+                    or limited_linear * linear < 0
+                    or limited_angular * angular < 0
+                ):
+                    raise ValueError("limited velocities must reduce the active command")
+                linear, angular = limited_linear, limited_angular
             if (linear or angular) and not self._move(grid, linear * elapsed, angular * elapsed):
                 self.collision = True
                 self.stop()
+                collided = True
 
         self._last_update = now
         if self._command_deadline is not None and now >= self._command_deadline:
             self.stop()
+        return collided
 
     def velocities(self) -> tuple[float, float, float]:
-        linear, angular = self._command_velocities()
+        linear, angular = self.body_velocities()
         return linear * math.cos(self.yaw), linear * math.sin(self.yaw), angular
 
-    def _command_velocities(self) -> tuple[float, float]:
-        if self.command == "forward":
+    def body_velocities(self) -> tuple[float, float]:
+        """Return the currently commanded linear and angular velocities."""
+        return self._linear_mps, self._angular_rps
+
+    @property
+    def last_update(self) -> float:
+        return self._last_update
+
+    @property
+    def command_deadline(self) -> float | None:
+        return self._command_deadline
+
+    def _install_velocities(
+        self, linear_mps: float, angular_rps: float, now: float, command: str
+    ) -> None:
+        if now != self._last_update:
+            raise ValueError("vehicle must be advanced to now before installing velocities")
+        if linear_mps == 0 and angular_rps == 0:
+            self.stop()
+            return
+        self.command = command
+        self._linear_mps = linear_mps
+        self._angular_rps = angular_rps
+        self._command_deadline = now + self.command_timeout
+
+    def velocities_for_command(self, command: str) -> tuple[float, float]:
+        if command not in COMMANDS:
+            raise ValueError(f"unsupported command: {command}")
+        if command == "forward":
             return self.linear_speed, 0.0
-        if self.command == "forward_left":
+        if command == "forward_left":
             return self.linear_speed, -self.angular_speed
-        if self.command == "forward_right":
+        if command == "forward_right":
             return self.linear_speed, self.angular_speed
-        if self.command == "backward":
+        if command == "backward":
             return -self.linear_speed, 0.0
-        if self.command == "backward_left":
+        if command == "backward_left":
             return -self.linear_speed, -self.angular_speed
-        if self.command == "backward_right":
+        if command == "backward_right":
             return -self.linear_speed, self.angular_speed
-        if self.command == "spin_left":
+        if command == "spin_left":
             return 0.0, -self.angular_speed
-        if self.command == "spin_right":
+        if command == "spin_right":
             return 0.0, self.angular_speed
         return 0.0, 0.0
 
