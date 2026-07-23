@@ -38,6 +38,19 @@ class SafetyRuntimeTest(unittest.TestCase):
         self.assertGreater(vehicle.body_velocities()[0], 0.0)
         self.assertLess(vehicle.body_velocities()[0], vehicle.linear_speed)
 
+    def test_delayed_automatic_tick_applies_slow_zone_limit_while_advancing(self) -> None:
+        vehicle = self.vehicle()
+        navigation = GotoController()
+        safety = LocalSafetyRuntime()
+        navigation.start(10.0, 5.5)
+        navigation.update(vehicle, wall_grid(4), 0.0, safety)
+
+        navigation.update(vehicle, wall_grid(4), 2.0, safety)
+
+        self.assertEqual(navigation.status, "active")
+        self.assertEqual(safety.snapshot()["state"], "limited")
+        self.assertLess(vehicle.x, 2.95)
+
     def test_automatic_obstacle_edge_and_fault_block_without_restart(self) -> None:
         cases: list[tuple[MapGrid, Vehicle, LocalSafetyRuntime, str]] = []
         cases.append((wall_grid(3), self.vehicle(2.3), LocalSafetyRuntime(), "safety_obstacle"))
@@ -289,12 +302,21 @@ class SafetyRuntimeTest(unittest.TestCase):
 
         navigation.update(vehicle, grid, 4.0, safety)
 
+        self.assertEqual(navigation.status, "active")
+        self.assertEqual(
+            (safety.snapshot()["state"], safety.snapshot()["reason"]),
+            ("limited", "safety_edge"),
+        )
+        self.assertLessEqual(vehicle.x, 4.0 - vehicle.radius - 0.25 + 1e-9)
+
+        navigation.update(vehicle, grid, 6.0, safety)
+
         self.assertEqual((navigation.status, navigation.reason), ("blocked", "safety_edge"))
         self.assertFalse(vehicle.collision)
         self.assertLessEqual(vehicle.x, 4.0 - vehicle.radius - 0.25 + 1e-9)
         stopped_pose = (vehicle.x, vehicle.y, vehicle.yaw)
         grid.set_cell(4, 5, FREE)
-        navigation.update(vehicle, grid, 5.0, safety)
+        navigation.update(vehicle, grid, 7.0, safety)
         self.assertEqual((vehicle.x, vehicle.y, vehicle.yaw), stopped_pose)
         self.assertEqual(navigation.status, "blocked")
 
@@ -320,7 +342,7 @@ class SafetyRuntimeTest(unittest.TestCase):
             safety,
         )
 
-        handle_command_message(
+        ack = handle_command_message(
             '{"type":"goto","seq":9,"x_m":10,"y_m":5.5}',
             vehicle,
             grid,
@@ -330,6 +352,17 @@ class SafetyRuntimeTest(unittest.TestCase):
             safety,
         )
 
+        self.assertEqual(
+            ack,
+            {
+                "type": "goto_ack",
+                "ts": 13.0,
+                "seq": 9,
+                "goal": {"x_m": 10.0, "y_m": 5.5},
+                "accepted": False,
+                "reason": "safety_obstacle",
+            },
+        )
         self.assertEqual((navigation.status, navigation.reason), ("blocked", "safety_obstacle"))
         self.assertFalse(vehicle.collision)
         self.assertLessEqual(vehicle.x, 4.0 - vehicle.radius - 0.25 + 1e-9)

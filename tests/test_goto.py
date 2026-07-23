@@ -233,7 +233,17 @@ class GotoTest(unittest.TestCase):
             navigation,
         )
 
-        self.assertEqual(ack["type"], "goto_ack")
+        self.assertEqual(
+            ack,
+            {
+                "type": "goto_ack",
+                "ts": 12.25,
+                "seq": 6,
+                "goal": {"x_m": 4.0, "y_m": 5.0},
+                "accepted": False,
+                "reason": "collision",
+            },
+        )
         self.assertEqual(navigation.goal, (4.0, 5.0))
         self.assertEqual((navigation.status, navigation.reason), ("blocked", "collision"))
         self.assertEqual(vehicle.velocities(), (0.0, 0.0, 0.0))

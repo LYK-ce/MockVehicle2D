@@ -21,7 +21,7 @@ MockVehicle2D 模拟小车行为：生成 2D 栅格地图、发送位姿、响�
 | 默认端口 | 9090 |
 | 地图规模 | 24×24 (pygame) / 256×256 (WebSocket) |
 | 车辆 | 圆形, r=0.5, 有航向角 yaw |
-| 每格含义 | 0 = 可通行, 1 = 不可通行 (wall) |
+| 每格含义 | 0 = 可通行, 1 = 墙, 2 = 无地面/落差 |
 
 ---
 
@@ -33,12 +33,18 @@ MockVehicle2D/
 │   ├── server.py           ← WebSocket Server 入口
 │   ├── vehicle.py          ← 共用车辆运动、碰撞与指令看门狗
 │   ├── scan.py             ← YDLidar 风格二维激光扫描
+│   ├── navigation.py       ← 本地 odom 直达目标控制
+│   ├── safety.py           ← 障碍/边缘净空与本地安全门控
 │   ├── map_grid.py         ← MapGrid 栅格地图数据结构
 │   ├── collision.py        ← Bresenham 线段 + AABB 圆形碰撞检测
 │   └── visual.py           ← Pygame 可视化测试
 ├── tests/
 │   ├── test_collision.py   ← 碰撞检测测试 (60 条断言)
 │   ├── test_scan.py        ← 二维扫描几何测试
+│   ├── test_vehicle.py     ← 运动、组合命令与看门狗测试
+│   ├── test_goto.py        ← goto 与手动接管测试
+│   ├── test_safety.py      ← 安全感知和策略测试
+│   ├── test_safety_runtime.py ← 延迟推进与安全门控测试
 │   └── test_server_scan.py ← scan WebSocket 帧测试
 ├── docs/
 │   ├── mock_server.md      ← 本文档
@@ -58,7 +64,8 @@ mockvehicle2d serve (WebSocket Server)
   ├── 连接握手: hello(vehicle_id)
   ├── 地图生成: voxel 数组 → map_full
   │
-  ├── cmd 接收: 严格校验 → cmd_ack / error → 故障停车
+  ├── cmd / drive / goto: 严格校验 → ack / error → 故障停车
+  ├── 本地安全: Tmini 障碍净空 + 模拟边缘净空 → 限速 / 停车
   │
   ├── 共用车辆状态: 实际单调时间 → 运动 / 看门狗 / 分步碰撞
   │
@@ -87,8 +94,8 @@ mockvehicle2d visual (Pygame 可视化)
 | 上行 | `pose` | ✅ 已实现 |
 | 上行 | `scan` | ✅ 已实现 |
 | 上行 | `map_delta` | ⏸️ 暂不实现 |
-| 下行 (Pictor → Server) | `cmd` | ✅ 已实现 |
-| 上行 | `cmd_ack` / `error` | ✅ 已实现 |
+| 下行 (Pictor → Server) | `cmd` / `drive` / `goto` | ✅ 已实现 |
+| 上行 | `cmd_ack` / `goto_ack` / `error` | ✅ 已实现 |
 
 ---
 
@@ -112,7 +119,7 @@ O(1) 查询, O(1) 写入, 256² = 64 KB
 
 ### Bresenham 线段碰撞
 
-直线路径逐格采样，途中任一 cell 为墙 → 碰撞。
+直线路径逐格采样，途中任一 cell 不可通行（墙、落差或越界）→ 碰撞。
 
 ```
 A(0,0) → B(4,3):  (0,0)→(1,0)→(2,1)→(3,2)→(4,3)
@@ -176,16 +183,8 @@ Pictor 连接 `ws://127.0.0.1:9090` 后，首帧为 `hello`，随后为 `map_ful
 
 ## 测试
 
-```bash
-mockvehicle2d test
-```
-
-| 模块 | 测试组 | 断言数 | 覆盖 |
-|------|--------|--------|------|
-| MapGrid | 8 | 25 | get/set, 越界, from_voxels, 性能 |
-| raycast | 9 | 19 | 水平/垂直/对角, 撞墙, 擦边 |
-| is_circle_passable | 9 | 16 | 圆心墙, 边界, 邻格重叠, 走廊, 航向角联动 |
-| **合计** | **26** | **60** | — |
+`mockvehicle2d test` 运行碰撞、扫描、运动、协议、`goto` 和安全运行时的
+全部确定性检查。
 
 ---
 
@@ -204,7 +203,10 @@ mockvehicle2d test
 | 二维扫描测试 | ✅ |
 | Pygame 可视化 | ✅ |
 | cmd 命令接收、确认和错误停车 | ✅ |
+| drive 连续速度与组合驾驶 | ✅ |
+| goto 直达目标与手动接管 | ✅ |
+| 障碍/边缘安全限速和停车 | ✅ |
 | 实际时间运动、看门狗和防穿墙 | ✅ |
-| 寻路算法 | ⏸️ 暂不选型 |
+| 绕障路径规划 | ⏸️ 暂不选型 |
 
-`map_full` 和 `pose` 的 `source` 为 `simulator_ground_truth`，只用于仿真验收与可视化；只有 `scan` 是模拟的 Tmini 本地观测。当前没有实现任何寻路算法、相机、定位误差、雷达噪声或 `map_delta`。
+`map_full` 和 `pose` 的 `source` 为 `simulator_ground_truth`，只用于仿真验收与可视化；只有 `scan` 是模拟的 Tmini 本地观测。当前只有无绕障直达目标控制，没有相机、定位误差、雷达噪声或 `map_delta`。

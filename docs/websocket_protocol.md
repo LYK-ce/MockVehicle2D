@@ -10,7 +10,8 @@
 | 角色 | 小车 = Server，PC = Client |
 | 默认端口 | 9090 |
 
-每条消息为单行 JSON，顶层必有 `type` 字段。
+除兼容旧客户端的精确 `{"cmd":"..."}` 格式外，每条消息均为 JSON 文本对象，
+顶层必有 `type` 字段。
 
 坐标系：2D 用 `(x, y)`，3D 高度用 `z`，与 Godot 坐标系统一。
 
@@ -46,15 +47,13 @@ Pictor 仅在收到 `hello` 后才认为连接可用，之后才开始处理 `po
 ```json
 {
     "type": "hello",
-    "vehicle_id": "car_0",
-    "address": "ws://192.168.1.10:9090"
+    "vehicle_id": "car_0"
 }
 ```
 
 | 字段 | 类型 | 说明 |
 |------|------|------|
 | `vehicle_id` | string | 车辆唯一标识 |
-| `address` | string | 本连接地址，用于匹配 |
 
 ### pose — 车辆位姿
 
@@ -182,7 +181,7 @@ Pictor 仅在收到 `hello` 后才认为连接可用，之后才开始处理 `po
 | `state` | u8 | `0`=可通行，`1`=墙/障碍物，`2`=无地面/落差 |
 | `conf` | f32 | 置信度 0.0~1.0 |
 
-### map_delta — 增量地图
+### map_delta — 增量地图（尚未实现）
 
 仅发送变化的格子。
 
@@ -269,6 +268,10 @@ Pictor 仅在收到 `hello` 后才认为连接可用，之后才开始处理 `po
     "accepted": true
 }
 ```
+
+`accepted` 只有在目标已进入 `active` 状态时才为 `true`。若旧运动在命令交接时
+已因碰撞或安全门控停止，则返回 `accepted: false`，并以 `reason` 报告
+`collision`、`safety_obstacle`、`safety_edge` 或 `safety_sensor_fault`。
 
 ### cmd_ack — 命令确认
 

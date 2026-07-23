@@ -1,12 +1,5 @@
 #!/usr/bin/env python3
-"""
-mock_visual.py — Mock Server Pygame 可视化测试
-
-24×24 地图，圆形车辆 (r=0.5)，W/S/A/D 驾驶，实时碰撞检测。
-
-用法:
-  cd test_tool && python mock_visual.py
-"""
+"""Standalone Pygame view for manual motion and collision checks."""
 
 import math
 import random
@@ -27,7 +20,7 @@ MOVE_SPEED = 0.5         # m/s
 TURN_SPEED = math.pi / 2  # rad/s
 
 # 窗口
-PANEL_H = 40             # 底部状态栏高度
+PANEL_H = 60             # 底部三行状态栏
 WINDOW_W = MAP_W * CELL
 WINDOW_H = MAP_H * CELL + PANEL_H
 FPS = 60

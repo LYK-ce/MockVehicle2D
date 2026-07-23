@@ -194,13 +194,17 @@ def handle_command_message(
             elif handoff_safety_stop is not None:
                 navigation.status = "blocked"
                 navigation.reason = handoff_safety_stop
-            return {
+            accepted = navigation.status == "active"
+            reply = {
                 "type": "goto_ack",
                 "ts": wall_timestamp,
                 "seq": seq,
                 "goal": {"x_m": x_m, "y_m": y_m},
-                "accepted": True,
+                "accepted": accepted,
             }
+            if not accepted:
+                reply["reason"] = navigation.reason
+            return reply
         if message.get("type") == "drive":
             linear_mps, angular_rps, seq = _parse_drive_object(
                 message, vehicle.linear_speed, vehicle.angular_speed

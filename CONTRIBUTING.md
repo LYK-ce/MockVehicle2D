@@ -30,7 +30,7 @@ mockvehicle2d test          # verify everything works
 
 4. **Commit** with a descriptive message:
    ```bash
-   git commit -m "Add A* pathfinding algorithm"
+   git commit -m "Fix command timeout handling"
    ```
 
 5. **Push and open a Pull Request.**
@@ -56,9 +56,10 @@ Every pull request must:
 MockVehicle2D/
 ├── src/mockvehicle2d/       ← library code
 │   ├── cli/                 ← CLI entry points
-│   ├── pathfinding/         ← pathfinding algorithms
 │   ├── map_grid.py          ← 2D grid map
 │   ├── collision.py         ← collision detection
+│   ├── navigation.py        ← direct go-to-goal control
+│   ├── safety.py            ← local safety sensing and limits
 │   ├── server.py            ← WebSocket server
 │   └── visual.py            ← Pygame visualization
 ├── tests/                   ← test suite

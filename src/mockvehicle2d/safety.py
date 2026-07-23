@@ -250,13 +250,23 @@ class LocalSafetyRuntime:
                 collided = vehicle.advance(grid, now)
                 return SafetyAdvanceResult(collided=collided)
 
+            policy_linear_mps = (
+                math.copysign(vehicle.linear_speed, linear_mps)
+                if automatic
+                else linear_mps
+            )
             decision = self.evaluate(
-                vehicle, grid, linear_mps, angular_rps, automatic=automatic
+                vehicle, grid, policy_linear_mps, angular_rps, automatic=automatic
             )
             if decision.state in {"stopped", "fault"}:
                 vehicle.stop()
                 vehicle.advance(grid, now)
                 return SafetyAdvanceResult(stopped=True, reason=decision.reason)
+            effective_linear = math.copysign(
+                min(abs(linear_mps), abs(decision.linear_mps)),
+                linear_mps,
+            )
+            effective_angular = decision.angular_rps
 
             nearest = min(
                 (
@@ -281,8 +291,10 @@ class LocalSafetyRuntime:
 
             step_time = min(
                 motion_until - vehicle.last_update,
-                step_distance / abs(linear_mps),
-                MAX_ROTATION_STEP_RAD / abs(angular_rps) if angular_rps else math.inf,
+                step_distance / abs(effective_linear),
+                MAX_ROTATION_STEP_RAD / abs(effective_angular)
+                if effective_angular
+                else math.inf,
             )
             next_update = vehicle.last_update + step_time
             too_many_rotations = (
@@ -296,13 +308,17 @@ class LocalSafetyRuntime:
                 or next_update <= vehicle.last_update
             ):
                 self.decision = SafetyDecision(
-                    0.0, angular_rps, "fault", "safety_sensor_fault"
+                    0.0, effective_angular, "fault", "safety_sensor_fault"
                 )
                 vehicle.stop()
                 vehicle.advance(grid, now)
                 return SafetyAdvanceResult(stopped=True, reason="safety_sensor_fault")
             steps += 1
-            collided = vehicle.advance(grid, next_update)
+            collided = vehicle.advance(
+                grid,
+                next_update,
+                limited_velocities=(effective_linear, effective_angular),
+            )
             if collided:
                 vehicle.advance(grid, now)
                 return SafetyAdvanceResult(collided=True)

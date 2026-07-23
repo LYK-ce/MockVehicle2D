@@ -37,7 +37,7 @@ python -m mockvehicle2d test
 ```
 MockVehicle2D/
 ├── src/mockvehicle2d/
-│   ├── cli.py              ← 统一 CLI 入口 (argparse)
+│   ├── cli/main.py         ← 统一 CLI 入口 (argparse)
 │   ├── map_grid.py         ← MapGrid 类，可通行/墙体/无地面三态栅格
 │   ├── collision.py        ← 碰撞检测：Bresenham 线段 + AABB vs Circle
 │   ├── vehicle.py          ← Server/Pygame 共用的运动、碰撞与指令看门狗
@@ -56,7 +56,8 @@ MockVehicle2D/
 │   └── test_server_scan.py ← scan WebSocket 帧测试
 ├── docs/
 │   ├── mock_server.md
-│   └── pygame_visual.md
+│   ├── pygame_visual.md
+│   └── websocket_protocol.md
 ├── pyproject.toml
 ├── LICENSE
 └── README.md
@@ -78,7 +79,7 @@ MapGrid (bytearray)
   操作: O(1)
 
 Bresenham 线段碰撞
-  逐格采样，任一格子是墙 → 碰撞
+  逐格采样，任一格子不可通行（墙、落差或越界）→ 碰撞
   复杂度: O(max(dx, dy))
 
 AABB vs Circle 圆形碰撞
@@ -88,15 +89,8 @@ AABB vs Circle 圆形碰撞
 
 ## 测试
 
-```bash
-mockvehicle2d test
-```
-
-| 模块 | 测试组 | 断言数 |
-|------|--------|--------|
-| MapGrid | 8 | 25 |
-| raycast | 9 | 19 |
-| is_circle_passable (r=0.5) | 9 | 16 |
+`mockvehicle2d test` 会运行栅格/碰撞、Tmini 扫描、车辆运动、WebSocket
+协议、`goto`、安全策略与延迟执行回归测试。
 
 ## 通信协议
 

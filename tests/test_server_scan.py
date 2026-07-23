@@ -10,10 +10,8 @@ from unittest.mock import patch
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
-sys.path.insert(0, str(REPO_ROOT))
 sys.path.insert(0, str(REPO_ROOT / "src"))
 
-from tests.test_collision import main as collision_main
 from mockvehicle2d.cli.main import _port
 from mockvehicle2d.collision import is_circle_passable
 from mockvehicle2d.map_grid import MapGrid
@@ -108,9 +106,6 @@ class ScanMessageTest(unittest.TestCase):
                 self.assertEqual(serve.call_args.args[1:], ("0.0.0.0", 19090))
 
         asyncio.run(run_server())
-
-    def test_existing_collision_suite_still_passes(self) -> None:
-        self.assertEqual(collision_main(), 0)
 
     def test_scan_message_contains_laserscan_metadata_and_points(self) -> None:
         grid = MapGrid.from_wall_set(8, 4, {(4, 1)})

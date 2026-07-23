@@ -105,8 +105,14 @@ class Vehicle:
         self._angular_rps = 0.0
         self._command_deadline = None
 
-    def advance(self, grid: MapGrid, now: float) -> bool:
-        """Integrate commanded motion through ``now`` and report a new collision."""
+    def advance(
+        self,
+        grid: MapGrid,
+        now: float,
+        *,
+        limited_velocities: tuple[float, float] | None = None,
+    ) -> bool:
+        """Integrate through ``now``, optionally using a safety-reduced velocity."""
         if now < self._last_update:
             raise ValueError("monotonic time moved backwards")
 
@@ -115,6 +121,17 @@ class Vehicle:
         elapsed = motion_until - self._last_update
         if elapsed > 0:
             linear, angular = self.body_velocities()
+            if limited_velocities is not None:
+                limited_linear, limited_angular = limited_velocities
+                if (
+                    not all(math.isfinite(value) for value in limited_velocities)
+                    or abs(limited_linear) > abs(linear)
+                    or abs(limited_angular) > abs(angular)
+                    or limited_linear * linear < 0
+                    or limited_angular * angular < 0
+                ):
+                    raise ValueError("limited velocities must reduce the active command")
+                linear, angular = limited_linear, limited_angular
             if (linear or angular) and not self._move(grid, linear * elapsed, angular * elapsed):
                 self.collision = True
                 self.stop()
