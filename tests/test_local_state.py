@@ -107,6 +107,40 @@ class ObservedGridTest(unittest.TestCase):
         self.assertEqual(delta.anchor_id, self.anchor.anchor_id)
         self.assertEqual({cell.state for cell in delta.changed_cells}, {FREE, OCCUPIED})
 
+    def test_hit_on_grid_boundary_uses_cell_entered_by_ray(self) -> None:
+        cases = (
+            ("negative x", (1.5, 0.5, 0.0), math.pi, 0.5, (0, 0), (1, 0)),
+            ("positive x", (0.5, 0.5, 0.0), 0.0, 0.5, (1, 0), (0, 0)),
+            ("negative y", (0.5, 1.5, 0.0), -math.pi / 2, 0.5, (0, 0), (0, 1)),
+            ("positive y", (0.5, 0.5, 0.0), math.pi / 2, 0.5, (0, 1), (0, 0)),
+            ("rotated negative x", (1.5, 0.5, math.pi / 4), 3 * math.pi / 4, 0.5, (0, 0), (1, 0)),
+            ("inside negative x", (1.5001, 0.5, 0.0), math.pi, 0.5002, (0, 0), (1, 0)),
+            ("inside positive x", (0.4999, 0.5, 0.0), 0.0, 0.5002, (1, 0), (0, 0)),
+        )
+        for name, (x_m, y_m, yaw_rad), angle, distance, hit_cell, start_cell in cases:
+            with self.subTest(name=name):
+                grid = ObservedGrid(self.anchor, resolution_m=1.0)
+                pose = PoseEstimate(
+                    "vehicle-1",
+                    x_m,
+                    y_m,
+                    yaw_rad,
+                    (0.0, 0.0, 0.0),
+                    "nominal",
+                    1.0,
+                    3,
+                )
+
+                grid.integrate_scan(
+                    [LaserPoint(angle, distance, 1.0)],
+                    pose,
+                    2.0,
+                    self.config,
+                )
+
+                self.assertEqual(grid.get_cell(*hit_cell), OCCUPIED)
+                self.assertEqual(grid.get_cell(*start_cell), FREE)
+
     def test_no_return_marks_to_max_range_free(self) -> None:
         grid = ObservedGrid(self.anchor, resolution_m=1.0)
 

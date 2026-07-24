@@ -280,11 +280,20 @@ class ObservedGrid:
             hit = point.range > 0
             distance = point.range if hit else config.max_range
             world_angle = pose.yaw_rad + point.angle
+            direction_x, direction_y = math.cos(world_angle), math.sin(world_angle)
+            if math.isclose(direction_x, 0.0, abs_tol=1e-12):
+                direction_x = 0.0
+            if math.isclose(direction_y, 0.0, abs_tol=1e-12):
+                direction_y = 0.0
             start = self._cell(pose.x_m, pose.y_m)
-            end = self._cell(
-                pose.x_m + distance * math.cos(world_angle),
-                pose.y_m + distance * math.sin(world_angle),
-            )
+            end_x = pose.x_m + distance * direction_x
+            end_y = pose.y_m + distance * direction_y
+            if hit:
+                if direction_x:
+                    end_x = math.nextafter(end_x, math.copysign(math.inf, direction_x))
+                if direction_y:
+                    end_y = math.nextafter(end_y, math.copysign(math.inf, direction_y))
+            end = self._cell(end_x, end_y)
             ray = tuple(_bresenham(*start, *end))
             for cell in ray[:-1] if hit else ray:
                 updates.setdefault(cell, FREE)
