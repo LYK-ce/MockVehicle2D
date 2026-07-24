@@ -185,7 +185,7 @@ mockvehicle2d serve \
 
 Pictor 连接 `ws://127.0.0.1:19090` 后，首帧为 `hello`，随后为 `map_full → pose → scan`。若端口被占用，可启动 `mockvehicle2d serve --port 9090`，并让 Pictor 连接 `ws://127.0.0.1:9090`。`hello` 不携带地址；Pictor 使用自己实际连接的 URL。
 
-每个 6 Hz deadline 只推进一次共用状态，再以相同 `seq` 和 Unix `ts` 顺序发送 `pose`、`scan`。命令接收和全部发送都在同一个连接协程内串行执行；每轮先处理已到期遥测，命令洪泛不会永久饿死遥测。车辆 runtime 由 Server 创建一次，控制器断开时停车，但锚定 odometry、本地观测地图和 revision 不会重置。
+每个 6 Hz deadline 只推进一次共用状态，再以相同 `seq` 和 Unix `ts` 顺序发送 `pose`、`scan`。命令接收和全部发送都在同一个连接协程内串行执行；每轮先处理已到期遥测，命令洪泛不会永久饿死遥测。车辆 runtime 由 Server 创建一次，同时只允许一个控制 WebSocket；并发连接收到 `vehicle_busy` 后结束，不能推进或清理当前控制器。当前控制器断开时停车并释放控制权，但锚定 odometry、本地观测地图和 revision 不会重置，下一连接可继续使用。
 
 ---
 

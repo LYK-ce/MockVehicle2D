@@ -2,7 +2,7 @@
 """Controllable 2D vehicle and Tmini-style WebSocket simulator."""
 
 import asyncio
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import json
 import math
 import random
@@ -44,31 +44,38 @@ class VehicleRuntime:
     safety: LocalSafetyRuntime
     local_state: AnchoredLocalState
     frame_sequence: int = 0
+    controller_lease: asyncio.Lock = field(
+        default_factory=asyncio.Lock, repr=False, compare=False
+    )
 
     def update(self, monotonic_now: float, wall_timestamp: float) -> None:
         automatic = self.navigation.status == "active"
-        if automatic and self.local_state.pose.quality == "lost":
-            self.vehicle.stop()
-        advance_result = self.safety.advance(
-            self.vehicle,
-            self.grid,
-            monotonic_now,
-            automatic=automatic,
+        lost_automatic = self.navigation.block_for_localization_loss(
+            self.vehicle, self.local_state.pose, monotonic_now
         )
+        advance_result = None
+        if not lost_automatic:
+            advance_result = self.safety.advance(
+                self.vehicle,
+                self.grid,
+                monotonic_now,
+                automatic=automatic,
+            )
         pose = self.local_state.update_from_truth(
             self.vehicle.x,
             self.vehicle.y,
             self.vehicle.yaw,
             timestamp=wall_timestamp,
         )
-        self.navigation.update(
-            self.vehicle,
-            self.grid,
-            monotonic_now,
-            self.safety,
-            pose=pose,
-            advance_result=advance_result,
-        )
+        if not lost_automatic:
+            self.navigation.update(
+                self.vehicle,
+                self.grid,
+                monotonic_now,
+                self.safety,
+                pose=pose,
+                advance_result=advance_result,
+            )
 
     @classmethod
     def create(
@@ -255,7 +262,17 @@ def handle_command_message(
     local_state: AnchoredLocalState | None = None,
 ) -> dict[str, object]:
     """Advance the prior command, then acknowledge or fail-safe stop."""
-    if safety is None:
+    lost_automatic = (
+        navigation is not None
+        and local_state is not None
+        and navigation.block_for_localization_loss(
+            vehicle, local_state.pose, monotonic_now
+        )
+    )
+    if lost_automatic:
+        handoff_collided = False
+        handoff_safety_stop = None
+    elif safety is None:
         handoff_collided = vehicle.advance(grid, monotonic_now)
         handoff_safety_stop = None
     else:
@@ -284,18 +301,18 @@ def handle_command_message(
             vehicle.stop()
             if path_following is not None:
                 path_following.cancel("manual_override")
-            if local_state is None:
+            if local_state is not None and local_state.pose.quality == "lost":
+                navigation.status = "blocked"
+                navigation.reason = "localization_lost"
+            elif local_state is None:
                 navigation.start(x_m, y_m)
             else:
                 local_x, local_y, _ = local_state.anchor.global_to_anchor(x_m, y_m)
                 navigation.start(local_x, local_y, reported_goal=(x_m, y_m))
-            if local_state is not None and local_state.pose.quality == "lost":
-                navigation.status = "blocked"
-                navigation.reason = "localization_lost"
-            elif handoff_collided:
+            if navigation.status == "active" and handoff_collided:
                 navigation.status = "blocked"
                 navigation.reason = "collision"
-            elif handoff_safety_stop is not None:
+            elif navigation.status == "active" and handoff_safety_stop is not None:
                 navigation.status = "blocked"
                 navigation.reason = handoff_safety_stop
             accepted = navigation.status == "active"
@@ -989,13 +1006,24 @@ async def handler(
         command_timeout=command_timeout,
         safety_healthy=_safety_healthy,
     )
-    if (
-        _localization_quality is not None
-        and _localization_quality != runtime.local_state.pose.quality
-    ):
-        runtime.local_state.set_localization_quality(
-            _localization_quality, timestamp=_wall_time()
-        )
+    if runtime.controller_lease.locked():
+        try:
+            await websocket.send(
+                json.dumps(
+                    {
+                        "type": "error",
+                        "ts": _wall_time(),
+                        "seq": None,
+                        "code": "vehicle_busy",
+                        "message": "another controller is active",
+                    }
+                )
+            )
+        except Exception as error:
+            print(f"[!] busy connection ended: {error}")
+        print(f"[-] busy client rejected: {addr}")
+        return
+    await runtime.controller_lease.acquire()
     voxels, grid = runtime.voxels, runtime.grid
     vehicle, navigation, safety = runtime.vehicle, runtime.navigation, runtime.safety
     path_following = PathFollowingController()
@@ -1011,6 +1039,13 @@ async def handler(
     last_scan_data: dict[str, object] | None = None
 
     try:
+        if (
+            _localization_quality is not None
+            and _localization_quality != runtime.local_state.pose.quality
+        ):
+            runtime.local_state.set_localization_quality(
+                _localization_quality, timestamp=_wall_time()
+            )
         await websocket.send(json.dumps({"type": "hello", "vehicle_id": vehicle_id}))
         map_chunks = _encode_map_chunks(voxels, 256)
         await _send_map_chunks(websocket, map_chunks, _wall_time())
@@ -1185,6 +1220,7 @@ async def handler(
         navigation.cancel("disconnected")
         path_following.cancel("disconnected")
         vehicle.stop()
+        runtime.controller_lease.release()
         print(f"[-] client disconnected: {addr}")
 
 

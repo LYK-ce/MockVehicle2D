@@ -45,6 +45,16 @@ class GotoController:
             self.status = "cancelled"
             self.reason = reason
 
+    def block_for_localization_loss(
+        self, vehicle: Vehicle, pose: PoseEstimate | None, now: float | None = None
+    ) -> bool:
+        if self.status != "active" or pose is None or pose.quality != "lost":
+            return False
+        vehicle.stop(now)
+        self.status = "blocked"
+        self.reason = "localization_lost"
+        return True
+
     def snapshot(self) -> dict[str, object]:
         goal = (
             None
@@ -64,6 +74,8 @@ class GotoController:
         advance_result: SafetyAdvanceResult | None = None,
     ) -> None:
         was_active = self.status == "active"
+        if self.block_for_localization_loss(vehicle, pose, now):
+            return
         if advance_result is not None:
             collided = advance_result.collided
             safety_stop = advance_result.reason if advance_result.stopped else None
@@ -75,11 +87,6 @@ class GotoController:
             collided = result.collided
             safety_stop = result.reason if result.stopped else None
         if not was_active:
-            return
-        if pose is not None and pose.quality == "lost":
-            vehicle.stop()
-            self.status = "blocked"
-            self.reason = "localization_lost"
             return
         if collided:
             self.status = "blocked"

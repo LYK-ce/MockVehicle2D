@@ -170,6 +170,36 @@ class _StopAfterScanSocket:
             raise RuntimeError("stop after scan")
 
 
+class _HeldControllerSocket:
+    remote_address = ("owner", 0)
+
+    def __init__(self) -> None:
+        self.messages: list[dict[str, object]] = []
+        self.ready = asyncio.Event()
+        self.disconnect = asyncio.Event()
+
+    async def send(self, payload: str) -> None:
+        self.messages.append(json.loads(payload))
+        if len(self.messages) == 4:
+            self.ready.set()
+
+    async def recv(self) -> str:
+        await self.disconnect.wait()
+        raise RuntimeError("owner disconnected")
+
+
+class _BusyControllerSocket:
+    remote_address = ("busy", 0)
+
+    def __init__(self) -> None:
+        self.messages: list[dict[str, object]] = []
+
+    async def send(self, payload: str) -> None:
+        self.messages.append(json.loads(payload))
+        if len(self.messages) == 4:
+            raise RuntimeError("stop unguarded second handler")
+
+
 class RuntimeIntegrationTest(unittest.TestCase):
     def setUp(self) -> None:
         self.grid = MapGrid.from_wall_set(30, 30, set())
@@ -199,8 +229,10 @@ class RuntimeIntegrationTest(unittest.TestCase):
             runtime.vehicle.body_velocities()[0], runtime.vehicle.linear_speed / 2
         )
 
+        x_before_loss = runtime.vehicle.x
         runtime.local_state.set_localization_quality("lost", timestamp=1.1)
         runtime.update(0.1, 1.1)
+        self.assertEqual(runtime.vehicle.x, x_before_loss)
         self.assertEqual(
             (runtime.navigation.status, runtime.navigation.reason),
             ("blocked", "localization_lost"),
@@ -272,6 +304,137 @@ class RuntimeIntegrationTest(unittest.TestCase):
                 "reason": "localization_lost",
             },
         )
+
+    def test_lost_command_handoff_does_not_advance_old_automatic_motion(self) -> None:
+        cases = (
+            ('{"type":"cmd","seq":1,"cmd":"stop"}', "cmd_ack"),
+            ('{"type":"cmd","seq":2,"cmd":"forward"}', "cmd_ack"),
+            ('{"type":"goto","seq":3,"x_m":15,"y_m":10}', "goto_ack"),
+            ('{"type":"cmd","seq":4,"cmd":"invalid"}', "error"),
+        )
+        for raw, reply_type in cases:
+            with self.subTest(reply_type=reply_type, raw=raw):
+                vehicle = Vehicle(10.0, 10.0, now=0.0)
+                navigation = GotoController()
+                state = AnchoredLocalState(
+                    self.anchor,
+                    truth_x_m=10.0,
+                    truth_y_m=10.0,
+                    truth_yaw_rad=0.0,
+                    timestamp=0.0,
+                )
+                navigation.start(5.0, 0.0)
+                vehicle.install_drive(0.5, 0.0, 0.0)
+                state.set_localization_quality("lost", timestamp=0.1)
+
+                reply = handle_command_message(
+                    raw,
+                    vehicle,
+                    self.grid,
+                    0.5,
+                    0.5,
+                    navigation,
+                    local_state=state,
+                )
+
+                self.assertEqual(vehicle.x, 10.0)
+                self.assertEqual(reply["type"], reply_type)
+                if reply_type == "goto_ack":
+                    self.assertEqual(
+                        (reply["accepted"], reply["reason"]),
+                        (False, "localization_lost"),
+                    )
+                elif '"forward"' in raw:
+                    self.assertEqual(
+                        (reply["accepted"], vehicle.command),
+                        (True, "forward"),
+                    )
+
+    def test_only_one_controller_can_mutate_shared_runtime(self) -> None:
+        async def scenario() -> None:
+            runtime = VehicleRuntime.create(
+                started_at=0.0,
+                anchor=self.anchor,
+                odometry_config=OdometryConfig(),
+            )
+            owner = _HeldControllerSocket()
+            owner_task = asyncio.create_task(
+                handler(
+                    owner,
+                    _runtime=runtime,
+                    _monotonic=lambda: 0.0,
+                    _wall_time=lambda: 10.0,
+                )
+            )
+            await asyncio.wait_for(owner.ready.wait(), timeout=1.0)
+            runtime.navigation.start(5.0, 0.0)
+            runtime.vehicle.install_drive(0.5, 0.0, 0.0)
+            before = (
+                runtime.vehicle.x,
+                runtime.vehicle.command,
+                runtime.navigation.status,
+                runtime.local_state.pose.revision,
+                runtime.local_state.local_map.revision,
+                runtime.frame_sequence,
+            )
+
+            busy = _BusyControllerSocket()
+            await handler(
+                busy,
+                _runtime=runtime,
+                _monotonic=lambda: 0.5,
+                _wall_time=lambda: 20.0,
+            )
+
+            self.assertEqual(
+                busy.messages,
+                [
+                    {
+                        "type": "error",
+                        "ts": 20.0,
+                        "seq": None,
+                        "code": "vehicle_busy",
+                        "message": "another controller is active",
+                    }
+                ],
+            )
+            self.assertEqual(
+                (
+                    runtime.vehicle.x,
+                    runtime.vehicle.command,
+                    runtime.navigation.status,
+                    runtime.local_state.pose.revision,
+                    runtime.local_state.local_map.revision,
+                    runtime.frame_sequence,
+                ),
+                before,
+            )
+
+            owner.disconnect.set()
+            await asyncio.wait_for(owner_task, timeout=1.0)
+            self.assertEqual(runtime.vehicle.command, "stop")
+            self.assertEqual(
+                (runtime.navigation.status, runtime.navigation.reason),
+                ("cancelled", "disconnected"),
+            )
+
+            pose_revision = runtime.local_state.pose.revision
+            map_revision = runtime.local_state.local_map.revision
+            replacement = _StopAfterScanSocket()
+            await handler(
+                replacement,
+                _runtime=runtime,
+                _monotonic=lambda: 1.0,
+                _wall_time=lambda: 30.0,
+            )
+            self.assertGreater(runtime.local_state.pose.revision, pose_revision)
+            self.assertGreaterEqual(runtime.local_state.local_map.revision, map_revision)
+            self.assertEqual(
+                replacement.messages[2]["localization"]["revision"],
+                runtime.local_state.pose.revision,
+            )
+
+        asyncio.run(scenario())
 
     def test_runtime_keeps_pose_and_local_map_across_reconnect(self) -> None:
         runtime = VehicleRuntime.create(
