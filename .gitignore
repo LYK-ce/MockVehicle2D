@@ -30,6 +30,7 @@ Thumbs.db
 
 # Project
 *.log
+docs/instruction/
 
 # Agents
 AGENTS.md
