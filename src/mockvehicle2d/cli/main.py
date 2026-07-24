@@ -5,6 +5,7 @@ Usage:
     mockvehicle2d serve       Start WebSocket mock server
     mockvehicle2d visual      Launch Pygame visualization
     mockvehicle2d test        Run motion, collision, and Tmini scan tests
+    mockvehicle2d nl          Parse natural language vehicle commands
 """
 
 import argparse
@@ -137,6 +138,167 @@ def _cmd_test(_args):
     )
 
 
+def _cmd_nl(args):
+    """Parse a natural language vehicle command through the offline pipeline."""
+    import json
+    import os
+    import random
+
+    from mockvehicle2d.instruction.llm_client import FakeModelClient
+    from mockvehicle2d.instruction.validator import (
+        SchemaValidator,
+        SemanticValidator,
+        run_validation_pipeline,
+    )
+    from mockvehicle2d.map_grid import MapGrid
+
+    # Build a deterministic test map
+    random.seed(42)
+    voxels = []
+    for gx in range(256):
+        for gy in range(256):
+            is_wall = random.random() < 0.05
+            voxels.append({
+                "gx": gx, "gy": gy, "gz": 0,
+                "state": 1 if is_wall else 0, "conf": 1.0,
+            })
+    grid = MapGrid.from_voxels(voxels)
+
+    schema_v = SchemaValidator()
+    semantic_v = SemanticValidator(grid)
+
+    # --- interactive mode ---
+    if args.interactive:
+        client = FakeModelClient()
+        print("NL Instruction REPL — type 'quit' to exit")
+        while True:
+            try:
+                text = input("nl> ")
+            except (EOFError, KeyboardInterrupt):
+                print()
+                break
+            if text.strip().lower() in ("quit", "exit", "q"):
+                break
+            if not text.strip():
+                continue
+            instruction = client.parse(text)
+            if instruction is None:
+                print("  parse failed: no result")
+                continue
+            print(f"  intent: {instruction.get('intent')}")
+            print(f"  params: {json.dumps(instruction.get('parameters', {}), ensure_ascii=False)}")
+            result = run_validation_pipeline(
+                instruction, schema_validator=schema_v, semantic_validator=semantic_v
+            )
+            if result.valid:
+                print(f"  ✓ valid")
+            else:
+                print(f"  ✗ {result.layer}: {result.message}")
+        return
+
+    # --- eval mode ---
+    if args.eval:
+        dataset_path = args.dataset
+        if not os.path.exists(dataset_path):
+            print(f"error: dataset not found: {dataset_path}")
+            sys.exit(1)
+        with open(dataset_path, encoding="utf-8") as f:
+            dataset = json.load(f)
+        return _run_eval(dataset, schema_v, semantic_v)
+
+    # --- single command mode ---
+    text = args.text
+    if text is None:
+        print("error: missing NL text (use --interactive or provide text argument)")
+        sys.exit(1)
+
+    client = FakeModelClient()
+    instruction = client.parse(text)
+    if instruction is None:
+        print("parse failed: no result")
+        sys.exit(1)
+
+    print(json.dumps(instruction, ensure_ascii=False, indent=2))
+
+    result = run_validation_pipeline(
+        instruction, schema_validator=schema_v, semantic_validator=semantic_v
+    )
+    if result.valid:
+        print("validation: ✓ passed")
+        sys.exit(0)
+    else:
+        print(f"validation: ✗ {result.layer} — {result.message}")
+        sys.exit(1)
+
+
+def _run_eval(dataset, schema_v, semantic_v):
+    """Run offline evaluation: compare FakeModelClient parse vs expected."""
+    import json
+
+    from mockvehicle2d.instruction.llm_client import FakeModelClient
+    from mockvehicle2d.instruction.validator import run_validation_pipeline
+
+    client = FakeModelClient()
+    total = len(dataset)
+    intent_correct = 0
+    schema_pass = 0
+    semantic_pass = 0
+    details: list[dict] = []
+
+    for entry in dataset:
+        text = entry["input"]
+        expected = entry["expected"]
+        instruction = client.parse(text)
+        parsed_intent = instruction.get("intent") if instruction else None
+        expected_intent = expected.get("intent")
+
+        intent_ok = parsed_intent == expected_intent
+        if intent_ok:
+            intent_correct += 1
+
+        schema_ok = False
+        semantic_ok = False
+        if instruction is not None:
+            result = run_validation_pipeline(
+                instruction, schema_validator=schema_v, semantic_validator=semantic_v
+            )
+            schema_ok = result.layer != "schema"
+            semantic_ok = result.valid
+
+        if schema_ok:
+            schema_pass += 1
+        if semantic_ok:
+            semantic_pass += 1
+
+        details.append({
+            "input": text,
+            "expected_intent": expected_intent,
+            "parsed_intent": parsed_intent,
+            "intent_ok": intent_ok,
+            "schema_ok": schema_ok,
+            "semantic_ok": semantic_ok,
+        })
+
+    # Print metrics
+    intent_acc = intent_correct / total * 100 if total else 0
+    schema_acc = schema_pass / total * 100 if total else 0
+    semantic_acc = semantic_pass / total * 100 if total else 0
+
+    print(f"Evaluation on {total} entries:")
+    print(f"  Intent accuracy:  {intent_correct}/{total} ({intent_acc:.1f}%)")
+    print(f"  Schema pass:      {schema_pass}/{total} ({schema_acc:.1f}%)")
+    print(f"  Semantic pass:    {semantic_pass}/{total} ({semantic_acc:.1f}%)")
+
+    # Print failures
+    failures = [d for d in details if not d["intent_ok"]]
+    if failures:
+        print(f"\nIntent mismatches ({len(failures)}):")
+        for d in failures[:10]:
+            print(f"  '{d['input']}' → expected {d['expected_intent']}, got {d['parsed_intent']}")
+
+    sys.exit(0 if intent_acc >= 90 else 1)
+
+
 def main():
     parser = argparse.ArgumentParser(
         prog="mockvehicle2d",
@@ -161,6 +323,21 @@ def main():
     pathfind.add_argument("--vehicle-radius", type=_positive_float, default=0.5, metavar="METRES")
     pathfind.add_argument("--verbose", "-v", action="store_true", help="Print each waypoint")
 
+    # ── nl subcommand ───────────────────────────────────────
+    nl_cmd = sub.add_parser("nl", help="Parse natural language vehicle commands")
+    nl_cmd.add_argument("text", nargs="?", default=None, metavar="TEXT",
+                        help="Natural language command text")
+    nl_cmd.add_argument("--interactive", "-i", action="store_true",
+                        help="Interactive REPL mode")
+    nl_cmd.add_argument("--eval", action="store_true",
+                        help="Run offline evaluation against a dataset")
+    nl_cmd.add_argument("--dataset", type=str, default="tests/nl_eval.json", metavar="PATH",
+                        help="Path to evaluation dataset JSON")
+    nl_cmd.add_argument("--fake", action="store_true", default=True,
+                        help="Use FakeModelClient (default)")
+    nl_cmd.add_argument("--vllm", action="store_true",
+                        help="Use VLLMClient (requires local vLLM)")
+
     args = parser.parse_args()
 
     commands = {
@@ -168,6 +345,7 @@ def main():
         "visual": _cmd_visual,
         "test": _cmd_test,
         "pathfind": _cmd_pathfind,
+        "nl": _cmd_nl,
     }
     commands[args.command](args)
 
