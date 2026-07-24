@@ -32,6 +32,7 @@ MockVehicle2D/
 ├── src/mockvehicle2d/
 │   ├── server.py           ← WebSocket Server 入口
 │   ├── vehicle.py          ← 共用车辆运动、碰撞与指令看门狗
+│   ├── local_state.py      ← 出生锚点、增量里程计与车辆自有观测地图
 │   ├── scan.py             ← YDLidar 风格二维激光扫描
 │   ├── navigation.py       ← 本地 odom 直达目标控制
 │   ├── safety.py           ← 障碍/边缘净空与本地安全门控
@@ -43,6 +44,7 @@ MockVehicle2D/
 │   ├── test_scan.py        ← 二维扫描几何测试
 │   ├── test_vehicle.py     ← 运动、组合命令与看门狗测试
 │   ├── test_goto.py        ← goto 与手动接管测试
+│   ├── test_local_state.py ← 锚点、里程计、观测地图和重连测试
 │   ├── test_safety.py      ← 安全感知和策略测试
 │   ├── test_safety_runtime.py ← 延迟推进与安全门控测试
 │   └── test_server_scan.py ← scan WebSocket 帧测试
@@ -63,6 +65,9 @@ mockvehicle2d serve (WebSocket Server)
   │
   ├── 连接握手: hello(vehicle_id)
   ├── 地图生成: voxel 数组 → map_full
+  │
+  ├── 锚定本地状态: global_map → anchor_map → odom → base_link → lidar
+  ├── 车辆自有地图: Tmini scan + PoseEstimate → Unknown / Free / Occupied + delta
   │
   ├── cmd / drive / goto: 严格校验 → ack / error → 故障停车
   ├── 本地安全: Tmini 障碍净空 + 模拟边缘净空 → 限速 / 停车
@@ -170,14 +175,17 @@ mockvehicle2d serve \
   --linear-speed 0.5 \
   --angular-speed 90 \
   --vehicle-radius 0.5 \
-  --command-timeout 1.0
+  --command-timeout 1.0 \
+  --anchor-id mock_vehicle_01_anchor \
+  --anchor-x 10 --anchor-y 10 --anchor-yaw 0 \
+  --odom-translation-noise 0 --odom-yaw-noise 0 --odom-seed 0
 ```
 
 角速度参数单位为度/秒。规范命令为 `{"type":"cmd","seq":0,"cmd":"forward"}`；W+D 等组合输入发送 `forward_right`，同时使用线速度和角速度。也兼容精确 legacy 格式 `{"cmd":"forward"}`。新命令生效前先把旧命令积分到接收时刻。非法消息、看门狗超时、碰撞或连接结束都会停车。
 
 Pictor 连接 `ws://127.0.0.1:19090` 后，首帧为 `hello`，随后为 `map_full → pose → scan`。若端口被占用，可启动 `mockvehicle2d serve --port 9090`，并让 Pictor 连接 `ws://127.0.0.1:9090`。`hello` 不携带地址；Pictor 使用自己实际连接的 URL。
 
-每个 6 Hz deadline 只推进一次共用状态，再以相同 `seq` 和 Unix `ts` 顺序发送 `pose`、`scan`。命令接收和全部发送都在同一个连接协程内串行执行；每轮先处理已到期遥测，命令洪泛不会永久饿死遥测。
+每个 6 Hz deadline 只推进一次共用状态，再以相同 `seq` 和 Unix `ts` 顺序发送 `pose`、`scan`。命令接收和全部发送都在同一个连接协程内串行执行；每轮先处理已到期遥测，命令洪泛不会永久饿死遥测。车辆 runtime 由 Server 创建一次，控制器断开时停车，但锚定 odometry、本地观测地图和 revision 不会重置。
 
 ---
 
@@ -207,6 +215,13 @@ Pictor 连接 `ws://127.0.0.1:19090` 后，首帧为 `hello`，随后为 `map_fu
 | goto 直达目标与手动接管 | ✅ |
 | 障碍/边缘安全限速和停车 | ✅ |
 | 实际时间运动、看门狗和防穿墙 | ✅ |
+| 出生锚点与增量 odometry | ✅ |
+| 车辆自有 ObservedGrid / delta | ✅ 内存 |
+| 定位 degraded/lost 安全语义 | ✅ |
 | 寻路算法 | ✅ |
 
-`map_full` 和 `pose` 的 `source` 为 `simulator_ground_truth`，只用于仿真验收与可视化；只有 `scan` 是模拟的 Tmini 本地观测。当前没有实现相机、定位误差、雷达噪声或 `map_delta`。
+`map_full.source=simulator_ground_truth` 只用于物理、传感器生成和调试显示；
+`pose.source=anchored_odometry`，正常协议不发送绝对真值。默认零噪声保持 Pictor 兼容，
+可用固定 seed 注入可重放 odometry 误差。当前自有地图 delta 不通过 WebSocket 上传；没有
+SLAM、scan matching、D* Lite 或中央地图同步。水平 Tmini 不能检测跌落，无回波按最大量程
+Free 只是当前模拟约定，接入真实硬件前必须校准。

@@ -2,6 +2,7 @@
 """Controllable 2D vehicle and Tmini-style WebSocket simulator."""
 
 import asyncio
+from dataclasses import dataclass
 import json
 import math
 import random
@@ -14,11 +15,12 @@ from mockvehicle2d.instruction.compiler import TaskCompiler
 from mockvehicle2d.instruction.llm_client import FakeModelClient
 from mockvehicle2d.instruction.state_machine import InstructionState, InstructionStateMachine
 from mockvehicle2d.instruction.validator import SchemaValidator, SemanticValidator
+from mockvehicle2d.local_state import AnchorSpec, AnchoredLocalState, OdometryConfig
 from mockvehicle2d.map_grid import MapGrid, VOID
 from mockvehicle2d.navigation import GotoController
 from mockvehicle2d.pathfinding import PathFollowingController
 from mockvehicle2d.safety import LocalSafetyRuntime
-from mockvehicle2d.scan import TMINI_SCAN_CONFIG, scan_message
+from mockvehicle2d.scan import TMINI_SCAN_CONFIG, scan_grid, scan_message
 from mockvehicle2d.vehicle import COMMANDS, Vehicle
 
 
@@ -29,6 +31,84 @@ SPAWN_X = 10.0
 SPAWN_Y = 10.0
 MAX_JSON_INTEGER_DIGITS = 4300
 VEHICLE_ID_PATTERN = re.compile(r"[A-Za-z0-9._-]{1,64}")
+
+
+@dataclass
+class VehicleRuntime:
+    """State owned by one simulated vehicle and retained across controller sessions."""
+
+    voxels: list[dict[str, object]]
+    grid: MapGrid
+    vehicle: Vehicle
+    navigation: GotoController
+    safety: LocalSafetyRuntime
+    local_state: AnchoredLocalState
+    frame_sequence: int = 0
+
+    def update(self, monotonic_now: float, wall_timestamp: float) -> None:
+        automatic = self.navigation.status == "active"
+        if automatic and self.local_state.pose.quality == "lost":
+            self.vehicle.stop()
+        advance_result = self.safety.advance(
+            self.vehicle,
+            self.grid,
+            monotonic_now,
+            automatic=automatic,
+        )
+        pose = self.local_state.update_from_truth(
+            self.vehicle.x,
+            self.vehicle.y,
+            self.vehicle.yaw,
+            timestamp=wall_timestamp,
+        )
+        self.navigation.update(
+            self.vehicle,
+            self.grid,
+            monotonic_now,
+            self.safety,
+            pose=pose,
+            advance_result=advance_result,
+        )
+
+    @classmethod
+    def create(
+        cls,
+        *,
+        started_at: float,
+        timestamp: float | None = None,
+        anchor: AnchorSpec,
+        odometry_config: OdometryConfig,
+        linear_speed: float = 0.5,
+        angular_speed: float = math.pi / 2,
+        radius: float = 0.5,
+        command_timeout: float = 1.0,
+        safety_healthy: bool = True,
+    ) -> "VehicleRuntime":
+        voxels, grid = generate_map(radius=radius)
+        vehicle = Vehicle(
+            SPAWN_X,
+            SPAWN_Y,
+            linear_speed=linear_speed,
+            angular_speed=angular_speed,
+            radius=radius,
+            command_timeout=command_timeout,
+            now=started_at,
+        )
+        return cls(
+            voxels,
+            grid,
+            vehicle,
+            GotoController(),
+            LocalSafetyRuntime(healthy=safety_healthy),
+            AnchoredLocalState(
+                anchor,
+                truth_x_m=vehicle.x,
+                truth_y_m=vehicle.y,
+                truth_yaw_rad=vehicle.yaw,
+                odometry_config=odometry_config,
+                timestamp=started_at if timestamp is None else timestamp,
+            ),
+        )
 
 
 class CommandMessageError(ValueError):
@@ -159,7 +239,7 @@ def _parse_goto_object(message: dict[str, object]) -> tuple[float, float, int]:
 
 
 def parse_goto_message(raw: object) -> tuple[float, float, int]:
-    """Validate one local-odometry go-to-goal command."""
+    """Validate one global-map go-to-goal command."""
     return _parse_goto_object(_decode_message(raw))
 
 
@@ -172,6 +252,7 @@ def handle_command_message(
     navigation: GotoController | None = None,
     safety: LocalSafetyRuntime | None = None,
     path_following: PathFollowingController | None = None,
+    local_state: AnchoredLocalState | None = None,
 ) -> dict[str, object]:
     """Advance the prior command, then acknowledge or fail-safe stop."""
     if safety is None:
@@ -189,6 +270,10 @@ def handle_command_message(
         )
         handoff_collided = handoff.collided
         handoff_safety_stop = handoff.reason if handoff.stopped else None
+    if local_state is not None:
+        local_state.update_from_truth(
+            vehicle.x, vehicle.y, vehicle.yaw, timestamp=wall_timestamp
+        )
     rejection_reason: str | None = None
     try:
         message = _decode_message(raw)
@@ -199,8 +284,15 @@ def handle_command_message(
             vehicle.stop()
             if path_following is not None:
                 path_following.cancel("manual_override")
-            navigation.start(x_m, y_m)
-            if handoff_collided:
+            if local_state is None:
+                navigation.start(x_m, y_m)
+            else:
+                local_x, local_y, _ = local_state.anchor.global_to_anchor(x_m, y_m)
+                navigation.start(local_x, local_y, reported_goal=(x_m, y_m))
+            if local_state is not None and local_state.pose.quality == "lost":
+                navigation.status = "blocked"
+                navigation.reason = "localization_lost"
+            elif handoff_collided:
                 navigation.status = "blocked"
                 navigation.reason = "collision"
             elif handoff_safety_stop is not None:
@@ -797,10 +889,22 @@ def telemetry_messages(
     navigation: GotoController | None = None,
     path_following: PathFollowingController | None = None,
     safety: LocalSafetyRuntime | None = None,
+    local_state: AnchoredLocalState | None = None,
 ) -> tuple[dict[str, object], dict[str, object]]:
     """Build a pose/scan pair from one state snapshot and wall-clock timestamp."""
-    vx, vy, omega = vehicle.velocities()
-    # Determine control_mode: PathFollowingController wins if both are active
+    if local_state is None:
+        x_m, y_m, yaw_rad = vehicle.x, vehicle.y, vehicle.yaw
+        source = "simulator_ground_truth"
+        localization = None
+    else:
+        estimate = local_state.pose
+        x_m, y_m, yaw_rad = local_state.anchor.anchor_to_global(
+            estimate.x_m, estimate.y_m, estimate.yaw_rad
+        )
+        source = "anchored_odometry"
+        localization = estimate.as_dict()
+    linear_mps, omega = vehicle.body_velocities()
+    vx, vy = linear_mps * math.cos(yaw_rad), linear_mps * math.sin(yaw_rad)
     if path_following is not None and path_following.status == "active":
         control_mode = path_following.control_mode
         nav_snapshot = path_following.snapshot()
@@ -814,11 +918,11 @@ def telemetry_messages(
         "type": "pose",
         "ts": timestamp,
         "seq": sequence,
-        "source": "simulator_ground_truth",
-        "x": vehicle.x,
-        "y": vehicle.y,
+        "source": source,
+        "x": x_m,
+        "y": y_m,
         "z": 0.0,
-        "yaw": vehicle.yaw,
+        "yaw": yaw_rad,
         "vx": vx,
         "vy": vy,
         "omega": omega,
@@ -837,7 +941,20 @@ def telemetry_messages(
             }
         ),
     }
-    scan = scan_message(grid, vehicle.x, vehicle.y, vehicle.yaw, timestamp, TMINI_SCAN_CONFIG)
+    if localization is not None:
+        pose["localization"] = localization
+    scan_points = scan_grid(grid, vehicle.x, vehicle.y, vehicle.yaw, TMINI_SCAN_CONFIG)
+    if local_state is not None:
+        local_state.integrate_scan(scan_points, timestamp, TMINI_SCAN_CONFIG)
+    scan = scan_message(
+        grid,
+        vehicle.x,
+        vehicle.y,
+        vehicle.yaw,
+        timestamp,
+        TMINI_SCAN_CONFIG,
+        scan_points,
+    )
     scan["seq"] = sequence
     return pose, scan
 
@@ -853,25 +970,35 @@ async def handler(
     _monotonic=time.monotonic,
     _wall_time=time.time,
     _safety_healthy: bool = True,
+    _localization_quality: str | None = None,
+    _runtime: VehicleRuntime | None = None,
 ) -> None:
     """Serve one client; all receives and sends stay serialized in this coroutine."""
     vehicle_id = validate_vehicle_id(vehicle_id)
     addr = websocket.remote_address
     print(f"[+] client connected: {addr}")
     started_at = _monotonic()
-    voxels, grid = generate_map(radius=radius)
-    vehicle = Vehicle(
-        SPAWN_X,
-        SPAWN_Y,
+    runtime = _runtime or VehicleRuntime.create(
+        started_at=started_at,
+        timestamp=_wall_time(),
+        anchor=AnchorSpec(f"{vehicle_id}_anchor", SPAWN_X, SPAWN_Y, 0.0),
+        odometry_config=OdometryConfig(),
         linear_speed=linear_speed,
         angular_speed=angular_speed,
         radius=radius,
         command_timeout=command_timeout,
-        now=started_at,
+        safety_healthy=_safety_healthy,
     )
-    navigation = GotoController()
+    if (
+        _localization_quality is not None
+        and _localization_quality != runtime.local_state.pose.quality
+    ):
+        runtime.local_state.set_localization_quality(
+            _localization_quality, timestamp=_wall_time()
+        )
+    voxels, grid = runtime.voxels, runtime.grid
+    vehicle, navigation, safety = runtime.vehicle, runtime.navigation, runtime.safety
     path_following = PathFollowingController()
-    safety = LocalSafetyRuntime(healthy=_safety_healthy)
 
     # NL instruction pipeline
     nl_client = FakeModelClient()
@@ -879,8 +1006,6 @@ async def handler(
     semantic_v = SemanticValidator(grid)
     state_machine = InstructionStateMachine()
     task_compiler = TaskCompiler(grid)
-
-    frame_sequence = 0
     next_deadline = started_at
     active_nl_seq: int | None = None
     last_scan_data: dict[str, object] | None = None
@@ -893,21 +1018,31 @@ async def handler(
         while True:
             now = _monotonic()
             if now >= next_deadline:
-                # Phase 3: update path_following if active, else navigation
                 if path_following.status == "active":
                     path_following.update(vehicle, grid, now, safety)
-                elif navigation.status == "active":
-                    navigation.update(vehicle, grid, now, safety)
+                    runtime.local_state.update_from_truth(
+                        vehicle.x, vehicle.y, vehicle.yaw, timestamp=_wall_time()
+                    )
                 else:
-                    navigation.update(vehicle, grid, now, safety)
+                    runtime.update(now, _wall_time())
                 timestamp = _wall_time()
                 pose, scan = telemetry_messages(
-                    vehicle, grid, frame_sequence, timestamp, navigation, path_following, safety
+                    vehicle,
+                    grid,
+                    runtime.frame_sequence,
+                    timestamp,
+                    navigation,
+                    path_following,
+                    safety,
+                    runtime.local_state,
                 )
                 await websocket.send(json.dumps(pose))
                 await websocket.send(json.dumps(scan))
                 last_scan_data = scan
-                print(f"[→] pose #{frame_sequence}: x={vehicle.x:.2f} y={vehicle.y:.2f} cmd={vehicle.command}")
+                print(
+                    f"[→] pose #{runtime.frame_sequence}: "
+                    f"x={pose['x']:.2f} y={pose['y']:.2f} cmd={vehicle.command}"
+                )
 
                 # Check NL task status — determine active controller
                 active_controller = (
@@ -959,7 +1094,7 @@ async def handler(
                         active_nl_seq = None
                         print(f"[NL] task cancelled: {reason}")
 
-                frame_sequence += 1
+                runtime.frame_sequence += 1
                 next_deadline = _next_deadline(next_deadline, _monotonic(), TMINI_SCAN_CONFIG.scan_time)
                 continue
 
@@ -1033,7 +1168,15 @@ async def handler(
                 print(f"[NL] task cancelled by manual override")
 
             reply = handle_command_message(
-                raw, vehicle, grid, _monotonic(), _wall_time(), navigation, safety, path_following=path_following
+                raw,
+                vehicle,
+                grid,
+                _monotonic(),
+                _wall_time(),
+                navigation,
+                safety,
+                path_following,
+                runtime.local_state,
             )
             await websocket.send(json.dumps(reply))
     except Exception as error:
@@ -1053,10 +1196,36 @@ async def main(
     angular_speed: float = math.pi / 2,
     radius: float = 0.5,
     command_timeout: float = 1.0,
+    anchor_id: str | None = None,
+    anchor_x_m: float = SPAWN_X,
+    anchor_y_m: float = SPAWN_Y,
+    anchor_yaw_rad: float = 0.0,
+    odometry_translation_noise_stddev_m: float = 0.0,
+    odometry_yaw_noise_stddev_rad: float = 0.0,
+    odometry_seed: int = 0,
 ) -> None:
     from websockets.asyncio.server import serve
 
     vehicle_id = validate_vehicle_id(vehicle_id)
+    runtime = VehicleRuntime.create(
+        started_at=time.monotonic(),
+        timestamp=time.time(),
+        anchor=AnchorSpec(
+            anchor_id or f"{vehicle_id}_anchor",
+            anchor_x_m,
+            anchor_y_m,
+            anchor_yaw_rad,
+        ),
+        odometry_config=OdometryConfig(
+            odometry_translation_noise_stddev_m,
+            odometry_yaw_noise_stddev_rad,
+            odometry_seed,
+        ),
+        linear_speed=linear_speed,
+        angular_speed=angular_speed,
+        radius=radius,
+        command_timeout=command_timeout,
+    )
     stop = asyncio.Event()
     _shutting_down = False
 
@@ -1085,6 +1254,7 @@ async def main(
             angular_speed=angular_speed,
             radius=radius,
             command_timeout=command_timeout,
+            _runtime=runtime,
         )
 
     try:

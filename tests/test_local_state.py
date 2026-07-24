@@ -1,0 +1,310 @@
+"""Anchored odometry and vehicle-owned observed-map checks."""
+
+import asyncio
+import json
+import math
+from pathlib import Path
+import sys
+import unittest
+
+
+REPO_ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(REPO_ROOT / "src"))
+
+from mockvehicle2d.local_state import (
+    FREE,
+    OCCUPIED,
+    UNKNOWN,
+    AnchorSpec,
+    AnchoredLocalState,
+    AnchoredOdometry,
+    OdometryConfig,
+    ObservedGrid,
+    PoseEstimate,
+)
+from mockvehicle2d.map_grid import MapGrid
+from mockvehicle2d.navigation import GotoController
+from mockvehicle2d.scan import LaserPoint, ScanConfig
+from mockvehicle2d.server import (
+    VehicleRuntime,
+    handle_command_message,
+    handler,
+    telemetry_messages,
+)
+from mockvehicle2d.vehicle import Vehicle
+
+
+class AnchorTransformTest(unittest.TestCase):
+    def test_global_anchor_round_trip_includes_heading(self) -> None:
+        anchor = AnchorSpec("vehicle-1", 100.0, 50.0, math.pi / 2, 0.2, 0.05)
+
+        global_pose = anchor.anchor_to_global(2.0, -1.0, 0.25)
+        self.assertAlmostEqual(global_pose[0], 101.0)
+        self.assertAlmostEqual(global_pose[1], 52.0)
+        local_pose = anchor.global_to_anchor(*global_pose)
+        for actual, expected in zip(local_pose, (2.0, -1.0, 0.25), strict=True):
+            self.assertAlmostEqual(actual, expected)
+
+    def test_odometry_is_relative_to_birth_not_world_origin(self) -> None:
+        anchor = AnchorSpec("vehicle-1", 100.0, 50.0, 0.0)
+        near = AnchoredOdometry(anchor, 10.0, 20.0, 0.3, timestamp=0.0)
+        far = AnchoredOdometry(anchor, 1010.0, -480.0, 0.3, timestamp=0.0)
+
+        near_pose = near.update(11.0, 22.0, 0.5, timestamp=1.0)
+        far_pose = far.update(1011.0, -478.0, 0.5, timestamp=1.0)
+        self.assertEqual(
+            (near_pose.x_m, near_pose.y_m, near_pose.yaw_rad),
+            (far_pose.x_m, far_pose.y_m, far_pose.yaw_rad),
+        )
+
+    def test_zero_noise_and_fixed_seed_noise(self) -> None:
+        anchor = AnchorSpec("vehicle-1", 10.0, 10.0, 0.0)
+        exact = AnchoredOdometry(anchor, 10.0, 10.0, 0.0, timestamp=0.0)
+        pose = exact.update(11.5, 9.5, 0.2, timestamp=1.0)
+        self.assertAlmostEqual(pose.x_m, 1.5)
+        self.assertAlmostEqual(pose.y_m, -0.5)
+        self.assertAlmostEqual(pose.yaw_rad, 0.2)
+
+        config = OdometryConfig(translation_noise_stddev_m=0.1, yaw_noise_stddev_rad=0.02, seed=7)
+        first = AnchoredOdometry(anchor, 10.0, 10.0, 0.0, config=config, timestamp=0.0)
+        second = AnchoredOdometry(anchor, 10.0, 10.0, 0.0, config=config, timestamp=0.0)
+        first_pose = first.update(11.5, 9.5, 0.2, timestamp=1.0)
+        second_pose = second.update(11.5, 9.5, 0.2, timestamp=1.0)
+        self.assertEqual(first_pose, second_pose)
+        self.assertNotEqual(
+            (first_pose.x_m, first_pose.y_m, first_pose.yaw_rad),
+            (pose.x_m, pose.y_m, pose.yaw_rad),
+        )
+
+
+class ObservedGridTest(unittest.TestCase):
+    def setUp(self) -> None:
+        self.anchor = AnchorSpec("vehicle-1", 10.0, 10.0, 0.0)
+        self.pose = PoseEstimate("vehicle-1", 0.5, 0.5, 0.0, (0.0, 0.0, 0.0), "nominal", 1.0, 3)
+        self.config = ScanConfig(
+            min_angle=0.0,
+            max_angle=0.0,
+            angle_increment=1.0,
+            scan_time=1.0,
+            min_range=0.02,
+            max_range=4.0,
+            range_sample_rate_hz=1,
+            scan_rate_hz=1,
+        )
+
+    def test_hit_marks_ray_free_endpoint_occupied_and_keeps_occlusion_unknown(self) -> None:
+        grid = ObservedGrid(self.anchor, resolution_m=1.0)
+
+        delta = grid.integrate_scan([LaserPoint(0.0, 2.5, 1.0)], self.pose, 2.0, self.config)
+
+        self.assertEqual(grid.get_cell(0, 0), FREE)
+        self.assertEqual(grid.get_cell(1, 0), FREE)
+        self.assertEqual(grid.get_cell(2, 0), FREE)
+        self.assertEqual(grid.get_cell(3, 0), OCCUPIED)
+        self.assertEqual(grid.get_cell(4, 0), UNKNOWN)
+        self.assertEqual(delta.revision, grid.revision)
+        self.assertEqual(delta.pose_revision, self.pose.revision)
+        self.assertEqual(delta.anchor_id, self.anchor.anchor_id)
+        self.assertEqual({cell.state for cell in delta.changed_cells}, {FREE, OCCUPIED})
+
+    def test_no_return_marks_to_max_range_free(self) -> None:
+        grid = ObservedGrid(self.anchor, resolution_m=1.0)
+
+        grid.integrate_scan([LaserPoint(0.0, 0.0, 0.0)], self.pose, 2.0, self.config)
+
+        for x in range(5):
+            self.assertEqual(grid.get_cell(x, 0), FREE)
+        self.assertEqual(grid.get_cell(5, 0), UNKNOWN)
+
+    def test_hit_wins_over_free_ray_within_one_scan(self) -> None:
+        grid = ObservedGrid(self.anchor, resolution_m=1.0)
+
+        grid.integrate_scan(
+            [LaserPoint(0.0, 2.5, 0.0), LaserPoint(0.0, 0.0, 0.0)],
+            self.pose,
+            2.0,
+            self.config,
+        )
+
+        self.assertEqual(grid.get_cell(3, 0), OCCUPIED)
+
+    def test_revision_changes_only_when_cells_change_and_snapshot_is_stable(self) -> None:
+        grid = ObservedGrid(self.anchor, resolution_m=1.0)
+        first = grid.integrate_scan([LaserPoint(0.0, 2.5, 1.0)], self.pose, 2.0, self.config)
+        second = grid.integrate_scan([LaserPoint(0.0, 2.5, 1.0)], self.pose, 3.0, self.config)
+
+        self.assertEqual(first.revision, 1)
+        self.assertEqual(second.revision, 1)
+        self.assertEqual(second.changed_cells, ())
+        snapshot = grid.snapshot()
+        self.assertEqual(snapshot["anchor_id"], "vehicle-1")
+        self.assertEqual(snapshot["revision"], 1)
+        self.assertEqual(snapshot["cells"][0], {"gx": 0, "gy": 0, "state": FREE})
+
+    def test_lost_localization_does_not_write_map(self) -> None:
+        state = AnchoredLocalState(
+            self.anchor,
+            truth_x_m=10.0,
+            truth_y_m=10.0,
+            truth_yaw_rad=0.0,
+            timestamp=0.0,
+        )
+        state.set_localization_quality("lost", timestamp=1.0)
+
+        delta = state.integrate_scan([LaserPoint(0.0, 2.5, 1.0)], 2.0, self.config)
+
+        self.assertIsNone(delta)
+        self.assertEqual(state.local_map.revision, 0)
+        self.assertEqual(state.local_map.snapshot()["cells"], [])
+
+
+class _StopAfterScanSocket:
+    remote_address = ("test", 0)
+
+    def __init__(self) -> None:
+        self.messages: list[dict[str, object]] = []
+
+    async def send(self, payload: str) -> None:
+        self.messages.append(json.loads(payload))
+        if len(self.messages) == 4:
+            raise RuntimeError("stop after scan")
+
+
+class RuntimeIntegrationTest(unittest.TestCase):
+    def setUp(self) -> None:
+        self.grid = MapGrid.from_wall_set(30, 30, set())
+        self.anchor = AnchorSpec("vehicle-1", 10.0, 10.0, 0.0)
+        self.vehicle = Vehicle(10.0, 10.0, now=0.0)
+        self.state = AnchoredLocalState(
+            self.anchor,
+            truth_x_m=10.0,
+            truth_y_m=10.0,
+            truth_yaw_rad=0.0,
+            timestamp=0.0,
+        )
+
+    def test_degraded_limits_automatic_speed_and_lost_blocks_it(self) -> None:
+        runtime = VehicleRuntime.create(
+            started_at=0.0,
+            anchor=self.anchor,
+            odometry_config=OdometryConfig(),
+        )
+        runtime.navigation.start(5.0, 0.0)
+        runtime.local_state.set_localization_quality("degraded", timestamp=0.0)
+
+        runtime.update(0.0, 1.0)
+
+        self.assertEqual(runtime.navigation.status, "active")
+        self.assertAlmostEqual(
+            runtime.vehicle.body_velocities()[0], runtime.vehicle.linear_speed / 2
+        )
+
+        runtime.local_state.set_localization_quality("lost", timestamp=1.1)
+        runtime.update(0.1, 1.1)
+        self.assertEqual(
+            (runtime.navigation.status, runtime.navigation.reason),
+            ("blocked", "localization_lost"),
+        )
+        self.assertEqual(runtime.vehicle.body_velocities(), (0.0, 0.0))
+
+    def test_pose_uses_anchor_estimate_and_never_labels_truth(self) -> None:
+        self.state.update_from_truth(11.0, 10.0, 0.0, timestamp=1.0)
+
+        pose, _scan = telemetry_messages(
+            self.vehicle,
+            self.grid,
+            1,
+            123.0,
+            local_state=self.state,
+        )
+
+        self.assertEqual((pose["x"], pose["y"], pose["yaw"]), (11.0, 10.0, 0.0))
+        self.assertEqual(pose["source"], "anchored_odometry")
+        self.assertNotIn("truth", json.dumps(pose).lower())
+        self.assertEqual(pose["localization"]["anchor_id"], "vehicle-1")
+        self.assertGreater(self.state.local_map.revision, 0)
+
+    def test_goto_converts_global_goal_and_rejects_lost_localization(self) -> None:
+        anchor = AnchorSpec("vehicle-1", 100.0, 50.0, math.pi / 2)
+        state = AnchoredLocalState(
+            anchor,
+            truth_x_m=10.0,
+            truth_y_m=10.0,
+            truth_yaw_rad=0.0,
+            timestamp=0.0,
+        )
+        navigation = GotoController()
+        accepted = handle_command_message(
+            '{"type":"goto","seq":1,"x_m":100,"y_m":52}',
+            self.vehicle,
+            self.grid,
+            0.0,
+            10.0,
+            navigation,
+            local_state=state,
+        )
+        self.assertEqual(accepted["accepted"], True)
+        self.assertAlmostEqual(navigation.goal[0], 2.0)
+        self.assertAlmostEqual(navigation.goal[1], 0.0)
+        self.assertEqual(
+            navigation.snapshot()["goal"],
+            {"x_m": 100.0, "y_m": 52.0},
+        )
+
+        state.set_localization_quality("lost", timestamp=11.0)
+        rejected = handle_command_message(
+            '{"type":"goto","seq":2,"x_m":101,"y_m":52}',
+            self.vehicle,
+            self.grid,
+            0.0,
+            11.0,
+            navigation,
+            local_state=state,
+        )
+        self.assertEqual(
+            rejected,
+            {
+                "type": "goto_ack",
+                "ts": 11.0,
+                "seq": 2,
+                "goal": {"x_m": 101.0, "y_m": 52.0},
+                "accepted": False,
+                "reason": "localization_lost",
+            },
+        )
+
+    def test_runtime_keeps_pose_and_local_map_across_reconnect(self) -> None:
+        runtime = VehicleRuntime.create(
+            started_at=0.0,
+            anchor=self.anchor,
+            odometry_config=OdometryConfig(),
+        )
+        first = _StopAfterScanSocket()
+        asyncio.run(handler(first, _runtime=runtime, _monotonic=lambda: 0.0, _wall_time=lambda: 10.0))
+        first_pose_revision = runtime.local_state.pose.revision
+        first_map_revision = runtime.local_state.local_map.revision
+
+        second = _StopAfterScanSocket()
+        asyncio.run(handler(second, _runtime=runtime, _monotonic=lambda: 1.0, _wall_time=lambda: 11.0))
+
+        self.assertGreater(runtime.local_state.pose.revision, first_pose_revision)
+        self.assertGreater(first_map_revision, 0)
+        self.assertGreaterEqual(runtime.local_state.local_map.revision, first_map_revision)
+        self.assertEqual(second.messages[2]["localization"]["revision"], runtime.local_state.pose.revision)
+
+    def test_navigation_does_not_query_world_grid_cells(self) -> None:
+        source = (REPO_ROOT / "src/mockvehicle2d/navigation.py").read_text(encoding="utf-8")
+        for forbidden in (".get_cell(", ".is_wall(", ".is_passable(", ".is_void("):
+            self.assertNotIn(forbidden, source)
+        self.assertNotIn("update_from_truth", source)
+
+
+def main() -> int:
+    result = unittest.TextTestRunner(verbosity=2).run(
+        unittest.defaultTestLoader.loadTestsFromModule(sys.modules[__name__])
+    )
+    return 0 if result.wasSuccessful() else 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

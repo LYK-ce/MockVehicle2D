@@ -2,6 +2,7 @@
 
 from dataclasses import dataclass
 import math
+from typing import Iterable
 
 from mockvehicle2d.map_grid import MapGrid
 
@@ -144,14 +145,21 @@ def scan_grid(
 
 
 def scan_message(
-    grid: MapGrid, x: float, y: float, yaw: float, timestamp: float, config: ScanConfig = DEFAULT_SCAN_CONFIG
+    grid: MapGrid,
+    x: float,
+    y: float,
+    yaw: float,
+    timestamp: float,
+    config: ScanConfig = DEFAULT_SCAN_CONFIG,
+    points: Iterable[LaserPoint] | None = None,
 ) -> dict[str, object]:
     """Build the JSON-compatible local scan frame used by the WebSocket server."""
 
+    scan_points = scan_grid(grid, x, y, yaw, config) if points is None else tuple(points)
     return {
         "type": "scan",
         "ts": timestamp,
         "frame_id": "laser",
         "config": config.as_dict(),
-        "points": [point.as_dict() for point in scan_grid(grid, x, y, yaw, config)],
+        "points": [point.as_dict() for point in scan_points],
     }

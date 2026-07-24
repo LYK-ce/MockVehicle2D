@@ -133,7 +133,13 @@ class ScanMessageTest(unittest.TestCase):
         )
         self.assertEqual(websocket.messages[0], {"type": "hello", "vehicle_id": "pictor_test-1"})
         self.assertEqual(websocket.messages[1]["x"], 10.0)
-        self.assertEqual(websocket.messages[1]["source"], "simulator_ground_truth")
+        self.assertEqual(websocket.messages[1]["source"], "anchored_odometry")
+        self.assertEqual(websocket.messages[1]["localization"]["frame_id"], "anchor_map")
+        self.assertEqual(
+            websocket.messages[1]["localization"]["anchor_id"],
+            "pictor_test-1_anchor",
+        )
+        self.assertNotIn("truth", json.dumps(websocket.messages[1]).lower())
         self.assertEqual(websocket.messages[1]["command"], "stop")
         self.assertEqual(
             websocket.messages[1]["safety"],

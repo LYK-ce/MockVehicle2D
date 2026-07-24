@@ -21,6 +21,27 @@ def _positive_float(value: str) -> float:
     return number
 
 
+def _finite_float(value: str) -> float:
+    number = float(value)
+    if not math.isfinite(number):
+        raise argparse.ArgumentTypeError("value must be finite")
+    return number
+
+
+def _nonnegative_float(value: str) -> float:
+    number = _finite_float(value)
+    if number < 0:
+        raise argparse.ArgumentTypeError("value cannot be negative")
+    return number
+
+
+def _integer(value: str) -> int:
+    try:
+        return int(value)
+    except ValueError as error:
+        raise argparse.ArgumentTypeError("value must be an integer") from error
+
+
 def _port(value: str) -> int:
     try:
         port = int(value)
@@ -52,6 +73,13 @@ def _cmd_serve(args):
             angular_speed=math.radians(args.angular_speed),
             radius=args.vehicle_radius,
             command_timeout=args.command_timeout,
+            anchor_id=args.anchor_id,
+            anchor_x_m=args.anchor_x,
+            anchor_y_m=args.anchor_y,
+            anchor_yaw_rad=math.radians(args.anchor_yaw),
+            odometry_translation_noise_stddev_m=args.odom_translation_noise,
+            odometry_yaw_noise_stddev_rad=math.radians(args.odom_yaw_noise),
+            odometry_seed=args.odom_seed,
         )
     )
 
@@ -121,6 +149,7 @@ def _cmd_test(_args):
 
     from tests.test_collision import main as collision_main
     from tests.test_goto import main as goto_main
+    from tests.test_local_state import main as local_state_main
     from tests.test_safety import main as safety_main
     from tests.test_safety_runtime import main as safety_runtime_main
     from tests.test_scan import main as scan_main
@@ -132,6 +161,7 @@ def _cmd_test(_args):
         or scan_main()
         or vehicle_main()
         or goto_main()
+        or local_state_main()
         or safety_main()
         or safety_runtime_main()
         or server_scan_main()
@@ -322,6 +352,29 @@ def main():
     serve.add_argument("--command-timeout", type=_positive_float, default=1.0, metavar="SECONDS")
     serve.add_argument("--nl", action="store_true", default=True,
                        help="Enable natural language command processing (default: on)")
+    serve.add_argument(
+        "--anchor-id",
+        type=_vehicle_id,
+        default=None,
+        metavar="ID",
+        help="Anchor id (default: <vehicle-id>_anchor)",
+    )
+    serve.add_argument("--anchor-x", type=_finite_float, default=10.0, metavar="METRES")
+    serve.add_argument("--anchor-y", type=_finite_float, default=10.0, metavar="METRES")
+    serve.add_argument("--anchor-yaw", type=_finite_float, default=0.0, metavar="DEGREES")
+    serve.add_argument(
+        "--odom-translation-noise",
+        type=_nonnegative_float,
+        default=0.0,
+        metavar="METRES",
+    )
+    serve.add_argument(
+        "--odom-yaw-noise",
+        type=_nonnegative_float,
+        default=0.0,
+        metavar="DEGREES",
+    )
+    serve.add_argument("--odom-seed", type=_integer, default=0, metavar="INTEGER")
     sub.add_parser("visual", help="Launch Pygame visualization (W/S/A/D driving)")
     sub.add_parser("test", help="Run motion, collision, and Tmini scan tests")
     pathfind = sub.add_parser("pathfind", help="Run A* pathfinding on generated map")

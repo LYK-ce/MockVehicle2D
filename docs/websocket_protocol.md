@@ -64,7 +64,7 @@ Pictor 仅在收到 `hello` 后才认为连接可用，之后才开始处理 `po
     "type": "pose",
     "ts": 1717800000.123,
     "seq": 12,
-    "source": "simulator_ground_truth",
+    "source": "anchored_odometry",
     "x": 1.5,
     "y": 3.2,
     "z": 0.0,
@@ -74,6 +74,17 @@ Pictor 仅在收到 `hello` 后才认为连接可用，之后才开始处理 `po
     "omega": 0.0,
     "collision": false,
     "command": "forward",
+    "localization": {
+        "frame_id": "anchor_map",
+        "anchor_id": "mock_vehicle_01_anchor",
+        "x_m": 1.5,
+        "y_m": 3.2,
+        "yaw_rad": 0.785,
+        "covariance_diagonal": [0.0, 0.0, 0.0],
+        "quality": "nominal",
+        "timestamp": 123.0,
+        "revision": 12
+    },
     "control_mode": "autonomous",
     "navigation": {
         "status": "active",
@@ -93,19 +104,23 @@ Pictor 仅在收到 `hello` 后才认为连接可用，之后才开始处理 `po
 |------|------|------|------|
 | `ts` | f64 | 秒 | Unix 时间戳 |
 | `seq` | u64 | — | 遥测帧序号；紧随其后的 `scan` 使用相同值 |
-| `source` | string | — | 固定为 `simulator_ground_truth` |
-| `x`, `y` | f32 | 米 | 2D 世界坐标 |
+| `source` | string | — | 固定为 `anchored_odometry` |
+| `x`, `y` | f32 | 米 | 锚定里程计投影到 `global_map` 的 2D 坐标 |
 | `z` | f32 | 米 | 高度 |
 | `yaw` | f32 | 弧度 | 偏航角 |
 | `vx`, `vy` | f32 | 米/秒 | 2D 速度分量 |
 | `omega` | f32 | 弧度/秒 | 实际角速度；左旋为负，右旋为正 |
 | `collision` | bool | — | 最近一次平移是否被碰撞截停 |
 | `command` | string | — | 当前有效命令；看门狗超时后为 `stop` |
+| `localization` | object | — | `anchor_map` 中的局部位姿、协方差对角线、质量和 revision |
 | `control_mode` | string | — | `navigation.status=active` 时为 `autonomous`，否则为 `manual` |
 | `navigation` | object | — | `status`、当前或最后一个 `goal`，以及终止 `reason` |
 | `safety` | object | — | 最新安全状态、原因、前进方向障碍净空和边缘净空；未发现时净空为 `null` |
 
-`pose` 是仿真器内部真值，只用于协议、控制闭环和可视化验收。它不是 Tmini 输出，也不代表真实小车已经具备定位能力。
+`pose` 不再发送绝对仿真真值。小车只保存已知出生锚点
+`global_map → anchor_map`，之后通过物理运动增量更新锚定 odometry。默认零噪声时显示效果
+与旧协议一致；配置噪声后会产生可重放漂移。该估计不是 SLAM，也不保证长期无漂移。
+`localization.quality` 为 `nominal`、`degraded` 或 `lost`；`lost` 会阻止自动任务和本地地图写入。
 `navigation.status` 为 `idle`、`active`、`reached`、`blocked` 或 `cancelled`；结束后仍保留目标与原因，便于客户端确认结果。
 
 ---
@@ -242,7 +257,7 @@ Pictor 仅在收到 `hello` 后才认为连接可用，之后才开始处理 `po
 
 `linear_mps` 和 `angular_rps` 必须是有限 JSON 数字，布尔值不算数字；绝对值分别不得超过 Server 的 `--linear-speed` 和 `--angular-speed` 配置。字段必须严格为示例中的四项。`0, 0` 等价于停车；非零速度沿用与 `cmd` 相同的看门狗、运动积分和碰撞停车。确认仍使用 `cmd_ack`，其中 `cmd` 为 `"drive"`。
 
-### goto — 局部坐标目标
+### goto — 全局锚定目标
 
 ```json
 {
@@ -253,7 +268,11 @@ Pictor 仅在收到 `hello` 后才认为连接可用，之后才开始处理 `po
 }
 ```
 
-`x_m`、`y_m` 是模拟器 `local odom` 坐标中的有限 JSON 数字，字段必须严格为以上四项。当前控制器使用 `pose.source=simulator_ground_truth` 作为定位输入，先对准目标，再沿直线前进并在接近目标时减速；它不做 A* 或绕障。到达后状态为 `reached`；碰撞、安全硬停止或安全输入故障都会立即停车并变为 `blocked`，且不会自行重启。
+`x_m`、`y_m` 是 `global_map` 中的有限 JSON 数字，字段必须严格为以上四项。Server 用已知
+出生锚点把目标转换到 `anchor_map`，控制器只读取锚定里程计，先对准目标，再沿直线前进并
+在接近目标时减速；它不做 A* 或绕障。定位 `degraded` 时自动线速限制为一半；
+`lost` 时 `goto_ack.accepted=false` 或活动任务变为 `blocked`，原因为
+`localization_lost`。碰撞、安全硬停止或安全输入故障也会立即停车且不会自行重启。
 
 新的 `goto` 会替换旧目标。任何 `cmd` 或 `drive`（包括 `stop`），以及任何非法输入，都会永久取消当前目标；除非客户端重新发送 `goto`，否则不会恢复自动行驶。连接断开也会停车并取消活动目标。
 
@@ -271,7 +290,8 @@ Pictor 仅在收到 `hello` 后才认为连接可用，之后才开始处理 `po
 
 `accepted` 只有在目标已进入 `active` 状态时才为 `true`。若旧运动在命令交接时
 已因碰撞或安全门控停止，则返回 `accepted: false`，并以 `reason` 报告
-`collision`、`safety_obstacle`、`safety_edge` 或 `safety_sensor_fault`。
+`collision`、`safety_obstacle`、`safety_edge`、`safety_sensor_fault` 或
+`localization_lost`。
 
 ### cmd_ack — 命令确认
 
@@ -318,7 +338,11 @@ cmd_ack / goto_ack / error
 map_delta
 ```
 
-`map_full` 和 `pose` 是 `simulator_ground_truth`，只有 `scan` 是模拟的 Tmini 本地观测；边缘净空来自独立的模拟辅助传感器。当前仅有带安全门控的无绕障直达目标控制；没有实现路径规划、真实相机/下视传感器、真实定位、传感器噪声或 `map_delta`。
+`map_full` 是 `simulator_ground_truth`，仅供物理、传感器生成和调试显示；`pose` 是
+`anchored_odometry`，`scan` 是模拟的 Tmini 本地观测。扫描会累计到车辆内存中的
+`ObservedGrid`，其 Unknown/Free/Occupied、revision 和 delta 尚未通过 WebSocket 上传。
+车辆 runtime 跨控制器断开重连保留。当前没有 SLAM、scan matching、回环、D* Lite 或中央
+地图同步。
 
 ## 安全运行时
 
@@ -327,3 +351,7 @@ map_delta
 运行时以车辆圆形 footprint 为边界输出障碍/边缘净空：Tmini 正回波投影到行驶方向的完整圆形扫掠走廊，不使用固定角度扇区。净空 `<=0.25 m` 时硬停止，自动模式在 `0.25–1.0 m` 内线性降低平移速度，手动模式不执行慢速区降速但仍执行硬停止。即使事件循环延迟，旧速度也只按不超过 `0.05 m` 且不越过硬停止净空的小步推进，并在每步前重新观测。带平移的手动命令触发硬停止后会全部停车；客户端可发送新的反向或纯旋转命令重新评估并脱困。停车状态不会自行恢复。
 
 `safety.state` 为 `clear`、`limited`、`stopped` 或 `fault`；对应原因目前为 `safety_obstacle`、`safety_edge` 或 `safety_sensor_fault`。安全输入故障采用 fail-safe：自动任务变为 `blocked`，手动命令也全部停车。未发现正雷达回波或有限前视范围内未发现边缘仅表示当前观测为 clear，不表示更远区域已知。生产模拟默认输入健康；`healthy=false` 只用于确定性故障测试。
+
+车辆自有地图按每条射线把命中前区域标为 Free、命中格标为 Occupied、遮挡后保持 Unknown。
+当前模拟协议把 `range=0` 的无回波射线更新到最大量程 Free；真实 Tmini 的无回波原因更复杂，
+接入硬件前必须校准，不能直接沿用。水平 Tmini 仍不能检测跌落。
