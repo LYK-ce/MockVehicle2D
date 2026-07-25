@@ -30,7 +30,7 @@ class _StopAfterScanSocket:
         if isinstance(payload, bytes):
             return
         self.messages.append(json.loads(payload))
-        if len(self.messages) == 4:
+        if len(self.messages) == 3:  # hello, pose, scan
             raise RuntimeError("stop after first scan")
 
 
@@ -45,7 +45,7 @@ class _CommandSocket:
         if isinstance(payload, bytes):
             return
         self.messages.append(json.loads(payload))
-        if len(self.messages) == 5:
+        if len(self.messages) == 4:  # hello, pose, scan, cmd_ack/error
             raise RuntimeError("stop after command reply")
 
     async def recv(self) -> str:
@@ -71,7 +71,7 @@ class _IdleTimeoutSocket:
         if isinstance(payload, bytes):
             return
         self.messages.append(json.loads(payload))
-        if len(self.messages) == 6:
+        if len(self.messages) == 5:  # hello, pose, scan, pose, scan
             raise RuntimeError("stop after telemetry following idle timeout")
 
     async def recv(self) -> str:

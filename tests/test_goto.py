@@ -43,7 +43,7 @@ class _GotoSocket:
         if isinstance(payload, bytes):
             return  # skip binary frames (map_full chunks)
         self.messages.append(json.loads(payload))
-        if len(self.messages) == 7:
+        if len(self.messages) == 6:
             raise RuntimeError("stop after autonomous telemetry")
 
     async def recv(self) -> str:
