@@ -2,7 +2,7 @@
 
 Phase 1: compiles instructions into task dicts without controlling the vehicle.
 Phase 2: will actually invoke vehicle / navigation / safety methods.
-Phase 3: A* path planning for blocked straight-line targets.
+The optional truth-grid A* branch is retained only for offline simulator debugging.
 """
 
 from __future__ import annotations
@@ -19,8 +19,10 @@ class TaskCompiler:
 
     Each compile_* method returns a dict describing the action to take.
     In Phase 1 these do NOT modify vehicle state — they describe what WOULD happen.
-    In Phase 3, navigation intents check straight-line clearance and fall back
-    to A* path planning when obstacles exist.
+    When explicitly constructed with a simulator truth grid, this legacy/debug
+    compiler can produce an A* reference path. The production WebSocket handler
+    never executes that controller choice; it routes navigation to finite-view
+    D* Lite.
     """
 
     def __init__(self, grid: MapGrid | None = None) -> None:
@@ -74,10 +76,10 @@ class TaskCompiler:
 
     def _compile_goto_point(self, params: dict, snapshot: dict) -> dict:
         x_m, y_m = params["x_m"], params["y_m"]
-        # Phase 3: check if straight-line path is clear
+        # Legacy simulator-debug truth-grid branch.
         pose = snapshot.get("pose", {})
-        start_x = pose.get("x", 0.0)
-        start_y = pose.get("y", 0.0)
+        start_x = pose.get("x_m", 0.0)
+        start_y = pose.get("y_m", 0.0)
         if self.grid is not None:
             if not _is_straight_path_clear(self.grid, start_x, start_y, x_m, y_m):
                 path = self._plan_path(start_x, start_y, x_m, y_m)
@@ -105,13 +107,13 @@ class TaskCompiler:
         direction = params["direction"]
         # Compute relative goal from current pose if available
         pose = snapshot.get("pose", {})
-        current_x = pose.get("x", 0.0)
-        current_y = pose.get("y", 0.0)
-        current_yaw = pose.get("yaw", 0.0)
+        current_x = pose.get("x_m", 0.0)
+        current_y = pose.get("y_m", 0.0)
+        current_yaw = pose.get("yaw_rad", 0.0)
         sign = 1.0 if direction == "forward" else -1.0
         goal_x = current_x + sign * distance_m * math.cos(current_yaw)
         goal_y = current_y + sign * distance_m * math.sin(current_yaw)
-        # Phase 3: check if straight-line path is clear
+        # Legacy simulator-debug truth-grid branch.
         if self.grid is not None:
             if not _is_straight_path_clear(self.grid, current_x, current_y, goal_x, goal_y):
                 path = self._plan_path(current_x, current_y, goal_x, goal_y)
@@ -145,13 +147,13 @@ class TaskCompiler:
         direction = params["direction"]
         # Compute target yaw
         pose = snapshot.get("pose", {})
-        current_yaw = pose.get("yaw", 0.0)
+        current_yaw = pose.get("yaw_rad", 0.0)
         sign = 1.0 if direction == "left" else -1.0
         target_yaw = current_yaw + sign * math.radians(angle_deg)
         target_yaw = math.atan2(math.sin(target_yaw), math.cos(target_yaw))
         return self._make_task("rotation", {
             "action": "rotate",
-            "angle_deg": angle_deg,
+            "angle_rad": math.radians(angle_deg),
             "direction": direction,
             "target_yaw_rad": round(target_yaw, 4),
         })
@@ -221,7 +223,7 @@ class TaskCompiler:
 
         return {"sectors": summary, "total_points": len(points)}
 
-    # ── Phase 3: path planning helpers ───────────────────────
+    # ── Legacy simulator-debug path planning helpers ─────────
 
     def _plan_path(
         self,
@@ -229,10 +231,10 @@ class TaskCompiler:
         start_y: float,
         goal_x: float,
         goal_y: float,
-    ) -> list[tuple[int, int]] | None:
-        """Run A* from the nearest grid cell of (start_x,start_y) to (goal_x,goal_y).
+    ) -> list[dict[str, float]] | None:
+        """Run A* internally and return SI metre waypoints.
 
-        Returns a list of grid-cell coordinates or ``None`` when no path exists.
+        Returns labelled metric coordinates or ``None`` when no path exists.
         """
         if self.grid is None:
             return None
@@ -242,7 +244,13 @@ class TaskCompiler:
         sy = int(round(start_y))
         gx = int(round(goal_x))
         gy = int(round(goal_y))
-        return a_star_search(self.grid, (sx, sy), (gx, gy))
+        path = a_star_search(self.grid, (sx, sy), (gx, gy))
+        if path is None:
+            return None
+        return [
+            {"x_m": float(cell_x), "y_m": float(cell_y)}
+            for cell_x, cell_y in path
+        ]
 
 
 # ── module-level helper ──────────────────────────────────────

@@ -36,7 +36,7 @@ class PathFollowingController:
     def __init__(self) -> None:
         self.status = "idle"
         self._follower: WaypointFollower | None = None
-        self._path: list[tuple[int, int]] = []
+        self._path: list[tuple[float, float]] = []
         self.reason: str | None = None
 
     @property
@@ -44,23 +44,23 @@ class PathFollowingController:
         return "autonomous" if self.status == "active" else "manual"
 
     @property
-    def path(self) -> list[tuple[int, int]]:
+    def path(self) -> list[tuple[float, float]]:
         return list(self._path)
 
     @property
-    def goal(self) -> tuple[int, int] | None:
+    def goal(self) -> tuple[float, float] | None:
         if self._follower is not None:
             return self._follower.goal
         return None
 
     @property
-    def current_target(self) -> tuple[int, int] | None:
+    def current_target(self) -> tuple[float, float] | None:
         if self._follower is not None:
             return self._follower.current_target
         return None
 
-    def start(self, path: list[tuple[int, int]]) -> None:
-        """Begin following *path* (grid coordinates)."""
+    def start(self, path: list[tuple[float, float]]) -> None:
+        """Begin following metric ``(x_m, y_m)`` waypoints."""
         if len(path) < 2:
             raise ValueError("path must contain at least two waypoints")
         self._path = path
@@ -86,7 +86,10 @@ class PathFollowingController:
                 else None
             ),
             "current_target": (
-                {"x": self.current_target[0], "y": self.current_target[1]}
+                {
+                    "x_m": self.current_target[0],
+                    "y_m": self.current_target[1],
+                }
                 if self.current_target is not None
                 else None
             ),

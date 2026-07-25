@@ -1,9 +1,9 @@
-"""Tests for PathFollowingController and Phase 3 A* integration.
+"""Legacy path-following tests plus production NL routing checks.
 
 Covers:
 - PathFollowingController basic, blocked, cancel
 - TaskCompiler A* fallback
-- NL pipeline with obstacle-avoidance
+- NL pipeline always routes navigation through finite-view D* Lite
 """
 
 from __future__ import annotations
@@ -18,6 +18,7 @@ from mockvehicle2d.instruction.llm_client import FakeModelClient
 from mockvehicle2d.instruction.state_machine import InstructionState, InstructionStateMachine
 from mockvehicle2d.instruction.validator import SchemaValidator, SemanticValidator
 from mockvehicle2d.map_grid import MapGrid, WALL
+from mockvehicle2d.local_state import AnchorSpec, AnchoredLocalState
 from mockvehicle2d.navigation import GotoController
 from mockvehicle2d.pathfinding import PathFollowingController, a_star_search
 from mockvehicle2d.safety import LocalSafetyRuntime
@@ -56,6 +57,17 @@ def path_following():
 @pytest.fixture
 def navigation():
     return GotoController()
+
+
+@pytest.fixture
+def local_state(vehicle):
+    return AnchoredLocalState(
+        AnchorSpec("nl-dstar-test", vehicle.x, vehicle.y, vehicle.yaw),
+        truth_x_m=vehicle.x,
+        truth_y_m=vehicle.y,
+        truth_yaw_rad=vehicle.yaw,
+        timestamp=0.0,
+    )
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -215,7 +227,7 @@ class TestTaskCompilerPhase3:
             "timestamp": "2026-07-24T12:00:00+08:00",
             "parameters": {"x_m": 20, "y_m": 10},
         }
-        snapshot = {"pose": {"x": 10.0, "y": 10.0, "yaw": 0.0}}
+        snapshot = {"pose": {"x_m": 10.0, "y_m": 10.0, "yaw_rad": 0.0}}
         task = compiler.compile(inst, snapshot)
         assert task["type"] == "navigation"
         assert task["controller"] == "GotoController"
@@ -230,7 +242,7 @@ class TestTaskCompilerPhase3:
             "timestamp": "2026-07-24T12:00:00+08:00",
             "parameters": {"x_m": 20, "y_m": 10},
         }
-        snapshot = {"pose": {"x": 10.0, "y": 10.0, "yaw": 0.0}}
+        snapshot = {"pose": {"x_m": 10.0, "y_m": 10.0, "yaw_rad": 0.0}}
         task = compiler.compile(inst, snapshot)
         assert task["type"] == "navigation"
         assert task["controller"] == "PathFollowingController"
@@ -238,8 +250,8 @@ class TestTaskCompilerPhase3:
         assert "path" in task
         path = task["path"]
         assert len(path) >= 2
-        assert path[0] == (10, 10)
-        assert path[-1] == (20, 10)
+        assert path[0] == {"x_m": 10.0, "y_m": 10.0}
+        assert path[-1] == {"x_m": 20.0, "y_m": 10.0}
 
     def test_compiler_blocked_when_no_path(self):
         """goto_point with unreachable goal → blocked."""
@@ -258,7 +270,7 @@ class TestTaskCompilerPhase3:
             "timestamp": "2026-07-24T12:00:00+08:00",
             "parameters": {"x_m": 20, "y_m": 10},
         }
-        snapshot = {"pose": {"x": 5.0, "y": 5.0, "yaw": 0.0}}
+        snapshot = {"pose": {"x_m": 5.0, "y_m": 5.0, "yaw_rad": 0.0}}
         task = compiler.compile(inst, snapshot)
         assert task["type"] == "navigation"
         assert task["controller"] == "blocked"
@@ -273,7 +285,7 @@ class TestTaskCompilerPhase3:
             "timestamp": "2026-07-24T12:00:00+08:00",
             "parameters": {"x_m": 20, "y_m": 10},
         }
-        snapshot = {"pose": {"x": 10.0, "y": 10.0, "yaw": 0.0}}
+        snapshot = {"pose": {"x_m": 10.0, "y_m": 10.0, "yaw_rad": 0.0}}
         task = compiler.compile(inst, snapshot)
         assert task["controller"] == "GotoController"
 
@@ -286,7 +298,7 @@ class TestTaskCompilerPhase3:
             "timestamp": "2026-07-24T12:00:00+08:00",
             "parameters": {"distance_m": 10.0, "direction": "forward"},
         }
-        snapshot = {"pose": {"x": 10.0, "y": 10.0, "yaw": 0.0}}
+        snapshot = {"pose": {"x_m": 10.0, "y_m": 10.0, "yaw_rad": 0.0}}
         task = compiler.compile(inst, snapshot)
         assert task["type"] == "navigation"
         # Straight line from (10,10) to (20,10) crosses wall at x=15
@@ -304,7 +316,7 @@ class TestTaskCompilerPhase3:
             "timestamp": "2026-07-24T12:00:00+08:00",
             "parameters": {"distance_m": 5.0, "direction": "forward"},
         }
-        snapshot = {"pose": {"x": 10.0, "y": 10.0, "yaw": 0.0}}
+        snapshot = {"pose": {"x_m": 10.0, "y_m": 10.0, "yaw_rad": 0.0}}
         task = compiler.compile(inst, snapshot)
         assert task["controller"] == "GotoController"
 
@@ -313,8 +325,8 @@ class TestTaskCompilerPhase3:
 # NL pipeline integration tests (Phase 3)
 # ═══════════════════════════════════════════════════════════════
 
-class TestNLPipelinePhase3:
-    """End-to-end: NL command → A* path planning → PathFollowingController."""
+class TestNLPipelineRouting:
+    """Production NL navigation never reaches truth-map A*/PathFollowing."""
 
     @pytest.fixture
     def nl_client(self):
@@ -328,21 +340,21 @@ class TestNLPipelinePhase3:
     def state_machine(self):
         return InstructionStateMachine()
 
-    def test_nl_goto_uses_path_following_with_obstacles(
+    def test_nl_goto_uses_dstar_without_reading_hidden_truth_obstacles(
         self, vehicle, grid_with_wall, navigation, path_following, nl_client,
-        schema_v, state_machine
+        schema_v, state_machine, local_state
     ):
-        """NL '去坐标 (20, 10)' with wall at x=15 → uses PathFollowingController."""
-        semantic_v = SemanticValidator(grid_with_wall)
-        compiler = TaskCompiler(grid_with_wall)
+        """An unobserved truth wall must not leak into the initial route."""
+        semantic_v = SemanticValidator(None)
 
         msg = {"type": "nl_command", "seq": 30, "text": "去坐标 (20, 10)"}
         replies = _handle_nl_command(
             msg, vehicle, grid_with_wall, navigation,
             time.time(), time.monotonic(),
             nl_client, schema_v, semantic_v,
-            state_machine, compiler,
+            state_machine,
             path_following=path_following,
+            local_state=local_state,
         )
 
         # Should have accepted parse + active task
@@ -355,25 +367,26 @@ class TestNLPipelinePhase3:
         assert len(task_updates) >= 1
         assert task_updates[0]["status"] == "active"
 
-        # PathFollowingController should be active (not GotoController)
-        assert path_following.status == "active"
-        assert len(path_following.path) > 2  # Should have A* detour waypoints
+        assert navigation.status == "active"
+        assert navigation.snapshot()["algorithm"] == "d_star_lite"
+        assert navigation.reported_goal == (20.0, 10.0)
+        assert path_following.status != "active"
 
     def test_nl_goto_uses_goto_when_clear(
         self, vehicle, empty_grid, navigation, path_following, nl_client,
-        schema_v, state_machine
+        schema_v, state_machine, local_state
     ):
         """NL '去坐标 (20, 10)' on empty grid → uses GotoController."""
-        semantic_v = SemanticValidator(empty_grid)
-        compiler = TaskCompiler(empty_grid)
+        semantic_v = SemanticValidator(None)
 
         msg = {"type": "nl_command", "seq": 31, "text": "去坐标 (20, 10)"}
         replies = _handle_nl_command(
             msg, vehicle, empty_grid, navigation,
             time.time(), time.monotonic(),
             nl_client, schema_v, semantic_v,
-            state_machine, compiler,
+            state_machine,
             path_following=path_following,
+            local_state=local_state,
         )
 
         task_updates = [r for r in replies if r["type"] == "nl_task_update"]
@@ -381,13 +394,13 @@ class TestNLPipelinePhase3:
 
         # GotoController should be active, path_following should be idle
         assert navigation.status == "active"
-        assert navigation.goal == (20.0, 10.0)
+        assert navigation.reported_goal == (20.0, 10.0)
         # path_following may have been cancelled but should not be active
         assert path_following.status != "active"
 
-    def test_nl_goto_blocked_when_no_path(
+    def test_nl_goto_does_not_use_truth_ring_as_no_path_evidence(
         self, vehicle, navigation, path_following, nl_client,
-        schema_v, state_machine
+        schema_v, state_machine, local_state
     ):
         """NL goto to unreachable goal → blocked response."""
         grid = MapGrid(256, 256)
@@ -399,42 +412,43 @@ class TestNLPipelinePhase3:
                     continue  # keep goal free
                 grid.set_cell(x, y, WALL)
 
-        semantic_v = SemanticValidator(grid)
-        compiler = TaskCompiler(grid)
+        semantic_v = SemanticValidator(None)
 
         msg = {"type": "nl_command", "seq": 32, "text": "去坐标 (20, 10)"}
         replies = _handle_nl_command(
             msg, vehicle, grid, navigation,
             time.time(), time.monotonic(),
             nl_client, schema_v, semantic_v,
-            state_machine, compiler,
+            state_machine,
             path_following=path_following,
+            local_state=local_state,
         )
 
         task_updates = [r for r in replies if r["type"] == "nl_task_update"]
         assert len(task_updates) >= 1
-        assert task_updates[0]["status"] == "blocked"
-        assert "no path" in str(task_updates[0].get("reason", ""))
+        assert task_updates[0]["status"] == "active"
+        assert navigation.snapshot()["algorithm"] == "d_star_lite"
+        assert path_following.status != "active"
 
-    def test_nl_move_distance_uses_path_following(
+    def test_nl_move_distance_uses_dstar_not_truth_path_following(
         self, vehicle, grid_with_wall, navigation, path_following, nl_client,
-        schema_v, state_machine
+        schema_v, state_machine, local_state
     ):
-        """NL '前进 10 米' with wall in path → PathFollowingController."""
+        """NL move-distance uses finite-view D* Lite, not truth-map following."""
         vehicle.yaw = 0.0  # facing +x
-        semantic_v = SemanticValidator(grid_with_wall)
-        compiler = TaskCompiler(grid_with_wall)
+        semantic_v = SemanticValidator(None)
 
         msg = {"type": "nl_command", "seq": 33, "text": "前进 10 米"}
         replies = _handle_nl_command(
             msg, vehicle, grid_with_wall, navigation,
             time.time(), time.monotonic(),
             nl_client, schema_v, semantic_v,
-            state_machine, compiler,
+            state_machine,
             path_following=path_following,
+            local_state=local_state,
         )
 
         task_updates = [r for r in replies if r["type"] == "nl_task_update"]
         assert task_updates[0]["status"] == "active"
-        # Should use path following since wall at x=15 blocks route
-        assert path_following.status == "active"
+        assert navigation.snapshot()["algorithm"] == "d_star_lite"
+        assert path_following.status != "active"

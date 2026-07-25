@@ -32,9 +32,11 @@ MockVehicle2D/
 ├── src/mockvehicle2d/
 │   ├── server.py           ← WebSocket Server 入口
 │   ├── vehicle.py          ← 共用车辆运动、碰撞与指令看门狗
-│   ├── local_state.py      ← 出生锚点、增量里程计与车辆自有观测地图
+│   ├── local_state.py      ← 锚定里程计、scan matching 与车辆自有观测地图
 │   ├── scan.py             ← YDLidar 风格二维激光扫描
-│   ├── navigation.py       ← 本地 odom 直达目标控制
+│   ├── navigation.py       ← 有限视野 D* Lite 自动导航
+│   ├── pathfinding/
+│   │   └── d_star_lite.py  ← 增量路径规划
 │   ├── safety.py           ← 障碍/边缘净空与本地安全门控
 │   ├── map_grid.py         ← MapGrid 栅格地图数据结构
 │   ├── collision.py        ← Bresenham 线段 + AABB 圆形碰撞检测
@@ -67,14 +69,16 @@ mockvehicle2d serve (WebSocket Server)
   ├── 地图生成: voxel 数组 → map_full
   │
   ├── 锚定本地状态: global_map → anchor_map → odom → base_link → lidar
-  ├── 车辆自有地图: Tmini scan + PoseEstimate → Unknown / Free / Occupied + delta
-  │
-  ├── cmd / drive / goto: 严格校验 → ack / error → 故障停车
+  ├── 定位前端: odometry prediction + bounded scan matching → corrected PoseEstimate
+  ├── 车辆自有地图: corrected pose + Tmini scan → Unknown / Free / Occupied + delta
+│
+  ├── goto: global goal → anchor goal → D* Lite 增量路径 → 下一周期速度
+  ├── cmd / drive: 严格校验 → 手动接管 / ack / error → 故障停车
   ├── 本地安全: Tmini 障碍净空 + 模拟边缘净空 → 限速 / 停车
   │
   ├── 共用车辆状态: 实际单调时间 → 运动 / 看门狗 / 分步碰撞
   │
-  ├── 同帧遥测: 名义 6 Hz pose → Tmini scan（相同 seq / ts）
+  ├── 同帧遥测: 名义 6 Hz pose → Tmini scan（相同 seq / timestamp_s）
   │
   └── 碰撞检测:
         ├── map_grid.py  → MapGrid
@@ -172,20 +176,20 @@ cell [gx, gx+1] × [gy, gy+1] 到圆心 (cx, cy) 的最近点:
 mockvehicle2d serve \
   --port 19090 \
   --vehicle-id mock_vehicle_01 \
-  --linear-speed 0.5 \
-  --angular-speed 90 \
-  --vehicle-radius 0.5 \
-  --command-timeout 1.0 \
+  --linear-speed-mps 0.5 \
+  --angular-speed-rps 1.5708 \
+  --vehicle-radius-m 0.5 \
+  --command-timeout-s 1.0 \
   --anchor-id mock_vehicle_01_anchor \
-  --anchor-x 10 --anchor-y 10 --anchor-yaw 0 \
-  --odom-translation-noise 0 --odom-yaw-noise 0 --odom-seed 0
+  --anchor-x-m 10 --anchor-y-m 10 --anchor-yaw-rad 0 \
+  --odom-translation-noise-m 0 --odom-yaw-noise-rad 0 --odom-seed 0
 ```
 
-角速度参数单位为度/秒。规范命令为 `{"type":"cmd","seq":0,"cmd":"forward"}`；W+D 等组合输入发送 `forward_right`，同时使用线速度和角速度。也兼容精确 legacy 格式 `{"cmd":"forward"}`。新命令生效前先把旧命令积分到接收时刻。非法消息、看门狗超时、碰撞或连接结束都会停车。
+公开配置使用 SI 单位：米、秒和弧度。规范命令为 `{"type":"cmd","seq":0,"cmd":"forward"}`；W+D 等组合输入发送 `forward_right`，同时使用线速度和角速度。也兼容精确 legacy 格式 `{"cmd":"forward"}`。新命令生效前先把旧命令积分到接收时刻。非法消息、看门狗超时、碰撞或连接结束都会停车。
 
 Pictor 连接 `ws://127.0.0.1:19090` 后，首帧为 `hello`，随后为 `map_full → pose → scan`。若端口被占用，可启动 `mockvehicle2d serve --port 9090`，并让 Pictor 连接 `ws://127.0.0.1:9090`。`hello` 不携带地址；Pictor 使用自己实际连接的 URL。
 
-每个 6 Hz deadline 只推进一次共用状态，再以相同 `seq` 和 Unix `ts` 顺序发送 `pose`、`scan`。命令接收和全部发送都在同一个连接协程内串行执行；每轮先处理已到期遥测，命令洪泛不会永久饿死遥测。车辆 runtime 由 Server 创建一次，同时只允许一个控制 WebSocket；并发连接收到 `vehicle_busy` 后结束，不能推进或清理当前控制器。当前控制器断开时停车并释放控制权，但锚定 odometry、本地观测地图和 revision 不会重置，下一连接可继续使用。
+每个 6 Hz deadline 只推进一次共用状态，再以相同 `seq` 和 Unix `timestamp_s` 顺序发送 `pose`、`scan`。运行循环先安全推进上一命令，再在同一时刻完成 scan、odometry prediction、scan matching、地图 delta 和 D* Lite 重规划；新速度从下一周期生效。命令接收和全部发送都在同一个连接协程内串行执行；每轮先处理已到期遥测，命令洪泛不会永久饿死遥测。车辆 runtime 由 Server 创建一次，同时只允许一个控制 WebSocket；并发连接收到 `vehicle_busy` 后结束，不能推进或清理当前控制器。当前控制器断开时停车并释放控制权；锚定 odometry、本地观测地图和 revision 不会重置，但活动 `goto` 被取消，下一连接需重新下发目标。
 
 ---
 
@@ -212,16 +216,19 @@ Pictor 连接 `ws://127.0.0.1:19090` 后，首帧为 `hello`，随后为 `map_fu
 | Pygame 可视化 | ✅ |
 | cmd 命令接收、确认和错误停车 | ✅ |
 | drive 连续速度与组合驾驶 | ✅ |
-| goto 直达目标与手动接管 | ✅ |
+| goto 有限视野 D* Lite 动态重规划与手动接管 | ✅ |
 | 障碍/边缘安全限速和停车 | ✅ |
 | 实际时间运动、看门狗和防穿墙 | ✅ |
 | 出生锚点与增量 odometry | ✅ |
 | 车辆自有 ObservedGrid / delta | ✅ 内存 |
+| bounded correlative scan matching | ✅ 局部前端 |
+| D* Lite 增量重规划 | ✅ |
 | 定位 degraded/lost 安全语义 | ✅ |
-| 寻路算法 | ✅ |
+| 回环 / 位姿图 / 全局优化 | ❌ |
 
 `map_full.source=simulator_ground_truth` 只用于物理、传感器生成和调试显示；
 `pose.source=anchored_odometry`，正常协议不发送绝对真值。默认零噪声保持 Pictor 兼容，
-可用固定 seed 注入可重放 odometry 误差。当前自有地图 delta 不通过 WebSocket 上传；没有
-SLAM、scan matching、D* Lite 或中央地图同步。水平 Tmini 不能检测跌落，无回波按最大量程
-Free 只是当前模拟约定，接入真实硬件前必须校准。
+可用固定 seed 注入可重放 odometry 误差。scan matching 只在旧局部占据证据上做有限窗
+SE(2) 配准，不含回环、地点识别、位姿图或全局优化。当前自有地图 delta 不通过 WebSocket
+上传，也没有地图持久化或中央地图同步。水平 Tmini 不能检测跌落，无回波按最大量程 Free
+只是当前模拟约定，接入真实硬件前必须校准。

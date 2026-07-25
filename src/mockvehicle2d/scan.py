@@ -158,6 +158,7 @@ def scan_message(
     scan_points = scan_grid(grid, x, y, yaw, config) if points is None else tuple(points)
     return {
         "type": "scan",
+        "timestamp_s": timestamp,
         "ts": timestamp,
         "frame_id": "laser",
         "config": config.as_dict(),

@@ -105,6 +105,8 @@ class PoseEstimate:
             "yaw_rad": self.yaw_rad,
             "covariance_diagonal": list(self.covariance),
             "quality": self.quality,
+            "timestamp_s": self.timestamp,
+            # Deprecated compatibility alias; value remains Unix seconds.
             "timestamp": self.timestamp,
             "revision": self.revision,
         }
@@ -123,6 +125,207 @@ class OdometryConfig:
             or type(self.seed) is not int
         ):
             raise ValueError("odometry noise must be finite and non-negative; seed must be an integer")
+
+
+@dataclass(frozen=True)
+class ScanMatchConfig:
+    """Small deterministic SE(2) search around one odometry prediction."""
+
+    xy_window_m: float = 0.5
+    xy_step_m: float = 0.1
+    yaw_window_rad: float = math.radians(5)
+    yaw_step_rad: float = math.radians(1)
+    sample_stride: int = 8
+    min_support: int = 6
+    min_score: float = 0.55
+    min_margin: float = 0.005
+
+    def __post_init__(self) -> None:
+        values = (
+            self.xy_window_m,
+            self.xy_step_m,
+            self.yaw_window_rad,
+            self.yaw_step_rad,
+            self.min_score,
+            self.min_margin,
+        )
+        if (
+            not _finite(*values)
+            or min(self.xy_window_m, self.yaw_window_rad, self.min_margin) < 0
+            or min(self.xy_step_m, self.yaw_step_rad) <= 0
+            or type(self.sample_stride) is not int
+            or self.sample_stride <= 0
+            or type(self.min_support) is not int
+            or self.min_support <= 0
+            or not 0 <= self.min_score <= 1
+        ):
+            raise ValueError("invalid scan-match configuration")
+
+
+@dataclass(frozen=True)
+class ScanMatchResult:
+    accepted: bool
+    score: float
+    support: int
+    margin: float
+    correction_x_m: float
+    correction_y_m: float
+    correction_yaw_rad: float
+    revision: int
+    reason: str | None
+
+    def as_dict(self) -> dict[str, object]:
+        return {
+            "accepted": self.accepted,
+            "score": self.score,
+            "support": self.support,
+            "margin": self.margin,
+            "correction": {
+                "x_m": self.correction_x_m,
+                "y_m": self.correction_y_m,
+                "yaw_rad": self.correction_yaw_rad,
+            },
+            "revision": self.revision,
+            "reason": self.reason,
+        }
+
+
+class CorrelativeScanMatcher:
+    """Match hit endpoints to occupied cells already present in the local map."""
+
+    def __init__(self, config: ScanMatchConfig = ScanMatchConfig()) -> None:
+        self.config = config
+        self.revision = 0
+
+    def match(
+        self,
+        points: Iterable[LaserPoint],
+        predicted: PoseEstimate,
+        grid: "ObservedGrid",
+    ) -> ScanMatchResult:
+        if predicted.anchor_id != grid.anchor.anchor_id:
+            raise ValueError("scan pose belongs to a different anchor")
+        self.revision += 1
+        occupied = frozenset(grid.occupied_cells())
+        if not occupied:
+            return self._rejected("empty_map")
+
+        hits = []
+        for index, point in enumerate(points):
+            if not _finite(point.angle, point.range, point.intensity) or point.range < 0:
+                raise ValueError("scan points must be finite and ranges cannot be negative")
+            if index % self.config.sample_stride == 0 and point.range > 0:
+                hits.append(point)
+        if len(hits) < self.config.min_support:
+            return self._rejected("insufficient_support")
+
+        candidates: list[tuple[float, int, float, float, float]] = []
+        for dx in _search_offsets(self.config.xy_window_m, self.config.xy_step_m):
+            for dy in _search_offsets(self.config.xy_window_m, self.config.xy_step_m):
+                for dyaw in _search_offsets(
+                    self.config.yaw_window_rad, self.config.yaw_step_rad
+                ):
+                    score, support = _endpoint_score(
+                        hits,
+                        predicted.x_m + dx,
+                        predicted.y_m + dy,
+                        predicted.yaw_rad + dyaw,
+                        occupied,
+                        grid.resolution_m,
+                    )
+                    if support >= self.config.min_support:
+                        candidates.append((score, support, dx, dy, dyaw))
+        if not candidates:
+            return self._rejected("insufficient_support")
+
+        candidates.sort(
+            key=lambda item: (
+                -item[0],
+                -item[1],
+                item[2] ** 2 + item[3] ** 2 + item[4] ** 2,
+                abs(item[4]),
+                item[2],
+                item[3],
+                item[4],
+            )
+        )
+        score, support, dx, dy, dyaw = candidates[0]
+        second_score = candidates[1][0] if len(candidates) > 1 else 0.0
+        margin = max(0.0, score - second_score)
+        if score < self.config.min_score:
+            return self._rejected("low_score", score, support, margin)
+        if margin < self.config.min_margin:
+            return self._rejected("ambiguous", score, support, margin)
+        return ScanMatchResult(
+            True,
+            score,
+            support,
+            margin,
+            dx,
+            dy,
+            dyaw,
+            self.revision,
+            None,
+        )
+
+    def rejected(self, reason: str) -> ScanMatchResult:
+        self.revision += 1
+        return self._rejected(reason)
+
+    def _rejected(
+        self, reason: str, score: float = 0.0, support: int = 0, margin: float = 0.0
+    ) -> ScanMatchResult:
+        return ScanMatchResult(
+            False, score, support, margin, 0.0, 0.0, 0.0, self.revision, reason
+        )
+
+
+def _search_offsets(window: float, step: float) -> tuple[float, ...]:
+    count = math.floor(window / step + 1e-9)
+    return tuple(index * step for index in range(-count, count + 1))
+
+
+def _endpoint_score(
+    points: Iterable[LaserPoint],
+    x_m: float,
+    y_m: float,
+    yaw_rad: float,
+    occupied: frozenset[tuple[int, int]],
+    resolution_m: float,
+) -> tuple[float, int]:
+    endpoints: dict[tuple[int, int], tuple[float, float]] = {}
+    for point in points:
+        angle = yaw_rad + point.angle
+        endpoint = (
+            x_m + point.range * math.cos(angle),
+            y_m + point.range * math.sin(angle),
+        )
+        cell = (
+            math.floor(endpoint[0] / resolution_m),
+            math.floor(endpoint[1] / resolution_m),
+        )
+        endpoints.setdefault(cell, endpoint)
+
+    score = 0.0
+    support = 0
+    radius = 2 * resolution_m
+    for (cell_x, cell_y), (endpoint_x, endpoint_y) in endpoints.items():
+        nearest = min(
+            (
+                math.hypot(
+                    endpoint_x - (gx + 0.5) * resolution_m,
+                    endpoint_y - (gy + 0.5) * resolution_m,
+                )
+                for gx in range(cell_x - 2, cell_x + 3)
+                for gy in range(cell_y - 2, cell_y + 3)
+                if (gx, gy) in occupied
+            ),
+            default=math.inf,
+        )
+        if nearest < radius:
+            support += 1
+            score += 1 - nearest / radius
+    return score / max(1, len(endpoints)), support
 
 
 class AnchoredOdometry:
@@ -214,6 +417,23 @@ class AnchoredOdometry:
         )
         return self._pose
 
+    def apply_correction(
+        self, dx_m: float, dy_m: float, dyaw_rad: float, *, timestamp: float
+    ) -> PoseEstimate:
+        if not _finite(dx_m, dy_m, dyaw_rad, timestamp):
+            raise ValueError("scan-match correction must be finite")
+        self._pose = PoseEstimate(
+            self.anchor.anchor_id,
+            self._pose.x_m + dx_m,
+            self._pose.y_m + dy_m,
+            _wrapped(self._pose.yaw_rad + dyaw_rad),
+            self._pose.covariance,
+            self._pose.quality,
+            timestamp,
+            self._pose.revision + 1,
+        )
+        return self._pose
+
 
 @dataclass(frozen=True)
 class MapCellUpdate:
@@ -238,7 +458,7 @@ class LocalMapDelta:
             "anchor_id": self.anchor_id,
             "revision": self.revision,
             "pose_revision": self.pose_revision,
-            "observed_at": self.observed_at,
+            "observed_at_s": self.observed_at,
             "changed_cells": [cell.as_dict() for cell in self.changed_cells],
         }
 
@@ -258,6 +478,12 @@ class ObservedGrid:
         if type(gx) is not int or type(gy) is not int:
             raise ValueError("grid coordinates must be integers")
         return self._cells.get((gx, gy), UNKNOWN)
+
+    def is_unknown(self, gx: int, gy: int) -> bool:
+        return self.get_cell(gx, gy) == UNKNOWN
+
+    def occupied_cells(self) -> tuple[tuple[int, int], ...]:
+        return tuple(sorted(cell for cell, state in self._cells.items() if state == OCCUPIED))
 
     def integrate_scan(
         self,
@@ -363,6 +589,7 @@ class AnchoredLocalState:
         truth_y_m: float,
         truth_yaw_rad: float,
         odometry_config: OdometryConfig = OdometryConfig(),
+        scan_match_config: ScanMatchConfig = ScanMatchConfig(),
         timestamp: float,
         map_resolution_m: float = 1.0,
     ) -> None:
@@ -376,6 +603,8 @@ class AnchoredLocalState:
             timestamp=timestamp,
         )
         self.local_map = ObservedGrid(anchor, resolution_m=map_resolution_m)
+        self.scan_matcher = CorrelativeScanMatcher(scan_match_config)
+        self.last_scan_match: ScanMatchResult | None = None
         self.last_map_delta: LocalMapDelta | None = None
 
     @property
@@ -397,3 +626,22 @@ class AnchoredLocalState:
             return None
         self.last_map_delta = self.local_map.integrate_scan(points, self.pose, observed_at, config)
         return self.last_map_delta
+
+    def match_and_integrate_scan(
+        self, points: Iterable[LaserPoint], observed_at: float, config: ScanConfig
+    ) -> LocalMapDelta | None:
+        if self.pose.quality == "lost":
+            self.last_scan_match = self.scan_matcher.rejected("localization_lost")
+            return None
+        scan_points = tuple(points)
+        self.last_scan_match = self.scan_matcher.match(
+            scan_points, self.pose, self.local_map
+        )
+        if self.last_scan_match.accepted:
+            self.odometry.apply_correction(
+                self.last_scan_match.correction_x_m,
+                self.last_scan_match.correction_y_m,
+                self.last_scan_match.correction_yaw_rad,
+                timestamp=observed_at,
+            )
+        return self.integrate_scan(scan_points, observed_at, config)

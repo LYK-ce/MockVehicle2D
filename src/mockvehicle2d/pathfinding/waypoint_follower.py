@@ -24,7 +24,7 @@ class WaypointFollower:
 
     def __init__(
         self,
-        path: list[tuple[int, int]],
+        path: list[tuple[float, float]],
         *,
         arrival_distance: float = ARRIVAL_DISTANCE,
         waypoint_distance: float = WAYPOINT_DISTANCE,
@@ -40,15 +40,15 @@ class WaypointFollower:
         self._angle_tolerance = angle_tolerance
 
     @property
-    def goal(self) -> tuple[int, int]:
+    def goal(self) -> tuple[float, float]:
         return self._goal
 
     @property
-    def current_target(self) -> tuple[int, int]:
+    def current_target(self) -> tuple[float, float]:
         return self._path[self._idx]
 
     @property
-    def path(self) -> list[tuple[int, int]]:
+    def path(self) -> list[tuple[float, float]]:
         return list(self._path)
 
     def next_cmd(self, x: float, y: float, yaw: float) -> tuple[str, bool]:
@@ -79,7 +79,7 @@ class WaypointFollower:
             return "forward", False
         return "spin_left" if delta > 0 else "spin_right", False
 
-    def reset(self, path: list[tuple[int, int]]) -> None:
+    def reset(self, path: list[tuple[float, float]]) -> None:
         """Replace the current path and restart from its first segment."""
         if len(path) < 2:
             raise ValueError("path must contain at least two waypoints")

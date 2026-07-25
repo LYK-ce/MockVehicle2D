@@ -454,7 +454,7 @@ class TestTaskCompiler:
     def test_compile_move_distance(self):
         inst = _valid_instruction("move_distance", {"distance_m": 5.0, "direction": "forward"})
         # Provide a pose snapshot
-        snapshot = {"pose": {"x": 10.0, "y": 20.0, "yaw": 0.0}}
+        snapshot = {"pose": {"x_m": 10.0, "y_m": 20.0, "yaw_rad": 0.0}}
         task = self.compiler.compile(inst, snapshot)
         assert task["type"] == "navigation"
         assert task["action"] == "move_distance"
@@ -466,11 +466,11 @@ class TestTaskCompiler:
 
     def test_compile_rotate(self):
         inst = _valid_instruction("rotate", {"angle_deg": 90, "direction": "left"})
-        snapshot = {"pose": {"yaw": 0.0}}
+        snapshot = {"pose": {"yaw_rad": 0.0}}
         task = self.compiler.compile(inst, snapshot)
         assert task["type"] == "rotation"
         assert task["action"] == "rotate"
-        assert task["angle_deg"] == 90
+        assert task["angle_rad"] == pytest.approx(math.pi / 2)
         assert task["direction"] == "left"
         assert abs(task["target_yaw_rad"] - math.pi / 2) < 1e-5
 

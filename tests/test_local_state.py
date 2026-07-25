@@ -259,12 +259,21 @@ class RuntimeIntegrationTest(unittest.TestCase):
             anchor=self.anchor,
             odometry_config=OdometryConfig(),
         )
-        runtime.navigation.start(5.0, 0.0)
+        runtime.navigation.start(
+            1.0,
+            0.0,
+            local_map=runtime.local_state.local_map,
+            pose=runtime.local_state.pose,
+            vehicle_radius_m=runtime.vehicle.radius,
+        )
         runtime.local_state.set_localization_quality("degraded", timestamp=0.0)
 
         runtime.update(0.0, 1.0)
 
-        self.assertEqual(runtime.navigation.status, "active")
+        self.assertEqual(
+            (runtime.navigation.status, runtime.navigation.reason),
+            ("active", None),
+        )
         self.assertAlmostEqual(
             runtime.vehicle.body_velocities()[0], runtime.vehicle.linear_speed / 2
         )
@@ -363,7 +372,13 @@ class RuntimeIntegrationTest(unittest.TestCase):
                     truth_yaw_rad=0.0,
                     timestamp=0.0,
                 )
-                navigation.start(5.0, 0.0)
+                navigation.start(
+                    5.0,
+                    0.0,
+                    local_map=state.local_map,
+                    pose=state.pose,
+                    vehicle_radius_m=vehicle.radius,
+                )
                 vehicle.install_drive(0.5, 0.0, 0.0)
                 state.set_localization_quality("lost", timestamp=0.1)
 
@@ -407,7 +422,13 @@ class RuntimeIntegrationTest(unittest.TestCase):
                 )
             )
             await asyncio.wait_for(owner.ready.wait(), timeout=1.0)
-            runtime.navigation.start(5.0, 0.0)
+            runtime.navigation.start(
+                5.0,
+                0.0,
+                local_map=runtime.local_state.local_map,
+                pose=runtime.local_state.pose,
+                vehicle_radius_m=runtime.vehicle.radius,
+            )
             runtime.vehicle.install_drive(0.5, 0.0, 0.0)
             before = (
                 runtime.vehicle.x,

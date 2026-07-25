@@ -8,12 +8,13 @@
 | 数据格式 | JSON 文本消息 |
 | 编码 | UTF-8 |
 | 角色 | 小车 = Server，PC = Client |
-| 默认端口 | 9090 |
+| 默认端口 | 19090 |
 
 除兼容旧客户端的精确 `{"cmd":"..."}` 格式外，每条消息均为 JSON 文本对象，
 顶层必有 `type` 字段。
 
-坐标系：2D 用 `(x, y)`，3D 高度用 `z`，与 Godot 坐标系统一。
+公开协议统一使用 SI 单位：距离为米、时间为秒、角度为弧度、线速度为米/秒、角速度为
+弧度/秒。规范字段以 `_m`、`_s`、`_rad`、`_mps`、`_rps` 明确单位。
 
 ---
 
@@ -65,9 +66,17 @@ Pictor 仅在收到 `hello` 后才认为连接可用，之后才开始处理 `po
 ```json
 {
     "type": "pose",
+    "timestamp_s": 1717800000.123,
     "ts": 1717800000.123,
     "seq": 12,
     "source": "anchored_odometry",
+    "x_m": 1.5,
+    "y_m": 3.2,
+    "z_m": 0.0,
+    "yaw_rad": 0.785,
+    "vx_mps": 0.5,
+    "vy_mps": 0.0,
+    "omega_rps": 0.0,
     "x": 1.5,
     "y": 3.2,
     "z": 0.0,
@@ -85,6 +94,7 @@ Pictor 仅在收到 `hello` 后才认为连接可用，之后才开始处理 `po
         "yaw_rad": 0.785,
         "covariance_diagonal": [0.0, 0.0, 0.0],
         "quality": "nominal",
+        "timestamp_s": 123.0,
         "timestamp": 123.0,
         "revision": 12
     },
@@ -92,7 +102,12 @@ Pictor 仅在收到 `hello` 后才认为连接可用，之后才开始处理 `po
     "navigation": {
         "status": "active",
         "goal": {"x_m": 8.0, "y_m": 3.5},
-        "reason": null
+        "reason": null,
+        "algorithm": "d_star_lite",
+        "path_revision": 3,
+        "replan_count": 1,
+        "current_waypoint": {"x_m": 2.5, "y_m": 3.5},
+        "path": [{"x_m": 1.5, "y_m": 3.5}]
     },
     "safety": {
         "state": "limited",
@@ -105,14 +120,15 @@ Pictor 仅在收到 `hello` 后才认为连接可用，之后才开始处理 `po
 
 | 字段 | 类型 | 单位 | 说明 |
 |------|------|------|------|
-| `ts` | f64 | 秒 | Unix 时间戳 |
+| `timestamp_s` | f64 | 秒 | 规范 Unix 时间戳 |
+| `ts` | f64 | 秒 | 已弃用的 Pictor 兼容别名；值等于 `timestamp_s` |
 | `seq` | u64 | — | 遥测帧序号；紧随其后的 `scan` 使用相同值 |
 | `source` | string | — | 固定为 `anchored_odometry` |
-| `x`, `y` | f32 | 米 | 锚定里程计投影到 `global_map` 的 2D 坐标 |
-| `z` | f32 | 米 | 高度 |
-| `yaw` | f32 | 弧度 | 偏航角 |
-| `vx`, `vy` | f32 | 米/秒 | 2D 速度分量 |
-| `omega` | f32 | 弧度/秒 | 实际角速度；左旋为负，右旋为正 |
+| `x_m`, `y_m`, `z_m` | f32 | 米 | 锚定里程计投影到 `global_map` 的坐标 |
+| `yaw_rad` | f32 | 弧度 | 偏航角 |
+| `vx_mps`, `vy_mps` | f32 | 米/秒 | 2D 速度分量 |
+| `omega_rps` | f32 | 弧度/秒 | 实际角速度；左旋为负，右旋为正 |
+| `x/y/z/yaw/vx/vy/omega` | f32 | SI | 已弃用的 Pictor 兼容别名；值与对应规范字段相同 |
 | `collision` | bool | — | 最近一次平移是否被碰撞截停 |
 | `command` | string | — | 当前有效命令；看门狗超时后为 `stop` |
 | `localization` | object | — | `anchor_map` 中的局部位姿、协方差对角线、质量和 revision |
@@ -121,20 +137,23 @@ Pictor 仅在收到 `hello` 后才认为连接可用，之后才开始处理 `po
 | `safety` | object | — | 最新安全状态、原因、前进方向障碍净空和边缘净空；未发现时净空为 `null` |
 
 `pose` 不再发送绝对仿真真值。小车只保存已知出生锚点
-`global_map → anchor_map`，之后通过物理运动增量更新锚定 odometry。默认零噪声时显示效果
-与旧协议一致；配置噪声后会产生可重放漂移。该估计不是 SLAM，也不保证长期无漂移。
+`global_map → anchor_map`，之后通过运动增量预测锚定 odometry，并用当前 scan 与旧的
+Occupied 证据做有限窗相关匹配。低支持、低得分、离群或歧义匹配不会修正位姿；该局部
+SLAM 前端不含回环、地点识别、位姿图或全局优化，仍可能长期漂移。
 `localization.quality` 为 `nominal`、`degraded` 或 `lost`；`lost` 会阻止自动任务和本地地图写入。
+`localization.timestamp_s` 是规范秒时间戳；`localization.timestamp` 是值相同的弃用别名。
 `navigation.status` 为 `idle`、`active`、`reached`、`blocked` 或 `cancelled`；结束后仍保留目标与原因，便于客户端确认结果。
 
 ---
 
 ### scan — 本地二维激光扫描
 
-每次 `pose` 后发送一帧 **YDLidar Tmini** 风格的局部扫描；Server 按单调时钟以名义 6 Hz 发送这对消息。它只表示小车相对坐标系中的障碍物距离，**不**提供定位、点云、SLAM 或全局地图。
+每次 `pose` 后发送一帧 **YDLidar Tmini** 风格的局部扫描；Server 按单调时钟以名义 6 Hz 发送这对消息。它只表示小车相对坐标系中的障碍物距离，不是点云或全局地图；定位前端会在小车内部将多帧 scan 与 odometry 组合。
 
 ```json
 {
     "type": "scan",
+    "timestamp_s": 1717800000.123,
     "ts": 1717800000.123,
     "seq": 12,
     "frame_id": "laser",
@@ -168,6 +187,8 @@ Pictor 仅在收到 `hello` 后才认为连接可用，之后才开始处理 `po
 
 | 字段 | 类型 | 说明 |
 |------|------|------|
+| `timestamp_s` | f64 | 规范 Unix 时间戳；与同帧 `pose.timestamp_s` 相同 |
+| `ts` | f64 | 已弃用兼容别名；值等于 `timestamp_s` |
 | `frame_id` | string | 固定为小车本地 `laser` 坐标系 |
 | `seq` | u64 | 与同一状态快照的 `pose.seq` 相同 |
 | `config` | object | 一帧的 LaserScan 配置与无回波约定 |
@@ -245,7 +266,7 @@ Pictor 仅在收到 `hello` 后才认为连接可用，之后才开始处理 `po
 | `spin_right` | 右旋 |
 | `stop` | 停止（松手时发送） |
 
-默认运动参数：前进/后退 `±0.5 m/s`；在 `+y` 向下、正 yaw 顺时针的坐标约定中，左旋/右旋为 `∓90°/s`。组合命令同时应用对应线速度与角速度，形成弧线。连续 `1.0 s` 未收到有效非停止命令时，看门狗令车辆停止。这些值可通过 `mockvehicle2d serve` 参数校准。
+默认运动参数：前进/后退 `±0.5 m/s`；在 `+y` 向下、正 yaw 顺时针的坐标约定中，左旋/右旋为 `∓1.5708 rad/s`。组合命令同时应用对应线速度与角速度，形成弧线。连续 `1.0 s` 未收到有效非停止命令时，看门狗令车辆停止。这些值可通过 `mockvehicle2d serve` 参数校准。
 
 ### drive — 连续速度控制
 
@@ -258,7 +279,7 @@ Pictor 仅在收到 `hello` 后才认为连接可用，之后才开始处理 `po
 }
 ```
 
-`linear_mps` 和 `angular_rps` 必须是有限 JSON 数字，布尔值不算数字；绝对值分别不得超过 Server 的 `--linear-speed` 和 `--angular-speed` 配置。字段必须严格为示例中的四项。`0, 0` 等价于停车；非零速度沿用与 `cmd` 相同的看门狗、运动积分和碰撞停车。确认仍使用 `cmd_ack`，其中 `cmd` 为 `"drive"`。
+`linear_mps` 和 `angular_rps` 必须是有限 JSON 数字，布尔值不算数字；绝对值分别不得超过 Server 的 `--linear-speed-mps` 和 `--angular-speed-rps` 配置。字段必须严格为示例中的四项。`0, 0` 等价于停车；非零速度沿用与 `cmd` 相同的看门狗、运动积分和碰撞停车。确认仍使用 `cmd_ack`，其中 `cmd` 为 `"drive"`。
 
 ### goto — 全局锚定目标
 
@@ -272,11 +293,13 @@ Pictor 仅在收到 `hello` 后才认为连接可用，之后才开始处理 `po
 ```
 
 `x_m`、`y_m` 是 `global_map` 中的有限 JSON 数字，字段必须严格为以上四项。Server 用已知
-出生锚点把目标转换到 `anchor_map`，控制器只读取锚定里程计，先对准目标，再沿直线前进并
-在接近目标时减速；它不做 A* 或绕障。定位 `degraded` 时自动线速限制为一半；
+出生锚点把目标转换到 `anchor_map`。控制器只读取 `PoseEstimate` 和 `ObservedGrid`，用
+D* Lite 在有限规划窗中经过高代价 Unknown、避开按车体半径膨胀的 Occupied。扫描 delta
+改变路线时增量修复路径；驶向 Unknown 时主动降速。完整 `map_full` 和 `vehicle.x/y/yaw`
+不参与路径决策。定位 `degraded` 时自动线速限制为一半；
 `lost` 时 `goto_ack.accepted=false` 或活动任务变为 `blocked`，原因为
 `localization_lost`；未结算的旧自动运动不会再积分，但新的人工 `cmd` / `drive` 仍可接管。
-碰撞、安全硬停止或安全输入故障也会立即停车且不会自行重启。
+安全硬停止或安全输入故障也会立即停车。
 
 新的 `goto` 会替换旧目标。任何 `cmd` 或 `drive`（包括 `stop`），以及任何非法输入，都会永久取消当前目标；除非客户端重新发送 `goto`，否则不会恢复自动行驶。连接断开也会停车并取消活动目标。
 
@@ -295,7 +318,8 @@ Pictor 仅在收到 `hello` 后才认为连接可用，之后才开始处理 `po
 `accepted` 只有在目标已进入 `active` 状态时才为 `true`。若旧运动在命令交接时
 已因碰撞或安全门控停止，则返回 `accepted: false`，并以 `reason` 报告
 `collision`、`safety_obstacle`、`safety_edge`、`safety_sensor_fault` 或
-`localization_lost`。
+`localization_lost`。超过规划距离/格数预算或缺少本地定位/地图时也会拒绝，而不会让
+WebSocket 连接崩溃。
 
 ### cmd_ack — 命令确认
 
@@ -345,9 +369,11 @@ map_delta
 
 `map_full` 是 `simulator_ground_truth`，仅供物理、传感器生成和调试显示；`pose` 是
 `anchored_odometry`，`scan` 是模拟的 Tmini 本地观测。扫描会累计到车辆内存中的
-`ObservedGrid`，其 Unknown/Free/Occupied、revision 和 delta 尚未通过 WebSocket 上传。
-车辆 runtime 跨控制器断开重连保留。当前没有 SLAM、scan matching、回环、D* Lite 或中央
-地图同步。
+`ObservedGrid`，D* Lite 在小车内部消费其 Unknown/Free/Occupied、revision 和 delta；
+局部地图 delta 尚未通过 WebSocket 上传。车辆 runtime 跨控制器断开重连保留，但活动
+`goto` 会取消。当前有轻量 scan matching 和局部增量规划，没有回环、位姿图、全局优化、
+地图持久化或中央地图同步。自然语言 `goto_point` / `move_distance` 也进入同一个
+GotoController，不走旧的全真值 A* / PathFollowingController。
 
 ## 安全运行时
 

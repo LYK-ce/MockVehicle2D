@@ -15,11 +15,13 @@ Usage::
 """
 
 from mockvehicle2d.pathfinding.a_star import a_star_search
+from mockvehicle2d.pathfinding.d_star_lite import DStarLitePlanner
 from mockvehicle2d.pathfinding.path_following_controller import PathFollowingController
 from mockvehicle2d.pathfinding.waypoint_follower import ARRIVAL_DISTANCE, ANGLE_TOLERANCE, WAYPOINT_DISTANCE, WaypointFollower
 
 __all__ = [
     "a_star_search",
+    "DStarLitePlanner",
     "PathFollowingController",
     "WaypointFollower",
     "ARRIVAL_DISTANCE",

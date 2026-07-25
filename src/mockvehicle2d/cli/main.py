@@ -69,16 +69,16 @@ def _cmd_serve(args):
         server_main(
             port=args.port,
             vehicle_id=args.vehicle_id,
-            linear_speed=args.linear_speed,
-            angular_speed=math.radians(args.angular_speed),
-            radius=args.vehicle_radius,
-            command_timeout=args.command_timeout,
+            linear_speed=args.linear_speed_mps,
+            angular_speed=args.angular_speed_rps,
+            radius=args.vehicle_radius_m,
+            command_timeout=args.command_timeout_s,
             anchor_id=args.anchor_id,
-            anchor_x_m=args.anchor_x,
-            anchor_y_m=args.anchor_y,
-            anchor_yaw_rad=math.radians(args.anchor_yaw),
-            odometry_translation_noise_stddev_m=args.odom_translation_noise,
-            odometry_yaw_noise_stddev_rad=math.radians(args.odom_yaw_noise),
+            anchor_x_m=args.anchor_x_m,
+            anchor_y_m=args.anchor_y_m,
+            anchor_yaw_rad=args.anchor_yaw_rad,
+            odometry_translation_noise_stddev_m=args.odom_translation_noise_m,
+            odometry_yaw_noise_stddev_rad=args.odom_yaw_noise_rad,
             odometry_seed=args.odom_seed,
         )
     )
@@ -91,15 +91,18 @@ def _cmd_visual(_args):
     visual_main()
 
 
-def _coords(value: str) -> tuple[int, int]:
-    """Parse 'x,y' coordinate pair."""
+def _coords_m(value: str) -> tuple[float, float]:
+    """Parse one finite ``x_m,y_m`` coordinate pair."""
     parts = value.split(",")
     if len(parts) != 2:
         raise argparse.ArgumentTypeError("coordinates must be in the form x,y")
     try:
-        return int(parts[0]), int(parts[1])
+        coordinates = float(parts[0]), float(parts[1])
     except ValueError as error:
-        raise argparse.ArgumentTypeError("coordinates must be integers") from error
+        raise argparse.ArgumentTypeError("coordinates must be metre numbers") from error
+    if not all(math.isfinite(coordinate) for coordinate in coordinates):
+        raise argparse.ArgumentTypeError("coordinates must be finite")
+    return coordinates
 
 
 def _cmd_pathfind(args):
@@ -113,8 +116,11 @@ def _cmd_pathfind(args):
     # walls around the start position so the vehicle can spawn safely
     # (matching server.generate_map's spawn-area clearing).
     random.seed(42)
-    sx, sy = args.start
-    margin = math.ceil(args.vehicle_radius) + 1  # 2-cell radius for r=0.5
+    resolution_m = 1.0
+    start = tuple(math.floor(value / resolution_m) for value in args.start_m)
+    goal = tuple(math.floor(value / resolution_m) for value in args.goal_m)
+    sx, sy = start
+    margin = math.ceil(args.vehicle_radius_m / resolution_m) + 1
     clear_x0, clear_x1 = sx - margin, sx + margin
     clear_y0, clear_y1 = sy - margin, sy + margin
 
@@ -127,14 +133,19 @@ def _cmd_pathfind(args):
                            "state": 1 if is_wall and not in_clear else 0, "conf": 1.0})
     grid = MapGrid.from_voxels(voxels)
 
-    path = a_star_search(grid, args.start, args.goal, vehicle_radius=args.vehicle_radius)
+    path = a_star_search(
+        grid, start, goal, vehicle_radius=args.vehicle_radius_m
+    )
     if path is None:
-        print(f"No path found from {args.start} to {args.goal}")
+        print(f"No path found from {args.start_m} m to {args.goal_m} m")
         sys.exit(1)
     print(f"Path found: {len(path)} waypoints")
     if args.verbose:
         for i, wp in enumerate(path):
-            print(f"  [{i}] {wp}")
+            print(
+                f"  [{i}] x_m={wp[0] * resolution_m:.3f} "
+                f"y_m={wp[1] * resolution_m:.3f}"
+            )
     sys.exit(0)
 
 
@@ -346,10 +357,10 @@ def main():
     serve = sub.add_parser("serve", help="Start controllable WebSocket server with YDLidar Tmini scans")
     serve.add_argument("--port", type=_port, default=19090, metavar="PORT")
     serve.add_argument("--vehicle-id", type=_vehicle_id, default="mock_vehicle_01", metavar="ID")
-    serve.add_argument("--linear-speed", type=_positive_float, default=0.5, metavar="MPS")
-    serve.add_argument("--angular-speed", type=_positive_float, default=90.0, metavar="DEG_PER_SECOND")
-    serve.add_argument("--vehicle-radius", type=_positive_float, default=0.5, metavar="METRES")
-    serve.add_argument("--command-timeout", type=_positive_float, default=1.0, metavar="SECONDS")
+    serve.add_argument("--linear-speed-mps", type=_positive_float, default=0.5, metavar="MPS")
+    serve.add_argument("--angular-speed-rps", type=_positive_float, default=math.pi / 2, metavar="RPS")
+    serve.add_argument("--vehicle-radius-m", type=_positive_float, default=0.5, metavar="M")
+    serve.add_argument("--command-timeout-s", type=_positive_float, default=1.0, metavar="S")
     serve.add_argument("--nl", action="store_true", default=True,
                        help="Enable natural language command processing (default: on)")
     serve.add_argument(
@@ -359,30 +370,30 @@ def main():
         metavar="ID",
         help="Anchor id (default: <vehicle-id>_anchor)",
     )
-    serve.add_argument("--anchor-x", type=_finite_float, default=10.0, metavar="METRES")
-    serve.add_argument("--anchor-y", type=_finite_float, default=10.0, metavar="METRES")
-    serve.add_argument("--anchor-yaw", type=_finite_float, default=0.0, metavar="DEGREES")
+    serve.add_argument("--anchor-x-m", type=_finite_float, default=10.0, metavar="M")
+    serve.add_argument("--anchor-y-m", type=_finite_float, default=10.0, metavar="M")
+    serve.add_argument("--anchor-yaw-rad", type=_finite_float, default=0.0, metavar="RAD")
     serve.add_argument(
-        "--odom-translation-noise",
+        "--odom-translation-noise-m",
         type=_nonnegative_float,
         default=0.0,
-        metavar="METRES",
+        metavar="M",
     )
     serve.add_argument(
-        "--odom-yaw-noise",
+        "--odom-yaw-noise-rad",
         type=_nonnegative_float,
         default=0.0,
-        metavar="DEGREES",
+        metavar="RAD",
     )
     serve.add_argument("--odom-seed", type=_integer, default=0, metavar="INTEGER")
     sub.add_parser("visual", help="Launch Pygame visualization (W/S/A/D driving)")
     sub.add_parser("test", help="Run motion, collision, and Tmini scan tests")
     pathfind = sub.add_parser("pathfind", help="Run A* pathfinding on generated map")
-    pathfind.add_argument("--start", type=_coords, default=(10, 10), metavar="X,Y",
-                          help="Start grid coordinate (default: 10,10)")
-    pathfind.add_argument("--goal", type=_coords, default=(200, 200), metavar="X,Y",
-                          help="Goal grid coordinate (default: 200,200)")
-    pathfind.add_argument("--vehicle-radius", type=_positive_float, default=0.5, metavar="METRES")
+    pathfind.add_argument("--start-m", type=_coords_m, default=(10.0, 10.0), metavar="X_M,Y_M",
+                          help="Start position in metres (default: 10,10)")
+    pathfind.add_argument("--goal-m", type=_coords_m, default=(200.0, 200.0), metavar="X_M,Y_M",
+                          help="Goal position in metres (default: 200,200)")
+    pathfind.add_argument("--vehicle-radius-m", type=_positive_float, default=0.5, metavar="M")
     pathfind.add_argument("--verbose", "-v", action="store_true", help="Print each waypoint")
 
     # ── nl subcommand ───────────────────────────────────────

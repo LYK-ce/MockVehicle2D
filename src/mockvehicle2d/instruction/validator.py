@@ -75,7 +75,9 @@ class SemanticValidator:
         Maximum allowed move_distance (default 10.0).
     """
 
-    def __init__(self, grid: MapGrid, max_distance_m: float = _DEFAULT_MAX_DISTANCE_M) -> None:
+    def __init__(
+        self, grid: MapGrid | None, max_distance_m: float = _DEFAULT_MAX_DISTANCE_M
+    ) -> None:
         self._grid = grid
         self._max_distance_m = max_distance_m
 
@@ -98,6 +100,8 @@ class SemanticValidator:
             return False, "goto_point requires x_m and y_m"
         if not (0 <= x_m <= _MAX_MAP_SIZE and 0 <= y_m <= _MAX_MAP_SIZE):
             return False, f"target ({x_m}, {y_m}) out of map bounds [0, {_MAX_MAP_SIZE}]"
+        if self._grid is None:
+            return True, ""
         gx, gy = int(x_m), int(y_m)
         if not self._grid.in_bounds(gx, gy):
             return False, f"target cell ({gx}, {gy}) out of map bounds"
