@@ -7,6 +7,7 @@ import math
 import random
 import re
 import signal
+import struct
 import time
 
 from mockvehicle2d.instruction.compiler import TaskCompiler
@@ -586,6 +587,42 @@ def _cancel_nl_task(
     return None
 
 
+def _encode_map_chunks(voxels: list[dict[str, object]], map_size: int) -> list[bytes]:
+    """Encode voxels into Pictor-compatible binary chunk frames.
+
+    Each chunk is a 256×256 cell sub-grid, encoded as:
+        [u8 type=0][i32 chunk_x BE][i32 chunk_y BE][65536 bytes cells]
+    Cells use state values directly: 0=free, 1=wall, 2=void.
+    """
+    CHUNK_SIZE = 256
+    cells_per_chunk = CHUNK_SIZE * CHUNK_SIZE
+    # Build flat (gx, gy) → state lookup
+    state = {}
+    for v in voxels:
+        state[(v["gx"], v["gy"])] = v.get("state", 0)
+    chunks = []
+    for chunk_y in range(0, map_size, CHUNK_SIZE):
+        for chunk_x in range(0, map_size, CHUNK_SIZE):
+            cell_bytes = bytearray(cells_per_chunk)
+            for gy in range(CHUNK_SIZE):
+                ay = chunk_y + gy
+                row_offset = gy * CHUNK_SIZE
+                for gx in range(CHUNK_SIZE):
+                    ax = chunk_x + gx
+                    cell_bytes[row_offset + gx] = state.get((ax, ay), 0)
+            header = struct.pack(">Bii", 0, chunk_x, chunk_y)
+            chunks.append(header + bytes(cell_bytes))
+    return chunks
+
+
+async def _send_map_chunks(websocket, chunks: list[bytes], wall_time: float) -> None:
+    """Send map_full as binary chunk frames to Pictor."""
+    total_bytes = sum(len(c) for c in chunks)
+    print(f"[→] sending map_full ({total_bytes} bytes, {len(chunks)} chunk(s))")
+    for chunk in chunks:
+        await websocket.send(chunk)
+
+
 def generate_map(size: int = 256, seed: int = 42, radius: float = 0.5) -> tuple[list[dict[str, object]], MapGrid]:
     """Create the deterministic ground-truth grid and clear the spawn area."""
     rng = random.Random(seed)
@@ -702,15 +739,8 @@ async def handler(
 
     try:
         await websocket.send(json.dumps({"type": "hello", "vehicle_id": vehicle_id}))
-        map_message = {
-            "type": "map_full",
-            "ts": _wall_time(),
-            "source": "simulator_ground_truth",
-            "voxels": voxels,
-        }
-        payload = json.dumps(map_message)
-        print(f"[→] sending map_full ({len(payload)} bytes, {len(voxels)} cells)")
-        await websocket.send(payload)
+        map_chunks = _encode_map_chunks(voxels, 256)
+        await _send_map_chunks(websocket, map_chunks, _wall_time())
 
         while True:
             now = _monotonic()
