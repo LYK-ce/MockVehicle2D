@@ -208,6 +208,29 @@ class TestSemanticValidator:
         ok, msg = self.v.validate(_valid_instruction("goto_point", {"x_m": 300, "y_m": 100}))
         assert not ok
 
+    def test_goto_uses_actual_grid_dimensions(self):
+        validator = SemanticValidator(MapGrid(12, 7))
+        assert validator.validate(
+            _valid_instruction("goto_point", {"x_m": 11.5, "y_m": 6.5})
+        )[0]
+        assert not validator.validate(
+            _valid_instruction("goto_point", {"x_m": 12.0, "y_m": 6.5})
+        )[0]
+
+    @pytest.mark.parametrize("coordinate", [math.nan, math.inf, -math.inf])
+    def test_goto_rejects_non_finite_coordinates(self, coordinate):
+        ok, msg = SemanticValidator(None).validate(
+            _valid_instruction("goto_point", {"x_m": coordinate, "y_m": 1.0})
+        )
+        assert not ok
+        assert "finite" in msg
+
+    def test_goto_without_truth_grid_does_not_apply_absolute_bounds(self):
+        ok, msg = SemanticValidator(None).validate(
+            _valid_instruction("goto_point", {"x_m": 1001.0, "y_m": 1000.0})
+        )
+        assert ok, msg
+
     def test_goto_point_is_wall(self, grid_with_obstacles):
         v = SemanticValidator(grid_with_obstacles)
         ok, msg = v.validate(_valid_instruction("goto_point", {"x_m": 50, "y_m": 50}))

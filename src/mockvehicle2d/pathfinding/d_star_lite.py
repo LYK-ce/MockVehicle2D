@@ -123,6 +123,8 @@ class DStarLitePlanner:
             if changes:
                 self._apply_changes(changes)
         self._replans += 1
+        if self._blocked(start) or self._blocked(goal):
+            return None
         self._compute_shortest_path()
         return self._extract_path()
 

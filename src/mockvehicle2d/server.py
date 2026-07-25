@@ -458,6 +458,28 @@ def _start_estimated_goto(
         navigation.reason = f"invalid_goal: {error}"
 
 
+def _start_estimated_rotation(
+    navigation: GotoController,
+    local_state: AnchoredLocalState,
+    delta_yaw_rad: float,
+) -> None:
+    if local_state.pose.quality == "lost":
+        navigation.status = "blocked"
+        navigation.reason = "localization_lost"
+        return
+    target_yaw_rad = math.atan2(
+        math.sin(local_state.pose.yaw_rad + delta_yaw_rad),
+        math.cos(local_state.pose.yaw_rad + delta_yaw_rad),
+    )
+    _, _, reported_yaw_rad = local_state.anchor.anchor_to_global(
+        0.0, 0.0, target_yaw_rad
+    )
+    navigation.start_rotation(
+        target_yaw_rad,
+        reported_yaw_rad=reported_yaw_rad,
+    )
+
+
 def _handle_nl_command(
     message: dict[str, object],
     vehicle: Vehicle,
@@ -710,18 +732,17 @@ def _handle_nl_command(
     if intent == "rotate":
         angle_deg = params["angle_deg"]
         direction = params["direction"]
-        sign = 1.0 if direction == "left" else -1.0
-        target_yaw = current_yaw_rad + sign * math.radians(angle_deg)
-        # Set a virtual goal 0.1m ahead in the target direction
-        goal_x = current_x_m + 0.1 * math.cos(target_yaw)
-        goal_y = current_y_m + 0.1 * math.sin(target_yaw)
+        sign = -1.0 if direction == "left" else 1.0
         vehicle.stop()
         if path_following is not None:
             path_following.cancel("manual_override")
-        _start_estimated_goto(
-            navigation, vehicle, local_state, goal_x, goal_y
+        _start_estimated_rotation(
+            navigation,
+            local_state,
+            sign * math.radians(angle_deg),
         )
         if navigation.status != "active":
+            state_machine.transition(InstructionState.ACTIVE)
             state_machine.transition(InstructionState.BLOCKED)
             replies.append({
                 "type": "nl_task_update",

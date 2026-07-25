@@ -130,8 +130,9 @@ AABB vs Circle 圆形碰撞
 
 ## 测试
 
-`mockvehicle2d test` 会运行栅格/碰撞、Tmini 扫描、车辆运动、WebSocket
-协议、`goto`、安全策略与延迟执行回归测试。
+`mockvehicle2d test` 使用当前 Python 解释器运行 `tests/` 下的完整 pytest
+测试集，包括有限视野 D* Lite、动态重规划、scan matching、SI 契约、WebSocket
+协议、车辆运动、碰撞与安全回归；任一测试失败时命令返回非零状态。
 
 ## 通信协议
 

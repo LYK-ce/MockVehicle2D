@@ -23,12 +23,16 @@ class GotoController:
     """Plan from one estimated pose and observed map; never read simulator pose truth."""
 
     goal_tolerance_m = 0.1
+    yaw_tolerance_rad = math.radians(2)
     turn_in_place_threshold_rad = math.radians(20)
 
     def __init__(self) -> None:
         self.status = "idle"
+        self.mode = "position"
         self.goal: tuple[float, float] | None = None
         self.reported_goal: tuple[float, float] | None = None
+        self.yaw_goal_rad: float | None = None
+        self.reported_yaw_goal_rad: float | None = None
         self.reason: str | None = None
         self._planner: DStarLitePlanner | None = None
         self._path: list[tuple[int, int]] = []
@@ -51,8 +55,11 @@ class GotoController:
         pose: PoseEstimate,
         vehicle_radius_m: float = 0.5,
     ) -> None:
+        self.mode = "position"
         self.goal = (x_m, y_m)
         self.reported_goal = self.goal if reported_goal is None else reported_goal
+        self.yaw_goal_rad = None
+        self.reported_yaw_goal_rad = None
         self.status = "active"
         self.reason = None
         self._planner = None
@@ -71,6 +78,33 @@ class GotoController:
             )
         )
 
+    def start_rotation(
+        self,
+        yaw_goal_rad: float,
+        *,
+        reported_yaw_rad: float | None = None,
+    ) -> None:
+        if not math.isfinite(yaw_goal_rad) or (
+            reported_yaw_rad is not None and not math.isfinite(reported_yaw_rad)
+        ):
+            raise ValueError("yaw goal must be finite")
+        self.mode = "rotation"
+        self.goal = None
+        self.reported_goal = None
+        self.yaw_goal_rad = _wrap_angle(yaw_goal_rad)
+        self.reported_yaw_goal_rad = _wrap_angle(
+            self.yaw_goal_rad
+            if reported_yaw_rad is None
+            else reported_yaw_rad
+        )
+        self.status = "active"
+        self.reason = None
+        self._planner = None
+        self._path = []
+        self._path_revision = 0
+        self._replan_count = 0
+        self._current_waypoint = None
+
     def cancel(self, reason: str) -> None:
         if self.status == "active":
             self.status = "cancelled"
@@ -87,13 +121,17 @@ class GotoController:
         return True
 
     def snapshot(self) -> dict[str, object]:
-        goal = (
-            None
-            if self.reported_goal is None
-            else {"x_m": self.reported_goal[0], "y_m": self.reported_goal[1]}
-        )
+        if self.mode == "rotation" and self.reported_yaw_goal_rad is not None:
+            goal = {"yaw_rad": self.reported_yaw_goal_rad}
+        else:
+            goal = (
+                None
+                if self.reported_goal is None
+                else {"x_m": self.reported_goal[0], "y_m": self.reported_goal[1]}
+            )
         snapshot: dict[str, object] = {
             "status": self.status,
+            "mode": self.mode,
             "goal": goal,
             "reason": self.reason,
         }
@@ -150,9 +188,10 @@ class GotoController:
         map_delta: LocalMapDelta | None = None,
     ) -> None:
         was_active = self.status == "active"
-        if was_active and (
-            pose is None or local_map is None or self._planner is None
-        ):
+        missing_position_state = self.mode == "position" and (
+            local_map is None or self._planner is None
+        )
+        if was_active and (pose is None or missing_position_state):
             vehicle.stop(now)
             self.status = "blocked"
             self.reason = "local_state_unavailable"
@@ -184,6 +223,31 @@ class GotoController:
             self.status = "blocked"
             self.reason = safety_stop
             vehicle.stop()
+            return
+
+        if self.mode == "rotation":
+            assert pose is not None and self.yaw_goal_rad is not None
+            yaw_error = _wrap_angle(self.yaw_goal_rad - pose.yaw_rad)
+            if abs(yaw_error) <= self.yaw_tolerance_rad:
+                self.status = "reached"
+                self.reason = "yaw_tolerance"
+                vehicle.stop()
+                return
+            angular_rps = max(
+                -vehicle.angular_speed,
+                min(vehicle.angular_speed, 2 * yaw_error),
+            )
+            if safety is not None:
+                decision = safety.evaluate(
+                    vehicle, grid, 0.0, angular_rps, automatic=True
+                )
+                if decision.state in {"stopped", "fault"}:
+                    self.status = "blocked"
+                    self.reason = decision.reason
+                    vehicle.stop()
+                    return
+                angular_rps = decision.angular_rps
+            vehicle.install_drive(0.0, angular_rps, now)
             return
 
         assert self.goal is not None
@@ -269,3 +333,7 @@ class GotoController:
             math.floor(pose.x_m / local_map.resolution_m),
             math.floor(pose.y_m / local_map.resolution_m),
         )
+
+
+def _wrap_angle(angle_rad: float) -> float:
+    return math.atan2(math.sin(angle_rad), math.cos(angle_rad))

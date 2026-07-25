@@ -5,6 +5,7 @@ import inspect
 import math
 from pathlib import Path
 import re
+import subprocess
 import sys
 
 import pytest
@@ -13,7 +14,7 @@ import pytest
 REPO_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO_ROOT / "src"))
 
-from mockvehicle2d.cli.main import main
+from mockvehicle2d.cli.main import _cmd_test, main
 from mockvehicle2d.instruction.compiler import TaskCompiler
 from mockvehicle2d.local_state import (
     AnchorSpec,
@@ -204,6 +205,95 @@ def test_goto_rejects_missing_state_and_resource_exhausting_goal() -> None:
     assert too_far["type"] == "error"
     assert too_far["code"] == "invalid_goto"
     assert "maximum distance" in too_far["message"]
+
+
+def test_shifted_anchor_direct_and_nl_goto_share_relative_bounds() -> None:
+    vehicle = Vehicle(10.0, 10.0, now=0.0)
+    grid = MapGrid(32, 32)
+    state = AnchoredLocalState(
+        AnchorSpec("shifted-anchor", 1000.0, 1000.0, 0.0),
+        truth_x_m=vehicle.x,
+        truth_y_m=vehicle.y,
+        truth_yaw_rad=vehicle.yaw,
+        timestamp=0.0,
+    )
+    direct = handle_command_message(
+        '{"type":"goto","seq":3,"x_m":1001,"y_m":1000}',
+        vehicle,
+        grid,
+        0.0,
+        1.0,
+        GotoController(),
+        local_state=state,
+    )
+    assert direct["accepted"]
+
+    from mockvehicle2d.instruction.llm_client import FakeModelClient
+    from mockvehicle2d.instruction.state_machine import InstructionStateMachine
+    from mockvehicle2d.instruction.validator import SchemaValidator, SemanticValidator
+
+    near_navigation = GotoController()
+    near = _handle_nl_command(
+        {"type": "nl_command", "seq": 4, "text": "去坐标 (1001, 1000)"},
+        vehicle,
+        grid,
+        near_navigation,
+        1.0,
+        0.0,
+        FakeModelClient(),
+        SchemaValidator(),
+        SemanticValidator(None),
+        InstructionStateMachine(),
+        local_state=state,
+    )
+    assert near_navigation.status == "active"
+    assert near[0]["accepted"]
+
+    far_direct = handle_command_message(
+        '{"type":"goto","seq":5,"x_m":1400,"y_m":1000}',
+        vehicle,
+        grid,
+        0.0,
+        1.0,
+        GotoController(),
+        local_state=state,
+    )
+    assert far_direct["type"] == "error"
+    far_navigation = GotoController()
+    far = _handle_nl_command(
+        {"type": "nl_command", "seq": 6, "text": "去坐标 (1400, 1000)"},
+        vehicle,
+        grid,
+        far_navigation,
+        1.0,
+        0.0,
+        FakeModelClient(),
+        SchemaValidator(),
+        SemanticValidator(None),
+        InstructionStateMachine(),
+        local_state=state,
+    )
+    assert far_navigation.status == "blocked"
+    assert any(reply.get("status") == "blocked" for reply in far)
+
+
+def test_test_command_runs_full_pytest_and_propagates_failure(monkeypatch) -> None:
+    captured = {}
+
+    def fail(command, *, cwd):
+        captured["command"] = command
+        captured["cwd"] = cwd
+        return type("Result", (), {"returncode": 7})()
+
+    monkeypatch.setattr(subprocess, "run", fail)
+    with pytest.raises(SystemExit) as stopped:
+        _cmd_test(None)
+    assert stopped.value.code == 7
+    assert captured["command"][:3] == [sys.executable, "-m", "pytest"]
+    assert "-p" in captured["command"]
+    assert "no:cacheprovider" in captured["command"]
+    assert Path(captured["command"][-1]).name == "tests"
+    assert Path(captured["cwd"]) == REPO_ROOT
 
 
 def test_production_navigation_source_has_no_truth_or_legacy_astar_route() -> None:

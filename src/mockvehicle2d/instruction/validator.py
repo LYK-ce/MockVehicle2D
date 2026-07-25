@@ -8,6 +8,7 @@ SafetyValidator   — delegates to existing SafetyRuntime
 from __future__ import annotations
 
 import json
+import math
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -19,7 +20,6 @@ from mockvehicle2d.safety import LocalSafetyRuntime
 
 _SCHEMA_PATH = Path(__file__).resolve().parent / "schemas" / "v1.json"
 
-_MAX_MAP_SIZE = 255
 _DEFAULT_MAX_DISTANCE_M = 10.0
 
 
@@ -98,13 +98,25 @@ class SemanticValidator:
         y_m = params.get("y_m")
         if x_m is None or y_m is None:
             return False, "goto_point requires x_m and y_m"
-        if not (0 <= x_m <= _MAX_MAP_SIZE and 0 <= y_m <= _MAX_MAP_SIZE):
-            return False, f"target ({x_m}, {y_m}) out of map bounds [0, {_MAX_MAP_SIZE}]"
+        try:
+            finite = (
+                not isinstance(x_m, bool)
+                and not isinstance(y_m, bool)
+                and math.isfinite(x_m)
+                and math.isfinite(y_m)
+            )
+        except (TypeError, OverflowError):
+            finite = False
+        if not finite:
+            return False, "goto coordinates must be finite numbers"
         if self._grid is None:
             return True, ""
-        gx, gy = int(x_m), int(y_m)
-        if not self._grid.in_bounds(gx, gy):
-            return False, f"target cell ({gx}, {gy}) out of map bounds"
+        if not (0 <= x_m < self._grid.width and 0 <= y_m < self._grid.height):
+            return False, (
+                f"target ({x_m}, {y_m}) out of map bounds "
+                f"[0, {self._grid.width}) x [0, {self._grid.height})"
+            )
+        gx, gy = math.floor(x_m), math.floor(y_m)
         if self._grid.is_wall(gx, gy):
             return False, f"target cell ({gx}, {gy}) is a wall"
         if self._grid.is_void(gx, gy):

@@ -11,6 +11,8 @@ Usage:
 import argparse
 import asyncio
 import math
+from pathlib import Path
+import subprocess
 import sys
 
 
@@ -150,33 +152,20 @@ def _cmd_pathfind(args):
 
 
 def _cmd_test(_args):
-    """Run deterministic motion, collision, and local scan tests."""
-    import os
-
-    # Add repo root to path so tests/ is importable (src/ layout)
-    repo_root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
-    if repo_root not in sys.path:
-        sys.path.insert(0, repo_root)
-
-    from tests.test_collision import main as collision_main
-    from tests.test_goto import main as goto_main
-    from tests.test_local_state import main as local_state_main
-    from tests.test_safety import main as safety_main
-    from tests.test_safety_runtime import main as safety_runtime_main
-    from tests.test_scan import main as scan_main
-    from tests.test_server_scan import main as server_scan_main
-    from tests.test_vehicle import main as vehicle_main
-
-    sys.exit(
-        collision_main()
-        or scan_main()
-        or vehicle_main()
-        or goto_main()
-        or local_state_main()
-        or safety_main()
-        or safety_runtime_main()
-        or server_scan_main()
+    """Run the complete repository test suite with the active interpreter."""
+    repo_root = Path(__file__).resolve().parents[3]
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "pytest",
+            "-p",
+            "no:cacheprovider",
+            str(repo_root / "tests"),
+        ],
+        cwd=repo_root,
     )
+    raise SystemExit(result.returncode)
 
 
 def _cmd_nl(args):
@@ -387,7 +376,7 @@ def main():
     )
     serve.add_argument("--odom-seed", type=_integer, default=0, metavar="INTEGER")
     sub.add_parser("visual", help="Launch Pygame visualization (W/S/A/D driving)")
-    sub.add_parser("test", help="Run motion, collision, and Tmini scan tests")
+    sub.add_parser("test", help="Run the complete pytest suite")
     pathfind = sub.add_parser("pathfind", help="Run A* pathfinding on generated map")
     pathfind.add_argument("--start-m", type=_coords_m, default=(10.0, 10.0), metavar="X_M,Y_M",
                           help="Start position in metres (default: 10,10)")

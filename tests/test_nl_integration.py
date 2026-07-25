@@ -17,11 +17,12 @@ from mockvehicle2d.instruction.validator import SchemaValidator, SemanticValidat
 from mockvehicle2d.map_grid import MapGrid
 from mockvehicle2d.local_state import AnchorSpec, AnchoredLocalState
 from mockvehicle2d.navigation import GotoController
-from mockvehicle2d.safety import LocalSafetyRuntime
+from mockvehicle2d.safety import LocalSafetyRuntime, SafetyAdvanceResult
 from mockvehicle2d.server import (
     _handle_nl_command,
     _summarize_scan_for_nl,
     _cancel_nl_task,
+    handle_command_message,
 )
 from mockvehicle2d.vehicle import Vehicle
 
@@ -278,22 +279,172 @@ class TestNlCommandClarify:
 class TestNlCommandRotate:
     """NL '左转 90 度' → rotates vehicle."""
 
-    def test_rotate_left_computes_goal(self, vehicle, empty_grid, navigation, nl_client,
-                                        schema_v, semantic_v, state_machine):
-        vehicle.yaw = 0.0
-        msg = {"type": "nl_command", "seq": 8, "text": "左转 90 度"}
-        replies = _handle_nl_command(
-            msg, vehicle, empty_grid, navigation,
-            time.time(), time.monotonic(),
-            nl_client, schema_v, semantic_v,
+    @staticmethod
+    def _run_until_done(
+        vehicle, grid, navigation, local_state, *, ticks=300
+    ):
+        now = vehicle.last_update
+        for _ in range(ticks):
+            now += 0.05
+            collided = vehicle.advance(grid, now)
+            local_state.update_from_truth(
+                vehicle.x,
+                vehicle.y,
+                vehicle.yaw,
+                timestamp=local_state.pose.timestamp + 0.05,
+            )
+            navigation.update(
+                vehicle,
+                grid,
+                now,
+                pose=local_state.pose,
+                advance_result=SafetyAdvanceResult(collided=collided),
+                local_map=local_state.local_map,
+            )
+            assert vehicle.body_velocities()[0] == 0.0
+            if navigation.status != "active":
+                break
+
+    @pytest.mark.parametrize(
+        ("text", "expected_sign"),
+        [("左转 90 度", -1), ("右转 90 度", 1)],
+    )
+    def test_rotate_changes_yaw_and_reaches(
+        self,
+        text,
+        expected_sign,
+        vehicle,
+        empty_grid,
+        navigation,
+        nl_client,
+        schema_v,
+        semantic_v,
+        state_machine,
+        estimated_nl_runtime,
+    ):
+        _handle_nl_command(
+            {"type": "nl_command", "seq": 8, "text": text},
+            vehicle,
+            empty_grid,
+            navigation,
+            time.time(),
+            time.monotonic(),
+            nl_client,
+            schema_v,
+            semantic_v,
             state_machine,
         )
 
         assert navigation.status == "active"
-        goal_x, goal_y = navigation.reported_goal
-        # Target yaw = 0 + pi/2 → goal should be ~(10, 10.1) (0.1m ahead in +y)
-        assert abs(goal_x - 10.0) < 0.15
-        assert goal_y > 10.0
+        assert navigation.snapshot()["goal"].keys() == {"yaw_rad"}
+        navigation.update(
+            vehicle,
+            empty_grid,
+            vehicle.last_update,
+            pose=estimated_nl_runtime.pose,
+            advance_result=SafetyAdvanceResult(),
+            local_map=estimated_nl_runtime.local_map,
+        )
+        assert navigation.status == "active"
+        assert math.copysign(1.0, vehicle.body_velocities()[1]) == expected_sign
+
+        self._run_until_done(
+            vehicle, empty_grid, navigation, estimated_nl_runtime
+        )
+        assert navigation.status == "reached"
+        assert expected_sign * vehicle.yaw > math.radians(85)
+
+    @pytest.mark.parametrize(
+        ("estimated_yaw_rad", "text", "delta_yaw_rad"),
+        [
+            (3.0, "右转 30 度", math.pi / 6),
+            (-3.0, "左转 30 度", -math.pi / 6),
+        ],
+    )
+    def test_rotate_wraps_pi_and_uses_estimate_not_truth(
+        self,
+        estimated_yaw_rad,
+        text,
+        delta_yaw_rad,
+        vehicle,
+        empty_grid,
+        navigation,
+        nl_client,
+        schema_v,
+        semantic_v,
+        state_machine,
+        estimated_nl_runtime,
+    ):
+        estimated_nl_runtime.odometry.apply_correction(
+            0.0, 0.0, estimated_yaw_rad, timestamp=time.time()
+        )
+        _handle_nl_command(
+            {"type": "nl_command", "seq": 81, "text": text},
+            vehicle,
+            empty_grid,
+            navigation,
+            time.time(),
+            time.monotonic(),
+            nl_client,
+            schema_v,
+            semantic_v,
+            state_machine,
+        )
+
+        assert vehicle.yaw == 0.0
+        assert navigation.yaw_goal_rad == pytest.approx(
+            math.atan2(
+                math.sin(estimated_yaw_rad + delta_yaw_rad),
+                math.cos(estimated_yaw_rad + delta_yaw_rad),
+            )
+        )
+
+    def test_rotate_lost_and_manual_override_use_existing_gates(
+        self,
+        vehicle,
+        empty_grid,
+        navigation,
+        nl_client,
+        schema_v,
+        semantic_v,
+        state_machine,
+        estimated_nl_runtime,
+    ):
+        estimated_nl_runtime.set_localization_quality(
+            "lost", timestamp=time.time()
+        )
+        replies = _handle_nl_command(
+            {"type": "nl_command", "seq": 82, "text": "左转 90 度"},
+            vehicle,
+            empty_grid,
+            navigation,
+            time.time(),
+            time.monotonic(),
+            nl_client,
+            schema_v,
+            semantic_v,
+            state_machine,
+        )
+        assert navigation.status == "blocked"
+        assert any(
+            reply.get("reason") == "localization_lost" for reply in replies
+        )
+
+        estimated_nl_runtime.set_localization_quality(
+            "nominal", timestamp=time.time()
+        )
+        navigation.start_rotation(1.0)
+        reply = handle_command_message(
+            '{"type":"cmd","seq":83,"cmd":"stop"}',
+            vehicle,
+            empty_grid,
+            vehicle.last_update,
+            time.time(),
+            navigation,
+            local_state=estimated_nl_runtime,
+        )
+        assert reply["accepted"]
+        assert navigation.status == "cancelled"
 
 
 class TestNlCommandScan:
@@ -624,20 +775,15 @@ class TestFullPipeline:
         assert abs(goal_x - 11.0) < 0.1
         assert abs(goal_y - 10.0) < 0.1
 
-    def test_pipeline_rotate_computes_goal_nearby(self, vehicle, empty_grid,
-                                                   navigation, nl_client, schema_v,
-                                                   semantic_v, state_machine):
-        """Rotate should set a goal very close to current position."""
-        vehicle.yaw = 0.0
-        msg = {"type": "nl_command", "seq": 25, "text": "右转 90 度"}
+    def test_pipeline_rotate_reports_si_yaw_goal(self, vehicle, empty_grid,
+                                                  navigation, nl_client, schema_v,
+                                                  semantic_v, state_machine):
         _handle_nl_command(
-            msg, vehicle, empty_grid, navigation,
+            {"type": "nl_command", "seq": 25, "text": "右转 90 度"},
+            vehicle, empty_grid, navigation,
             time.time(), time.monotonic(),
-            nl_client, schema_v, semantic_v,
-            state_machine,
+            nl_client, schema_v, semantic_v, state_machine,
         )
-        assert navigation.status == "active"
-        goal_x, goal_y = navigation.reported_goal
-        # Goal should be ~0.1m from vehicle
-        dist = math.hypot(goal_x - 10.0, goal_y - 10.0)
-        assert 0.05 < dist < 0.2, f"expected goal ~0.1m from vehicle, got {dist:.3f}m"
+        assert navigation.snapshot()["goal"] == {
+            "yaw_rad": pytest.approx(math.pi / 2)
+        }

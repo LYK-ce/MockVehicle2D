@@ -113,6 +113,58 @@ def test_no_route_returns_none() -> None:
     assert search.plan((0, 0), (4, 3), changed_cells=wall) is None
 
 
+@pytest.mark.parametrize("blocked", [(0, 0), (4, 0)])
+def test_occupied_start_or_goal_returns_none(blocked: tuple[int, int]) -> None:
+    search = planner()
+    assert search.plan(
+        (0, 0),
+        (4, 0),
+        changed_cells=(MapCellUpdate(*blocked, OCCUPIED),),
+    ) is None
+
+
+def test_blocked_start_equals_goal_returns_none_but_free_returns_singleton() -> None:
+    search = planner()
+    assert search.plan((2, 2), (2, 2)) == [(2, 2)]
+    assert search.plan(
+        (2, 2),
+        (2, 2),
+        changed_cells=(MapCellUpdate(2, 2, OCCUPIED),),
+    ) is None
+
+
+def test_inflated_start_or_goal_and_overlapping_removal_stay_blocked() -> None:
+    search = DStarLitePlanner(
+        ObservedGrid(ANCHOR),
+        vehicle_radius_m=1.0,
+        bounds_margin_m=3.0,
+    )
+    assert search.plan(
+        (0, 0),
+        (4, 0),
+        changed_cells=(
+            MapCellUpdate(4, -1, OCCUPIED),
+            MapCellUpdate(4, 1, OCCUPIED),
+        ),
+    ) is None
+    assert search.plan(
+        (0, 0),
+        (4, 0),
+        changed_cells=(MapCellUpdate(4, -1, FREE),),
+    ) is None
+    assert search.plan(
+        (0, 0),
+        (4, 0),
+        changed_cells=(MapCellUpdate(4, 1, FREE),),
+    ) is not None
+
+    assert search.plan(
+        (0, 0),
+        (4, 0),
+        changed_cells=(MapCellUpdate(0, 1, OCCUPIED),),
+    ) is None
+
+
 def test_goal_and_cell_budget_are_validated() -> None:
     search = planner(max_goal_distance_m=10.0, max_cells=100)
     with pytest.raises(ValueError, match="goal"):
