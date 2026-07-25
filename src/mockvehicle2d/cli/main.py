@@ -212,8 +212,15 @@ def _cmd_nl(args):
         print("error: missing NL text (use --interactive or provide text argument)")
         sys.exit(1)
 
-    client = FakeModelClient()
-    instruction = client.parse(text)
+    if args.vllm:
+        import asyncio
+        from mockvehicle2d.instruction.llm_client import VLLMClient
+        client = VLLMClient()
+        instruction = asyncio.run(client.parse(text))
+    else:
+        client = FakeModelClient()
+        instruction = client.parse(text)
+
     if instruction is None:
         print("parse failed: no result")
         sys.exit(1)
@@ -313,6 +320,8 @@ def main():
     serve.add_argument("--angular-speed", type=_positive_float, default=90.0, metavar="DEG_PER_SECOND")
     serve.add_argument("--vehicle-radius", type=_positive_float, default=0.5, metavar="METRES")
     serve.add_argument("--command-timeout", type=_positive_float, default=1.0, metavar="SECONDS")
+    serve.add_argument("--nl", action="store_true", default=True,
+                       help="Enable natural language command processing (default: on)")
     sub.add_parser("visual", help="Launch Pygame visualization (W/S/A/D driving)")
     sub.add_parser("test", help="Run motion, collision, and Tmini scan tests")
     pathfind = sub.add_parser("pathfind", help="Run A* pathfinding on generated map")
