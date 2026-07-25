@@ -26,7 +26,9 @@ class _StopAfterScanSocket:
     def __init__(self) -> None:
         self.messages: list[dict[str, object]] = []
 
-    async def send(self, payload: str) -> None:
+    async def send(self, payload: str | bytes) -> None:
+        if isinstance(payload, bytes):
+            return
         self.messages.append(json.loads(payload))
         if len(self.messages) == 4:
             raise RuntimeError("stop after first scan")
@@ -39,7 +41,9 @@ class _CommandSocket:
         self.command = command
         self.messages: list[dict[str, object]] = []
 
-    async def send(self, payload: str) -> None:
+    async def send(self, payload: str | bytes) -> None:
+        if isinstance(payload, bytes):
+            return
         self.messages.append(json.loads(payload))
         if len(self.messages) == 5:
             raise RuntimeError("stop after command reply")
@@ -63,7 +67,9 @@ class _IdleTimeoutSocket:
         self.clock = clock
         self.messages: list[dict[str, object]] = []
 
-    async def send(self, payload: str) -> None:
+    async def send(self, payload: str | bytes) -> None:
+        if isinstance(payload, bytes):
+            return
         self.messages.append(json.loads(payload))
         if len(self.messages) == 6:
             raise RuntimeError("stop after telemetry following idle timeout")
@@ -123,15 +129,14 @@ class ScanMessageTest(unittest.TestCase):
         websocket = _StopAfterScanSocket()
         asyncio.run(handler(websocket, vehicle_id="pictor_test-1"))
         self.assertEqual(
-            [message["type"] for message in websocket.messages], ["hello", "map_full", "pose", "scan"]
+            [message["type"] for message in websocket.messages], ["hello", "pose", "scan"]
         )
         self.assertEqual(websocket.messages[0], {"type": "hello", "vehicle_id": "pictor_test-1"})
-        self.assertEqual(websocket.messages[2]["x"], 10.0)
+        self.assertEqual(websocket.messages[1]["x"], 10.0)
         self.assertEqual(websocket.messages[1]["source"], "simulator_ground_truth")
-        self.assertEqual(websocket.messages[2]["source"], "simulator_ground_truth")
-        self.assertEqual(websocket.messages[2]["command"], "stop")
+        self.assertEqual(websocket.messages[1]["command"], "stop")
         self.assertEqual(
-            websocket.messages[2]["safety"],
+            websocket.messages[1]["safety"],
             {
                 "state": "clear",
                 "reason": None,
@@ -139,9 +144,8 @@ class ScanMessageTest(unittest.TestCase):
                 "edge_clearance_m": None,
             },
         )
-        self.assertTrue(any(voxel["state"] == 2 for voxel in websocket.messages[1]["voxels"]))
-        self.assertEqual(websocket.messages[2]["seq"], websocket.messages[3]["seq"])
-        self.assertEqual(websocket.messages[2]["ts"], websocket.messages[3]["ts"])
+        self.assertEqual(websocket.messages[1]["seq"], websocket.messages[2]["seq"])
+        self.assertEqual(websocket.messages[1]["ts"], websocket.messages[2]["ts"])
         self.assertEqual(websocket.messages[-1]["config"]["model"], "ydlidar_tmini")
 
     def test_vehicle_id_is_safe_for_pictor_names_and_logs(self) -> None:
@@ -175,7 +179,7 @@ class ScanMessageTest(unittest.TestCase):
         )
         asyncio.run(handler(accepted))
         self.assertEqual(
-            [message["type"] for message in accepted.messages], ["hello", "map_full", "pose", "scan", "cmd_ack"]
+            [message["type"] for message in accepted.messages], ["hello", "pose", "scan", "cmd_ack"]
         )
         self.assertEqual(accepted.messages[-1]["seq"], 3)
         self.assertEqual(accepted.messages[-1]["cmd"], "drive")
@@ -185,7 +189,7 @@ class ScanMessageTest(unittest.TestCase):
         )
         asyncio.run(handler(rejected))
         self.assertEqual(
-            [message["type"] for message in rejected.messages], ["hello", "map_full", "pose", "scan", "error"]
+            [message["type"] for message in rejected.messages], ["hello", "pose", "scan", "error"]
         )
         self.assertEqual(rejected.messages[-1]["seq"], 4)
         self.assertEqual(rejected.messages[-1]["code"], "drive_out_of_range")
@@ -201,7 +205,7 @@ class ScanMessageTest(unittest.TestCase):
 
         self.assertEqual(
             [message["type"] for message in websocket.messages],
-            ["hello", "map_full", "pose", "scan", "pose", "scan"],
+            ["hello", "pose", "scan", "pose", "scan"],
         )
 
 

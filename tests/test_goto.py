@@ -39,7 +39,9 @@ class _GotoSocket:
         self.messages: list[dict[str, object]] = []
         self.receive_count = 0
 
-    async def send(self, payload: str) -> None:
+    async def send(self, payload: str | bytes) -> None:
+        if isinstance(payload, bytes):
+            return  # skip binary frames (map_full chunks)
         self.messages.append(json.loads(payload))
         if len(self.messages) == 7:
             raise RuntimeError("stop after autonomous telemetry")
