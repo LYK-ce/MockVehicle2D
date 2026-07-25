@@ -189,16 +189,25 @@ _SYSTEM_PROMPT = """你是一个车辆指令解析器。将用户的自然语言
 
 
 class VLLMClient:
-    """Async client for local vLLM (OpenAI-compatible API).
+    """Async client for LLM inference (llama.cpp / vLLM OpenAI-compatible API).
+
+    Currently configured for llama.cpp server.
 
     Parameters
     ----------
     base_url : str
-        vLLM OpenAI-compatible API endpoint.
+        OpenAI-compatible API endpoint (default: llama.cpp local server).
+    model : str
+        Model name as registered in the server.
     """
 
-    def __init__(self, base_url: str = "http://localhost:8000/v1") -> None:
+    def __init__(
+        self,
+        base_url: str = "http://localhost:8000/v1",
+        model: str = "Qwen3-8B-Q4_K_M",
+    ) -> None:
         self._base_url = base_url
+        self._model = model
         self._client = None  # Lazy init
 
     @property
@@ -210,25 +219,32 @@ class VLLMClient:
         return self._client
 
     async def parse(self, text: str) -> dict | None:
-        """Send text to Qwen3-8B-Instruct and return parsed JSON dict.
+        """Send text to the LLM and return parsed JSON dict.
 
         Returns None on parse failure or timeout.
         """
+        import re
+
         try:
             response = await self._async_client.chat.completions.create(
-                model="Qwen/Qwen3-8B-Instruct",
+                model=self._model,
                 messages=[
                     {"role": "system", "content": _SYSTEM_PROMPT},
                     {"role": "user", "content": text},
                 ],
                 temperature=0.1,
                 max_tokens=512,
-                response_format={"type": "json_object"},
-                timeout=2.0,
+                extra_body={"enable_thinking": False},
+                timeout=10.0,
             )
             content = response.choices[0].message.content
             if content is None:
                 return None
+            # Strip <think>...</think> tags if present (Qwen3 thinking mode)
+            content = re.sub(r"<think>.*?</think>\s*", "", content, flags=re.DOTALL).strip()
+            # Strip markdown code fences if present
+            content = re.sub(r"^```(?:json)?\s*", "", content)
+            content = re.sub(r"\s*```$", "", content)
             return json.loads(content)
         except Exception:
             return None
