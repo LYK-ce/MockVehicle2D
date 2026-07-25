@@ -198,9 +198,11 @@ class _StopAfterScanSocket:
     def __init__(self) -> None:
         self.messages: list[dict[str, object]] = []
 
-    async def send(self, payload: str) -> None:
+    async def send(self, payload: str | bytes) -> None:
+        if isinstance(payload, bytes):
+            return
         self.messages.append(json.loads(payload))
-        if len(self.messages) == 4:
+        if len(self.messages) == 3:
             raise RuntimeError("stop after scan")
 
 
@@ -212,9 +214,11 @@ class _HeldControllerSocket:
         self.ready = asyncio.Event()
         self.disconnect = asyncio.Event()
 
-    async def send(self, payload: str) -> None:
+    async def send(self, payload: str | bytes) -> None:
+        if isinstance(payload, bytes):
+            return
         self.messages.append(json.loads(payload))
-        if len(self.messages) == 4:
+        if len(self.messages) == 3:
             self.ready.set()
 
     async def recv(self) -> str:
@@ -228,9 +232,11 @@ class _BusyControllerSocket:
     def __init__(self) -> None:
         self.messages: list[dict[str, object]] = []
 
-    async def send(self, payload: str) -> None:
+    async def send(self, payload: str | bytes) -> None:
+        if isinstance(payload, bytes):
+            return
         self.messages.append(json.loads(payload))
-        if len(self.messages) == 4:
+        if len(self.messages) == 3:
             raise RuntimeError("stop unguarded second handler")
 
 
@@ -464,7 +470,7 @@ class RuntimeIntegrationTest(unittest.TestCase):
             self.assertGreater(runtime.local_state.pose.revision, pose_revision)
             self.assertGreaterEqual(runtime.local_state.local_map.revision, map_revision)
             self.assertEqual(
-                replacement.messages[2]["localization"]["revision"],
+                replacement.messages[1]["localization"]["revision"],
                 runtime.local_state.pose.revision,
             )
 
@@ -487,7 +493,7 @@ class RuntimeIntegrationTest(unittest.TestCase):
         self.assertGreater(runtime.local_state.pose.revision, first_pose_revision)
         self.assertGreater(first_map_revision, 0)
         self.assertGreaterEqual(runtime.local_state.local_map.revision, first_map_revision)
-        self.assertEqual(second.messages[2]["localization"]["revision"], runtime.local_state.pose.revision)
+        self.assertEqual(second.messages[1]["localization"]["revision"], runtime.local_state.pose.revision)
 
     def test_navigation_does_not_query_world_grid_cells(self) -> None:
         source = (REPO_ROOT / "src/mockvehicle2d/navigation.py").read_text(encoding="utf-8")
