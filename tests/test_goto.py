@@ -267,11 +267,11 @@ class GotoTest(unittest.TestCase):
 
         self.assertEqual(
             [message["type"] for message in websocket.messages],
-            ["hello", "map_full", "pose", "scan", "goto_ack", "pose", "scan"],
+            ["hello", "pose", "scan", "goto_ack", "pose", "scan"],
         )
-        self.assertEqual(websocket.messages[4]["seq"], 21)
-        self.assertEqual(websocket.messages[5]["control_mode"], "autonomous")
-        self.assertEqual(websocket.messages[5]["navigation"]["status"], "active")
+        self.assertEqual(websocket.messages[3]["seq"], 21)
+        self.assertEqual(websocket.messages[4]["control_mode"], "autonomous")
+        self.assertEqual(websocket.messages[4]["navigation"]["status"], "active")
 
 
 def main() -> int:
