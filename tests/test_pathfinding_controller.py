@@ -72,7 +72,7 @@ class TestPathFollowingBasic:
         assert path_following.control_mode == "autonomous"
         snap = path_following.snapshot()
         assert snap["status"] == "active"
-        assert snap["goal"] == {"x": 20, "y": 10}
+        assert snap["goal"] == {"x_m": 20, "y_m": 10}
         assert snap["path_length"] == 2
 
     def test_path_too_short_raises(self, path_following):

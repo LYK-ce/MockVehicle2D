@@ -81,7 +81,7 @@ class PathFollowingController:
         return {
             "status": self.status,
             "goal": (
-                {"x": self._follower.goal[0], "y": self._follower.goal[1]}
+                {"x_m": self._follower.goal[0], "y_m": self._follower.goal[1]}
                 if self._follower is not None
                 else None
             ),
@@ -163,10 +163,6 @@ class PathFollowingController:
         elif cmd == "spin_right":
             linear_mps = 0.0
             angular_rps = vehicle.angular_speed
-        elif cmd == "stop":
-            # Already handled by reached check above, but guard here too
-            vehicle.stop()
-            return
 
         # Step 4 — safety evaluation
         if safety is not None:

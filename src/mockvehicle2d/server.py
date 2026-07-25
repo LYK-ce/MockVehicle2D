@@ -197,6 +197,8 @@ def handle_command_message(
             if navigation is None:
                 raise CommandMessageError("goto_unavailable", "goto controller is unavailable", seq)
             vehicle.stop()
+            if path_following is not None:
+                path_following.cancel("manual_override")
             navigation.start(x_m, y_m)
             if handoff_collided:
                 navigation.status = "blocked"
@@ -619,6 +621,8 @@ def _handle_nl_command(
         goal_x = vehicle.x + 0.1 * math.cos(target_yaw)
         goal_y = vehicle.y + 0.1 * math.sin(target_yaw)
         vehicle.stop()
+        if path_following is not None:
+            path_following.cancel("manual_override")
         navigation.start(goal_x, goal_y)
         if navigation.status != "active":
             state_machine.transition(InstructionState.BLOCKED)
