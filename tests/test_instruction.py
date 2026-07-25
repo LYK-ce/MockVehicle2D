@@ -487,15 +487,33 @@ class TestTaskCompiler:
         assert task["goal"]["x_m"] == 15.0
         assert task["goal"]["y_m"] == 20.0
 
-    def test_compile_rotate(self):
-        inst = _valid_instruction("rotate", {"angle_deg": 90, "direction": "left"})
-        snapshot = {"pose": {"yaw_rad": 0.0}}
+    @pytest.mark.parametrize(
+        ("direction", "current_yaw_rad", "delta_yaw_rad"),
+        [
+            ("left", 0.0, -math.pi / 2),
+            ("right", 0.0, math.pi / 2),
+            ("left", 3.0, -math.pi / 2),
+            ("right", 3.0, math.pi / 2),
+            ("left", -3.0, -math.pi / 2),
+            ("right", -3.0, math.pi / 2),
+        ],
+    )
+    def test_compile_rotate(self, direction, current_yaw_rad, delta_yaw_rad):
+        inst = _valid_instruction("rotate", {"angle_deg": 90, "direction": direction})
+        snapshot = {"pose": {"yaw_rad": current_yaw_rad}}
         task = self.compiler.compile(inst, snapshot)
+        expected_yaw_rad = math.atan2(
+            math.sin(current_yaw_rad + delta_yaw_rad),
+            math.cos(current_yaw_rad + delta_yaw_rad),
+        )
         assert task["type"] == "rotation"
         assert task["action"] == "rotate"
         assert task["angle_rad"] == pytest.approx(math.pi / 2)
-        assert task["direction"] == "left"
-        assert abs(task["target_yaw_rad"] - math.pi / 2) < 1e-5
+        assert "angle_deg" not in task
+        assert task["direction"] == direction
+        assert task["target_yaw_rad"] == pytest.approx(
+            round(expected_yaw_rad, 4)
+        )
 
     def test_compile_scan_report(self):
         inst = _valid_instruction("scan_report", {"query": "前方"})

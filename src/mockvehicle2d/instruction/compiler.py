@@ -148,7 +148,7 @@ class TaskCompiler:
         # Compute target yaw
         pose = snapshot.get("pose", {})
         current_yaw = pose.get("yaw_rad", 0.0)
-        sign = 1.0 if direction == "left" else -1.0
+        sign = -1.0 if direction == "left" else 1.0
         target_yaw = current_yaw + sign * math.radians(angle_deg)
         target_yaw = math.atan2(math.sin(target_yaw), math.cos(target_yaw))
         return self._make_task("rotation", {
