@@ -16,6 +16,7 @@ from mockvehicle2d.instruction.state_machine import InstructionState, Instructio
 from mockvehicle2d.instruction.validator import SchemaValidator, SemanticValidator
 from mockvehicle2d.map_grid import MapGrid, VOID
 from mockvehicle2d.navigation import GotoController
+from mockvehicle2d.pathfinding import PathFollowingController
 from mockvehicle2d.safety import LocalSafetyRuntime
 from mockvehicle2d.scan import TMINI_SCAN_CONFIG, scan_message
 from mockvehicle2d.vehicle import COMMANDS, Vehicle
@@ -170,6 +171,7 @@ def handle_command_message(
     wall_timestamp: float,
     navigation: GotoController | None = None,
     safety: LocalSafetyRuntime | None = None,
+    path_following: PathFollowingController | None = None,
 ) -> dict[str, object]:
     """Advance the prior command, then acknowledge or fail-safe stop."""
     if safety is None:
@@ -180,7 +182,10 @@ def handle_command_message(
             vehicle,
             grid,
             monotonic_now,
-            automatic=navigation is not None and navigation.status == "active",
+            automatic=(
+                (navigation is not None and navigation.status == "active")
+                or (path_following is not None and path_following.status == "active")
+            ),
         )
         handoff_collided = handoff.collided
         handoff_safety_stop = handoff.reason if handoff.stopped else None
@@ -220,6 +225,8 @@ def handle_command_message(
             linear_mps, angular_rps = vehicle.velocities_for_command(command)
         if navigation is not None:
             navigation.cancel("manual_override")
+        if path_following is not None:
+            path_following.cancel("manual_override")
         decision = (
             safety.enforce_manual(vehicle, grid, (linear_mps, angular_rps))
             if safety is not None
@@ -237,6 +244,8 @@ def handle_command_message(
         vehicle.stop()
         if navigation is not None:
             navigation.cancel("invalid_command")
+        if path_following is not None:
+            path_following.cancel("invalid_command")
         return {
             "type": "error",
             "ts": wall_timestamp,
@@ -270,6 +279,7 @@ def _handle_nl_command(
     state_machine: InstructionStateMachine,
     task_compiler: TaskCompiler,
     scan_data: dict[str, object] | None = None,
+    path_following: PathFollowingController | None = None,
 ) -> list[dict[str, object]]:
     """Process one nl_command message. Returns a list of reply dicts to send."""
     seq = message.get("seq")
@@ -382,6 +392,8 @@ def _handle_nl_command(
     if intent == "stop":
         vehicle.stop()
         navigation.cancel("nl_stop")
+        if path_following is not None:
+            path_following.cancel("nl_stop")
         state_machine.transition(InstructionState.ACTIVE)
         state_machine.transition(InstructionState.COMPLETED)
         replies.append({
@@ -425,9 +437,70 @@ def _handle_nl_command(
     if intent == "goto_point":
         x_m = params["x_m"]
         y_m = params["y_m"]
+        # Phase 3: use task compiler to decide controller
+        pose_snap = {"pose": {"x": vehicle.x, "y": vehicle.y, "yaw": vehicle.yaw}}
+        task = task_compiler.compile(instruction, pose_snap)
+        controller_choice = task.get("controller", "GotoController")
+
+        if controller_choice == "blocked":
+            # Go through ACTIVE first (state machine: ACCEPTED→ACTIVE→BLOCKED)
+            state_machine.transition(InstructionState.ACTIVE)
+            state_machine.transition(InstructionState.BLOCKED)
+            replies.append({
+                "type": "nl_task_update",
+                "ts": wall_timestamp,
+                "seq": seq,
+                "status": "blocked",
+                "reason": task.get("reason", "no path found"),
+            })
+            state_machine.transition(InstructionState.IDLE)
+            return replies
+
         vehicle.stop()
+        if controller_choice == "PathFollowingController" and path_following is not None:
+            path = task.get("path")
+            if not path or len(path) < 2:
+                state_machine.transition(InstructionState.ACTIVE)
+                state_machine.transition(InstructionState.BLOCKED)
+                replies.append({
+                    "type": "nl_task_update",
+                    "ts": wall_timestamp,
+                    "seq": seq,
+                    "status": "blocked",
+                    "reason": "invalid path",
+                })
+                state_machine.transition(InstructionState.IDLE)
+                return replies
+            navigation.cancel("path_following_active")
+            path_following.start(path)
+            if path_following.status != "active":
+                state_machine.transition(InstructionState.ACTIVE)
+                state_machine.transition(InstructionState.BLOCKED)
+                replies.append({
+                    "type": "nl_task_update",
+                    "ts": wall_timestamp,
+                    "seq": seq,
+                    "status": "blocked",
+                    "reason": path_following.reason or "path rejected",
+                })
+                state_machine.transition(InstructionState.IDLE)
+                return replies
+            state_machine.transition(InstructionState.ACTIVE)
+            replies.append({
+                "type": "nl_task_update",
+                "ts": wall_timestamp,
+                "seq": seq,
+                "status": "active",
+                "reason": f"path-following to ({x_m}, {y_m}) via {len(path)} waypoints",
+            })
+            return replies
+
+        # Default: GotoController
+        if path_following is not None:
+            path_following.cancel("goto_active")
         navigation.start(x_m, y_m)
         if navigation.status != "active":
+            state_machine.transition(InstructionState.ACTIVE)
             state_machine.transition(InstructionState.BLOCKED)
             replies.append({
                 "type": "nl_task_update",
@@ -454,9 +527,69 @@ def _handle_nl_command(
         sign = 1.0 if direction == "forward" else -1.0
         goal_x = vehicle.x + sign * distance_m * math.cos(vehicle.yaw)
         goal_y = vehicle.y + sign * distance_m * math.sin(vehicle.yaw)
+        # Phase 3: use task compiler to decide controller
+        pose_snap = {"pose": {"x": vehicle.x, "y": vehicle.y, "yaw": vehicle.yaw}}
+        task = task_compiler.compile(instruction, pose_snap)
+        controller_choice = task.get("controller", "GotoController")
+
+        if controller_choice == "blocked":
+            state_machine.transition(InstructionState.ACTIVE)
+            state_machine.transition(InstructionState.BLOCKED)
+            replies.append({
+                "type": "nl_task_update",
+                "ts": wall_timestamp,
+                "seq": seq,
+                "status": "blocked",
+                "reason": task.get("reason", "no path found"),
+            })
+            state_machine.transition(InstructionState.IDLE)
+            return replies
+
         vehicle.stop()
+        if controller_choice == "PathFollowingController" and path_following is not None:
+            path = task.get("path")
+            if not path or len(path) < 2:
+                state_machine.transition(InstructionState.ACTIVE)
+                state_machine.transition(InstructionState.BLOCKED)
+                replies.append({
+                    "type": "nl_task_update",
+                    "ts": wall_timestamp,
+                    "seq": seq,
+                    "status": "blocked",
+                    "reason": "invalid path",
+                })
+                state_machine.transition(InstructionState.IDLE)
+                return replies
+            navigation.cancel("path_following_active")
+            path_following.start(path)
+            if path_following.status != "active":
+                state_machine.transition(InstructionState.ACTIVE)
+                state_machine.transition(InstructionState.BLOCKED)
+                replies.append({
+                    "type": "nl_task_update",
+                    "ts": wall_timestamp,
+                    "seq": seq,
+                    "status": "blocked",
+                    "reason": path_following.reason or "move_distance path rejected",
+                })
+                state_machine.transition(InstructionState.IDLE)
+                return replies
+            state_machine.transition(InstructionState.ACTIVE)
+            replies.append({
+                "type": "nl_task_update",
+                "ts": wall_timestamp,
+                "seq": seq,
+                "status": "active",
+                "reason": f"path-following {direction} {distance_m}m via {len(path)} waypoints",
+            })
+            return replies
+
+        # Default: GotoController
+        if path_following is not None:
+            path_following.cancel("goto_active")
         navigation.start(goal_x, goal_y)
         if navigation.status != "active":
+            state_machine.transition(InstructionState.ACTIVE)
             state_machine.transition(InstructionState.BLOCKED)
             replies.append({
                 "type": "nl_task_update",
@@ -568,11 +701,14 @@ def _cancel_nl_task(
     navigation: GotoController,
     state_machine: InstructionStateMachine,
     reason: str,
+    path_following: PathFollowingController | None = None,
 ) -> dict[str, object] | None:
     """Cancel any active NL task and return the nl_task_update to send, or None."""
     current = state_machine.current_state
     if current in (InstructionState.ACCEPTED, InstructionState.ACTIVE, InstructionState.CONFIRMING):
         navigation.cancel(reason)
+        if path_following is not None:
+            path_following.cancel(reason)
         state_machine.transition(InstructionState.CANCELLED)
         update: dict[str, object] = {
             "type": "nl_task_update",
@@ -655,10 +791,21 @@ def telemetry_messages(
     sequence: int,
     timestamp: float,
     navigation: GotoController | None = None,
+    path_following: PathFollowingController | None = None,
     safety: LocalSafetyRuntime | None = None,
 ) -> tuple[dict[str, object], dict[str, object]]:
     """Build a pose/scan pair from one state snapshot and wall-clock timestamp."""
     vx, vy, omega = vehicle.velocities()
+    # Determine control_mode: PathFollowingController wins if both are active
+    if path_following is not None and path_following.status == "active":
+        control_mode = path_following.control_mode
+        nav_snapshot = path_following.snapshot()
+    elif navigation is not None:
+        control_mode = navigation.control_mode
+        nav_snapshot = navigation.snapshot()
+    else:
+        control_mode = "manual"
+        nav_snapshot = {"status": "idle", "goal": None, "reason": None}
     pose = {
         "type": "pose",
         "ts": timestamp,
@@ -673,12 +820,8 @@ def telemetry_messages(
         "omega": omega,
         "collision": vehicle.collision,
         "command": vehicle.command,
-        "control_mode": navigation.control_mode if navigation is not None else "manual",
-        "navigation": (
-            navigation.snapshot()
-            if navigation is not None
-            else {"status": "idle", "goal": None, "reason": None}
-        ),
+        "control_mode": control_mode,
+        "navigation": nav_snapshot,
         "safety": (
             safety.snapshot()
             if safety is not None
@@ -723,6 +866,7 @@ async def handler(
         now=started_at,
     )
     navigation = GotoController()
+    path_following = PathFollowingController()
     safety = LocalSafetyRuntime(healthy=_safety_healthy)
 
     # NL instruction pipeline
@@ -730,7 +874,7 @@ async def handler(
     schema_v = SchemaValidator()
     semantic_v = SemanticValidator(grid)
     state_machine = InstructionStateMachine()
-    task_compiler = TaskCompiler()
+    task_compiler = TaskCompiler(grid)
 
     frame_sequence = 0
     next_deadline = started_at
@@ -745,20 +889,34 @@ async def handler(
         while True:
             now = _monotonic()
             if now >= next_deadline:
-                navigation.update(vehicle, grid, now, safety)
+                # Phase 3: update path_following if active, else navigation
+                if path_following.status == "active":
+                    path_following.update(vehicle, grid, now, safety)
+                elif navigation.status == "active":
+                    navigation.update(vehicle, grid, now, safety)
+                else:
+                    navigation.update(vehicle, grid, now, safety)
                 timestamp = _wall_time()
                 pose, scan = telemetry_messages(
-                    vehicle, grid, frame_sequence, timestamp, navigation, safety
+                    vehicle, grid, frame_sequence, timestamp, navigation, path_following, safety
                 )
                 await websocket.send(json.dumps(pose))
                 await websocket.send(json.dumps(scan))
                 last_scan_data = scan
                 print(f"[→] pose #{frame_sequence}: x={vehicle.x:.2f} y={vehicle.y:.2f} cmd={vehicle.command}")
 
-                # Check NL task status
+                # Check NL task status — determine active controller
+                active_controller = (
+                    path_following if path_following.status == "active"
+                    else navigation if navigation.status == "active"
+                    else None
+                )
+                # Also handle completed/blocked from non-active controllers
                 if state_machine.current_state == InstructionState.ACTIVE:
+                    # Check path_following first
+                    pf_status = path_following.status
                     nav_status = navigation.status
-                    if nav_status == "reached":
+                    if pf_status == "reached" or nav_status == "reached":
                         state_machine.transition(InstructionState.COMPLETED)
                         await websocket.send(json.dumps({
                             "type": "nl_task_update",
@@ -770,30 +928,32 @@ async def handler(
                         state_machine.transition(InstructionState.IDLE)
                         active_nl_seq = None
                         print(f"[NL] task completed: goal reached")
-                    elif nav_status == "blocked":
+                    elif pf_status == "blocked" or nav_status == "blocked":
+                        reason = path_following.reason if pf_status == "blocked" else navigation.reason
                         state_machine.transition(InstructionState.BLOCKED)
                         await websocket.send(json.dumps({
                             "type": "nl_task_update",
                             "ts": timestamp,
                             "seq": active_nl_seq if active_nl_seq is not None else 0,
                             "status": "blocked",
-                            "reason": navigation.reason or "unknown",
+                            "reason": reason or "unknown",
                         }))
                         state_machine.transition(InstructionState.IDLE)
                         active_nl_seq = None
-                        print(f"[NL] task blocked: {navigation.reason}")
-                    elif nav_status == "cancelled":
+                        print(f"[NL] task blocked: {reason}")
+                    elif pf_status == "cancelled" or nav_status == "cancelled":
+                        reason = path_following.reason if pf_status == "cancelled" else navigation.reason
                         state_machine.transition(InstructionState.CANCELLED)
                         await websocket.send(json.dumps({
                             "type": "nl_task_update",
                             "ts": timestamp,
                             "seq": active_nl_seq if active_nl_seq is not None else 0,
                             "status": "cancelled",
-                            "reason": navigation.reason or "unknown",
+                            "reason": reason or "unknown",
                         }))
                         state_machine.transition(InstructionState.IDLE)
                         active_nl_seq = None
-                        print(f"[NL] task cancelled: {navigation.reason}")
+                        print(f"[NL] task cancelled: {reason}")
 
                 frame_sequence += 1
                 next_deadline = _next_deadline(next_deadline, _monotonic(), TMINI_SCAN_CONFIG.scan_time)
@@ -814,6 +974,7 @@ async def handler(
                         nl_client, schema_v, semantic_v,
                         state_machine, task_compiler,
                         scan_data=last_scan_data,
+                        path_following=path_following,
                     )
                     for r in replies:
                         await websocket.send(json.dumps(r))
@@ -832,6 +993,7 @@ async def handler(
                             nl_client, schema_v, semantic_v,
                             state_machine, task_compiler,
                             scan_data=last_scan_data,
+                            path_following=path_following,
                         )
                         for r in replies:
                             await websocket.send(json.dumps(r))
@@ -854,6 +1016,7 @@ async def handler(
             # Cancel active NL task if manual command arrives
             if state_machine.current_state in (InstructionState.ACCEPTED, InstructionState.ACTIVE, InstructionState.CONFIRMING):
                 navigation.cancel("manual_override")
+                path_following.cancel("manual_override")
                 state_machine.transition(InstructionState.CANCELLED)
                 await websocket.send(json.dumps({
                     "type": "nl_task_update",
@@ -866,13 +1029,14 @@ async def handler(
                 print(f"[NL] task cancelled by manual override")
 
             reply = handle_command_message(
-                raw, vehicle, grid, _monotonic(), _wall_time(), navigation, safety
+                raw, vehicle, grid, _monotonic(), _wall_time(), navigation, safety, path_following=path_following
             )
             await websocket.send(json.dumps(reply))
     except Exception as error:
         print(f"[!] connection ended: {error}")
     finally:
         navigation.cancel("disconnected")
+        path_following.cancel("disconnected")
         vehicle.stop()
         print(f"[-] client disconnected: {addr}")
 

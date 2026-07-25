@@ -2,6 +2,7 @@
 
 Phase 1: compiles instructions into task dicts without controlling the vehicle.
 Phase 2: will actually invoke vehicle / navigation / safety methods.
+Phase 3: A* path planning for blocked straight-line targets.
 """
 
 from __future__ import annotations
@@ -9,13 +10,21 @@ from __future__ import annotations
 import math
 from typing import Any
 
+from mockvehicle2d.collision import is_swept_circle_passable
+from mockvehicle2d.map_grid import MapGrid
+
 
 class TaskCompiler:
     """Convert validated instructions into executable task dicts.
 
     Each compile_* method returns a dict describing the action to take.
     In Phase 1 these do NOT modify vehicle state — they describe what WOULD happen.
+    In Phase 3, navigation intents check straight-line clearance and fall back
+    to A* path planning when obstacles exist.
     """
+
+    def __init__(self, grid: MapGrid | None = None) -> None:
+        self.grid = grid
 
     # ── public API ───────────────────────────────────────────
 
@@ -41,6 +50,14 @@ class TaskCompiler:
             return self._make_task("unknown", {"intent": intent})
         return method(params, state_snapshot or {})
 
+    def with_grid(self, grid: MapGrid) -> "TaskCompiler":
+        """Return a new compiler sharing the same state but with a different grid.
+
+        Useful for server.py which discovers the grid after compiler construction.
+        """
+        new = TaskCompiler(grid)
+        return new
+
     # ── per-intent compilers ─────────────────────────────────
 
     def _compile_stop(self, params: dict, snapshot: dict) -> dict:
@@ -57,6 +74,26 @@ class TaskCompiler:
 
     def _compile_goto_point(self, params: dict, snapshot: dict) -> dict:
         x_m, y_m = params["x_m"], params["y_m"]
+        # Phase 3: check if straight-line path is clear
+        pose = snapshot.get("pose", {})
+        start_x = pose.get("x", 0.0)
+        start_y = pose.get("y", 0.0)
+        if self.grid is not None:
+            if not _is_straight_path_clear(self.grid, start_x, start_y, x_m, y_m):
+                path = self._plan_path(start_x, start_y, x_m, y_m)
+                if path is not None:
+                    return self._make_task("navigation", {
+                        "action": "goto_point",
+                        "controller": "PathFollowingController",
+                        "goal": {"x_m": x_m, "y_m": y_m},
+                        "path": path,
+                    })
+                return self._make_task("navigation", {
+                    "action": "goto_point",
+                    "controller": "blocked",
+                    "goal": {"x_m": x_m, "y_m": y_m},
+                    "reason": "no path found",
+                })
         return self._make_task("navigation", {
             "action": "goto_point",
             "controller": "GotoController",
@@ -74,6 +111,27 @@ class TaskCompiler:
         sign = 1.0 if direction == "forward" else -1.0
         goal_x = current_x + sign * distance_m * math.cos(current_yaw)
         goal_y = current_y + sign * distance_m * math.sin(current_yaw)
+        # Phase 3: check if straight-line path is clear
+        if self.grid is not None:
+            if not _is_straight_path_clear(self.grid, current_x, current_y, goal_x, goal_y):
+                path = self._plan_path(current_x, current_y, goal_x, goal_y)
+                if path is not None:
+                    return self._make_task("navigation", {
+                        "action": "move_distance",
+                        "controller": "PathFollowingController",
+                        "distance_m": distance_m,
+                        "direction": direction,
+                        "goal": {"x_m": round(goal_x, 4), "y_m": round(goal_y, 4)},
+                        "path": path,
+                    })
+                return self._make_task("navigation", {
+                    "action": "move_distance",
+                    "controller": "blocked",
+                    "distance_m": distance_m,
+                    "direction": direction,
+                    "goal": {"x_m": round(goal_x, 4), "y_m": round(goal_y, 4)},
+                    "reason": "no path found",
+                })
         return self._make_task("navigation", {
             "action": "move_distance",
             "controller": "GotoController",
@@ -162,3 +220,41 @@ class TaskCompiler:
                 summary[sector] = {"min_m": None, "avg_m": None, "count": 0}
 
         return {"sectors": summary, "total_points": len(points)}
+
+    # ── Phase 3: path planning helpers ───────────────────────
+
+    def _plan_path(
+        self,
+        start_x: float,
+        start_y: float,
+        goal_x: float,
+        goal_y: float,
+    ) -> list[tuple[int, int]] | None:
+        """Run A* from the nearest grid cell of (start_x,start_y) to (goal_x,goal_y).
+
+        Returns a list of grid-cell coordinates or ``None`` when no path exists.
+        """
+        if self.grid is None:
+            return None
+        from mockvehicle2d.pathfinding.a_star import a_star_search
+
+        sx = int(round(start_x))
+        sy = int(round(start_y))
+        gx = int(round(goal_x))
+        gy = int(round(goal_y))
+        return a_star_search(self.grid, (sx, sy), (gx, gy))
+
+
+# ── module-level helper ──────────────────────────────────────
+
+
+def _is_straight_path_clear(
+    grid: MapGrid,
+    x1: float,
+    y1: float,
+    x2: float,
+    y2: float,
+    radius: float = 0.5,
+) -> bool:
+    """Check if the straight line from (x1,y1) to (x2,y2) is obstacle-free."""
+    return is_swept_circle_passable(grid, x1, y1, x2, y2, radius)
