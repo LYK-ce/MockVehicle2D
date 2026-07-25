@@ -1,0 +1,167 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://mockvehicle2d/instruction/v1",
+  "title": "Vehicle Instruction Specification v1",
+  "type": "object",
+  "required": ["schema_version", "intent", "timestamp"],
+  "properties": {
+    "schema_version": {
+      "type": "string",
+      "const": "1.0"
+    },
+    "intent": {
+      "type": "string",
+      "enum": ["stop", "status", "goto_point", "move_distance", "rotate", "scan_report", "clarify"],
+      "description": "解析出的用户意图"
+    },
+    "timestamp": {
+      "type": "string",
+      "format": "date-time",
+      "description": "模型生成时间（ISO 8601）"
+    },
+    "parameters": {
+      "type": "object",
+      "description": "意图相关参数，根据 intent 不同而不同"
+    },
+    "confidence": {
+      "type": "number",
+      "minimum": 0.0,
+      "maximum": 1.0,
+      "description": "模型对该解析结果的置信度"
+    },
+    "reasoning": {
+      "type": "string",
+      "maxLength": 500,
+      "description": "模型简短的解析推理过程"
+    }
+  },
+  "allOf": [
+    {
+      "if": {
+        "properties": { "intent": { "const": "stop" } },
+        "required": ["intent"]
+      },
+      "then": {
+        "properties": {
+          "parameters": {
+            "type": "object",
+            "properties": {},
+            "additionalProperties": false
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": { "intent": { "const": "status" } },
+        "required": ["intent"]
+      },
+      "then": {
+        "properties": {
+          "parameters": {
+            "type": "object",
+            "properties": {},
+            "additionalProperties": false
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": { "intent": { "const": "goto_point" } },
+        "required": ["intent"]
+      },
+      "then": {
+        "properties": {
+          "parameters": {
+            "type": "object",
+            "required": ["x_m", "y_m"],
+            "properties": {
+              "x_m": { "type": "number", "description": "目标 X 坐标 (米)" },
+              "y_m": { "type": "number", "description": "目标 Y 坐标 (米)" }
+            },
+            "additionalProperties": false
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": { "intent": { "const": "move_distance" } },
+        "required": ["intent"]
+      },
+      "then": {
+        "properties": {
+          "parameters": {
+            "type": "object",
+            "required": ["distance_m", "direction"],
+            "properties": {
+              "distance_m": { "type": "number", "minimum": 0.01, "maximum": 10.0 },
+              "direction": { "type": "string", "enum": ["forward", "backward"] }
+            },
+            "additionalProperties": false
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": { "intent": { "const": "rotate" } },
+        "required": ["intent"]
+      },
+      "then": {
+        "properties": {
+          "parameters": {
+            "type": "object",
+            "required": ["angle_deg", "direction"],
+            "properties": {
+              "angle_deg": { "type": "number", "minimum": -360, "maximum": 360 },
+              "direction": { "type": "string", "enum": ["left", "right"] }
+            },
+            "additionalProperties": false
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": { "intent": { "const": "scan_report" } },
+        "required": ["intent"]
+      },
+      "then": {
+        "properties": {
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "query": { "type": "string", "description": "可选的关注点" }
+            },
+            "additionalProperties": false
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": { "intent": { "const": "clarify" } },
+        "required": ["intent"]
+      },
+      "then": {
+        "properties": {
+          "parameters": {
+            "type": "object",
+            "required": ["question"],
+            "properties": {
+              "question": { "type": "string", "description": "向用户提出的澄清问题" },
+              "missing_parameters": {
+                "type": "array",
+                "items": { "type": "string" }
+              }
+            },
+            "additionalProperties": false
+          }
+        }
+      }
+    }
+  ],
+  "additionalProperties": false
+}

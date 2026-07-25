@@ -39,9 +39,11 @@ class _GotoSocket:
         self.messages: list[dict[str, object]] = []
         self.receive_count = 0
 
-    async def send(self, payload: str) -> None:
+    async def send(self, payload: str | bytes) -> None:
+        if isinstance(payload, bytes):
+            return  # skip binary frames (map_full chunks)
         self.messages.append(json.loads(payload))
-        if len(self.messages) == 7:
+        if len(self.messages) == 6:
             raise RuntimeError("stop after autonomous telemetry")
 
     async def recv(self) -> str:
@@ -265,11 +267,11 @@ class GotoTest(unittest.TestCase):
 
         self.assertEqual(
             [message["type"] for message in websocket.messages],
-            ["hello", "map_full", "pose", "scan", "goto_ack", "pose", "scan"],
+            ["hello", "pose", "scan", "goto_ack", "pose", "scan"],
         )
-        self.assertEqual(websocket.messages[4]["seq"], 21)
-        self.assertEqual(websocket.messages[5]["control_mode"], "autonomous")
-        self.assertEqual(websocket.messages[5]["navigation"]["status"], "active")
+        self.assertEqual(websocket.messages[3]["seq"], 21)
+        self.assertEqual(websocket.messages[4]["control_mode"], "autonomous")
+        self.assertEqual(websocket.messages[4]["navigation"]["status"], "active")
 
 
 def main() -> int:

@@ -9,10 +9,12 @@ description = "2D vehicle simulator for Pictor WebSocket protocol testing and co
 requires-python = ">=3.10"
 dependencies = [
     "websockets",
+    "jsonschema>=4.0",
 ]
 
 [project.optional-dependencies]
 visual = ["pygame"]
+nl = ["openai"]
 dev = ["pytest"]
 
 [project.scripts]
