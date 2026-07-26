@@ -900,14 +900,14 @@ class TestScanSummary:
         points = [
             {"angle": 0.0, "range": 1.0},       # front
             {"angle": 0.3, "range": 2.0},       # front
-            {"angle": math.pi / 2, "range": 3.0},  # left
-            {"angle": -math.pi / 2, "range": 4.0},  # right
+            {"angle": math.pi / 2, "range": 3.0},  # right
+            {"angle": -math.pi / 2, "range": 4.0},  # left
             {"angle": math.pi, "range": 5.0},    # back
         ]
         result = _summarize_scan_for_nl({"type": "scan", "points": points})
         assert result["sectors"]["front"] == 1.0
-        assert result["sectors"]["left"] == 3.0
-        assert result["sectors"]["right"] == 4.0
+        assert result["sectors"]["left"] == 4.0
+        assert result["sectors"]["right"] == 3.0
         assert result["sectors"]["back"] == 5.0
         assert "前方" in result["text"]
         assert "左侧" in result["text"]

@@ -72,16 +72,15 @@ DEFAULT_SCAN_CONFIG = TMINI_SCAN_CONFIG
 
 
 def scan_sector(angle_rad: float) -> str:
-    """Classify a wrapped laser angle into one of four 90-degree sectors."""
+    """Classify a clockwise-from-forward angle into a symmetric 90° sector."""
 
-    angle_rad = math.atan2(math.sin(angle_rad), math.cos(angle_rad))
-    if -math.pi / 4 <= angle_rad < math.pi / 4:
+    angle_rad = math.remainder(angle_rad, math.tau)
+    magnitude = abs(angle_rad)
+    if magnitude <= math.pi / 4:
         return "front"
-    if math.pi / 4 <= angle_rad < 3 * math.pi / 4:
-        return "left"
-    if -3 * math.pi / 4 <= angle_rad < -math.pi / 4:
-        return "right"
-    return "back"
+    if magnitude >= 3 * math.pi / 4:
+        return "back"
+    return "right" if angle_rad > 0 else "left"
 
 
 def _first_wall_range(

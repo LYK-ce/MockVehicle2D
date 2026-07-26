@@ -34,7 +34,7 @@ from mockvehicle2d.instruction.validator import (
     run_validation_pipeline,
 )
 from mockvehicle2d.map_grid import MapGrid, WALL, VOID
-from mockvehicle2d.scan import LaserPoint, scan_message
+from mockvehicle2d.scan import LaserPoint, scan_message, scan_sector
 from mockvehicle2d.safety import LocalSafetyRuntime
 from mockvehicle2d.server import _summarize_scan_for_nl
 
@@ -550,8 +550,8 @@ class TestTaskCompiler:
         points = [
             {"angle": 0.0, "range": 1.5},
             {"angle": 0.3, "range": 2.0},
-            {"angle": math.pi / 2, "range": 3.0},   # left
-            {"angle": -math.pi / 2, "range": 4.0},  # right
+            {"angle": math.pi / 2, "range": 3.0},   # right
+            {"angle": -math.pi / 2, "range": 4.0},  # left
             {"angle": math.pi, "range": 5.0},        # back
         ]
         snapshot = {"scan": {"points": points}}
@@ -565,7 +565,7 @@ class TestTaskCompiler:
         assert sectors["back"]["count"] == 1
         assert sectors["front"]["min_m"] == 1.5
 
-    def test_real_tmini_positive_angles_are_wrapped_for_both_summaries(self):
+    def test_real_tmini_clockwise_angles_match_both_summaries(self):
         scan = scan_message(
             MapGrid(1, 1),
             0.5,
@@ -574,9 +574,11 @@ class TestTaskCompiler:
             1.0,
             points=(
                 LaserPoint(0.0, 1.0, 1.0),
-                LaserPoint(3 * math.pi / 2, 2.0, 1.0),
-                LaserPoint(7 * math.pi / 4, 3.0, 1.0),
-                LaserPoint(math.pi, 4.0, 1.0),
+                LaserPoint(math.pi / 2, 2.0, 1.0),
+                LaserPoint(3 * math.pi / 2, 3.0, 1.0),
+                LaserPoint(7 * math.pi / 4, 4.0, 1.0),
+                LaserPoint(math.pi / 4, 5.0, 1.0),
+                LaserPoint(math.pi, 6.0, 1.0),
             ),
         )
 
@@ -586,10 +588,42 @@ class TestTaskCompiler:
             {"scan": scan},
         )["summary"]["sectors"]
 
-        assert server_summary["right"] == 2.0
-        assert server_summary["back"] == 4.0
-        assert compiler_summary["right"]["min_m"] == 2.0
-        assert compiler_summary["back"]["count"] == 1
+        assert {
+            angle: scan_sector(angle)
+            for angle in (
+                0.0,
+                math.pi / 2,
+                3 * math.pi / 2,
+                7 * math.pi / 4,
+                math.pi / 4,
+                math.pi,
+                -math.pi / 2,
+                5 * math.pi / 2,
+                3 * math.pi / 4,
+                5 * math.pi / 4,
+            )
+        } == {
+            0.0: "front",
+            math.pi / 2: "right",
+            3 * math.pi / 2: "left",
+            7 * math.pi / 4: "front",
+            math.pi / 4: "front",
+            math.pi: "back",
+            -math.pi / 2: "left",
+            5 * math.pi / 2: "right",
+            3 * math.pi / 4: "back",
+            5 * math.pi / 4: "back",
+        }
+        assert server_summary == {
+            "front": 1.0,
+            "left": 3.0,
+            "right": 2.0,
+            "back": 6.0,
+        }
+        assert {
+            sector: values["min_m"] for sector, values in compiler_summary.items()
+        } == server_summary
+        assert compiler_summary["front"]["count"] == 3
 
 
 # ═══════════════════════════════════════════════════════════════
