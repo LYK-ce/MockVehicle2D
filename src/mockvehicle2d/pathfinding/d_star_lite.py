@@ -6,7 +6,14 @@ import heapq
 import math
 from typing import Iterable
 
-from mockvehicle2d.local_state import FREE, OCCUPIED, UNKNOWN, MapCellUpdate, ObservedGrid
+from mockvehicle2d.local_state import (
+    FORBIDDEN,
+    FREE,
+    OCCUPIED,
+    UNKNOWN,
+    MapCellUpdate,
+    ObservedGrid,
+)
 
 
 Cell = tuple[int, int]
@@ -256,7 +263,7 @@ class DStarLitePlanner:
             return True
         radius = self._inflation_cells
         return any(
-            self._states.get((gx, gy), UNKNOWN) == OCCUPIED
+            self._states.get((gx, gy), UNKNOWN) in {OCCUPIED, FORBIDDEN}
             for gx in range(cell[0] - radius, cell[0] + radius + 1)
             for gy in range(cell[1] - radius, cell[1] + radius + 1)
         )
@@ -337,7 +344,7 @@ class DStarLitePlanner:
             not isinstance(update, MapCellUpdate)
             or type(update.gx) is not int
             or type(update.gy) is not int
-            or update.state not in {UNKNOWN, FREE, OCCUPIED}
+            or update.state not in {UNKNOWN, FREE, OCCUPIED, FORBIDDEN}
         ):
             raise ValueError("invalid map cell update")
 

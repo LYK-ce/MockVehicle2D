@@ -51,13 +51,33 @@ Pictor 仅在收到 `hello` 后才认为连接可用，之后才开始处理 `po
 ```json
 {
     "type": "hello",
-    "vehicle_id": "car_0"
+    "vehicle_id": "car_0",
+    "map": {
+        "source": "simulator_ground_truth",
+        "frame_id": "simulator_map",
+        "resolution_m": 1.0,
+        "width_cells": 256,
+        "height_cells": 256,
+        "transform_to_global_map": {
+            "x_m": 0.0,
+            "y_m": 0.0,
+            "yaw_rad": 0.0
+        },
+        "binary_chunks": {
+            "type": 0,
+            "chunk_size_cells": 256,
+            "header": ">Bii",
+            "byte_order": "big",
+            "payload_order": "row_major_y_x"
+        }
+    }
 }
 ```
 
 | 字段 | 类型 | 说明 |
 |------|------|------|
 | `vehicle_id` | string | 车辆唯一标识 |
+| `map` | object | 随后的二进制地图帧元数据与 `simulator_map → global_map` 刚体变换 |
 
 ### pose — 车辆位姿
 
@@ -196,29 +216,21 @@ SLAM 前端不含回环、地点识别、位姿图或全局优化，仍可能长
 
 ### map_full — 全量地图
 
-连接建立或重连后，在 `hello` 之后发送完整地图。
+连接建立或重连后，在 `hello` 之后发送一个或多个二进制 chunk；不存在 JSON
+`map_full` 消息。每个 chunk 固定为：
 
-```json
-{
-    "type": "map_full",
-    "ts": 1717800000.200,
-    "source": "simulator_ground_truth",
-    "voxels": [
-        {"gx": 0, "gy": 0, "gz": 0, "state": 0, "conf": 0.95},
-        {"gx": 1, "gy": 0, "gz": 0, "state": 1, "conf": 0.80}
-    ]
-}
+```text
+offset  bytes  encoding
+0       1      u8 frame_type = 0
+1       4      i32 big-endian chunk_origin_gx
+5       4      i32 big-endian chunk_origin_gy
+9       65536  256×256 u8 cells, row-major: payload[local_y*256 + local_x]
 ```
 
-| 字段 | 类型 | 说明 |
-|------|------|------|
-| `ts` | f64 | Unix 时间戳 |
-| `source` | string | 固定为 `simulator_ground_truth`；不是车辆传感器输出 |
-| `voxels` | array | 全量体素列表 |
-| `gx`, `gy` | i32 | 2D 网格坐标 |
-| `gz` | i32 | 高度层 |
-| `state` | u8 | `0`=可通行，`1`=墙/障碍物，`2`=无地面/落差 |
-| `conf` | f32 | 置信度 0.0~1.0 |
+格状态为 `0`=可通行、`1`=墙/障碍物、`2`=无地面/落差。`chunk_origin_gx/gy`
+是 chunk 左上格在 `simulator_map` 中的格坐标，不是 chunk 序号。格分辨率、地图尺寸、
+帧名和 `simulator_map → global_map` 变换由前一条 `hello.map` 给出；因此非默认出生锚点
+下，消费者不得把原始格坐标直接当成全局坐标。
 
 ### map_delta — 增量地图（尚未实现）
 
@@ -234,7 +246,7 @@ SLAM 前端不含回环、地点识别、位姿图或全局优化，仍可能长
 }
 ```
 
-字段同 `map_full`。
+这是预留的 JSON 增量格式；当前 Server 不发送。它与上面的二进制全量 chunk 不是同一种封装。
 
 ---
 
@@ -369,7 +381,7 @@ map_delta
 
 `map_full` 是 `simulator_ground_truth`，仅供物理、传感器生成和调试显示；`pose` 是
 `anchored_odometry`，`scan` 是模拟的 Tmini 本地观测。扫描会累计到车辆内存中的
-`ObservedGrid`，D* Lite 在小车内部消费其 Unknown/Free/Occupied、revision 和 delta；
+`ObservedGrid`，D* Lite 在小车内部消费其 Unknown/Free/Occupied/Forbidden、revision 和 delta；
 局部地图 delta 尚未通过 WebSocket 上传。车辆 runtime 跨控制器断开重连保留，但活动
 `goto` 会取消。当前有轻量 scan matching 和局部增量规划，没有回环、位姿图、全局优化、
 地图持久化或中央地图同步。自然语言 `goto_point` / `move_distance` 也进入同一个
@@ -383,6 +395,7 @@ GotoController，不走旧的全真值 A* / PathFollowingController。
 
 `safety.state` 为 `clear`、`limited`、`stopped` 或 `fault`；对应原因目前为 `safety_obstacle`、`safety_edge` 或 `safety_sensor_fault`。安全输入故障采用 fail-safe：自动任务变为 `blocked`，手动命令也全部停车。未发现正雷达回波或有限前视范围内未发现边缘仅表示当前观测为 clear，不表示更远区域已知。生产模拟默认输入健康；`healthy=false` 只用于确定性故障测试。
 
-车辆自有地图按每条射线把命中前区域标为 Free、命中格标为 Occupied、遮挡后保持 Unknown。
+车辆自有地图按每条射线把命中前区域标为 Free、命中格标为 Occupied、遮挡后保持 Unknown；
+独立下视输入发现无地面时把对应格标为不可被水平雷达覆盖的 Forbidden，供 D* Lite 绕行。
 当前模拟协议把 `range=0` 的无回波射线更新到最大量程 Free；真实 Tmini 的无回波原因更复杂，
 接入硬件前必须校准，不能直接沿用。水平 Tmini 仍不能检测跌落。

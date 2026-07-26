@@ -13,6 +13,7 @@ from mockvehicle2d.scan import LaserPoint, ScanConfig
 UNKNOWN = -1
 FREE = 0
 OCCUPIED = 1
+FORBIDDEN = 2
 LOCALIZATION_QUALITIES = frozenset(("nominal", "degraded", "lost"))
 
 
@@ -139,6 +140,7 @@ class ScanMatchConfig:
     min_support: int = 6
     min_score: float = 0.55
     min_margin: float = 0.005
+    max_work_units: int = 50_000
 
     def __post_init__(self) -> None:
         values = (
@@ -157,6 +159,8 @@ class ScanMatchConfig:
             or self.sample_stride <= 0
             or type(self.min_support) is not int
             or self.min_support <= 0
+            or type(self.max_work_units) is not int
+            or self.max_work_units < self.min_support
             or not 0 <= self.min_score <= 1
         ):
             raise ValueError("invalid scan-match configuration")
@@ -173,6 +177,7 @@ class ScanMatchResult:
     correction_yaw_rad: float
     revision: int
     reason: str | None
+    work_units: int
 
     def as_dict(self) -> dict[str, object]:
         return {
@@ -187,6 +192,7 @@ class ScanMatchResult:
             },
             "revision": self.revision,
             "reason": self.reason,
+            "work_units": self.work_units,
         }
 
 
@@ -209,6 +215,11 @@ class CorrelativeScanMatcher:
         occupied = frozenset(grid.occupied_cells())
         if not occupied:
             return self._rejected("empty_map")
+        nearby_occupied: dict[tuple[int, int], list[tuple[int, int]]] = {}
+        for gx, gy in occupied:
+            for query_x in range(gx - 2, gx + 3):
+                for query_y in range(gy - 2, gy + 3):
+                    nearby_occupied.setdefault((query_x, query_y), []).append((gx, gy))
 
         hits = []
         for index, point in enumerate(points):
@@ -218,44 +229,80 @@ class CorrelativeScanMatcher:
                 hits.append(point)
         if len(hits) < self.config.min_support:
             return self._rejected("insufficient_support")
+        if len(hits) > self.config.max_work_units:
+            hit_count = len(hits)
+            hits = [
+                hits[index * hit_count // self.config.max_work_units]
+                for index in range(self.config.max_work_units)
+            ]
 
-        candidates: list[tuple[float, int, float, float, float]] = []
-        for dx in _search_offsets(self.config.xy_window_m, self.config.xy_step_m):
-            for dy in _search_offsets(self.config.xy_window_m, self.config.xy_step_m):
-                for dyaw in _search_offsets(
-                    self.config.yaw_window_rad, self.config.yaw_step_rad
-                ):
-                    score, support = _endpoint_score(
-                        hits,
-                        predicted.x_m + dx,
-                        predicted.y_m + dy,
-                        predicted.yaw_rad + dyaw,
-                        occupied,
-                        grid.resolution_m,
-                    )
-                    if support >= self.config.min_support:
-                        candidates.append((score, support, dx, dy, dyaw))
-        if not candidates:
-            return self._rejected("insufficient_support")
-
-        candidates.sort(
+        x_offsets = _search_offsets(self.config.xy_window_m, self.config.xy_step_m)
+        y_offsets = x_offsets
+        yaw_offsets = _search_offsets(
+            self.config.yaw_window_rad, self.config.yaw_step_rad
+        )
+        coarse_x = _coarse_offsets(x_offsets)
+        coarse_y = coarse_x
+        coarse_yaw = _coarse_offsets(yaw_offsets)
+        max_candidates = self.config.max_work_units // len(hits)
+        candidate_offsets = [
+            (dx, dy, dyaw)
+            for dx in coarse_x
+            for dy in coarse_y
+            for dyaw in coarse_yaw
+        ]
+        candidate_offsets.sort(
             key=lambda item: (
-                -item[0],
-                -item[1],
-                item[2] ** 2 + item[3] ** 2 + item[4] ** 2,
-                abs(item[4]),
-                item[2],
-                item[3],
-                item[4],
+                item[0] ** 2 + item[1] ** 2 + item[2] ** 2,
+                abs(item[2]),
+                item,
             )
         )
+        candidates: list[tuple[float, int, float, float, float]] = []
+        evaluated: set[tuple[float, float, float]] = set()
+
+        def evaluate(offsets: Iterable[tuple[float, float, float]]) -> None:
+            for dx, dy, dyaw in offsets:
+                if len(evaluated) >= max_candidates:
+                    return
+                offset = (dx, dy, dyaw)
+                if offset in evaluated:
+                    continue
+                evaluated.add(offset)
+                score, support = _endpoint_score(
+                    hits,
+                    predicted.x_m + dx,
+                    predicted.y_m + dy,
+                    predicted.yaw_rad + dyaw,
+                    nearby_occupied,
+                    grid.resolution_m,
+                )
+                if support >= self.config.min_support:
+                    candidates.append((score, support, dx, dy, dyaw))
+
+        evaluate(candidate_offsets)
+        if not candidates:
+            return self._rejected(
+                "insufficient_support", work_units=len(evaluated) * len(hits)
+            )
+
+        candidates.sort(key=_candidate_key)
+        refinements = []
+        for _, _, dx, dy, dyaw in candidates[:4]:
+            for refined_x in _neighbour_offsets(x_offsets, dx):
+                for refined_y in _neighbour_offsets(y_offsets, dy):
+                    for refined_yaw in _neighbour_offsets(yaw_offsets, dyaw):
+                        refinements.append((refined_x, refined_y, refined_yaw))
+        evaluate(refinements)
+        candidates.sort(key=_candidate_key)
         score, support, dx, dy, dyaw = candidates[0]
         second_score = candidates[1][0] if len(candidates) > 1 else 0.0
         margin = max(0.0, score - second_score)
+        work_units = len(evaluated) * len(hits)
         if score < self.config.min_score:
-            return self._rejected("low_score", score, support, margin)
+            return self._rejected("low_score", score, support, margin, work_units)
         if margin < self.config.min_margin:
-            return self._rejected("ambiguous", score, support, margin)
+            return self._rejected("ambiguous", score, support, margin, work_units)
         return ScanMatchResult(
             True,
             score,
@@ -266,6 +313,7 @@ class CorrelativeScanMatcher:
             dyaw,
             self.revision,
             None,
+            work_units,
         )
 
     def rejected(self, reason: str) -> ScanMatchResult:
@@ -273,10 +321,24 @@ class CorrelativeScanMatcher:
         return self._rejected(reason)
 
     def _rejected(
-        self, reason: str, score: float = 0.0, support: int = 0, margin: float = 0.0
+        self,
+        reason: str,
+        score: float = 0.0,
+        support: int = 0,
+        margin: float = 0.0,
+        work_units: int = 0,
     ) -> ScanMatchResult:
         return ScanMatchResult(
-            False, score, support, margin, 0.0, 0.0, 0.0, self.revision, reason
+            False,
+            score,
+            support,
+            margin,
+            0.0,
+            0.0,
+            0.0,
+            self.revision,
+            reason,
+            work_units,
         )
 
 
@@ -285,12 +347,39 @@ def _search_offsets(window: float, step: float) -> tuple[float, ...]:
     return tuple(index * step for index in range(-count, count + 1))
 
 
+def _coarse_offsets(offsets: tuple[float, ...]) -> tuple[float, ...]:
+    return tuple(
+        value
+        for index, value in enumerate(offsets)
+        if index % 2 == 0 or value == 0.0
+    )
+
+
+def _neighbour_offsets(offsets: tuple[float, ...], value: float) -> tuple[float, ...]:
+    index = offsets.index(value)
+    return offsets[max(0, index - 1) : index + 2]
+
+
+def _candidate_key(
+    item: tuple[float, int, float, float, float],
+) -> tuple[float, int, float, float, float, float, float]:
+    return (
+        -item[0],
+        -item[1],
+        item[2] ** 2 + item[3] ** 2 + item[4] ** 2,
+        abs(item[4]),
+        item[2],
+        item[3],
+        item[4],
+    )
+
+
 def _endpoint_score(
     points: Iterable[LaserPoint],
     x_m: float,
     y_m: float,
     yaw_rad: float,
-    occupied: frozenset[tuple[int, int]],
+    nearby_occupied: dict[tuple[int, int], list[tuple[int, int]]],
     resolution_m: float,
 ) -> tuple[float, int]:
     endpoints: dict[tuple[int, int], tuple[float, float]] = {}
@@ -312,13 +401,14 @@ def _endpoint_score(
     for (cell_x, cell_y), (endpoint_x, endpoint_y) in endpoints.items():
         nearest = min(
             (
-                math.hypot(
-                    endpoint_x - (gx + 0.5) * resolution_m,
-                    endpoint_y - (gy + 0.5) * resolution_m,
+                _distance_to_cell_boundary(
+                    endpoint_x,
+                    endpoint_y,
+                    gx,
+                    gy,
+                    resolution_m,
                 )
-                for gx in range(cell_x - 2, cell_x + 3)
-                for gy in range(cell_y - 2, cell_y + 3)
-                if (gx, gy) in occupied
+                for gx, gy in nearby_occupied.get((cell_x, cell_y), ())
             ),
             default=math.inf,
         )
@@ -326,6 +416,18 @@ def _endpoint_score(
             support += 1
             score += 1 - nearest / radius
     return score / max(1, len(endpoints)), support
+
+
+def _distance_to_cell_boundary(
+    x_m: float, y_m: float, gx: int, gy: int, resolution_m: float
+) -> float:
+    left, top = gx * resolution_m, gy * resolution_m
+    right, bottom = left + resolution_m, top + resolution_m
+    if left <= x_m <= right and top <= y_m <= bottom:
+        return min(x_m - left, right - x_m, y_m - top, bottom - y_m)
+    dx = max(left - x_m, 0.0, x_m - right)
+    dy = max(top - y_m, 0.0, y_m - bottom)
+    return math.hypot(dx, dy)
 
 
 class AnchoredOdometry:
@@ -491,6 +593,8 @@ class ObservedGrid:
         pose: PoseEstimate,
         observed_at: float,
         config: ScanConfig,
+        *,
+        forbidden_points_vehicle_m: Iterable[tuple[float, float]] = (),
     ) -> LocalMapDelta:
         if pose.anchor_id != self.anchor.anchor_id:
             raise ValueError("scan pose belongs to a different anchor")
@@ -526,6 +630,27 @@ class ObservedGrid:
             if hit:
                 updates[ray[-1]] = OCCUPIED
 
+        cosine, sine = math.cos(pose.yaw_rad), math.sin(pose.yaw_rad)
+        for point in forbidden_points_vehicle_m:
+            if (
+                not isinstance(point, tuple)
+                or len(point) != 2
+                or not _finite(*point)
+            ):
+                raise ValueError("forbidden evidence must be finite vehicle-frame points")
+            vehicle_x, vehicle_y = point
+            updates[
+                self._cell(
+                    pose.x_m + cosine * vehicle_x - sine * vehicle_y,
+                    pose.y_m + sine * vehicle_x + cosine * vehicle_y,
+                )
+            ] = FORBIDDEN
+
+        updates = {
+            cell: state
+            for cell, state in updates.items()
+            if self._cells.get(cell) != FORBIDDEN or state == FORBIDDEN
+        }
         original = {cell: self._cells.get(cell, UNKNOWN) for cell in updates}
         self._cells.update(updates)
         changed = tuple(
@@ -620,15 +745,31 @@ class AnchoredLocalState:
         return self.odometry.set_quality(quality, timestamp=timestamp)
 
     def integrate_scan(
-        self, points: Iterable[LaserPoint], observed_at: float, config: ScanConfig
+        self,
+        points: Iterable[LaserPoint],
+        observed_at: float,
+        config: ScanConfig,
+        *,
+        forbidden_points_vehicle_m: Iterable[tuple[float, float]] = (),
     ) -> LocalMapDelta | None:
         if self.pose.quality == "lost":
             return None
-        self.last_map_delta = self.local_map.integrate_scan(points, self.pose, observed_at, config)
+        self.last_map_delta = self.local_map.integrate_scan(
+            points,
+            self.pose,
+            observed_at,
+            config,
+            forbidden_points_vehicle_m=forbidden_points_vehicle_m,
+        )
         return self.last_map_delta
 
     def match_and_integrate_scan(
-        self, points: Iterable[LaserPoint], observed_at: float, config: ScanConfig
+        self,
+        points: Iterable[LaserPoint],
+        observed_at: float,
+        config: ScanConfig,
+        *,
+        forbidden_points_vehicle_m: Iterable[tuple[float, float]] = (),
     ) -> LocalMapDelta | None:
         if self.pose.quality == "lost":
             self.last_scan_match = self.scan_matcher.rejected("localization_lost")
@@ -644,4 +785,9 @@ class AnchoredLocalState:
                 self.last_scan_match.correction_yaw_rad,
                 timestamp=observed_at,
             )
-        return self.integrate_scan(scan_points, observed_at, config)
+        return self.integrate_scan(
+            scan_points,
+            observed_at,
+            config,
+            forbidden_points_vehicle_m=forbidden_points_vehicle_m,
+        )

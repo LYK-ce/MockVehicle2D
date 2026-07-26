@@ -137,7 +137,7 @@ def test_navigation_and_compiler_paths_are_labelled_metric_waypoints() -> None:
             "schema_version": "1.0",
             "intent": "rotate",
             "timestamp": "2026-07-26T00:00:00+08:00",
-            "parameters": {"angle_deg": 90.0, "direction": "left"},
+            "parameters": {"angle_rad": math.pi / 2, "direction": "left"},
         }
     )
     assert rotation["angle_rad"] == pytest.approx(math.pi / 2)

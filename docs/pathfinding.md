@@ -103,7 +103,13 @@ mockvehicle2d pathfind --start-m 10,10 --goal-m 200,200 --verbose
 ```python
 from mockvehicle2d.pathfinding import a_star_search
 
-cell_path = a_star_search(grid, start=(0, 0), goal=(100, 100), vehicle_radius=0.5)
+cell_path = a_star_search(
+    grid,
+    start=(0, 0),
+    goal=(100, 100),
+    vehicle_radius=0.5,
+    resolution_m=1.0,
+)
 ```
 
 ## 已知限制

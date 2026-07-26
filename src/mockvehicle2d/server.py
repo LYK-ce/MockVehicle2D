@@ -33,6 +33,7 @@ PORT = 19090
 DEFAULT_VEHICLE_ID = "mock_vehicle_01"
 SPAWN_X = 10.0
 SPAWN_Y = 10.0
+MAP_RESOLUTION_M = 1.0
 MAX_JSON_INTEGER_DIGITS = 4300
 VEHICLE_ID_PATTERN = re.compile(r"[A-Za-z0-9._-]{1,64}")
 
@@ -43,6 +44,7 @@ class RuntimeFrame:
     map_delta: LocalMapDelta | None
     pose_timestamp: float
     scan_timestamp: float
+    safety_stop: str | None = None
 
 
 @dataclass
@@ -89,7 +91,14 @@ class VehicleRuntime:
             timestamp=wall_timestamp,
         )
         map_delta = self.local_state.match_and_integrate_scan(
-            scan_points, wall_timestamp, TMINI_SCAN_CONFIG
+            scan_points,
+            wall_timestamp,
+            TMINI_SCAN_CONFIG,
+            forbidden_points_vehicle_m=(
+                ()
+                if self.safety.observation.edge_point_vehicle_m is None
+                else (self.safety.observation.edge_point_vehicle_m,)
+            ),
         )
         pose = self.local_state.pose
         if not lost_automatic:
@@ -104,7 +113,11 @@ class VehicleRuntime:
                 map_delta=map_delta,
             )
         return RuntimeFrame(
-            scan_points, map_delta, wall_timestamp, wall_timestamp
+            scan_points,
+            map_delta,
+            wall_timestamp,
+            wall_timestamp,
+            None if advance_result is None else advance_result.reason,
         )
 
     @classmethod
@@ -280,6 +293,46 @@ def parse_goto_message(raw: object) -> tuple[float, float, int]:
     return _parse_goto_object(_decode_message(raw))
 
 
+def _advance_command_handoff(
+    vehicle: Vehicle,
+    grid: MapGrid,
+    monotonic_now: float,
+    wall_timestamp: float,
+    navigation: GotoController | None,
+    safety: LocalSafetyRuntime | None,
+    path_following: PathFollowingController | None,
+    local_state: AnchoredLocalState | None,
+) -> tuple[bool, str | None]:
+    lost_automatic = (
+        navigation is not None
+        and local_state is not None
+        and navigation.block_for_localization_loss(
+            vehicle, local_state.pose, monotonic_now
+        )
+    )
+    if lost_automatic:
+        collided, safety_stop = False, None
+    elif safety is None:
+        collided, safety_stop = vehicle.advance(grid, monotonic_now), None
+    else:
+        handoff = safety.advance(
+            vehicle,
+            grid,
+            monotonic_now,
+            automatic=(
+                (navigation is not None and navigation.status == "active")
+                or (path_following is not None and path_following.status == "active")
+            ),
+        )
+        collided = handoff.collided
+        safety_stop = handoff.reason if handoff.stopped else None
+    if local_state is not None:
+        local_state.update_from_truth(
+            vehicle.x, vehicle.y, vehicle.yaw, timestamp=wall_timestamp
+        )
+    return collided, safety_stop
+
+
 def handle_command_message(
     raw: object,
     vehicle: Vehicle,
@@ -292,35 +345,16 @@ def handle_command_message(
     local_state: AnchoredLocalState | None = None,
 ) -> dict[str, object]:
     """Advance the prior command, then acknowledge or fail-safe stop."""
-    lost_automatic = (
-        navigation is not None
-        and local_state is not None
-        and navigation.block_for_localization_loss(
-            vehicle, local_state.pose, monotonic_now
-        )
+    handoff_collided, handoff_safety_stop = _advance_command_handoff(
+        vehicle,
+        grid,
+        monotonic_now,
+        wall_timestamp,
+        navigation,
+        safety,
+        path_following,
+        local_state,
     )
-    if lost_automatic:
-        handoff_collided = False
-        handoff_safety_stop = None
-    elif safety is None:
-        handoff_collided = vehicle.advance(grid, monotonic_now)
-        handoff_safety_stop = None
-    else:
-        handoff = safety.advance(
-            vehicle,
-            grid,
-            monotonic_now,
-            automatic=(
-                (navigation is not None and navigation.status == "active")
-                or (path_following is not None and path_following.status == "active")
-            ),
-        )
-        handoff_collided = handoff.collided
-        handoff_safety_stop = handoff.reason if handoff.stopped else None
-    if local_state is not None:
-        local_state.update_from_truth(
-            vehicle.x, vehicle.y, vehicle.yaw, timestamp=wall_timestamp
-        )
     rejection_reason: str | None = None
     try:
         message = _decode_message(raw)
@@ -494,10 +528,21 @@ def _handle_nl_command(
     scan_data: dict[str, object] | None = None,
     path_following: PathFollowingController | None = None,
     local_state: AnchoredLocalState | None = None,
+    safety: LocalSafetyRuntime | None = None,
 ) -> list[dict[str, object]]:
     """Process one nl_command message. Returns a list of reply dicts to send."""
-    seq = message.get("seq")
-    if not isinstance(seq, int) or isinstance(seq, bool) or seq < 0:
+    _advance_command_handoff(
+        vehicle,
+        grid,
+        monotonic_now,
+        wall_timestamp,
+        navigation,
+        safety,
+        path_following,
+        local_state,
+    )
+    seq = _safe_seq(message)
+    if seq is None:
         seq = 0
     text = message.get("text", "")
     if not isinstance(text, str) or not text.strip():
@@ -531,7 +576,10 @@ def _handle_nl_command(
 
     # 1. Parse
     state_machine.transition(InstructionState.PARSING)
-    instruction = nl_client.parse(text)
+    try:
+        instruction = nl_client.parse(text)
+    except (ValueError, OverflowError):
+        instruction = None
     if instruction is None:
         state_machine.transition(InstructionState.FAILED)
         replies.append({
@@ -730,7 +778,7 @@ def _handle_nl_command(
         return replies
 
     if intent == "rotate":
-        angle_deg = params["angle_deg"]
+        angle_rad = params["angle_rad"]
         direction = params["direction"]
         sign = -1.0 if direction == "left" else 1.0
         vehicle.stop()
@@ -739,7 +787,7 @@ def _handle_nl_command(
         _start_estimated_rotation(
             navigation,
             local_state,
-            sign * math.radians(angle_deg),
+            sign * angle_rad,
         )
         if navigation.status != "active":
             state_machine.transition(InstructionState.ACTIVE)
@@ -760,7 +808,7 @@ def _handle_nl_command(
             "seq": seq,
             "status": "active",
             "reason": (
-                f"rotating {direction} {math.radians(angle_deg):.6f} rad"
+                f"rotating {direction} {angle_rad:.6f} rad"
             ),
         })
         return replies
@@ -875,7 +923,32 @@ def _encode_map_chunks(voxels: list[dict[str, object]], map_size: int) -> list[b
     return chunks
 
 
-async def _send_map_chunks(websocket, chunks: list[bytes], wall_time: float) -> None:
+def _map_metadata(grid: MapGrid, anchor: AnchorSpec) -> dict[str, object]:
+    origin_x_m, origin_y_m, origin_yaw_rad = anchor.anchor_to_global(
+        -SPAWN_X, -SPAWN_Y, 0.0
+    )
+    return {
+        "source": "simulator_ground_truth",
+        "frame_id": "simulator_map",
+        "resolution_m": MAP_RESOLUTION_M,
+        "width_cells": grid.width,
+        "height_cells": grid.height,
+        "transform_to_global_map": {
+            "x_m": origin_x_m,
+            "y_m": origin_y_m,
+            "yaw_rad": origin_yaw_rad,
+        },
+        "binary_chunks": {
+            "type": 0,
+            "chunk_size_cells": 256,
+            "header": ">Bii",
+            "byte_order": "big",
+            "payload_order": "row_major_y_x",
+        },
+    }
+
+
+async def _send_map_chunks(websocket, chunks: list[bytes]) -> None:
     """Send map_full as binary chunk frames to Pictor."""
     total_bytes = sum(len(c) for c in chunks)
     print(f"[→] sending map_full ({total_bytes} bytes, {len(chunks)} chunk(s))")
@@ -990,6 +1063,7 @@ def telemetry_messages(
                 "reason": None,
                 "obstacle_clearance_m": None,
                 "edge_clearance_m": None,
+                "edge_point_vehicle_m": None,
             }
         ),
     }
@@ -1059,18 +1133,21 @@ async def handler(
         print(f"[-] busy client rejected: {addr}")
         return
     await runtime.controller_lease.acquire()
-    voxels, grid = runtime.voxels, runtime.grid
-    vehicle, navigation, safety = runtime.vehicle, runtime.navigation, runtime.safety
-    # NL instruction pipeline
-    nl_client = FakeModelClient()
-    schema_v = SchemaValidator()
-    semantic_v = SemanticValidator(None)
-    state_machine = InstructionStateMachine()
-    next_deadline = started_at
-    active_nl_seq: int | None = None
-    last_scan_data: dict[str, object] | None = None
-
     try:
+        voxels, grid = runtime.voxels, runtime.grid
+        vehicle, navigation, safety = (
+            runtime.vehicle,
+            runtime.navigation,
+            runtime.safety,
+        )
+        nl_client = FakeModelClient()
+        schema_v = SchemaValidator()
+        semantic_v = SemanticValidator(None)
+        state_machine = InstructionStateMachine()
+        next_deadline = started_at
+        active_nl_seq: int | None = None
+        last_scan_data: dict[str, object] | None = None
+
         if (
             _localization_quality is not None
             and _localization_quality != runtime.local_state.pose.quality
@@ -1078,9 +1155,17 @@ async def handler(
             runtime.local_state.set_localization_quality(
                 _localization_quality, timestamp=_wall_time()
             )
-        await websocket.send(json.dumps({"type": "hello", "vehicle_id": vehicle_id}))
+        await websocket.send(
+            json.dumps(
+                {
+                    "type": "hello",
+                    "vehicle_id": vehicle_id,
+                    "map": _map_metadata(grid, runtime.local_state.anchor),
+                }
+            )
+        )
         map_chunks = _encode_map_chunks(voxels, 256)
-        await _send_map_chunks(websocket, map_chunks, _wall_time())
+        await _send_map_chunks(websocket, map_chunks)
 
         while True:
             now = _monotonic()
@@ -1168,12 +1253,15 @@ async def handler(
                         state_machine,
                         scan_data=last_scan_data,
                         local_state=runtime.local_state,
+                        safety=safety,
                     )
                     for r in replies:
                         await websocket.send(json.dumps(r))
                     # Track active seq
                     if state_machine.current_state == InstructionState.ACTIVE:
-                        active_nl_seq = message.get("seq")
+                        active_nl_seq = _safe_seq(message)
+                        if active_nl_seq is None:
+                            active_nl_seq = 0
                     continue
                 if message.get("type") == "nl_clarify_response":
                     # Treat as a follow-up nl_command with the response text
@@ -1187,16 +1275,20 @@ async def handler(
                             state_machine,
                             scan_data=last_scan_data,
                             local_state=runtime.local_state,
+                            safety=safety,
                         )
                         for r in replies:
                             await websocket.send(json.dumps(r))
                         if state_machine.current_state == InstructionState.ACTIVE:
-                            active_nl_seq = message.get("seq")
+                            active_nl_seq = _safe_seq(message)
+                            if active_nl_seq is None:
+                                active_nl_seq = 0
                     else:
+                        clarify_seq = _safe_seq(message)
                         await websocket.send(json.dumps({
                             "type": "nl_parse_result",
                             "ts": _wall_time(),
-                            "seq": message.get("seq", 0),
+                            "seq": clarify_seq if clarify_seq is not None else 0,
                             "instruction": None,
                             "accepted": False,
                             "reason": "empty clarify response",
@@ -1235,8 +1327,8 @@ async def handler(
     except Exception as error:
         print(f"[!] connection ended: {error}")
     finally:
-        navigation.cancel("disconnected")
-        vehicle.stop()
+        runtime.navigation.cancel("disconnected")
+        runtime.vehicle.stop()
         runtime.controller_lease.release()
         print(f"[-] client disconnected: {addr}")
 

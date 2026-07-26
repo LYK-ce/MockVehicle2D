@@ -20,10 +20,10 @@
   {"input": "前进 10 米", "expected": {"intent": "move_distance", "parameters": {"distance_m": 10.0, "direction": "forward"}}},
   {"input": "后退 1.5 米", "expected": {"intent": "move_distance", "parameters": {"distance_m": 1.5, "direction": "backward"}}},
   {"input": "后退 5 米", "expected": {"intent": "move_distance", "parameters": {"distance_m": 5.0, "direction": "backward"}}},
-  {"input": "左转 90 度", "expected": {"intent": "rotate", "parameters": {"angle_deg": 90, "direction": "left"}}},
-  {"input": "右转 45 度", "expected": {"intent": "rotate", "parameters": {"angle_deg": 45, "direction": "right"}}},
-  {"input": "左转 180 度", "expected": {"intent": "rotate", "parameters": {"angle_deg": 180, "direction": "left"}}},
-  {"input": "右转 360 度", "expected": {"intent": "rotate", "parameters": {"angle_deg": 360, "direction": "right"}}},
+  {"input": "左转 90 度", "expected": {"intent": "rotate", "parameters": {"angle_rad": 1.5707963267948966, "direction": "left"}}},
+  {"input": "右转 45 度", "expected": {"intent": "rotate", "parameters": {"angle_rad": 0.7853981633974483, "direction": "right"}}},
+  {"input": "左转 180 度", "expected": {"intent": "rotate", "parameters": {"angle_rad": 3.141592653589793, "direction": "left"}}},
+  {"input": "右转 360 度", "expected": {"intent": "rotate", "parameters": {"angle_rad": 6.283185307179586, "direction": "right"}}},
   {"input": "看一下", "expected": {"intent": "scan_report"}},
   {"input": "扫一圈", "expected": {"intent": "scan_report"}},
   {"input": "扫描一下", "expected": {"intent": "scan_report"}},
@@ -45,9 +45,9 @@
   {"input": "去 (99999, 99999)", "expected": {"intent": "goto_point", "parameters": {"x_m": 99999, "y_m": 99999}}},
   {"input": "去 (-5, 10)", "expected": {"intent": "goto_point", "parameters": {"x_m": -5, "y_m": 10}}},
   {"input": "前进 100 米", "expected": {"intent": "move_distance", "parameters": {"distance_m": 100.0, "direction": "forward"}}},
-  {"input": "左转 999 度", "expected": {"intent": "rotate", "parameters": {"angle_deg": 999, "direction": "left"}}},
+  {"input": "左转 999 度", "expected": {"intent": "rotate", "parameters": {"angle_rad": 17.43583922742335, "direction": "left"}}},
   {"input": "去坐标 (128, 64)", "expected": {"intent": "goto_point", "parameters": {"x_m": 128, "y_m": 64}}},
   {"input": "前进 7.5 米", "expected": {"intent": "move_distance", "parameters": {"distance_m": 7.5, "direction": "forward"}}},
   {"input": "后退 0.1 米", "expected": {"intent": "move_distance", "parameters": {"distance_m": 0.1, "direction": "backward"}}},
-  {"input": "左转 15 度", "expected": {"intent": "rotate", "parameters": {"angle_deg": 15, "direction": "left"}}}
+  {"input": "左转 15 度", "expected": {"intent": "rotate", "parameters": {"angle_rad": 0.2617993877991494, "direction": "left"}}}
 ]

@@ -6,6 +6,7 @@ import math
 from pathlib import Path
 import sys
 import unittest
+from unittest.mock import patch
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -13,6 +14,7 @@ sys.path.insert(0, str(REPO_ROOT / "src"))
 
 from mockvehicle2d.local_state import (
     FREE,
+    FORBIDDEN,
     OCCUPIED,
     UNKNOWN,
     AnchorSpec,
@@ -161,6 +163,25 @@ class ObservedGridTest(unittest.TestCase):
         )
 
         self.assertEqual(grid.get_cell(3, 0), OCCUPIED)
+
+    def test_downward_edge_evidence_wins_over_horizontal_free_space(self) -> None:
+        grid = ObservedGrid(self.anchor, resolution_m=1.0)
+
+        grid.integrate_scan(
+            [LaserPoint(0.0, 0.0, 0.0)],
+            self.pose,
+            2.0,
+            self.config,
+            forbidden_points_vehicle_m=((2.5, 0.0),),
+        )
+        grid.integrate_scan(
+            [LaserPoint(0.0, 0.0, 0.0)],
+            self.pose,
+            3.0,
+            self.config,
+        )
+
+        self.assertEqual(grid.get_cell(3, 0), FORBIDDEN)
 
     def test_revision_changes_only_when_cells_change_and_snapshot_is_stable(self) -> None:
         grid = ObservedGrid(self.anchor, resolution_m=1.0)
@@ -515,6 +536,39 @@ class RuntimeIntegrationTest(unittest.TestCase):
         self.assertGreater(first_map_revision, 0)
         self.assertGreaterEqual(runtime.local_state.local_map.revision, first_map_revision)
         self.assertEqual(second.messages[1]["localization"]["revision"], runtime.local_state.pose.revision)
+
+    def test_controller_lease_is_released_when_pipeline_initialization_fails(self) -> None:
+        runtime = VehicleRuntime.create(
+            started_at=0.0,
+            anchor=self.anchor,
+            odometry_config=OdometryConfig(),
+        )
+
+        with patch(
+            "mockvehicle2d.server.SchemaValidator",
+            side_effect=RuntimeError("schema unavailable"),
+        ):
+            asyncio.run(
+                handler(
+                    _StopAfterScanSocket(),
+                    _runtime=runtime,
+                    _monotonic=lambda: 0.0,
+                    _wall_time=lambda: 10.0,
+                )
+            )
+        self.assertFalse(runtime.controller_lease.locked())
+
+        replacement = _StopAfterScanSocket()
+        asyncio.run(
+            handler(
+                replacement,
+                _runtime=runtime,
+                _monotonic=lambda: 1.0,
+                _wall_time=lambda: 11.0,
+            )
+        )
+        self.assertFalse(runtime.controller_lease.locked())
+        self.assertTrue(replacement.messages)
 
     def test_navigation_does_not_query_world_grid_cells(self) -> None:
         source = (REPO_ROOT / "src/mockvehicle2d/navigation.py").read_text(encoding="utf-8")

@@ -109,7 +109,7 @@ class TestSchemaValidator:
 
     def test_valid_rotate(self):
         ok, msg = self.v.validate(
-            _valid_instruction("rotate", {"angle_deg": 90, "direction": "left"})
+            _valid_instruction("rotate", {"angle_rad": math.pi / 2, "direction": "left"})
         )
         assert ok, msg
 
@@ -151,7 +151,14 @@ class TestSchemaValidator:
 
     def test_rotate_angle_out_of_bounds(self):
         ok, msg = self.v.validate(
-            _valid_instruction("rotate", {"angle_deg": 999, "direction": "left"})
+            _valid_instruction("rotate", {"angle_rad": 999, "direction": "left"})
+        )
+        assert not ok
+
+    @pytest.mark.parametrize("angle_rad", (0, -math.pi / 4))
+    def test_rotate_angle_must_be_positive(self, angle_rad):
+        ok, msg = self.v.validate(
+            _valid_instruction("rotate", {"angle_rad": angle_rad, "direction": "left"})
         )
         assert not ok
 
@@ -270,13 +277,14 @@ class TestSemanticValidator:
 
     def test_rotate_non_zero(self):
         ok, msg = self.v.validate(
-            _valid_instruction("rotate", {"angle_deg": 45, "direction": "right"})
+            _valid_instruction("rotate", {"angle_rad": math.pi / 4, "direction": "right"})
         )
         assert ok, msg
 
-    def test_rotate_zero_angle(self):
+    @pytest.mark.parametrize("angle_rad", (0, -math.pi / 4))
+    def test_rotate_non_positive_angle(self, angle_rad):
         ok, msg = self.v.validate(
-            _valid_instruction("rotate", {"angle_deg": 0, "direction": "left"})
+            _valid_instruction("rotate", {"angle_rad": angle_rad, "direction": "left"})
         )
         assert not ok
 
@@ -499,7 +507,7 @@ class TestTaskCompiler:
         ],
     )
     def test_compile_rotate(self, direction, current_yaw_rad, delta_yaw_rad):
-        inst = _valid_instruction("rotate", {"angle_deg": 90, "direction": direction})
+        inst = _valid_instruction("rotate", {"angle_rad": math.pi / 2, "direction": direction})
         snapshot = {"pose": {"yaw_rad": current_yaw_rad}}
         task = self.compiler.compile(inst, snapshot)
         expected_yaw_rad = math.atan2(
@@ -657,18 +665,27 @@ class TestFakeModelClient:
         assert result["parameters"]["distance_m"] == 1.5
         assert result["parameters"]["direction"] == "backward"
 
+    @pytest.mark.parametrize(
+        "text",
+        ("前进 .... 米", "后退 . 米", "去 (..., 1)", "左转 .... 度"),
+    )
+    def test_malformed_numeric_text_is_rejected_without_raising(self, text):
+        result = self.client.parse(text)
+        assert result is not None
+        assert result["intent"] == "clarify"
+
     def test_rotate_left(self):
         result = self.client.parse("左转 90 度")
         assert result is not None
         assert result["intent"] == "rotate"
-        assert result["parameters"]["angle_deg"] == 90
+        assert result["parameters"]["angle_rad"] == pytest.approx(math.pi / 2)
         assert result["parameters"]["direction"] == "left"
 
     def test_rotate_right(self):
         result = self.client.parse("右转 45 度")
         assert result is not None
         assert result["intent"] == "rotate"
-        assert result["parameters"]["angle_deg"] == 45
+        assert result["parameters"]["angle_rad"] == pytest.approx(math.pi / 4)
         assert result["parameters"]["direction"] == "right"
 
     def test_scan_simple(self):

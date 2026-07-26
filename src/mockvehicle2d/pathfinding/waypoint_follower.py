@@ -77,7 +77,7 @@ class WaypointFollower:
 
         if abs(delta) < self._angle_tolerance:
             return "forward", False
-        return "spin_left" if delta > 0 else "spin_right", False
+        return "spin_right" if delta > 0 else "spin_left", False
 
     def reset(self, path: list[tuple[float, float]]) -> None:
         """Replace the current path and restart from its first segment."""

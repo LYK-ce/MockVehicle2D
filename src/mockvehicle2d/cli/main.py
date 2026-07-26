@@ -136,7 +136,11 @@ def _cmd_pathfind(args):
     grid = MapGrid.from_voxels(voxels)
 
     path = a_star_search(
-        grid, start, goal, vehicle_radius=args.vehicle_radius_m
+        grid,
+        start,
+        goal,
+        vehicle_radius=args.vehicle_radius_m,
+        resolution_m=resolution_m,
     )
     if path is None:
         print(f"No path found from {args.start_m} m to {args.goal_m} m")
@@ -350,8 +354,6 @@ def main():
     serve.add_argument("--angular-speed-rps", type=_positive_float, default=math.pi / 2, metavar="RPS")
     serve.add_argument("--vehicle-radius-m", type=_positive_float, default=0.5, metavar="M")
     serve.add_argument("--command-timeout-s", type=_positive_float, default=1.0, metavar="S")
-    serve.add_argument("--nl", action="store_true", default=True,
-                       help="Enable natural language command processing (default: on)")
     serve.add_argument(
         "--anchor-id",
         type=_vehicle_id,
@@ -395,8 +397,6 @@ def main():
                         help="Run offline evaluation against a dataset")
     nl_cmd.add_argument("--dataset", type=str, default="tests/nl_eval.json", metavar="PATH",
                         help="Path to evaluation dataset JSON")
-    nl_cmd.add_argument("--fake", action="store_true", default=True,
-                        help="Use FakeModelClient (default)")
     nl_cmd.add_argument("--vllm", action="store_true",
                         help="Use VLLMClient (requires local vLLM)")
 

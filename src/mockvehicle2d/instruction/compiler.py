@@ -143,17 +143,17 @@ class TaskCompiler:
         })
 
     def _compile_rotate(self, params: dict, snapshot: dict) -> dict:
-        angle_deg = params["angle_deg"]
+        angle_rad = params["angle_rad"]
         direction = params["direction"]
         # Compute target yaw
         pose = snapshot.get("pose", {})
         current_yaw = pose.get("yaw_rad", 0.0)
         sign = -1.0 if direction == "left" else 1.0
-        target_yaw = current_yaw + sign * math.radians(angle_deg)
+        target_yaw = current_yaw + sign * angle_rad
         target_yaw = math.atan2(math.sin(target_yaw), math.cos(target_yaw))
         return self._make_task("rotation", {
             "action": "rotate",
-            "angle_rad": math.radians(angle_deg),
+            "angle_rad": angle_rad,
             "direction": direction,
             "target_yaw_rad": round(target_yaw, 4),
         })

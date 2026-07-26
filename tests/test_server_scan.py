@@ -3,6 +3,7 @@
 import argparse
 import asyncio
 import json
+import math
 from pathlib import Path
 import sys
 import unittest
@@ -16,7 +17,16 @@ from mockvehicle2d.cli.main import _port
 from mockvehicle2d.collision import is_circle_passable
 from mockvehicle2d.map_grid import MapGrid
 from mockvehicle2d.scan import scan_message
-from mockvehicle2d.server import _next_deadline, generate_map, handler, main as server_main, telemetry_messages, validate_vehicle_id
+from mockvehicle2d.local_state import AnchorSpec
+from mockvehicle2d.server import (
+    _map_metadata,
+    _next_deadline,
+    generate_map,
+    handler,
+    main as server_main,
+    telemetry_messages,
+    validate_vehicle_id,
+)
 from mockvehicle2d.vehicle import Vehicle
 
 
@@ -131,7 +141,10 @@ class ScanMessageTest(unittest.TestCase):
         self.assertEqual(
             [message["type"] for message in websocket.messages], ["hello", "pose", "scan"]
         )
-        self.assertEqual(websocket.messages[0], {"type": "hello", "vehicle_id": "pictor_test-1"})
+        self.assertEqual(websocket.messages[0]["type"], "hello")
+        self.assertEqual(websocket.messages[0]["vehicle_id"], "pictor_test-1")
+        self.assertEqual(websocket.messages[0]["map"]["frame_id"], "simulator_map")
+        self.assertEqual(websocket.messages[0]["map"]["resolution_m"], 1.0)
         self.assertEqual(websocket.messages[1]["x"], 10.0)
         self.assertEqual(websocket.messages[1]["source"], "anchored_odometry")
         self.assertEqual(websocket.messages[1]["localization"]["frame_id"], "anchor_map")
@@ -148,11 +161,26 @@ class ScanMessageTest(unittest.TestCase):
                 "reason": None,
                 "obstacle_clearance_m": None,
                 "edge_clearance_m": None,
+                "edge_point_vehicle_m": None,
             },
         )
         self.assertEqual(websocket.messages[1]["seq"], websocket.messages[2]["seq"])
         self.assertEqual(websocket.messages[1]["ts"], websocket.messages[2]["ts"])
         self.assertEqual(websocket.messages[-1]["config"]["model"], "ydlidar_tmini")
+
+    def test_map_metadata_places_raw_grid_in_global_frame_for_custom_anchor(self) -> None:
+        metadata = _map_metadata(
+            MapGrid(32, 16),
+            AnchorSpec("custom", 100.0, 50.0, math.pi / 2),
+        )
+
+        self.assertEqual(metadata["frame_id"], "simulator_map")
+        self.assertEqual((metadata["width_cells"], metadata["height_cells"]), (32, 16))
+        self.assertEqual(metadata["binary_chunks"]["header"], ">Bii")
+        transform = metadata["transform_to_global_map"]
+        self.assertAlmostEqual(transform["x_m"], 110.0)
+        self.assertAlmostEqual(transform["y_m"], 40.0)
+        self.assertAlmostEqual(transform["yaw_rad"], math.pi / 2)
 
     def test_vehicle_id_is_safe_for_pictor_names_and_logs(self) -> None:
         self.assertEqual(validate_vehicle_id("mock.Vehicle_01-test"), "mock.Vehicle_01-test")

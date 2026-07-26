@@ -474,6 +474,7 @@ class SafetyRuntimeTest(unittest.TestCase):
                 "reason": None,
                 "obstacle_clearance_m": None,
                 "edge_clearance_m": None,
+                "edge_point_vehicle_m": None,
             },
         )
 

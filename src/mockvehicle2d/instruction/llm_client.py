@@ -13,11 +13,20 @@ from datetime import datetime, timezone, timedelta
 
 # Beijing timezone (UTC+8)
 _BEIJING_TZ = timezone(timedelta(hours=8))
+_NUMBER = r"(?:\d+(?:\.\d*)?|\.\d+)"
 
 
 def _beijing_now() -> str:
     """Return current Beijing time as ISO 8601 string."""
     return datetime.now(_BEIJING_TZ).isoformat()
+
+
+def _finite_number(value: str) -> float | None:
+    try:
+        number = float(value)
+    except (ValueError, OverflowError):
+        return None
+    return number if math.isfinite(number) else None
 
 
 class FakeModelClient:
@@ -74,40 +83,58 @@ class FakeModelClient:
     def _parse_goto_point(text: str) -> tuple[float, float] | None:
         # "去 (x, y)" / "去坐标 (x, y)" / "开到 x, y" / "前往 (x, y)"
         patterns = [
-            r"^去\s*\(\s*(-?[\d.]+)\s*[,，]\s*(-?[\d.]+)\s*\)$",
-            r"^去坐标\s*\(\s*(-?[\d.]+)\s*[,，]\s*(-?[\d.]+)\s*\)$",
-            r"^开到\s*(-?[\d.]+)\s*[,，]\s*(-?[\d.]+)$",
-            r"^前往\s*\(\s*(-?[\d.]+)\s*[,，]\s*(-?[\d.]+)\s*\)$",
+            rf"^去\s*\(\s*(-?{_NUMBER})\s*[,，]\s*(-?{_NUMBER})\s*\)$",
+            rf"^去坐标\s*\(\s*(-?{_NUMBER})\s*[,，]\s*(-?{_NUMBER})\s*\)$",
+            rf"^开到\s*(-?{_NUMBER})\s*[,，]\s*(-?{_NUMBER})$",
+            rf"^前往\s*\(\s*(-?{_NUMBER})\s*[,，]\s*(-?{_NUMBER})\s*\)$",
         ]
         for pat in patterns:
             m = re.match(pat, text)
             if m:
-                try:
-                    return float(m.group(1)), float(m.group(2))
-                except ValueError:
-                    return None
+                x_m, y_m = _finite_number(m.group(1)), _finite_number(m.group(2))
+                return None if x_m is None or y_m is None else (x_m, y_m)
         return None
 
     @staticmethod
     def _parse_move_distance(text: str) -> dict | None:
         # "前进 N 米" / "后退 N 米"
-        m = re.match(r"^前进\s*([\d.]+)\s*米$", text)
+        m = re.match(rf"^前进\s*({_NUMBER})\s*米$", text)
         if m:
-            return {"distance_m": float(m.group(1)), "direction": "forward"}
-        m = re.match(r"^后退\s*([\d.]+)\s*米$", text)
+            distance_m = _finite_number(m.group(1))
+            return (
+                None
+                if distance_m is None
+                else {"distance_m": distance_m, "direction": "forward"}
+            )
+        m = re.match(rf"^后退\s*({_NUMBER})\s*米$", text)
         if m:
-            return {"distance_m": float(m.group(1)), "direction": "backward"}
+            distance_m = _finite_number(m.group(1))
+            return (
+                None
+                if distance_m is None
+                else {"distance_m": distance_m, "direction": "backward"}
+            )
         return None
 
     @staticmethod
     def _parse_rotate(text: str) -> dict | None:
         # "左转 N 度" / "右转 N 度"
-        m = re.match(r"^左转\s*([\d.]+)\s*度$", text)
+        m = re.match(rf"^左转\s*({_NUMBER})\s*度$", text)
         if m:
-            return {"angle_deg": float(m.group(1)), "direction": "left"}
-        m = re.match(r"^右转\s*([\d.]+)\s*度$", text)
+            angle_deg = _finite_number(m.group(1))
+            return (
+                None
+                if angle_deg is None
+                else {"angle_rad": math.radians(angle_deg), "direction": "left"}
+            )
+        m = re.match(rf"^右转\s*({_NUMBER})\s*度$", text)
         if m:
-            return {"angle_deg": float(m.group(1)), "direction": "right"}
+            angle_deg = _finite_number(m.group(1))
+            return (
+                None
+                if angle_deg is None
+                else {"angle_rad": math.radians(angle_deg), "direction": "right"}
+            )
         return None
 
     @staticmethod
@@ -163,7 +190,7 @@ _SYSTEM_PROMPT = """你是一个车辆指令解析器。将用户的自然语言
 - status: 无需参数，parameters 为空对象 {}
 - goto_point: 需要 x_m (数字) 和 y_m (数字)
 - move_distance: 需要 distance_m (数字, 0.01-10.0) 和 direction ("forward" 或 "backward")
-- rotate: 需要 angle_deg (数字, -360到360) 和 direction ("left" 或 "right")
+- rotate: 需要 angle_rad (弧度, 大于0且不超过6.283185307179586) 和 direction ("left" 或 "right")
 - scan_report: 可选 query (字符串)
 - clarify: 需要 question (字符串)，可选 missing_parameters (字符串数组)
 
@@ -178,7 +205,7 @@ _SYSTEM_PROMPT = """你是一个车辆指令解析器。将用户的自然语言
 输出: {"schema_version": "1.0", "intent": "move_distance", "timestamp": "2026-01-01T00:00:00+08:00", "parameters": {"distance_m": 3.0, "direction": "forward"}, "confidence": 0.95, "reasoning": "用户要求向前移动指定距离"}
 
 输入: "左转 90 度"
-输出: {"schema_version": "1.0", "intent": "rotate", "timestamp": "2026-01-01T00:00:00+08:00", "parameters": {"angle_deg": 90, "direction": "left"}, "confidence": 0.95, "reasoning": "用户要求左转指定角度"}
+输出: {"schema_version": "1.0", "intent": "rotate", "timestamp": "2026-01-01T00:00:00+08:00", "parameters": {"angle_rad": 1.5707963267948966, "direction": "left"}, "confidence": 0.95, "reasoning": "用户要求左转指定角度"}
 
 输入: "前面有什么"
 输出: {"schema_version": "1.0", "intent": "scan_report", "timestamp": "2026-01-01T00:00:00+08:00", "parameters": {"query": "前方"}, "confidence": 0.9, "reasoning": "用户询问前方障碍物情况"}

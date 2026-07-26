@@ -106,6 +106,18 @@ class TestPathFollowingBasic:
         assert path_following.reason == "goal_tolerance"
         assert math.hypot(v.x - 12, v.y - 10) < 1.0  # Within ~1m of goal
 
+    def test_follows_positive_y_path_with_real_vehicle(self, path_following, empty_grid):
+        v = Vehicle(10.0, 10.0, yaw=0.0)
+        path_following.start([(10, 10), (10, 12)])
+
+        for step in range(300):
+            path_following.update(v, empty_grid, step * 0.1)
+            if path_following.status == "reached":
+                break
+
+        assert path_following.status == "reached"
+        assert math.hypot(v.x - 10, v.y - 12) < 1.0
+
     def test_cancel_during_path(self, path_following, empty_grid):
         v = Vehicle(10.0, 10.0, yaw=0.0)
         path = [(10, 10), (20, 10)]

@@ -40,18 +40,19 @@ _DIAGONAL_GATE: dict[tuple[int, int], list[tuple[int, int]]] = {
 }
 
 
-def _inflate_blocked(grid: MapGrid) -> set[tuple[int, int]]:
-    """Return the set of cells that are walls *or* adjacent to a wall.
-
-    With vehicle radius 0.5, a vehicle whose centre is in a cell adjacent to a
-    wall will overlap the wall cell, so those neighbours are also impassable.
-    """
+def _inflate_blocked(
+    grid: MapGrid, inflation_cells: int = 1
+) -> set[tuple[int, int]]:
+    """Return every non-passable cell and its conservative inflation zone."""
+    if inflation_cells < 0:
+        raise ValueError("inflation_cells must be non-negative")
     blocked: set[tuple[int, int]] = set()
     for x in range(grid.width):
         for y in range(grid.height):
-            if grid.is_wall(x, y):
-                blocked.add((x, y))
-                for dx, dy, _ in _MOVES:
+            if grid.is_passable(x, y):
+                continue
+            for dx in range(-inflation_cells, inflation_cells + 1):
+                for dy in range(-inflation_cells, inflation_cells + 1):
                     nx, ny = x + dx, y + dy
                     if grid.in_bounds(nx, ny):
                         blocked.add((nx, ny))
@@ -64,26 +65,28 @@ def a_star_search(
     goal: tuple[int, int],
     *,
     vehicle_radius: float = 0.5,
+    resolution_m: float = 1.0,
 ) -> Optional[list[tuple[int, int]]]:
     """Find an eight-connected shortest path from *start* to *goal*.
 
     Returns a list of grid coordinates (including start and goal) or ``None``
-    when no path exists.  Walls are inflated by one cell when
-    *vehicle_radius* > 0 so that the returned path keeps the vehicle centre at
-    least 0.5 away from any wall.
+    when no path exists. Every non-passable cell is inflated conservatively by
+    ``ceil(vehicle_radius / resolution_m)`` cells.
     """
     if not grid.in_bounds(*start):
         raise ValueError(f"start {start} out of bounds")
     if not grid.in_bounds(*goal):
         raise ValueError(f"goal {goal} out of bounds")
 
-    inflate = vehicle_radius > 0
-    blocked = _inflate_blocked(grid) if inflate else None
+    if not math.isfinite(vehicle_radius) or vehicle_radius < 0:
+        raise ValueError("vehicle_radius must be finite and non-negative")
+    if not math.isfinite(resolution_m) or resolution_m <= 0:
+        raise ValueError("resolution_m must be finite and positive")
+    inflation_cells = math.ceil(vehicle_radius / resolution_m)
+    blocked = _inflate_blocked(grid, inflation_cells)
 
     def _passable(cell: tuple[int, int]) -> bool:
-        if inflate:
-            return cell not in blocked
-        return grid.is_passable(*cell)
+        return cell not in blocked
 
     if not _passable(start):
         return None

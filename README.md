@@ -140,7 +140,8 @@ AABB vs Circle 圆形碰撞
 
 启动 Server 后，在 Pictor 中连接 `ws://127.0.0.1:19090`；使用 `--port 9090` 时，
 Pictor 也应连接 `ws://127.0.0.1:9090`。连接首帧固定为
-`{"type":"hello","vehicle_id":"mock_vehicle_01"}`，随后依次发送 `map_full → pose → scan`。
+`hello` 除 `vehicle_id` 外还包含 `map` 元数据（分辨率、尺寸、二进制 chunk 布局及
+`simulator_map → global_map` 变换），随后依次发送 `map_full → pose → scan`。
 
 | 方向 | 消息 | 状态 |
 |------|------|------|
@@ -155,7 +156,8 @@ Pictor 也应连接 `ws://127.0.0.1:9090`。连接首帧固定为
 
 每辆车启动时只知道 `global_map → anchor_map` 的出生锚点。随后用运动增量生成
 `anchor_map → odom → base_link → lidar` 的锚定里程计，并把 Tmini 扫描累计到独立的
-`ObservedGrid`（`Unknown/Free/Occupied`）。该地图及 revision 在 Pictor 断开重连后仍保留，
+`ObservedGrid`（`Unknown/Free/Occupied/Forbidden`）。其中下视安全输入发现的落差写为
+不会被水平雷达 Free 射线覆盖的 `Forbidden`。该地图及 revision 在 Pictor 断开重连后仍保留，
 但当前只存在小车内存中，不上传中央地图。每帧先用 bounded correlative scan matching
 将当前扫描与旧的 Occupied 证据配准，通过支持数、得分和歧义 margin 后才修正里程计，再
 写入当前帧。默认噪声为零以保持确定性；非零噪声使用 `--odom-seed` 重放。这是最小局部
@@ -172,9 +174,10 @@ SLAM 前端，不含回环检测、位姿图或全局优化，不能宣称生产
 行驶在障碍/边缘净空 `0.25–1.0 m` 内线性降速，净空 `<=0.25 m` 或安全输入故障时停车；
 任何手动 `cmd`/`drive` 或非法输入也会取消活动目标。
 
-`pose.safety` 持续报告 `{state, reason, obstacle_clearance_m, edge_clearance_m}`。障碍净空按圆形车体沿行驶方向扫过的完整走廊计算，不使用固定角度扇区；运行时把延迟时段拆成不超过 `0.05 m` 且不越过硬停止净空的小步，每步重新观测。手动驾驶不在慢速区降速，但仍执行硬停止和故障停车；新的安全方向命令可解除手动安全锁停，纯旋转允许用于脱困。Tmini 只负责正障碍距离，落差净空是模拟的辅助下视/相机输入，不能解释为雷达能力。
+`pose.safety` 持续报告 `{state, reason, obstacle_clearance_m, edge_clearance_m,
+edge_point_vehicle_m}`。障碍净空按圆形车体沿行驶方向扫过的完整走廊计算，不使用固定角度扇区；运行时把延迟时段拆成不超过 `0.05 m` 且不越过硬停止净空的小步，每步重新观测。手动驾驶不在慢速区降速，但仍执行硬停止和故障停车；新的安全方向命令可解除手动安全锁停，纯旋转允许用于脱困。Tmini 只负责正障碍距离，落差净空及车辆坐标系证据点是模拟的辅助下视/相机输入，不能解释为雷达能力。
 
-`map_full` 仍标有 `source: "simulator_ground_truth"`，仅用于物理碰撞、生成传感器数据和
+`hello.map.source` 将二进制 `map_full` 标为 `simulator_ground_truth`，仅用于物理碰撞、生成传感器数据和
 调试显示；正常 WebSocket `pose` 不再泄露绝对真值。模拟 scan 生成器仍必须读取真值环境，
 但导航只消费锚定里程计、车辆自有地图和局部安全结果。无回波目前按最大量程更新为自由空间，这是当前
 模拟协议约定，接入真实 Tmini 前必须按硬件无回波语义校准。水平 Tmini 不能检测跌落。

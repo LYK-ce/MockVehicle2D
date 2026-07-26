@@ -12,6 +12,7 @@ from mockvehicle2d.local_state import (
     AnchorSpec,
     AnchoredLocalState,
     FREE,
+    FORBIDDEN,
     LocalMapDelta,
     MapCellUpdate,
     OCCUPIED,
@@ -19,7 +20,7 @@ from mockvehicle2d.local_state import (
     OdometryConfig,
     PoseEstimate,
 )
-from mockvehicle2d.map_grid import MapGrid
+from mockvehicle2d.map_grid import MapGrid, VOID
 from mockvehicle2d.navigation import GotoController
 from mockvehicle2d.safety import LocalSafetyRuntime, SafetyAdvanceResult
 from mockvehicle2d.server import VehicleRuntime
@@ -160,3 +161,59 @@ def test_runtime_discovers_hidden_route_obstacle_before_collision_and_reaches_go
     assert runtime.navigation.snapshot()["path"] != initial_path
     assert runtime.navigation.status == "reached"
     assert math.hypot(runtime.vehicle.x - 26.5, runtime.vehicle.y - 5.5) <= 0.2
+
+
+def test_runtime_maps_a_hidden_drop_and_replans_around_it() -> None:
+    world = MapGrid.from_wall_set(20, 12, set())
+    vehicle = Vehicle(2.5, 5.5, radius=0.5, command_timeout=1.0, now=0.0)
+    anchor = AnchorSpec("nav-anchor", vehicle.x, vehicle.y, 0.0)
+    runtime = VehicleRuntime(
+        [],
+        world,
+        vehicle,
+        GotoController(),
+        LocalSafetyRuntime(),
+        AnchoredLocalState(
+            anchor,
+            truth_x_m=vehicle.x,
+            truth_y_m=vehicle.y,
+            truth_yaw_rad=vehicle.yaw,
+            timestamp=0.0,
+        ),
+    )
+    runtime.navigation.start(
+        10.0,
+        0.0,
+        reported_goal=(12.5, 5.5),
+        local_map=runtime.local_state.local_map,
+        pose=runtime.local_state.pose,
+        vehicle_radius_m=vehicle.radius,
+    )
+
+    saw_edge_stop = False
+    inserted_drop = False
+    for tick in range(1, 900):
+        now = tick / 6
+        if not inserted_drop and runtime.vehicle.x >= 6.35:
+            for y in range(3, 9):
+                world.set_cell(7, y, VOID)
+            inserted_drop = True
+        frame = runtime.update(now, now)
+        saw_edge_stop |= frame.safety_stop == "safety_edge"
+        assert not runtime.vehicle.collision
+        if runtime.navigation.status == "reached":
+            break
+
+    assert inserted_drop and saw_edge_stop, (
+        runtime.navigation.snapshot(),
+        runtime.safety.snapshot(),
+        runtime.vehicle.x,
+        runtime.vehicle.y,
+    )
+    assert any(
+        cell["state"] == FORBIDDEN
+        for cell in runtime.local_state.local_map.snapshot()["cells"]
+    )
+    assert runtime.navigation.snapshot()["replan_count"] >= 1
+    assert runtime.navigation.status == "reached"
+    assert math.hypot(runtime.vehicle.x - 12.5, runtime.vehicle.y - 5.5) <= 0.2

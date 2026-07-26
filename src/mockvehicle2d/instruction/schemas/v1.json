@@ -113,9 +113,9 @@
         "properties": {
           "parameters": {
             "type": "object",
-            "required": ["angle_deg", "direction"],
+            "required": ["angle_rad", "direction"],
             "properties": {
-              "angle_deg": { "type": "number", "minimum": -360, "maximum": 360 },
+              "angle_rad": { "type": "number", "exclusiveMinimum": 0, "maximum": 6.283185307179586 },
               "direction": { "type": "string", "enum": ["left", "right"] }
             },
             "additionalProperties": false

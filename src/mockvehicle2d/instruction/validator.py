@@ -137,9 +137,14 @@ class SemanticValidator:
 
     @staticmethod
     def _validate_rotate(params: dict) -> tuple[bool, str]:
-        angle = params.get("angle_deg", 0)
-        if angle == 0:
-            return False, "rotate angle must be non-zero"
+        angle = params.get("angle_rad", 0)
+        if (
+            isinstance(angle, bool)
+            or not isinstance(angle, (int, float))
+            or not math.isfinite(angle)
+            or angle <= 0
+        ):
+            return False, "rotate angle must be positive"
         return True, ""
 
 

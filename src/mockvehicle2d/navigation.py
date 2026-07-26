@@ -5,6 +5,7 @@ from __future__ import annotations
 import math
 from typing import TYPE_CHECKING
 
+from mockvehicle2d.local_state import FORBIDDEN
 from mockvehicle2d.map_grid import MapGrid
 from mockvehicle2d.pathfinding.d_star_lite import DStarLitePlanner
 from mockvehicle2d.safety import LocalSafetyRuntime, SafetyAdvanceResult
@@ -218,7 +219,17 @@ class GotoController:
             vehicle.stop()
             return
         if safety_stop is not None and not (
-            self._planner is not None and safety_stop == "safety_obstacle"
+            self._planner is not None
+            and (
+                safety_stop == "safety_obstacle"
+                or (
+                    safety_stop == "safety_edge"
+                    and map_delta is not None
+                    and any(
+                        cell.state == FORBIDDEN for cell in map_delta.changed_cells
+                    )
+                )
+            )
         ):
             self.status = "blocked"
             self.reason = safety_stop

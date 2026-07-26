@@ -6,6 +6,8 @@ Uses FakeModelClient for deterministic results.
 
 from __future__ import annotations
 
+import asyncio
+import json
 import math
 import time
 
@@ -15,7 +17,7 @@ from mockvehicle2d.instruction.llm_client import FakeModelClient
 from mockvehicle2d.instruction.state_machine import InstructionState, InstructionStateMachine
 from mockvehicle2d.instruction.validator import SchemaValidator, SemanticValidator
 from mockvehicle2d.map_grid import MapGrid
-from mockvehicle2d.local_state import AnchorSpec, AnchoredLocalState
+from mockvehicle2d.local_state import AnchorSpec, AnchoredLocalState, OdometryConfig
 from mockvehicle2d.navigation import GotoController
 from mockvehicle2d.safety import LocalSafetyRuntime, SafetyAdvanceResult
 from mockvehicle2d.server import (
@@ -23,6 +25,8 @@ from mockvehicle2d.server import (
     _summarize_scan_for_nl,
     _cancel_nl_task,
     handle_command_message,
+    handler,
+    VehicleRuntime,
 )
 from mockvehicle2d.vehicle import Vehicle
 
@@ -94,6 +98,40 @@ def state_machine():
     return InstructionStateMachine()
 
 
+class _Clock:
+    now = 0.0
+
+    def monotonic(self):
+        return self.now
+
+
+class _InvalidSeqSocket:
+    remote_address = ("nl-seq", 0)
+
+    def __init__(self, clock, seq):
+        self.clock = clock
+        self.seq = seq
+        self.messages = []
+        self.received = False
+
+    async def send(self, payload):
+        if isinstance(payload, bytes):
+            return
+        message = json.loads(payload)
+        self.messages.append(message)
+        if message.get("type") == "nl_task_update" and message.get("status") == "completed":
+            raise RuntimeError("test complete")
+
+    async def recv(self):
+        if not self.received:
+            self.received = True
+            return json.dumps(
+                {"type": "nl_command", "seq": self.seq, "text": "前进 0.1 米"}
+            )
+        self.clock.now = 0.2
+        raise asyncio.TimeoutError
+
+
 # ═══════════════════════════════════════════════════════════════
 # NL command execution tests
 # ═══════════════════════════════════════════════════════════════
@@ -127,6 +165,55 @@ class TestNlCommandStop:
         assert len(task_update) == 1
         assert task_update[0]["status"] == "completed"
         assert "stopped" in str(task_update[0].get("reason", ""))
+
+    def test_stop_handoff_integrates_the_same_mid_tick_motion_as_direct_command(
+        self, empty_grid, nl_client, schema_v, semantic_v
+    ):
+        direct = Vehicle(10.0, 10.0, now=0.0)
+        natural = Vehicle(10.0, 10.0, now=0.0)
+        direct.install_command("forward", 0.0)
+        natural.install_command("forward", 0.0)
+        direct_state = AnchoredLocalState(
+            AnchorSpec("direct", 10.0, 10.0, 0.0),
+            truth_x_m=10.0,
+            truth_y_m=10.0,
+            truth_yaw_rad=0.0,
+            timestamp=0.0,
+        )
+        natural_state = AnchoredLocalState(
+            AnchorSpec("natural", 10.0, 10.0, 0.0),
+            truth_x_m=10.0,
+            truth_y_m=10.0,
+            truth_yaw_rad=0.0,
+            timestamp=0.0,
+        )
+
+        handle_command_message(
+            '{"type":"cmd","seq":1,"cmd":"stop"}',
+            direct,
+            empty_grid,
+            0.5,
+            10.5,
+            GotoController(),
+            local_state=direct_state,
+        )
+        _handle_nl_command(
+            {"type": "nl_command", "seq": 2, "text": "停"},
+            natural,
+            empty_grid,
+            GotoController(),
+            10.5,
+            0.5,
+            nl_client,
+            schema_v,
+            semantic_v,
+            InstructionStateMachine(),
+            local_state=natural_state,
+        )
+
+        assert natural.x == pytest.approx(direct.x)
+        assert natural_state.pose.x_m == pytest.approx(direct_state.pose.x_m)
+        assert natural.command == direct.command == "stop"
 
 
 class TestNlCommandGoto:
@@ -643,6 +730,59 @@ class TestValidationFailures:
         assert len(replies) == 1
         assert replies[0]["type"] == "nl_parse_result"
         assert replies[0]["accepted"] is False
+
+    @pytest.mark.parametrize("seq", ("bad", True, -1))
+    def test_invalid_sequence_is_normalized_in_every_reply(
+        self,
+        seq,
+        vehicle,
+        empty_grid,
+        navigation,
+        nl_client,
+        schema_v,
+        semantic_v,
+    ):
+        replies = _handle_nl_command(
+            {"type": "nl_command", "seq": seq, "text": "前进 1 米"},
+            vehicle,
+            empty_grid,
+            navigation,
+            time.time(),
+            time.monotonic(),
+            nl_client,
+            schema_v,
+            semantic_v,
+            InstructionStateMachine(),
+        )
+        assert replies
+        assert {reply["seq"] for reply in replies} == {0}
+
+    @pytest.mark.parametrize("seq", ("bad", True, -1))
+    def test_invalid_sequence_stays_normalized_on_async_completion(self, seq):
+        clock = _Clock()
+        socket = _InvalidSeqSocket(clock, seq)
+        runtime = VehicleRuntime.create(
+            started_at=0.0,
+            anchor=AnchorSpec("nl-seq", 10.0, 10.0, 0.0),
+            odometry_config=OdometryConfig(),
+        )
+
+        asyncio.run(
+            handler(
+                socket,
+                _runtime=runtime,
+                _monotonic=clock.monotonic,
+                _wall_time=lambda: 10.0 + clock.now,
+            )
+        )
+
+        task_updates = [
+            message
+            for message in socket.messages
+            if message.get("type") == "nl_task_update"
+        ]
+        assert task_updates
+        assert {message["seq"] for message in task_updates} == {0}
 
     def test_busy_state_rejected(self, vehicle, empty_grid, navigation, nl_client,
                                   schema_v, semantic_v, state_machine):
