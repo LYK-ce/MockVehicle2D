@@ -12,7 +12,7 @@ bash bootstrap.sh
 source .venv/bin/activate
 
 # 运行测试
-mockvehicle2d test
+python -m pytest
 
 # 启动可控 WebSocket Mock Server（默认端口 19090）
 mockvehicle2d serve --vehicle-id mock_vehicle_01
@@ -35,8 +35,6 @@ mockvehicle2d pathfind --start-m 10,10 --goal-m 200,200
 # 启动 Pygame 可视化
 mockvehicle2d visual
 
-# 或通过 Python 模块运行
-python -m mockvehicle2d test
 ```
 
 > **注意**：依赖安装在项目本地的 `.venv/` 中，不会污染系统 Python。
@@ -130,7 +128,7 @@ AABB vs Circle 圆形碰撞
 
 ## 测试
 
-`mockvehicle2d test` 使用当前 Python 解释器运行 `tests/` 下的完整 pytest
+在源码仓库中运行 `python -m pytest` 执行 `tests/` 下的完整
 测试集，包括有限视野 D* Lite、动态重规划、scan matching、SI 契约、WebSocket
 协议、车辆运动、碰撞与安全回归；任一测试失败时命令返回非零状态。
 
@@ -142,6 +140,9 @@ AABB vs Circle 圆形碰撞
 Pictor 也应连接 `ws://127.0.0.1:9090`。连接首帧固定为
 `hello` 除 `vehicle_id` 外还包含 `map` 元数据（分辨率、尺寸、二进制 chunk 布局及
 `simulator_map → global_map` 变换），随后依次发送 `map_full → pose → scan`。
+
+> 旧版 Pictor 若忽略 `hello.map`，只适用于默认出生锚点产生的恒等变换。使用非默认
+> anchor 时，消费者必须应用 `transform_to_global_map`，否则地图叠加位置必然错误。
 
 | 方向 | 消息 | 状态 |
 |------|------|------|

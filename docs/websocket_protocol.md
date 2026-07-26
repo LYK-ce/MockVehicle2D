@@ -232,6 +232,10 @@ offset  bytes  encoding
 帧名和 `simulator_map → global_map` 变换由前一条 `hello.map` 给出；因此非默认出生锚点
 下，消费者不得把原始格坐标直接当成全局坐标。
 
+> **Legacy Pictor 限制**：忽略 `hello.map` 的客户端只支持默认 anchor 产生的恒等
+> `simulator_map → global_map` 变换。Server 不会为非默认 anchor 重写二进制格坐标；
+> 此时客户端必须应用 `transform_to_global_map`，否则调试地图与车辆位姿不会对齐。
+
 ### map_delta — 增量地图（尚未实现）
 
 仅发送变化的格子。
@@ -264,7 +268,7 @@ offset  bytes  encoding
 }
 ```
 
-`seq` 必须是非负整数。为兼容旧客户端，也接受字段严格为 `{"cmd":"forward"}` 的 legacy 格式，其确认消息中 `seq` 为 `null`。二进制帧、非 JSON、非对象、错误 `type`、额外字段、非法 `seq` 或未知 `cmd` 都会立即停车并返回 `error`。
+所有带 `seq` 的下行命令统一使用 u64：`0 <= seq <= 18446744073709551615`，布尔值不算整数。非法值在可解析回复中规范化为 `0`；缺失字段或无法解析消息时可为 `null`。为兼容旧客户端，也接受字段严格为 `{"cmd":"forward"}` 的 legacy 格式，其确认消息中 `seq` 为 `null`。二进制帧、非 JSON、非对象、错误 `type`、额外字段、非法 `seq` 或未知 `cmd` 都会立即停车并返回 `error`。
 
 | 命令 | 说明 |
 |------|------|

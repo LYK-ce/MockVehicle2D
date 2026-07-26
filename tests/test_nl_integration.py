@@ -132,6 +132,45 @@ class _InvalidSeqSocket:
         raise asyncio.TimeoutError
 
 
+class _ActiveOwnerSocket:
+    remote_address = ("nl-owner", 0)
+
+    def __init__(self, clock, second_type, outcome):
+        self.clock = clock
+        self.second_type = second_type
+        self.outcome = outcome
+        self.messages = []
+        self.receive_count = 0
+        self.runtime = None
+
+    async def send(self, payload):
+        if isinstance(payload, bytes):
+            return
+        message = json.loads(payload)
+        self.messages.append(message)
+        if (
+            message.get("type") == "nl_task_update"
+            and message.get("status") == self.outcome
+        ):
+            raise RuntimeError("test complete")
+
+    async def recv(self):
+        self.receive_count += 1
+        if self.receive_count == 1:
+            return json.dumps(
+                {"type": "nl_command", "seq": 1, "text": "前进 0.1 米"}
+            )
+        if self.receive_count == 2:
+            return json.dumps(
+                {"type": self.second_type, "seq": 2, "text": "停"}
+            )
+        if self.outcome == "blocked":
+            self.runtime.navigation.status = "blocked"
+            self.runtime.navigation.reason = "test_block"
+        self.clock.now = 0.2
+        raise asyncio.TimeoutError
+
+
 # ═══════════════════════════════════════════════════════════════
 # NL command execution tests
 # ═══════════════════════════════════════════════════════════════
@@ -731,7 +770,7 @@ class TestValidationFailures:
         assert replies[0]["type"] == "nl_parse_result"
         assert replies[0]["accepted"] is False
 
-    @pytest.mark.parametrize("seq", ("bad", True, -1))
+    @pytest.mark.parametrize("seq", ("bad", True, -1, 2**64, 10**100))
     def test_invalid_sequence_is_normalized_in_every_reply(
         self,
         seq,
@@ -757,7 +796,7 @@ class TestValidationFailures:
         assert replies
         assert {reply["seq"] for reply in replies} == {0}
 
-    @pytest.mark.parametrize("seq", ("bad", True, -1))
+    @pytest.mark.parametrize("seq", ("bad", True, -1, 2**64, 10**100))
     def test_invalid_sequence_stays_normalized_on_async_completion(self, seq):
         clock = _Clock()
         socket = _InvalidSeqSocket(clock, seq)
@@ -783,6 +822,47 @@ class TestValidationFailures:
         ]
         assert task_updates
         assert {message["seq"] for message in task_updates} == {0}
+
+    @pytest.mark.parametrize(
+        "second_type", ("nl_command", "nl_clarify_response")
+    )
+    @pytest.mark.parametrize("outcome", ("completed", "blocked"))
+    def test_busy_request_does_not_take_active_task_sequence(
+        self, second_type, outcome
+    ):
+        clock = _Clock()
+        socket = _ActiveOwnerSocket(clock, second_type, outcome)
+        runtime = VehicleRuntime.create(
+            started_at=0.0,
+            anchor=AnchorSpec("nl-owner", 10.0, 10.0, 0.0),
+            odometry_config=OdometryConfig(),
+        )
+        socket.runtime = runtime
+
+        asyncio.run(
+            handler(
+                socket,
+                _runtime=runtime,
+                _monotonic=clock.monotonic,
+                _wall_time=lambda: 10.0 + clock.now,
+            )
+        )
+
+        busy = [
+            message
+            for message in socket.messages
+            if message.get("type") == "nl_parse_result"
+            and not message.get("accepted")
+        ]
+        terminal = [
+            message
+            for message in socket.messages
+            if message.get("type") == "nl_task_update"
+            and message.get("status") == outcome
+        ]
+        assert busy and busy[-1]["seq"] == 2
+        assert "busy" in busy[-1]["reason"]
+        assert terminal and terminal[-1]["seq"] == 1
 
     def test_busy_state_rejected(self, vehicle, empty_grid, navigation, nl_client,
                                   schema_v, semantic_v, state_machine):

@@ -4,15 +4,12 @@ cli.py — Unified CLI entry point for MockVehicle2D.
 Usage:
     mockvehicle2d serve       Start WebSocket mock server
     mockvehicle2d visual      Launch Pygame visualization
-    mockvehicle2d test        Run motion, collision, and Tmini scan tests
     mockvehicle2d nl          Parse natural language vehicle commands
 """
 
 import argparse
 import asyncio
 import math
-from pathlib import Path
-import subprocess
 import sys
 
 
@@ -153,23 +150,6 @@ def _cmd_pathfind(args):
                 f"y_m={wp[1] * resolution_m:.3f}"
             )
     sys.exit(0)
-
-
-def _cmd_test(_args):
-    """Run the complete repository test suite with the active interpreter."""
-    repo_root = Path(__file__).resolve().parents[3]
-    result = subprocess.run(
-        [
-            sys.executable,
-            "-m",
-            "pytest",
-            "-p",
-            "no:cacheprovider",
-            str(repo_root / "tests"),
-        ],
-        cwd=repo_root,
-    )
-    raise SystemExit(result.returncode)
 
 
 def _cmd_nl(args):
@@ -378,7 +358,6 @@ def main():
     )
     serve.add_argument("--odom-seed", type=_integer, default=0, metavar="INTEGER")
     sub.add_parser("visual", help="Launch Pygame visualization (W/S/A/D driving)")
-    sub.add_parser("test", help="Run the complete pytest suite")
     pathfind = sub.add_parser("pathfind", help="Run A* pathfinding on generated map")
     pathfind.add_argument("--start-m", type=_coords_m, default=(10.0, 10.0), metavar="X_M,Y_M",
                           help="Start position in metres (default: 10,10)")
@@ -405,7 +384,6 @@ def main():
     commands = {
         "serve": _cmd_serve,
         "visual": _cmd_visual,
-        "test": _cmd_test,
         "pathfind": _cmd_pathfind,
         "nl": _cmd_nl,
     }

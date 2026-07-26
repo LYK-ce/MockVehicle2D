@@ -12,6 +12,7 @@ from typing import Any
 
 from mockvehicle2d.collision import is_swept_circle_passable
 from mockvehicle2d.map_grid import MapGrid
+from mockvehicle2d.scan import scan_sector
 
 
 class TaskCompiler:
@@ -200,15 +201,7 @@ class TaskCompiler:
             rng = pt.get("range", 0.0)
             if rng <= 0:
                 continue
-            # sector classification by angle (forward = 0 rad, +x)
-            if -math.pi / 4 <= angle < math.pi / 4:
-                sectors["front"].append(rng)
-            elif math.pi / 4 <= angle < 3 * math.pi / 4:
-                sectors["left"].append(rng)
-            elif -3 * math.pi / 4 <= angle < -math.pi / 4:
-                sectors["right"].append(rng)
-            else:
-                sectors["back"].append(rng)
+            sectors[scan_sector(angle)].append(rng)
 
         summary = {}
         for sector, ranges in sectors.items():

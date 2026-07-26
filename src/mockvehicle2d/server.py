@@ -24,7 +24,13 @@ from mockvehicle2d.map_grid import MapGrid, VOID
 from mockvehicle2d.navigation import GotoController
 from mockvehicle2d.pathfinding import PathFollowingController
 from mockvehicle2d.safety import LocalSafetyRuntime
-from mockvehicle2d.scan import LaserPoint, TMINI_SCAN_CONFIG, scan_grid, scan_message
+from mockvehicle2d.scan import (
+    LaserPoint,
+    TMINI_SCAN_CONFIG,
+    scan_grid,
+    scan_message,
+    scan_sector,
+)
 from mockvehicle2d.vehicle import COMMANDS, Vehicle
 
 
@@ -35,6 +41,7 @@ SPAWN_X = 10.0
 SPAWN_Y = 10.0
 MAP_RESOLUTION_M = 1.0
 MAX_JSON_INTEGER_DIGITS = 4300
+MAX_SEQUENCE = 2**64 - 1
 VEHICLE_ID_PATTERN = re.compile(r"[A-Za-z0-9._-]{1,64}")
 
 
@@ -180,11 +187,40 @@ def _next_deadline(deadline: float, now: float, period: float) -> float:
     return deadline + (math.floor((now - deadline) / period) + 1) * period
 
 
-def _safe_seq(message: object) -> int | None:
+def _is_sequence(value: object) -> bool:
+    return (
+        isinstance(value, int)
+        and not isinstance(value, bool)
+        and 0 <= value <= MAX_SEQUENCE
+    )
+
+
+def _safe_seq(message: object) -> int:
     if not isinstance(message, dict):
-        return None
+        return 0
     seq = message.get("seq")
-    return seq if isinstance(seq, int) and not isinstance(seq, bool) and seq >= 0 else None
+    return seq if _is_sequence(seq) else 0
+
+
+def _require_seq(message: dict[str, object], subject: str) -> int:
+    if "seq" not in message:
+        raise CommandMessageError("missing_seq", f"{subject} requires seq")
+    seq = message["seq"]
+    if not _is_sequence(seq):
+        raise CommandMessageError(
+            "invalid_seq", "seq must be an unsigned 64-bit integer", 0
+        )
+    return seq
+
+
+def _started_nl_task_seq(replies: list[dict[str, object]]) -> int | None:
+    for reply in replies:
+        if (
+            reply.get("type") == "nl_task_update"
+            and reply.get("status") == "active"
+        ):
+            return _safe_seq(reply)
+    return None
 
 
 def _bounded_json_int(value: str) -> int:
@@ -217,10 +253,7 @@ def _parse_command_object(message: dict[str, object]) -> tuple[str, int | None]:
         raise CommandMessageError("missing_type", "canonical command requires type", seq)
     if message["type"] != "cmd":
         raise CommandMessageError("invalid_type", "type must be cmd", seq)
-    if "seq" not in message:
-        raise CommandMessageError("missing_seq", "canonical command requires seq", None)
-    if seq is None:
-        raise CommandMessageError("invalid_seq", "seq must be a non-negative integer", None)
+    seq = _require_seq(message, "canonical command")
     if "cmd" not in message or not isinstance(message["cmd"], str) or message["cmd"] not in COMMANDS:
         raise CommandMessageError("invalid_cmd", "unsupported cmd", seq)
     if set(message) != {"type", "seq", "cmd"}:
@@ -239,10 +272,7 @@ def _parse_drive_object(
     seq = _safe_seq(message)
     if message.get("type") != "drive":
         raise CommandMessageError("invalid_type", "type must be drive", seq)
-    if "seq" not in message:
-        raise CommandMessageError("missing_seq", "drive command requires seq", None)
-    if seq is None:
-        raise CommandMessageError("invalid_seq", "seq must be a non-negative integer", None)
+    seq = _require_seq(message, "drive command")
     if set(message) != {"type", "seq", "linear_mps", "angular_rps"}:
         raise CommandMessageError("invalid_fields", "drive command has missing or unexpected fields", seq)
 
@@ -269,10 +299,7 @@ def _parse_goto_object(message: dict[str, object]) -> tuple[float, float, int]:
     seq = _safe_seq(message)
     if message.get("type") != "goto":
         raise CommandMessageError("invalid_type", "type must be goto", seq)
-    if "seq" not in message:
-        raise CommandMessageError("missing_seq", "goto command requires seq", None)
-    if seq is None:
-        raise CommandMessageError("invalid_seq", "seq must be a non-negative integer", None)
+    seq = _require_seq(message, "goto command")
     if set(message) != {"type", "seq", "x_m", "y_m"}:
         raise CommandMessageError("invalid_fields", "goto command has missing or unexpected fields", seq)
 
@@ -542,8 +569,6 @@ def _handle_nl_command(
         local_state,
     )
     seq = _safe_seq(message)
-    if seq is None:
-        seq = 0
     text = message.get("text", "")
     if not isinstance(text, str) or not text.strip():
         return [{
@@ -842,14 +867,7 @@ def _summarize_scan_for_nl(scan_data: dict[str, object] | None) -> dict[str, obj
         rng = pt.get("range", 0.0)
         if not isinstance(rng, (int, float)) or rng <= 0:
             continue
-        if -math.pi / 4 <= angle < math.pi / 4:
-            sectors["front"].append(rng)
-        elif math.pi / 4 <= angle < 3 * math.pi / 4:
-            sectors["left"].append(rng)
-        elif -3 * math.pi / 4 <= angle < -math.pi / 4:
-            sectors["right"].append(rng)
-        else:
-            sectors["back"].append(rng)
+        sectors[scan_sector(angle)].append(rng)
 
     summary: dict[str, float] = {}
     for sector, ranges in sectors.items():
@@ -1257,11 +1275,9 @@ async def handler(
                     )
                     for r in replies:
                         await websocket.send(json.dumps(r))
-                    # Track active seq
-                    if state_machine.current_state == InstructionState.ACTIVE:
-                        active_nl_seq = _safe_seq(message)
-                        if active_nl_seq is None:
-                            active_nl_seq = 0
+                    started_seq = _started_nl_task_seq(replies)
+                    if started_seq is not None:
+                        active_nl_seq = started_seq
                     continue
                 if message.get("type") == "nl_clarify_response":
                     # Treat as a follow-up nl_command with the response text
@@ -1279,16 +1295,15 @@ async def handler(
                         )
                         for r in replies:
                             await websocket.send(json.dumps(r))
-                        if state_machine.current_state == InstructionState.ACTIVE:
-                            active_nl_seq = _safe_seq(message)
-                            if active_nl_seq is None:
-                                active_nl_seq = 0
+                        started_seq = _started_nl_task_seq(replies)
+                        if started_seq is not None:
+                            active_nl_seq = started_seq
                     else:
                         clarify_seq = _safe_seq(message)
                         await websocket.send(json.dumps({
                             "type": "nl_parse_result",
                             "ts": _wall_time(),
-                            "seq": clarify_seq if clarify_seq is not None else 0,
+                            "seq": clarify_seq,
                             "instruction": None,
                             "accepted": False,
                             "reason": "empty clarify response",

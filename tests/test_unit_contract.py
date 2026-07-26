@@ -5,7 +5,6 @@ import inspect
 import math
 from pathlib import Path
 import re
-import subprocess
 import sys
 
 import pytest
@@ -14,7 +13,7 @@ import pytest
 REPO_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO_ROOT / "src"))
 
-from mockvehicle2d.cli.main import _cmd_test, main
+from mockvehicle2d.cli.main import main
 from mockvehicle2d.instruction.compiler import TaskCompiler
 from mockvehicle2d.local_state import (
     AnchorSpec,
@@ -27,6 +26,7 @@ from mockvehicle2d.navigation import GotoController
 from mockvehicle2d.pathfinding.d_star_lite import DStarLitePlanner
 from mockvehicle2d.server import (
     _handle_nl_command,
+    _safe_seq,
     handle_command_message,
     handler,
     telemetry_messages,
@@ -277,23 +277,72 @@ def test_shifted_anchor_direct_and_nl_goto_share_relative_bounds() -> None:
     assert any(reply.get("status") == "blocked" for reply in far)
 
 
-def test_test_command_runs_full_pytest_and_propagates_failure(monkeypatch) -> None:
-    captured = {}
-
-    def fail(command, *, cwd):
-        captured["command"] = command
-        captured["cwd"] = cwd
-        return type("Result", (), {"returncode": 7})()
-
-    monkeypatch.setattr(subprocess, "run", fail)
+def test_cli_does_not_publish_repository_test_runner(monkeypatch, capsys) -> None:
+    monkeypatch.setattr(sys, "argv", ["mockvehicle2d", "--help"])
     with pytest.raises(SystemExit) as stopped:
-        _cmd_test(None)
-    assert stopped.value.code == 7
-    assert captured["command"][:3] == [sys.executable, "-m", "pytest"]
-    assert "-p" in captured["command"]
-    assert "no:cacheprovider" in captured["command"]
-    assert Path(captured["command"][-1]).name == "tests"
-    assert Path(captured["cwd"]) == REPO_ROOT
+        main()
+    assert stopped.value.code == 0
+    assert "test" not in capsys.readouterr().out.splitlines()[0]
+
+    monkeypatch.setattr(sys, "argv", ["mockvehicle2d", "test"])
+    with pytest.raises(SystemExit) as stopped:
+        main()
+    assert stopped.value.code == 2
+    assert "invalid choice" in capsys.readouterr().err
+
+
+def test_client_sequences_use_unsigned_64_bit_contract() -> None:
+    maximum = 2**64 - 1
+    assert _safe_seq({"seq": maximum}) == maximum
+    for invalid in (True, -1, 2**64, 10**100):
+        assert _safe_seq({"seq": invalid}) == 0
+
+    messages = (
+        {"type": "cmd", "seq": maximum, "cmd": "stop"},
+        {
+            "type": "drive",
+            "seq": maximum,
+            "linear_mps": 0,
+            "angular_rps": 0,
+        },
+        {"type": "goto", "seq": maximum, "x_m": 10, "y_m": 10},
+    )
+    invalid_sequences = (True, -1, 2**64, 10**100)
+    for message in messages:
+        vehicle = Vehicle(10.0, 10.0, now=0.0)
+        grid = MapGrid(32, 32)
+        state = AnchoredLocalState(
+            AnchorSpec("seq-contract", 10.0, 10.0, 0.0),
+            truth_x_m=vehicle.x,
+            truth_y_m=vehicle.y,
+            truth_yaw_rad=vehicle.yaw,
+            timestamp=0.0,
+        )
+        accepted = handle_command_message(
+            json.dumps(message),
+            vehicle,
+            grid,
+            0.0,
+            1.0,
+            GotoController(),
+            local_state=state,
+        )
+        assert accepted["seq"] == maximum
+        assert accepted["type"] != "error"
+
+        for invalid in invalid_sequences:
+            rejected = handle_command_message(
+                json.dumps({**message, "seq": invalid}),
+                Vehicle(10.0, 10.0, now=0.0),
+                grid,
+                0.0,
+                1.0,
+                GotoController(),
+                local_state=state,
+            )
+            assert rejected["type"] == "error"
+            assert rejected["code"] == "invalid_seq"
+            assert rejected["seq"] == 0
 
 
 def test_production_navigation_source_has_no_truth_or_legacy_astar_route() -> None:
