@@ -625,6 +625,80 @@ class TestTaskCompiler:
         } == server_summary
         assert compiler_summary["front"]["count"] == 3
 
+    @pytest.mark.parametrize(
+        ("angle", "expected"),
+        (
+            (2 * math.pi, "front"),
+            (-2 * math.pi, "front"),
+            (math.nan, None),
+            (math.inf, None),
+            (-math.inf, None),
+            (True, None),
+            ("0", None),
+            (None, None),
+        ),
+    )
+    def test_scan_sector_rejects_non_finite_or_non_real_angles(self, angle, expected):
+        assert scan_sector(angle) == expected
+
+    def test_scan_summaries_skip_invalid_samples_consistently(self):
+        points = [
+            {"angle": 0.0, "range": 2.0},
+            {"angle": math.pi / 2, "range": 3.0},
+            {"angle": math.nan, "range": 0.1},
+            {"angle": math.inf, "range": 0.2},
+            {"angle": -math.inf, "range": 0.3},
+            {"angle": True, "range": 0.4},
+            {"angle": "0", "range": 0.5},
+            {"angle": 0.0, "range": math.nan},
+            {"angle": 0.0, "range": math.inf},
+            {"angle": 0.0, "range": -math.inf},
+            {"angle": 0.0, "range": True},
+            {"angle": 0.0, "range": "1"},
+            {"angle": 0.0, "range": None},
+            {"angle": 0.0, "range": 0.0},
+            "not-a-point",
+        ]
+        scan = {"points": points}
+
+        server_summary = _summarize_scan_for_nl(scan)["sectors"]
+        compiler_summary = self.compiler.compile(
+            _valid_instruction("scan_report", {"query": ""}),
+            {"scan": scan},
+        )["summary"]
+
+        assert server_summary == {"front": 2.0, "right": 3.0}
+        assert {
+            sector: values["min_m"]
+            for sector, values in compiler_summary["sectors"].items()
+            if values["count"]
+        } == server_summary
+        assert compiler_summary["total_points"] == len(points)
+
+    def test_scan_summaries_are_safe_when_every_sample_is_invalid(self):
+        scan = {
+            "points": [
+                {"angle": math.nan, "range": 1.0},
+                {"angle": 0.0, "range": math.inf},
+                {"angle": False, "range": 1.0},
+                {},
+                None,
+            ]
+        }
+
+        server_summary = _summarize_scan_for_nl(scan)
+        compiler_summary = self.compiler.compile(
+            _valid_instruction("scan_report", {"query": ""}),
+            {"scan": scan},
+        )["summary"]
+
+        assert server_summary["sectors"] == {}
+        assert all(
+            values == {"min_m": None, "avg_m": None, "count": 0}
+            for values in compiler_summary["sectors"].values()
+        )
+        assert compiler_summary["total_points"] == len(scan["points"])
+
 
 # ═══════════════════════════════════════════════════════════════
 # AuthorityManager tests (5+)

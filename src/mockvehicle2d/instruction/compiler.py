@@ -12,7 +12,7 @@ from typing import Any
 
 from mockvehicle2d.collision import is_swept_circle_passable
 from mockvehicle2d.map_grid import MapGrid
-from mockvehicle2d.scan import scan_sector
+from mockvehicle2d.scan import scan_summary_sample
 
 
 class TaskCompiler:
@@ -197,11 +197,11 @@ class TaskCompiler:
 
         sectors = {"front": [], "left": [], "right": [], "back": []}
         for pt in points:
-            angle = pt.get("angle", 0.0)
-            rng = pt.get("range", 0.0)
-            if rng <= 0:
+            sample = scan_summary_sample(pt)
+            if sample is None:
                 continue
-            sectors[scan_sector(angle)].append(rng)
+            sector, range_m = sample
+            sectors[sector].append(range_m)
 
         summary = {}
         for sector, ranges in sectors.items():

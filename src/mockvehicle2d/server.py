@@ -29,7 +29,7 @@ from mockvehicle2d.scan import (
     TMINI_SCAN_CONFIG,
     scan_grid,
     scan_message,
-    scan_sector,
+    scan_summary_sample,
 )
 from mockvehicle2d.vehicle import COMMANDS, Vehicle
 
@@ -861,13 +861,11 @@ def _summarize_scan_for_nl(scan_data: dict[str, object] | None) -> dict[str, obj
 
     sectors: dict[str, list[float]] = {"front": [], "left": [], "right": [], "back": []}
     for pt in points:
-        if not isinstance(pt, dict):
+        sample = scan_summary_sample(pt)
+        if sample is None:
             continue
-        angle = pt.get("angle", 0.0)
-        rng = pt.get("range", 0.0)
-        if not isinstance(rng, (int, float)) or rng <= 0:
-            continue
-        sectors[scan_sector(angle)].append(rng)
+        sector, range_m = sample
+        sectors[sector].append(range_m)
 
     summary: dict[str, float] = {}
     for sector, ranges in sectors.items():
