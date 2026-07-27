@@ -641,6 +641,9 @@ def _handle_nl_command(
         path_following,
         local_state,
     )
+    handoff_reason = _block_navigation_for_handoff(
+        navigation, handoff_collided, handoff_safety_stop
+    )
     seq = _safe_seq(message)
     text = message.get("text", "")
     if not isinstance(text, str) or not text.strip():
@@ -812,9 +815,6 @@ def _handle_nl_command(
         state_machine.transition(InstructionState.IDLE)
         return replies
 
-    handoff_reason = _block_navigation_for_handoff(
-        navigation, handoff_collided, handoff_safety_stop
-    )
     if handoff_reason is not None:
         replies[-1]["accepted"] = False
         replies[-1]["reason"] = handoff_reason

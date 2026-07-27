@@ -150,7 +150,7 @@ class GotoController:
         self._clear_pending_planning()
 
     def cancel(self, reason: str) -> None:
-        if self.status == "active":
+        if self.status in {"active", "blocked"}:
             self.status = "cancelled"
             self.reason = reason
             self.detail = None

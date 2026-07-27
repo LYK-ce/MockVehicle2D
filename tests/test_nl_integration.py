@@ -645,6 +645,106 @@ def test_nl_automatic_command_rejects_terminal_handoff(
     assert vehicle.command == "stop"
 
 
+@pytest.mark.parametrize(
+    (
+        "text",
+        "use_safety",
+        "response_type",
+        "navigation_status",
+        "navigation_reason",
+    ),
+    (
+        ("状态", False, "nl_task_update", "blocked", "collision"),
+        (
+            "看一下",
+            True,
+            "nl_scan_report",
+            "blocked",
+            "safety_obstacle",
+        ),
+        ("开到那边去", False, "nl_confirm_request", "blocked", "collision"),
+        ("停", False, "nl_task_update", "cancelled", "nl_stop"),
+    ),
+)
+def test_nl_early_response_settles_terminal_goto_handoff(
+    text,
+    use_safety,
+    response_type,
+    navigation_status,
+    navigation_reason,
+    nl_client,
+    schema_v,
+):
+    grid = MapGrid.from_wall_set(256, 256, {(4, y) for y in range(256)})
+    vehicle = Vehicle(
+        2.0,
+        5.5,
+        radius=0.5,
+        linear_speed=5.0,
+        command_timeout=10.0,
+        now=0.0,
+    )
+    navigation = GotoController()
+    local_state = AnchoredLocalState(
+        AnchorSpec("nl-early-handoff", vehicle.x, vehicle.y, vehicle.yaw),
+        truth_x_m=vehicle.x,
+        truth_y_m=vehicle.y,
+        truth_yaw_rad=vehicle.yaw,
+        timestamp=0.0,
+    )
+    ack = handle_command_message(
+        '{"type":"goto","seq":92,"x_m":250,"y_m":5.5}',
+        vehicle,
+        grid,
+        0.0,
+        12.0,
+        navigation,
+        local_state=local_state,
+    )
+    assert ack["accepted"]
+    assert navigation.snapshot()["planning"] is True
+    vehicle.install_drive(5.0, 0.0, 0.0)
+
+    replies = _handle_nl_command(
+        {"type": "nl_command", "seq": 93, "text": text},
+        vehicle,
+        grid,
+        navigation,
+        13.0,
+        1.0,
+        nl_client,
+        schema_v,
+        SemanticValidator(grid),
+        InstructionStateMachine(),
+        scan_data={"type": "scan", "points": []},
+        local_state=local_state,
+        safety=LocalSafetyRuntime() if use_safety else None,
+    )
+
+    assert any(reply["type"] == response_type for reply in replies)
+    assert not any(reply.get("status") == "blocked" for reply in replies)
+    assert (navigation.status, navigation.reason) == (
+        navigation_status,
+        navigation_reason,
+    )
+    assert navigation.snapshot()["planning"] is False
+    assert vehicle.command == "stop"
+
+    navigation.replan(local_state.pose, None, local_state.local_map)
+    navigation.update(
+        vehicle,
+        grid,
+        1.1,
+        pose=local_state.pose,
+        local_map=local_state.local_map,
+    )
+    assert (navigation.status, navigation.reason) == (
+        navigation_status,
+        navigation_reason,
+    )
+    assert navigation.snapshot()["planning"] is False
+
+
 class TestNlCommandScan:
     """NL '看一下' → scan report."""
 
