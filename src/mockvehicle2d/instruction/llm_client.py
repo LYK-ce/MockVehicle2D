@@ -1,7 +1,6 @@
-"""LLM clients for natural language instruction parsing.
+"""LLM client for natural language instruction parsing.
 
-FakeModelClient — rule-based deterministic parser for offline testing
-LLMClient       — async client for llama.cpp server (OpenAI-compatible API)
+LLMClient — async client for llama.cpp server (OpenAI-compatible API)
 """
 
 from __future__ import annotations
@@ -21,123 +20,6 @@ def _strip_thinking(content: str) -> str:
     # If an unclosed <think> remains (truncated output), remove it and everything after
     content = re.sub(r"<think>.*$", "", content, flags=re.DOTALL)
     return content.strip()
-
-
-class FakeModelClient:
-    """Rule-based deterministic parser for offline testing.
-
-    Supports basic Chinese patterns for all seven intents.
-    """
-
-    def parse(self, text: str) -> dict | None:
-        """Parse NL text into a structured instruction dict, or None on failure."""
-        text = text.strip()
-        if not text:
-            return self._clarify("输入为空，请提供指令", [])
-
-        result = self._try_parse(text)
-        if result is not None:
-            return result
-        return self._clarify(f"无法理解指令「{text}」，请使用坐标指定目标位置", [])
-
-    def _try_parse(self, text: str) -> dict | None:
-        # stop
-        if re.match(r"^(停|停下|停止|紧急停止|别动了)$", text):
-            return self._make_instruction("stop", {})
-
-        # status
-        if re.match(r"^(现在什么状态|到哪了|有没有问题|状态|在哪)$", text):
-            return self._make_instruction("status", {})
-
-        # goto_point
-        m = self._parse_goto_point(text)
-        if m:
-            return self._make_instruction("goto_point", {"x_m": m[0], "y_m": m[1]})
-
-        # move_distance
-        m = self._parse_move_distance(text)
-        if m:
-            return self._make_instruction("move_distance", m)
-
-        # rotate
-        m = self._parse_rotate(text)
-        if m:
-            return self._make_instruction("rotate", m)
-
-        # scan_report
-        m = self._parse_scan(text)
-        if m is not None:
-            return self._make_instruction("scan_report", m)
-
-        return None
-
-    # ── pattern parsers ──────────────────────────────────────
-
-    @staticmethod
-    def _parse_goto_point(text: str) -> tuple[float, float] | None:
-        # "去 (x, y)" / "去坐标 (x, y)" / "开到 x, y" / "前往 (x, y)"
-        patterns = [
-            r"^去\s*\(\s*(-?[\d.]+)\s*[,，]\s*(-?[\d.]+)\s*\)$",
-            r"^去坐标\s*\(\s*(-?[\d.]+)\s*[,，]\s*(-?[\d.]+)\s*\)$",
-            r"^开到\s*(-?[\d.]+)\s*[,，]\s*(-?[\d.]+)$",
-            r"^前往\s*\(\s*(-?[\d.]+)\s*[,，]\s*(-?[\d.]+)\s*\)$",
-        ]
-        for pat in patterns:
-            m = re.match(pat, text)
-            if m:
-                try:
-                    return float(m.group(1)), float(m.group(2))
-                except ValueError:
-                    return None
-        return None
-
-    @staticmethod
-    def _parse_move_distance(text: str) -> dict | None:
-        # "前进 N 米" / "后退 N 米"
-        m = re.match(r"^前进\s*([\d.]+)\s*米$", text)
-        if m:
-            return {"distance_m": float(m.group(1)), "direction": "forward"}
-        m = re.match(r"^后退\s*([\d.]+)\s*米$", text)
-        if m:
-            return {"distance_m": float(m.group(1)), "direction": "backward"}
-        return None
-
-    @staticmethod
-    def _parse_rotate(text: str) -> dict | None:
-        # "左转 N 度" / "右转 N 度"
-        m = re.match(r"^左转\s*([\d.]+)\s*度$", text)
-        if m:
-            return {"angle_deg": float(m.group(1)), "direction": "left"}
-        m = re.match(r"^右转\s*([\d.]+)\s*度$", text)
-        if m:
-            return {"angle_deg": float(m.group(1)), "direction": "right"}
-        return None
-
-    @staticmethod
-    def _parse_scan(text: str) -> dict | None:
-        if text in ("看一下", "扫一圈", "扫描一下", "扫描"):
-            return {}
-        m = re.match(r"^(前面|左边|右边|后面|周围)(有什么|有障碍吗|有东西吗)$", text)
-        if m:
-            query_map = {"前面": "前方", "左边": "左侧", "右边": "右侧", "后面": "后方", "周围": "四周"}
-            return {"query": query_map.get(m.group(1), "")}
-        return None
-
-    # ── helpers ──────────────────────────────────────────────
-
-    @staticmethod
-    def _make_instruction(intent: str, params: dict) -> dict:
-        return {"intent": intent, "parameters": params}
-
-    @staticmethod
-    def _clarify(question: str, missing: list[str]) -> dict:
-        return {
-            "intent": "clarify",
-            "parameters": {
-                "question": question,
-                "missing_parameters": missing,
-            },
-        }
 
 
 _SYSTEM_PROMPT = """你是一个车辆指令解析器。将用户的自然语言指令转换为 JSON 格式。

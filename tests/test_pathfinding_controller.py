@@ -14,7 +14,6 @@ import time
 import pytest
 
 from mockvehicle2d.instruction.compiler import TaskCompiler
-from mockvehicle2d.instruction.llm_client import FakeModelClient
 from mockvehicle2d.instruction.state_machine import InstructionState, InstructionStateMachine
 from mockvehicle2d.instruction.validator import SchemaValidator, SemanticValidator
 from mockvehicle2d.map_grid import MapGrid, WALL
@@ -23,6 +22,46 @@ from mockvehicle2d.pathfinding import PathFollowingController, a_star_search
 from mockvehicle2d.safety import LocalSafetyRuntime
 from mockvehicle2d.server import _handle_nl_command
 from mockvehicle2d.vehicle import Vehicle
+
+
+# ═══════════════════════════════════════════════════════════════
+# Test helper — minimal deterministic parser for pipeline tests
+# ═══════════════════════════════════════════════════════════════
+
+import re as _re
+
+
+class _TestParser:
+    """Minimal deterministic NL parser for integration testing."""
+
+    _GOTO_PAT = _re.compile(r"去.*?(\d+(?:\.\d+)?).*?(\d+(?:\.\d+)?)")
+
+    def parse(self, text: str) -> dict | None:
+        text = text.strip()
+        if not text:
+            return {"intent": "clarify", "parameters": {"question": "请输入指令"}}
+
+        m = self._GOTO_PAT.search(text)
+        if m:
+            return {"intent": "goto_point", "parameters": {"x_m": float(m.group(1)), "y_m": float(m.group(2))}}
+
+        m = _re.search(r"前进\s*(\d+(?:\.\d+)?)", text)
+        if m:
+            return {"intent": "move_distance", "parameters": {"distance_m": float(m.group(1)), "direction": "forward"}}
+        m = _re.search(r"后退\s*(\d+(?:\.\d+)?)", text)
+        if m:
+            return {"intent": "move_distance", "parameters": {"distance_m": float(m.group(1)), "direction": "backward"}}
+
+        m = _re.search(r"左转\s*(\d+(?:\.\d+)?)", text)
+        if m:
+            return {"intent": "rotate", "parameters": {"angle_deg": int(m.group(1)), "direction": "left"}}
+        m = _re.search(r"右转\s*(\d+(?:\.\d+)?)", text)
+        if m:
+            return {"intent": "rotate", "parameters": {"angle_deg": int(m.group(1)), "direction": "right"}}
+
+        if text in {"停"}:
+            return {"intent": "stop", "parameters": {}}
+        return {"intent": "clarify", "parameters": {"question": "请指定坐标"}}
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -306,7 +345,7 @@ class TestNLPipelinePhase3:
 
     @pytest.fixture
     def nl_client(self):
-        return FakeModelClient()
+        return _TestParser()
 
     @pytest.fixture
     def schema_v(self):

@@ -11,7 +11,7 @@ import struct
 import time
 
 from mockvehicle2d.instruction.compiler import TaskCompiler
-from mockvehicle2d.instruction.llm_client import FakeModelClient, LLMClient
+from mockvehicle2d.instruction.llm_client import LLMClient
 from mockvehicle2d.instruction.state_machine import InstructionState, InstructionStateMachine
 from mockvehicle2d.instruction.validator import SchemaValidator, SemanticValidator
 from mockvehicle2d.map_grid import MapGrid, VOID
@@ -275,7 +275,7 @@ def _handle_nl_command(
     navigation: GotoController,
     wall_timestamp: float,
     monotonic_now: float,
-    nl_client: FakeModelClient,
+    nl_client: LLMClient,
     schema_v: SchemaValidator,
     semantic_v: SemanticValidator,
     state_machine: InstructionStateMachine,
@@ -874,9 +874,8 @@ async def handler(
     safety = LocalSafetyRuntime(healthy=_safety_healthy)
 
     # NL instruction pipeline
-    nl_client = FakeModelClient()
     schema_v = SchemaValidator()
-    nl_llm_client = LLMClient(schema_validator=schema_v)  # LLM client with self-validation
+    nl_client = LLMClient(schema_validator=schema_v)  # LLM client for NL parsing
     semantic_v = SemanticValidator(grid)
     state_machine = InstructionStateMachine()
     task_compiler = TaskCompiler(grid)

@@ -1,7 +1,7 @@
 """Integration tests for NL command pipeline in server.py.
 
 Tests the NL → parse → validate → execute pipeline without WebSocket.
-Uses FakeModelClient for deterministic results.
+Uses a deterministic test parser for reproducible results.
 """
 
 from __future__ import annotations
@@ -12,7 +12,6 @@ import time
 import pytest
 
 from mockvehicle2d.instruction.compiler import TaskCompiler
-from mockvehicle2d.instruction.llm_client import FakeModelClient
 from mockvehicle2d.instruction.state_machine import InstructionState, InstructionStateMachine
 from mockvehicle2d.instruction.validator import SchemaValidator, SemanticValidator
 from mockvehicle2d.map_grid import MapGrid
@@ -24,6 +23,69 @@ from mockvehicle2d.server import (
     _cancel_nl_task,
 )
 from mockvehicle2d.vehicle import Vehicle
+
+
+# ═══════════════════════════════════════════════════════════════
+# Test helper — minimal deterministic parser for pipeline tests
+# ═══════════════════════════════════════════════════════════════
+
+import re as _re
+
+
+class _TestParser:
+    """Minimal deterministic NL parser for integration testing.
+
+    Replaces FakeModelClient with a simple regex-based parser
+    that covers the inputs used in these tests.
+    """
+
+    _STOP_WORDS = {"停", "停下", "停止", "紧急停止", "别动了"}
+    _STATUS_WORDS = {"现在什么状态", "到哪了", "状态", "在哪"}
+    _GOTO_PAT = _re.compile(r"去.*?(\d+(?:\.\d+)?).*?(\d+(?:\.\d+)?)")
+    _SCAN_WORDS = {"看一下", "扫一圈", "扫描一下", "扫描", "前面有什么"}
+    _CLARIFY_WORDS = {"开到那边去"}
+
+    def parse(self, text: str) -> dict | None:
+        text = text.strip()
+        if not text:
+            return {"intent": "clarify", "parameters": {"question": "请输入指令"}}
+
+        if text in self._STOP_WORDS:
+            return {"intent": "stop", "parameters": {}}
+
+        if text in self._STATUS_WORDS:
+            return {"intent": "status", "parameters": {}}
+
+        if text in self._SCAN_WORDS:
+            return {"intent": "scan_report", "parameters": {}}
+
+        if text in self._CLARIFY_WORDS:
+            return {"intent": "clarify", "parameters": {"question": "请指定坐标"}}
+
+        # goto_point patterns
+        m = self._GOTO_PAT.search(text)
+        if m:
+            x = float(m.group(1))
+            y = float(m.group(2))
+            return {"intent": "goto_point", "parameters": {"x_m": x, "y_m": y}}
+
+        # move_distance
+        m = _re.search(r"前进\s*(\d+(?:\.\d+)?)", text)
+        if m:
+            return {"intent": "move_distance", "parameters": {"distance_m": float(m.group(1)), "direction": "forward"}}
+        m = _re.search(r"后退\s*(\d+(?:\.\d+)?)", text)
+        if m:
+            return {"intent": "move_distance", "parameters": {"distance_m": float(m.group(1)), "direction": "backward"}}
+
+        # rotate
+        m = _re.search(r"左转\s*(\d+(?:\.\d+)?)", text)
+        if m:
+            return {"intent": "rotate", "parameters": {"angle_deg": int(m.group(1)), "direction": "left"}}
+        m = _re.search(r"右转\s*(\d+(?:\.\d+)?)", text)
+        if m:
+            return {"intent": "rotate", "parameters": {"angle_deg": int(m.group(1)), "direction": "right"}}
+
+        return {"intent": "clarify", "parameters": {"question": "请指定坐标"}}
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -52,7 +114,7 @@ def safety():
 
 @pytest.fixture
 def nl_client():
-    return FakeModelClient()
+    return _TestParser()
 
 
 @pytest.fixture

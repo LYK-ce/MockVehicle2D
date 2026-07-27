@@ -195,7 +195,6 @@ def _cmd_nl(args):
     import os
     import random
 
-    from mockvehicle2d.instruction.llm_client import FakeModelClient
     from mockvehicle2d.instruction.validator import (
         SchemaValidator,
         SemanticValidator,
@@ -220,7 +219,9 @@ def _cmd_nl(args):
 
     # --- interactive mode ---
     if args.interactive:
-        client = FakeModelClient()
+        import asyncio
+        from mockvehicle2d.instruction.llm_client import LLMClient
+        client = LLMClient(model=args.model, schema_validator=schema_v)
         print("NL Instruction REPL — type 'quit' to exit")
         while True:
             try:
@@ -232,7 +233,7 @@ def _cmd_nl(args):
                 break
             if not text.strip():
                 continue
-            instruction = client.parse(text)
+            instruction = asyncio.run(client.parse(text))
             if instruction is None:
                 print("  parse failed: no result")
                 continue
@@ -263,14 +264,10 @@ def _cmd_nl(args):
         print("error: missing NL text (use --interactive or provide text argument)")
         sys.exit(1)
 
-    if args.llm:
-        import asyncio
-        from mockvehicle2d.instruction.llm_client import LLMClient
-        client = LLMClient(model=args.model, schema_validator=schema_v)
-        instruction = asyncio.run(client.parse(text))
-    else:
-        client = FakeModelClient()
-        instruction = client.parse(text)
+    import asyncio
+    from mockvehicle2d.instruction.llm_client import LLMClient
+    client = LLMClient(model=args.model, schema_validator=schema_v)
+    instruction = asyncio.run(client.parse(text))
 
     if instruction is None:
         print("parse failed: no result")
@@ -290,13 +287,14 @@ def _cmd_nl(args):
 
 
 def _run_eval(dataset, schema_v, semantic_v):
-    """Run offline evaluation: compare FakeModelClient parse vs expected."""
+    """Run offline evaluation: compare LLMClient parse vs expected."""
+    import asyncio
     import json
 
-    from mockvehicle2d.instruction.llm_client import FakeModelClient
+    from mockvehicle2d.instruction.llm_client import LLMClient
     from mockvehicle2d.instruction.validator import run_validation_pipeline
 
-    client = FakeModelClient()
+    client = LLMClient(schema_validator=schema_v)
     total = len(dataset)
     intent_correct = 0
     schema_pass = 0
@@ -306,7 +304,7 @@ def _run_eval(dataset, schema_v, semantic_v):
     for entry in dataset:
         text = entry["input"]
         expected = entry["expected"]
-        instruction = client.parse(text)
+        instruction = asyncio.run(client.parse(text))
         parsed_intent = instruction.get("intent") if instruction else None
         expected_intent = expected.get("intent")
 
@@ -407,10 +405,6 @@ def main():
                         help="Run offline evaluation against a dataset")
     nl_cmd.add_argument("--dataset", type=str, default="tests/nl_eval.json", metavar="PATH",
                         help="Path to evaluation dataset JSON")
-    nl_cmd.add_argument("--fake", action="store_true", default=True,
-                        help="Use FakeModelClient (default)")
-    nl_cmd.add_argument("--llm", action="store_true",
-                        help="Use LLMClient (requires local llama.cpp server)")
     nl_cmd.add_argument("--model", type=str, default="Qwen3-8B-Q4_K_M", metavar="MODEL",
                         help="Model name for LLMClient (default: Qwen3-8B-Q4_K_M)")
 

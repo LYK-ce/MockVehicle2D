@@ -27,13 +27,7 @@ mockvehicle2d serve --linear-speed 0.5 --angular-speed 90 --vehicle-radius 0.5 -
 # A* 寻路（在 256×256 随机地图上规划路径）
 mockvehicle2d pathfind --start 10,10 --goal 200,200
 
-# 自然语言指令（离线模式 - FakeModelClient）
-mockvehicle2d nl "去坐标 (100, 200)"
-mockvehicle2d nl "前进 3 米"
-mockvehicle2d nl "左转 90 度"
-mockvehicle2d nl --interactive
-
-# 自然语言指令（LLM 模式 - 需要本地 llama.cpp server）
+# 自然语言指令（需要本地 llama.cpp server）
 # 方式一：通过 CLI 一键启动 server
 mockvehicle2d serve-llm                         # 默认 GPU 0, Qwen3-8B
 mockvehicle2d serve-llm --gpu 0 --model Qwen3-14B-Q4_K_M  # 14B 模型
@@ -43,8 +37,11 @@ bash scripts/start_llm_server.sh                # 默认
 bash scripts/start_llm_server.sh 0 Qwen3-14B-Q4_K_M  # 14B
 
 # 然后执行 NL 指令
-mockvehicle2d nl --llm "去坐标 (100, 200)"
-mockvehicle2d nl --llm --model Qwen3-14B-Q4_K_M "前面有什么"
+mockvehicle2d nl "去坐标 (100, 200)"
+mockvehicle2d nl "前进 3 米"
+mockvehicle2d nl "左转 90 度"
+mockvehicle2d nl --interactive
+mockvehicle2d nl --model Qwen3-14B-Q4_K_M "前面有什么"
 
 # 离线评测
 mockvehicle2d nl --eval
@@ -66,7 +63,7 @@ MockVehicle2D/
 │   ├── cli/                ← 统一 CLI 入口 (argparse)
 │   │   └── main.py
 │   ├── instruction/        ← NL→JSON 自然语言指令系统
-│   │   ├── llm_client.py   ← FakeModelClient + LLMClient (Qwen via llama.cpp)
+│   │   ├── llm_client.py   ← LLMClient (Qwen via llama.cpp)
 │   │   ├── validator.py    ← 三层校验：Schema → 语义 → 安全
 │   │   ├── state_machine.py← 11 状态指令生命周期
 │   │   ├── compiler.py     ← JSON 指令 → 可执行任务
@@ -86,9 +83,9 @@ MockVehicle2D/
 │   ├── scan.py             ← YDLidar Tmini 二维角度/距离/强度扫描
 │   └── visual.py           ← Pygame 可视化，支持 W+D 等组合驾驶与实时碰撞反馈
 ├── tests/
-│   ├── test_instruction.py ← NL 解析/校验/状态机/编译器测试
+│   ├── test_instruction.py ← NL 校验/状态机/编译器单元测试
 │   ├── test_nl_integration.py ← NL 全链路集成测试
-│   ├── nl_eval.json        ← 51 条离线评测数据集
+│   ├── nl_eval.json        ← 51 条评测数据集
 │   ├── test_collision.py
 │   ├── test_pathfinding.py
 │   ├── test_pathfinding_controller.py
@@ -166,8 +163,7 @@ AABB vs Circle 圆形碰撞
     ▼
 ┌──────────────────────────┐
 │ LLM Client               │
-│ FakeModelClient (regex)  │  ← 离线模式，确定性，零依赖
-│ LLMClient (Qwen 8B/14B) │  ← LLM 模式，需要 llama.cpp server
+│ LLMClient (Qwen 8B/14B) │  ← LLM 模式，通过 llama.cpp server
 └──────────┬───────────────┘
            │
            ▼
@@ -206,21 +202,18 @@ AABB vs Circle 圆形碰撞
 | `scan_report` | "前面有什么"、"扫一圈" | `{"query": "前方"}` |
 | `clarify` | "开到那边去" → 反问坐标 | `{"question": "请指定坐标", "missing_parameters": [...]}` |
 
-### 两种运行模式
+### 运行模式
 
-| 模式 | 客户端 | 命令 | 说明 |
-|------|--------|------|------|
-| **离线** | `FakeModelClient` | `mockvehicle2d nl` | 正则匹配，确定性，零外部依赖 |
-| **LLM** | `LLMClient` | `mockvehicle2d nl --llm` | 需要本地 llama.cpp server（`localhost:8000`） |
+`mockvehicle2d nl` 通过 `LLMClient` 连接本地 llama.cpp server（`localhost:8000`）进行 NL→JSON 推理。
 
 ### LLM 配置
 
 ```bash
 # 默认 Qwen3-8B (8-bit 量化)
-mockvehicle2d nl --llm "去坐标 (100, 200)"
+mockvehicle2d nl "去坐标 (100, 200)"
 
 # 切换到 Qwen3-14B
-mockvehicle2d nl --llm --model Qwen3-14B-Q4_K_M "去坐标 (100, 200)"
+mockvehicle2d nl --model Qwen3-14B-Q4_K_M "去坐标 (100, 200)"
 ```
 
 ### JSON Schema v2（最小化设计）
@@ -249,7 +242,6 @@ mockvehicle2d nl --eval
 ```
 
 51 条测试覆盖全部 7 种意图 + 边界情况（越界坐标、注入攻击、乱码输入）。
-FakeModelClient 得分：51/51。
 
 ## 通信协议
 

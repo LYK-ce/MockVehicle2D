@@ -6,7 +6,7 @@ Covers:
 - InstructionStateMachine
 - TaskCompiler
 - AuthorityManager
-- FakeModelClient
+- LLMClient
 - Integration: nl command → parse → validate pipeline
 """
 
@@ -21,7 +21,6 @@ import pytest
 
 from mockvehicle2d.instruction.authority import AuthorityLevel, AuthorityManager
 from mockvehicle2d.instruction.compiler import TaskCompiler
-from mockvehicle2d.instruction.llm_client import FakeModelClient
 from mockvehicle2d.instruction.state_machine import (
     InstructionState,
     InstructionStateMachine,
@@ -560,139 +559,38 @@ class TestAuthorityManager:
 
 
 # ═══════════════════════════════════════════════════════════════
-# FakeModelClient tests (10+)
-# ═══════════════════════════════════════════════════════════════
-
-class TestFakeModelClient:
-    def setup_method(self):
-        self.client = FakeModelClient()
-
-    def test_stop_variants(self):
-        for text in ("停", "停下", "停止", "紧急停止", "别动了"):
-            result = self.client.parse(text)
-            assert result is not None
-            assert result["intent"] == "stop", f"failed for '{text}'"
-
-    def test_status_variants(self):
-        for text in ("现在什么状态", "到哪了", "有没有问题", "状态", "在哪"):
-            result = self.client.parse(text)
-            assert result is not None
-            assert result["intent"] == "status", f"failed for '{text}'"
-
-    def test_goto_point_variants(self):
-        tests = [
-            ("去 (100, 200)", 100, 200),
-            ("去坐标 (50, 30)", 50, 30),
-            ("开到 10, 20", 10, 20),
-            ("前往 (5, 8)", 5, 8),
-        ]
-        for text, ex, ey in tests:
-            result = self.client.parse(text)
-            assert result is not None, f"no result for '{text}'"
-            assert result["intent"] == "goto_point", f"wrong intent for '{text}': {result['intent']}"
-            assert result["parameters"]["x_m"] == ex
-            assert result["parameters"]["y_m"] == ey
-
-    def test_move_distance_forward(self):
-        result = self.client.parse("前进 3 米")
-        assert result is not None
-        assert result["intent"] == "move_distance"
-        assert result["parameters"]["distance_m"] == 3.0
-        assert result["parameters"]["direction"] == "forward"
-
-    def test_move_distance_backward(self):
-        result = self.client.parse("后退 1.5 米")
-        assert result is not None
-        assert result["intent"] == "move_distance"
-        assert result["parameters"]["distance_m"] == 1.5
-        assert result["parameters"]["direction"] == "backward"
-
-    def test_rotate_left(self):
-        result = self.client.parse("左转 90 度")
-        assert result is not None
-        assert result["intent"] == "rotate"
-        assert result["parameters"]["angle_deg"] == 90
-        assert result["parameters"]["direction"] == "left"
-
-    def test_rotate_right(self):
-        result = self.client.parse("右转 45 度")
-        assert result is not None
-        assert result["intent"] == "rotate"
-        assert result["parameters"]["angle_deg"] == 45
-        assert result["parameters"]["direction"] == "right"
-
-    def test_scan_simple(self):
-        for text in ("看一下", "扫一圈", "扫描一下", "扫描"):
-            result = self.client.parse(text)
-            assert result is not None, f"failed for '{text}'"
-            assert result["intent"] == "scan_report", f"wrong intent for '{text}': {result['intent']}"
-
-    def test_scan_with_region(self):
-        result = self.client.parse("前面有什么")
-        assert result is not None
-        assert result["intent"] == "scan_report"
-        assert result["parameters"].get("query") == "前方"
-
-    def test_clarify_unknown(self):
-        result = self.client.parse("开到那边去")
-        assert result is not None
-        assert result["intent"] == "clarify"
-        assert "question" in result["parameters"]
-
-    def test_empty_input(self):
-        result = self.client.parse("")
-        assert result is not None
-        assert result["intent"] == "clarify"
-
-    def test_gibberish(self):
-        result = self.client.parse("asdfghjkl")
-        assert result is not None
-        assert result["intent"] == "clarify"
-
-    def test_no_extra_fields_in_output(self):
-        """v2 output should only contain intent and parameters."""
-        result = self.client.parse("停")
-        assert set(result.keys()) == {"intent", "parameters"}
-
-
-# ═══════════════════════════════════════════════════════════════
 # Integration tests (3+)
 # ═══════════════════════════════════════════════════════════════
 
 class TestIntegration:
     def test_full_pipeline_stop(self):
         """stop: parse → schema ✓ → semantic ✓ → accepted"""
-        client = FakeModelClient()
-        instruction = client.parse("停")
+        instruction = {"intent": "stop", "parameters": {}}
         result = run_validation_pipeline(instruction)
         assert result.valid, result.message
 
     def test_full_pipeline_goto_valid(self, empty_grid):
-        client = FakeModelClient()
         semantic = SemanticValidator(empty_grid)
-        instruction = client.parse("去 (100, 100)")
+        instruction = {"intent": "goto_point", "parameters": {"x_m": 100, "y_m": 100}}
         result = run_validation_pipeline(instruction, semantic_validator=semantic)
         assert result.valid, result.message
 
     def test_full_pipeline_goto_wall(self, grid_with_obstacles):
-        client = FakeModelClient()
         semantic = SemanticValidator(grid_with_obstacles)
-        instruction = client.parse("去 (50, 50)")
+        instruction = {"intent": "goto_point", "parameters": {"x_m": 50, "y_m": 50}}
         result = run_validation_pipeline(instruction, semantic_validator=semantic)
         assert not result.valid
         assert result.layer == "semantic"
 
     def test_full_pipeline_with_safety(self, healthy_safety):
-        client = FakeModelClient()
         safety_v = SafetyValidator(healthy_safety)
-        instruction = client.parse("停")
+        instruction = {"intent": "stop", "parameters": {}}
         result = run_validation_pipeline(instruction, safety_validator=safety_v)
         assert result.valid
 
     def test_full_pipeline_safety_fault(self, faulty_safety):
-        client = FakeModelClient()
         safety_v = SafetyValidator(faulty_safety)
-        instruction = client.parse("停")
+        instruction = {"intent": "stop", "parameters": {}}
         result = run_validation_pipeline(instruction, safety_validator=safety_v)
         assert not result.valid
         assert result.layer == "safety"
