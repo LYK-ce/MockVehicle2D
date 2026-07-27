@@ -1,7 +1,8 @@
 # MockVehicle2D
 
 2D 车辆模拟器，Python 实现。用于 Pictor 项目的 WebSocket 协议测试、碰撞检测验证、
-以及 **Qwen 驱动的自然语言车辆指令系统**（NL→JSON→执行）。
+以及 **Qwen3-8B/14B 驱动的自然语言车辆指令系统**（NL→JSON→执行），
+支持 stop / goto / clarify / patrol 四种意图。
 
 ## 快速开始
 
@@ -38,10 +39,10 @@ bash scripts/start_llm_server.sh 0 Qwen3-14B-Q4_K_M  # 14B
 
 # 然后执行 NL 指令
 mockvehicle2d nl "去坐标 (100, 200)"
-mockvehicle2d nl "前进 3 米"
-mockvehicle2d nl "左转 90 度"
+mockvehicle2d nl "停"
+mockvehicle2d nl "开始巡逻"
 mockvehicle2d nl --interactive
-mockvehicle2d nl --model Qwen3-14B-Q4_K_M "前面有什么"
+mockvehicle2d nl --model Qwen3-14B-Q4_K_M "去坐标 (50, 30)"
 
 # 离线评测
 mockvehicle2d nl --eval
@@ -69,7 +70,7 @@ MockVehicle2D/
 │   │   ├── compiler.py     ← JSON 指令 → 可执行任务
 │   │   ├── authority.py    ← 5 级权限仲裁
 │   │   └── schemas/
-│   │       └── v3.json     ← JSON Schema v3（仅 intent + parameters）
+│   │       └── v3.json     ← JSON Schema v3（stop/goto/clarify/patrol）
 │   ├── pathfinding/        ← A* 寻路 + 路径跟随
 │   │   ├── a_star.py
 │   │   ├── waypoint_follower.py
@@ -85,7 +86,7 @@ MockVehicle2D/
 ├── tests/
 │   ├── test_instruction.py ← NL 校验/状态机/编译器单元测试
 │   ├── test_nl_integration.py ← NL 全链路集成测试
-│   ├── nl_eval.json        ← 51 条评测数据集
+│   ├── nl_eval.json        ← 46 条评测数据集（stop/goto/clarify/patrol）
 │   ├── test_collision.py
 │   ├── test_pathfinding.py
 │   ├── test_pathfinding_controller.py
@@ -201,7 +202,7 @@ AABB vs Circle 圆形碰撞
 
 ### 运行模式
 
-`mockvehicle2d nl` 通过 `LLMClient` 连接本地 llama.cpp server（`localhost:8000`）进行 NL→JSON 推理。
+`mockvehicle2d nl` 通过 `LLMClient` 连接本地 llama.cpp server（`localhost:8000`）进行 NL→JSON 推理。默认单 GPU（`CUDA_VISIBLE_DEVICES=0`），Qwen3-8B-Q4_K_M，Thinking 模式开启。
 
 ### LLM 配置
 
@@ -215,7 +216,7 @@ mockvehicle2d nl --model Qwen3-14B-Q4_K_M "去坐标 (100, 200)"
 
 ### JSON Schema v3（最小化设计）
 
-LLM 仅需输出 2 个字段——大幅降低小模型出错概率：
+LLM 仅需输出 2 个字段：
 
 ```json
 {"intent": "goto", "parameters": {"x_m": 100, "y_m": 200}}
@@ -227,10 +228,7 @@ LLM 仅需输出 2 个字段——大幅降低小模型出错概率：
 ### Retry 机制
 
 LLM 输出 JSON 解析失败或 Schema 校验失败时，自动将错误反馈给 LLM 进行最多 3 次重试。
-超时和连接错误不重试（infra 问题不是 LLM 质量问题）。
-
-> **当前限制：单指令模式。** 一次 NL 输入仅处理一条指令（如 "去 (10,20)"）。
-> 复合指令（如 "去 (10,20) 然后左转 90 度"）需要分两次发送，或未来扩展多指令序列支持。
+超时和连接错误不重试。
 
 ### 离线评测
 
@@ -238,7 +236,8 @@ LLM 输出 JSON 解析失败或 Schema 校验失败时，自动将错误反馈�
 mockvehicle2d nl --eval
 ```
 
-51 条测试覆盖全部 4 种意图 + 边界情况（越界坐标、注入攻击、乱码输入）。
+46 条测试覆盖全部 4 种意图 + 边界情况（越界坐标、注入攻击、乱码输入）。
+Qwen3-8B: 98% | Qwen3-14B: 100%（单 GPU A100, Q4_K_M, Thinking 开启）。
 
 ## 通信协议
 
