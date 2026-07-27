@@ -369,6 +369,17 @@ def _advance_command_handoff(
     return collided, safety_stop
 
 
+def _block_navigation_for_handoff(
+    navigation: GotoController,
+    collided: bool,
+    safety_stop: str | None,
+) -> str | None:
+    reason = "collision" if collided else safety_stop
+    if reason is not None:
+        navigation.block(reason)
+    return reason
+
+
 def handle_command_message(
     raw: object,
     vehicle: Vehicle,
@@ -424,10 +435,10 @@ def handle_command_message(
                     raise CommandMessageError(
                         "invalid_goto", str(error), seq
                     ) from error
-            if navigation.status == "active" and handoff_collided:
-                navigation.block("collision")
-            elif navigation.status == "active" and handoff_safety_stop is not None:
-                navigation.block(handoff_safety_stop)
+            if navigation.status == "active":
+                _block_navigation_for_handoff(
+                    navigation, handoff_collided, handoff_safety_stop
+                )
             accepted = navigation.status == "active"
             reply = {
                 "type": "goto_ack",
@@ -620,7 +631,7 @@ def _handle_nl_command(
     safety: LocalSafetyRuntime | None = None,
 ) -> list[dict[str, object]]:
     """Process one nl_command message. Returns a list of reply dicts to send."""
-    _advance_command_handoff(
+    handoff_collided, handoff_safety_stop = _advance_command_handoff(
         vehicle,
         grid,
         monotonic_now,
@@ -798,6 +809,26 @@ def _handle_nl_command(
             "points_summary": summary.get("sectors", {}),
         })
         state_machine.transition(InstructionState.COMPLETED)
+        state_machine.transition(InstructionState.IDLE)
+        return replies
+
+    handoff_reason = _block_navigation_for_handoff(
+        navigation, handoff_collided, handoff_safety_stop
+    )
+    if handoff_reason is not None:
+        replies[-1]["accepted"] = False
+        replies[-1]["reason"] = handoff_reason
+        if path_following is not None:
+            path_following.cancel(handoff_reason)
+        state_machine.transition(InstructionState.ACTIVE)
+        state_machine.transition(InstructionState.BLOCKED)
+        replies.append({
+            "type": "nl_task_update",
+            "ts": wall_timestamp,
+            "seq": seq,
+            "status": "blocked",
+            "reason": handoff_reason,
+        })
         state_machine.transition(InstructionState.IDLE)
         return replies
 

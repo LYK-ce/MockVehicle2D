@@ -574,6 +574,77 @@ class TestNlCommandRotate:
         assert navigation.status == "cancelled"
 
 
+@pytest.mark.parametrize(
+    ("text", "use_safety", "reason"),
+    (
+        ("去坐标 (10, 5.5)", False, "collision"),
+        ("去坐标 (10, 5.5)", True, "safety_obstacle"),
+        ("前进 1 米", True, "safety_obstacle"),
+        ("右转 90 度", True, "safety_obstacle"),
+    ),
+)
+def test_nl_automatic_command_rejects_terminal_handoff(
+    text, use_safety, reason, nl_client, schema_v, semantic_v
+):
+    grid = MapGrid.from_wall_set(30, 30, {(4, y) for y in range(30)})
+    vehicle = Vehicle(
+        2.0,
+        5.5,
+        radius=0.5,
+        linear_speed=5.0,
+        command_timeout=10.0,
+        now=0.0,
+    )
+    navigation = GotoController()
+    safety = LocalSafetyRuntime() if use_safety else None
+    local_state = AnchoredLocalState(
+        AnchorSpec("nl-handoff", vehicle.x, vehicle.y, vehicle.yaw),
+        truth_x_m=vehicle.x,
+        truth_y_m=vehicle.y,
+        truth_yaw_rad=vehicle.yaw,
+        timestamp=0.0,
+    )
+    drive_ack = handle_command_message(
+        '{"type":"drive","seq":90,"linear_mps":5,"angular_rps":0}',
+        vehicle,
+        grid,
+        0.0,
+        12.0,
+        navigation,
+        safety,
+        local_state=local_state,
+    )
+    assert drive_ack["accepted"]
+
+    replies = _handle_nl_command(
+        {"type": "nl_command", "seq": 91, "text": text},
+        vehicle,
+        grid,
+        navigation,
+        13.0,
+        1.0,
+        nl_client,
+        schema_v,
+        semantic_v,
+        InstructionStateMachine(),
+        local_state=local_state,
+        safety=safety,
+    )
+
+    assert replies[0]["accepted"] is False
+    assert replies[0]["reason"] == reason
+    assert replies[-1]["status"] == "blocked"
+    assert replies[-1]["reason"] == reason
+    assert (navigation.status, navigation.reason) == (
+        "blocked",
+        reason,
+    )
+    assert navigation.snapshot()["planning"] is False
+    assert navigation.reported_goal is None
+    assert navigation.reported_yaw_goal_rad is None
+    assert vehicle.command == "stop"
+
+
 class TestNlCommandScan:
     """NL '看一下' → scan report."""
 
