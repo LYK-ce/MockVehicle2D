@@ -138,13 +138,63 @@ def _cmd_test(_args):
     )
 
 
+def _cmd_serve_llm(args):
+    """Start llama.cpp server for NL→JSON inference."""
+    import os
+    import subprocess
+
+    model_name = args.model
+    # Derive GGUF repo name: Qwen3-8B-Q4_K_M → Qwen3-8B-GGUF
+    repo_name = model_name.rsplit("-", 1)[0] + "-GGUF"
+
+    # Find model in HF cache
+    hf_cache = os.environ.get("HF_HOME", os.path.expanduser("~/.cache/huggingface"))
+    model_dir = os.path.join(hf_cache, "hub", f"models--Qwen--{repo_name}")
+    snapshots = os.path.join(model_dir, "snapshots")
+    if not os.path.isdir(snapshots):
+        print(f"ERROR: Model not found. Download first:")
+        print(f"  hf download Qwen/{repo_name} {model_name}.gguf")
+        sys.exit(1)
+
+    # Find the .gguf file in any snapshot
+    model_path = None
+    for snap in os.listdir(snapshots):
+        candidate = os.path.join(snapshots, snap, f"{model_name}.gguf")
+        if os.path.isfile(candidate):
+            model_path = candidate
+            break
+    if model_path is None:
+        print(f"ERROR: {model_name}.gguf not found in {snapshots}")
+        sys.exit(1)
+
+    env = os.environ.copy()
+    env["CUDA_VISIBLE_DEVICES"] = str(args.gpu)
+
+    print(f"=== MockVehicle2D LLM Server ===")
+    print(f"GPU:          {args.gpu} (CUDA_VISIBLE_DEVICES={args.gpu})")
+    print(f"Model:        {model_name}")
+    print(f"Port:         {args.port}")
+    print(f"GPU Layers:   {args.n_gpu_layers}")
+    print(f"Context:      {args.n_ctx}")
+    print(f"Model path:   {model_path}")
+    print(f"================================")
+
+    subprocess.run([
+        sys.executable, "-m", "llama_cpp.server",
+        "--model", model_path,
+        "--host", "0.0.0.0",
+        "--port", str(args.port),
+        "--n_gpu_layers", str(args.n_gpu_layers),
+        "--n_ctx", str(args.n_ctx),
+    ], env=env)
+
+
 def _cmd_nl(args):
     """Parse a natural language vehicle command through the offline pipeline."""
     import json
     import os
     import random
 
-    from mockvehicle2d.instruction.llm_client import FakeModelClient
     from mockvehicle2d.instruction.validator import (
         SchemaValidator,
         SemanticValidator,
@@ -169,7 +219,9 @@ def _cmd_nl(args):
 
     # --- interactive mode ---
     if args.interactive:
-        client = FakeModelClient()
+        import asyncio
+        from mockvehicle2d.instruction.llm_client import LLMClient
+        client = LLMClient(model=args.model, schema_validator=schema_v)
         print("NL Instruction REPL — type 'quit' to exit")
         while True:
             try:
@@ -181,7 +233,7 @@ def _cmd_nl(args):
                 break
             if not text.strip():
                 continue
-            instruction = client.parse(text)
+            instruction = asyncio.run(client.parse(text))
             if instruction is None:
                 print("  parse failed: no result")
                 continue
@@ -212,14 +264,10 @@ def _cmd_nl(args):
         print("error: missing NL text (use --interactive or provide text argument)")
         sys.exit(1)
 
-    if args.vllm:
-        import asyncio
-        from mockvehicle2d.instruction.llm_client import VLLMClient
-        client = VLLMClient()
-        instruction = asyncio.run(client.parse(text))
-    else:
-        client = FakeModelClient()
-        instruction = client.parse(text)
+    import asyncio
+    from mockvehicle2d.instruction.llm_client import LLMClient
+    client = LLMClient(model=args.model, schema_validator=schema_v)
+    instruction = asyncio.run(client.parse(text))
 
     if instruction is None:
         print("parse failed: no result")
@@ -239,13 +287,14 @@ def _cmd_nl(args):
 
 
 def _run_eval(dataset, schema_v, semantic_v):
-    """Run offline evaluation: compare FakeModelClient parse vs expected."""
+    """Run offline evaluation: compare LLMClient parse vs expected."""
+    import asyncio
     import json
 
-    from mockvehicle2d.instruction.llm_client import FakeModelClient
+    from mockvehicle2d.instruction.llm_client import LLMClient
     from mockvehicle2d.instruction.validator import run_validation_pipeline
 
-    client = FakeModelClient()
+    client = LLMClient(schema_validator=schema_v)
     total = len(dataset)
     intent_correct = 0
     schema_pass = 0
@@ -255,7 +304,7 @@ def _run_eval(dataset, schema_v, semantic_v):
     for entry in dataset:
         text = entry["input"]
         expected = entry["expected"]
-        instruction = client.parse(text)
+        instruction = asyncio.run(client.parse(text))
         parsed_intent = instruction.get("intent") if instruction else None
         expected_intent = expected.get("intent")
 
@@ -325,6 +374,20 @@ def main():
     sub.add_parser("visual", help="Launch Pygame visualization (W/S/A/D driving)")
     sub.add_parser("test", help="Run motion, collision, and Tmini scan tests")
     pathfind = sub.add_parser("pathfind", help="Run A* pathfinding on generated map")
+
+
+    # ── serve-llm subcommand ────────────────────────────────
+    llm_serve = sub.add_parser("serve-llm", help="Start llama.cpp server for NL→JSON inference")
+    llm_serve.add_argument("--gpu", type=int, default=0, metavar="ID",
+                           help="GPU device ID (default: 0, single GPU)")
+    llm_serve.add_argument("--model", type=str, default="Qwen3-8B-Q4_K_M", metavar="NAME",
+                           help="GGUF model name (default: Qwen3-8B-Q4_K_M)")
+    llm_serve.add_argument("--port", type=int, default=8000,
+                           help="Server port (default: 8000)")
+    llm_serve.add_argument("--n-gpu-layers", type=int, default=36, metavar="N",
+                           help="Layers to offload to GPU (default: 36)")
+    llm_serve.add_argument("--n-ctx", type=int, default=2048, metavar="N",
+                           help="Context size (default: 2048)")
     pathfind.add_argument("--start", type=_coords, default=(10, 10), metavar="X,Y",
                           help="Start grid coordinate (default: 10,10)")
     pathfind.add_argument("--goal", type=_coords, default=(200, 200), metavar="X,Y",
@@ -342,15 +405,14 @@ def main():
                         help="Run offline evaluation against a dataset")
     nl_cmd.add_argument("--dataset", type=str, default="tests/nl_eval.json", metavar="PATH",
                         help="Path to evaluation dataset JSON")
-    nl_cmd.add_argument("--fake", action="store_true", default=True,
-                        help="Use FakeModelClient (default)")
-    nl_cmd.add_argument("--vllm", action="store_true",
-                        help="Use VLLMClient (requires local vLLM)")
+    nl_cmd.add_argument("--model", type=str, default="Qwen3-8B-Q4_K_M", metavar="MODEL",
+                        help="Model name for LLMClient (default: Qwen3-8B-Q4_K_M)")
 
     args = parser.parse_args()
 
     commands = {
         "serve": _cmd_serve,
+        "serve-llm": _cmd_serve_llm,
         "visual": _cmd_visual,
         "test": _cmd_test,
         "pathfind": _cmd_pathfind,
