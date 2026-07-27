@@ -83,6 +83,7 @@ class GotoController:
                 self._goal_cell(local_map),
             )
         )
+        self._block_if_goal_unsafe()
 
     def start_rotation(
         self,
@@ -286,15 +287,7 @@ class GotoController:
             map_delta is not None and map_delta.changed_cells
         ):
             self.replan(pose, map_delta, local_map)
-        if not self._planner.is_segment_passable(
-            self.goal,
-            self.goal,
-            extra_clearance_m=HARD_STOP_CLEARANCE_M,
-        ):
-            self.status = "blocked"
-            self.reason = "no_path"
-            self.detail = "goal_blocked"
-            self._current_waypoint = None
+        if self._block_if_goal_unsafe():
             vehicle.stop()
             return
         if not self._path:
@@ -372,6 +365,24 @@ class GotoController:
                 return
             linear_mps, angular_rps = decision.linear_mps, decision.angular_rps
         vehicle.install_drive(linear_mps, angular_rps, now)
+
+    def _block_if_goal_unsafe(self) -> bool:
+        assert self.goal is not None and self._planner is not None
+        if (
+            self._planner.last_failure != "goal_blocked"
+            and self._planner.is_segment_passable(
+                self.goal,
+                self.goal,
+                extra_clearance_m=HARD_STOP_CLEARANCE_M,
+            )
+        ):
+            return False
+        self._set_path(None)
+        self.status = "blocked"
+        self.reason = "no_path"
+        self.detail = "goal_blocked"
+        self._current_waypoint = None
+        return True
 
     def _set_path(self, path: list[tuple[int, int]] | None) -> None:
         new_path = [] if path is None else path

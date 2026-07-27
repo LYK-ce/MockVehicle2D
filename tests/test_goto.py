@@ -14,6 +14,7 @@ sys.path.insert(0, str(REPO_ROOT / "src"))
 from mockvehicle2d.map_grid import MapGrid
 from mockvehicle2d.local_state import AnchorSpec, AnchoredLocalState, ObservedGrid, PoseEstimate
 from mockvehicle2d.navigation import GotoController
+from mockvehicle2d.scan import LaserPoint, TMINI_SCAN_CONFIG
 from mockvehicle2d.server import (
     CommandMessageError,
     handler,
@@ -308,6 +309,72 @@ class GotoTest(unittest.TestCase):
         )
         self.assertEqual(pose["control_mode"], "manual")
         self.assertEqual(pose["navigation"]["status"], "cancelled")
+
+    def test_known_occupied_goal_is_rejected_immediately(self) -> None:
+        vehicle = self.vehicle()
+        navigation = GotoController()
+        local_state = self.local_state(vehicle)
+        local_state.integrate_scan(
+            (LaserPoint(0.0, 1.0, 1.0),),
+            0.0,
+            TMINI_SCAN_CONFIG,
+        )
+        self.assertIn((1, 0), local_state.local_map.occupied_cells())
+
+        ack = handle_command_message(
+            '{"type":"goto","seq":5,"x_m":6,"y_m":5}',
+            vehicle,
+            self.grid,
+            0.0,
+            12.0,
+            navigation,
+            local_state=local_state,
+        )
+
+        self.assertEqual(
+            ack,
+            {
+                "type": "goto_ack",
+                "ts": 12.0,
+                "seq": 5,
+                "goal": {"x_m": 6.0, "y_m": 5.0},
+                "accepted": False,
+                "reason": "no_path",
+                "detail": "goal_blocked",
+            },
+        )
+        self.assertEqual(
+            (navigation.status, navigation.reason, navigation.detail),
+            ("blocked", "no_path", "goal_blocked"),
+        )
+        self.assertEqual(navigation.snapshot()["path"], [])
+        self.assertIsNone(navigation.snapshot()["current_waypoint"])
+        self.assertEqual(vehicle.command, "stop")
+        self.assertEqual(vehicle.body_velocities(), (0.0, 0.0))
+
+    def test_known_free_goal_remains_accepted(self) -> None:
+        vehicle = self.vehicle()
+        navigation = GotoController()
+        local_state = self.local_state(vehicle)
+        local_state.integrate_scan(
+            (LaserPoint(0.0, 0.0, 0.0),),
+            0.0,
+            TMINI_SCAN_CONFIG,
+        )
+        self.assertFalse(local_state.local_map.is_unknown(1, 0))
+
+        ack = handle_command_message(
+            '{"type":"goto","seq":5,"x_m":6,"y_m":5}',
+            vehicle,
+            self.grid,
+            0.0,
+            12.0,
+            navigation,
+            local_state=local_state,
+        )
+
+        self.assertTrue(ack["accepted"])
+        self.assertEqual(navigation.status, "active")
 
     def test_goto_handoff_collision_blocks_replacement_goal(self) -> None:
         grid = MapGrid.from_wall_set(30, 30, {(7, y) for y in range(30)})
