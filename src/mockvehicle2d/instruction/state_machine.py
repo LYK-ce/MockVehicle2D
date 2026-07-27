@@ -7,7 +7,6 @@ from __future__ import annotations
 
 import threading
 from enum import Enum, auto
-from typing import ClassVar
 
 
 class InstructionState(Enum):
@@ -73,16 +72,60 @@ class InstructionStateMachine:
     """Thread-safe instruction state machine with 11 states.
 
     IDLE ← any terminal state (new nl_command can restart).
+
+    Also maintains an instruction queue for multi-instruction sequences.
     """
+
+    _MAX_QUEUE_SIZE: int = 10
 
     def __init__(self) -> None:
         self._state = InstructionState.IDLE
         self._lock = threading.Lock()
+        self._queue: list[dict] = []
+        self._current_index: int = 0
 
     @property
     def current_state(self) -> InstructionState:
         with self._lock:
             return self._state
+
+    @property
+    def queue_size(self) -> int:
+        with self._lock:
+            return len(self._queue)
+
+    @property
+    def current_index(self) -> int:
+        with self._lock:
+            return self._current_index
+
+    def enqueue(self, instructions: list[dict]) -> None:
+        """Append instructions to the queue, truncating to max 10 total."""
+        with self._lock:
+            self._queue.extend(instructions)
+            if len(self._queue) > self._MAX_QUEUE_SIZE:
+                self._queue = self._queue[: self._MAX_QUEUE_SIZE]
+            self._current_index = 0
+
+    def dequeue_next(self) -> dict | None:
+        """Return the next instruction from the queue, or None if exhausted."""
+        with self._lock:
+            if self._current_index >= len(self._queue):
+                return None
+            inst = self._queue[self._current_index]
+            self._current_index += 1
+            return inst
+
+    def clear_queue(self) -> None:
+        """Drop the entire queue and reset the index."""
+        with self._lock:
+            self._queue.clear()
+            self._current_index = 0
+
+    def has_more(self) -> bool:
+        """True if there are more instructions in the queue after the current index."""
+        with self._lock:
+            return self._current_index < len(self._queue)
 
     def transition(self, new_state: InstructionState) -> None:
         """Transition to *new_state*, raising InvalidTransitionError if illegal."""

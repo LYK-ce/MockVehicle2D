@@ -1143,3 +1143,109 @@ class YDLidarProvider:
 ---
 
 > **Phase 0 完成后进入 Phase 1**：在此 PLAN.md 被审查和批准后，开始 Phase 1（模型解析离线闭环）实现。
+
+---
+
+## 附录 D: 多指令序列 (Multi-Instruction Sequence)
+
+> **实施日期**: 2026-07-27
+> **状态**: Implemented
+
+### D.1 概述
+
+扩展 NL→JSON 管道以支持多指令序列。单个自然语言句子可以包含由连接词分隔的多个指令，系统将其解析为 JSON 数组并顺序执行。
+
+### D.2 连接词
+
+系统识别以下连接词，触发多指令解析：
+
+| 连接词 | 示例 |
+|--------|------|
+| `然后` | "去 (10, 20) 然后去 (30, 40)" |
+| `接着` | "去 (5, 5) 接着停" |
+| `再` | "去 (10, 10) 然后去 (20, 20) 再去 (30, 30)" |
+| `之后` | "巡逻之后去 (50, 50)" |
+| `;` / `；` | "去 (100, 200)；巡逻" |
+| `并` / `并且` | "去 (1, 2) 然后去 (3, 4) 并且巡逻" |
+
+### D.3 设计变更
+
+#### LLMClient.parse() 返回类型
+
+从 `dict | None` 改为 `list[dict]`：
+- 单指令 → 包装为 len-1 列表
+- 多指令（含连接词）→ 返回数组
+- 解析失败 → 返回空列表 `[]`
+- Schema 校验：对列表中每个元素单独校验
+
+#### InstructionStateMachine 队列
+
+在 `InstructionStateMachine` 中新增指令队列（线程安全，复用现有 `_lock`）：
+
+```python
+_queue: list[dict] = []
+_current_index: int = 0
+
+def enqueue(self, instructions: list[dict]) -> None:  # 最大 10 条，截断
+def dequeue_next(self) -> dict | None:
+def clear_queue(self) -> None:
+def has_more(self) -> bool:
+# 属性: queue_size, current_index
+```
+
+队列最大长度: **10**，超出部分截断。
+
+#### 执行流程
+
+1. `_handle_nl_command()` 调用 `nl_client.parse(text)` 获取 `list[dict]`
+2. 所有指令入队: `state_machine.enqueue(instructions)`
+3. 出队首条: `instruction = state_machine.dequeue_next()`
+4. 通过 `_execute_parsed_instruction()` 执行（原 validate → accept → execute 管道）
+5. 回复中添加 `sequence_index`（1-based）和 `sequence_total`
+
+#### 主循环自动出队
+
+在 `handler()` 主循环中：
+- **COMPLETED → IDLE**: 检查 `state_machine.has_more()`，自动出队并执行下一条
+- **同步完成**（如 stop）: 在 `nl_command` 处理完成后检查 `has_more()`
+
+### D.4 失败传播
+
+**任何步骤失败 → 清空整个队列**：
+
+| 失败类型 | 触发位置 | 操作 |
+|----------|---------|------|
+| 解析失败 | `_handle_nl_command` — parse 返回空列表 | 不清空队列（尚未入队） |
+| Schema 校验失败 | `_execute_parsed_instruction` | 状态机 → REJECTED → IDLE（不清空队列，仅拒绝当前指令；后续指令可由用户手动恢复） |
+| 语义校验失败 | `_execute_parsed_instruction` | 同上 |
+| 任务 BLOCKED | handler 主循环 — navigation 状态检测 | `clear_queue()` |
+| 任务 CANCELLED | handler 主循环 / 手动覆盖 | `clear_queue()` |
+| 任务 FAILED（未知 intent） | `_execute_parsed_instruction` | `clear_queue()` |
+| 手动覆盖（manual cmd） | handler — 收到非 NL 消息 | `clear_queue()` |
+| `_cancel_nl_task()` | 程序化取消 | `clear_queue()` |
+
+### D.5 Clarify 序列处理
+
+当序列中包含 `clarify` 意图且队列中还有剩余指令时：
+1. 当前 clarify 指令入队，出队并执行 → 进入 CONFIRMING 状态
+2. 用户通过 `nl_clarify_response` 回复
+3. 回复处理完成后，如果队列中还有剩余指令（`has_more()`），自动继续执行
+4. Clarify 响应不会清除或覆盖现有队列
+
+### D.6 向后兼容性
+
+所有 46 个现有单指令测试用例保持不变：
+- `nl_eval.json` 中的 `expected` 字段可以是 dict（单指令）或 list（多指令）
+- `_run_eval()` 自动检测并规范化比较
+- 单指令 `parse()` 返回 len-1 列表，行为与之前完全兼容
+
+### D.7 测试
+
+新增测试覆盖：
+- `InstructionStateMachine.enqueue()` / `dequeue_next()` / `clear_queue()` / `has_more()`
+- 队列最大长度截断（入队 12 → queue_size == 10）
+- `LLMClient.parse()` 返回类型为 `list[dict]`（单指令 len-1）
+- `SchemaValidator.validate_list()` 验证列表中每个元素
+- 线程安全：并发入队 + 出队
+
+多指令评估用例（`tests/nl_eval.json` 新增 8 条）。

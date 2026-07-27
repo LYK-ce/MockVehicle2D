@@ -32,12 +32,24 @@ class SchemaValidator:
         self._validator = self._validator_cls(self._schema)
 
     def validate(self, instruction: dict) -> tuple[bool, str]:
-        """Return (is_valid, error_message)."""
+        """Return (is_valid, error_message) for a single instruction."""
         errors = list(self._validator.iter_errors(instruction))
         if not errors:
             return True, ""
         messages = [self._format_error(error) for error in errors[:5]]
         return False, "; ".join(messages)
+
+    def validate_list(self, instructions: list[dict]) -> tuple[bool, str]:
+        """Return (all_valid, error_message) for a list of instructions.
+
+        Validates each element individually. Returns the first failure
+        or (True, \"\") if all pass.
+        """
+        for i, inst in enumerate(instructions):
+            valid, error = self.validate(inst)
+            if not valid:
+                return False, f"element [{i}]: {error}"
+        return True, ""
 
     @staticmethod
     def _format_error(error: jsonschema.ValidationError) -> str:

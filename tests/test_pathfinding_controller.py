@@ -36,18 +36,18 @@ class _TestParser:
 
     _GOTO_PAT = _re.compile(r"去.*?(\d+(?:\.\d+)?).*?(\d+(?:\.\d+)?)")
 
-    def parse(self, text: str) -> dict | None:
+    def parse(self, text: str) -> list[dict]:
         text = text.strip()
         if not text:
-            return {"intent": "clarify", "parameters": {"question": "请输入指令"}}
+            return [{"intent": "clarify", "parameters": {"question": "请输入指令"}}]
 
         m = self._GOTO_PAT.search(text)
         if m:
-            return {"intent": "goto", "parameters": {"x_m": float(m.group(1)), "y_m": float(m.group(2))}}
+            return [{"intent": "goto", "parameters": {"x_m": float(m.group(1)), "y_m": float(m.group(2))}}]
 
         if text in {"停"}:
-            return {"intent": "stop", "parameters": {}}
-        return {"intent": "clarify", "parameters": {"question": "请指定坐标"}}
+            return [{"intent": "stop", "parameters": {}}]
+        return [{"intent": "clarify", "parameters": {"question": "请指定坐标"}}]
 
 
 # ═══════════════════════════════════════════════════════════════

@@ -497,3 +497,191 @@ class TestIntegration:
         result = run_validation_pipeline(instruction, safety_validator=safety_v)
         assert not result.valid
         assert result.layer == "safety"
+
+
+# ═══════════════════════════════════════════════════════════════
+# InstructionStateMachine queue tests
+# ═══════════════════════════════════════════════════════════════
+
+class TestInstructionStateMachineQueue:
+    def setup_method(self):
+        self.sm = InstructionStateMachine()
+
+    def test_initial_queue_empty(self):
+        assert self.sm.queue_size == 0
+        assert self.sm.current_index == 0
+        assert not self.sm.has_more()
+
+    def test_enqueue_and_dequeue(self):
+        instructions = [
+            {"intent": "goto", "parameters": {"x_m": 100, "y_m": 200}},
+            {"intent": "patrol", "parameters": {}},
+        ]
+        self.sm.enqueue(instructions)
+        assert self.sm.queue_size == 2
+        assert self.sm.current_index == 0
+
+        inst = self.sm.dequeue_next()
+        assert inst is not None
+        assert inst["intent"] == "goto"
+        assert self.sm.current_index == 1
+        assert self.sm.has_more()
+
+        inst = self.sm.dequeue_next()
+        assert inst is not None
+        assert inst["intent"] == "patrol"
+        assert self.sm.current_index == 2
+        assert not self.sm.has_more()
+
+    def test_dequeue_exhausted_returns_none(self):
+        instructions = [{"intent": "stop", "parameters": {}}]
+        self.sm.enqueue(instructions)
+        self.sm.dequeue_next()
+        assert self.sm.dequeue_next() is None
+
+    def test_clear_queue(self):
+        instructions = [
+            {"intent": "goto", "parameters": {"x_m": 100, "y_m": 200}},
+            {"intent": "stop", "parameters": {}},
+        ]
+        self.sm.enqueue(instructions)
+        assert self.sm.queue_size == 2
+        self.sm.clear_queue()
+        assert self.sm.queue_size == 0
+        assert self.sm.current_index == 0
+        assert not self.sm.has_more()
+
+    def test_queue_max_length_truncation(self):
+        """Enqueue 12 instructions → queue_size must be 10."""
+        instructions = [{"intent": "stop", "parameters": {}}] * 12
+        self.sm.enqueue(instructions)
+        assert self.sm.queue_size == 10
+        assert self.sm.current_index == 0
+
+    def test_has_more(self):
+        instructions = [
+            {"intent": "goto", "parameters": {"x_m": 1, "y_m": 2}},
+            {"intent": "goto", "parameters": {"x_m": 3, "y_m": 4}},
+        ]
+        self.sm.enqueue(instructions)
+        assert self.sm.has_more()
+        self.sm.dequeue_next()
+        assert self.sm.has_more()
+        self.sm.dequeue_next()
+        assert not self.sm.has_more()
+
+    def test_thread_safety_enqueue_dequeue(self):
+        """Concurrent enqueue + dequeue should not deadlock or corrupt state."""
+        errors = []
+
+        def enqueuer():
+            for _ in range(50):
+                try:
+                    self.sm.enqueue([{"intent": "stop", "parameters": {}}])
+                except Exception as e:
+                    errors.append(e)
+
+        def dequeuer():
+            for _ in range(50):
+                try:
+                    self.sm.dequeue_next()
+                except Exception as e:
+                    errors.append(e)
+
+        threads = [threading.Thread(target=enqueuer) for _ in range(2)] + \
+                  [threading.Thread(target=dequeuer) for _ in range(2)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+        # No deadlocks, no exceptions
+        assert len(errors) == 0
+
+    def test_enqueue_resets_index(self):
+        """Enqueue should reset current_index to 0."""
+        instructions = [
+            {"intent": "goto", "parameters": {"x_m": 10, "y_m": 20}},
+            {"intent": "goto", "parameters": {"x_m": 30, "y_m": 40}},
+        ]
+        self.sm.enqueue(instructions)
+        self.sm.dequeue_next()
+        assert self.sm.current_index == 1
+
+        # New enqueue extends queue and resets index
+        self.sm.enqueue([{"intent": "stop", "parameters": {}}])
+        assert self.sm.current_index == 0
+        assert self.sm.queue_size == 3  # 2 original + 1 new
+
+
+# ═══════════════════════════════════════════════════════════════
+# SchemaValidator validate_list tests
+# ═══════════════════════════════════════════════════════════════
+
+class TestSchemaValidatorList:
+    def setup_method(self):
+        self.v = SchemaValidator()
+
+    def test_validate_list_all_valid(self):
+        instructions = [
+            {"intent": "stop", "parameters": {}},
+            {"intent": "goto", "parameters": {"x_m": 100, "y_m": 200}},
+            {"intent": "patrol", "parameters": {}},
+        ]
+        ok, msg = self.v.validate_list(instructions)
+        assert ok, msg
+
+    def test_validate_list_one_invalid(self):
+        instructions = [
+            {"intent": "stop", "parameters": {}},
+            {"intent": "goto", "parameters": {}},  # missing x_m, y_m
+        ]
+        ok, msg = self.v.validate_list(instructions)
+        assert not ok
+        assert "element [1]" in msg
+
+    def test_validate_list_empty(self):
+        ok, msg = self.v.validate_list([])
+        assert ok, msg
+
+    def test_validate_list_first_invalid(self):
+        instructions = [
+            {"intent": "invalid_intent", "parameters": {}},
+            {"intent": "stop", "parameters": {}},
+        ]
+        ok, msg = self.v.validate_list(instructions)
+        assert not ok
+        assert "element [0]" in msg
+
+
+# ═══════════════════════════════════════════════════════════════
+# LLMClient parse returns list tests
+# ═══════════════════════════════════════════════════════════════
+
+class TestLLMClientParseReturnType:
+    """Tests that parse() returns list[dict] — single instruction wrapped in list."""
+
+    def test_parse_single_returns_len_one_list(self):
+        """For a single instruction input, parse should return a len-1 list."""
+        from tests.test_nl_integration import _TestParser
+        parser = _TestParser()
+        result = parser.parse("停")
+        assert isinstance(result, list)
+        assert len(result) == 1
+        assert result[0]["intent"] == "stop"
+
+    def test_parse_clarify_returns_list(self):
+        from tests.test_nl_integration import _TestParser
+        parser = _TestParser()
+        result = parser.parse("开到那边去")
+        assert isinstance(result, list)
+        assert len(result) == 1
+        assert result[0]["intent"] == "clarify"
+
+    def test_parse_goto_returns_list(self):
+        from tests.test_nl_integration import _TestParser
+        parser = _TestParser()
+        result = parser.parse("去坐标 (50, 30)")
+        assert isinstance(result, list)
+        assert len(result) == 1
+        assert result[0]["intent"] == "goto"
+        assert result[0]["parameters"]["x_m"] == 50
