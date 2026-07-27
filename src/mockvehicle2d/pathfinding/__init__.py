@@ -7,10 +7,14 @@ Usage::
 
     from mockvehicle2d.pathfinding import a_star_search, WaypointFollower, PathFollowingController
 
-    path = a_star_search(grid, (10, 10), (200, 200))
-    if path:
+    path_cells = a_star_search(grid, (10, 10), (200, 200))
+    if path_cells:
+        path_m = [
+            ((gx + 0.5) * grid.resolution_m, (gy + 0.5) * grid.resolution_m)
+            for gx, gy in path_cells
+        ]
         controller = PathFollowingController()
-        controller.start(path)
+        controller.start(path_m)
         controller.update(vehicle, grid, now, safety)
 """
 
