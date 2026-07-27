@@ -43,7 +43,7 @@ D* Lite（增量修复路径）──► 局部 waypoint ──► 速度控制 
 | Footprint | Occupied 按 `vehicle_radius_m` 膨胀 |
 | 规划范围 | 起点和目标包围框加默认 `16 m` margin |
 | 资源限制 | 默认目标最远 `256 m`、最多 `100000` 格 |
-| 不可达目标 | 在原目标 `3 m` 内选择安全包络均已确认 Free 且 D* 可达的最近 cell center |
+| 不可达目标 | 在原目标 `1 m` 内选择安全包络均已确认 Free 且 D* 可达的最近 cell center |
 
 Unknown 可以通行是启动探索所必需：车辆开始时除出生附近外没有地图。如果要求 Unknown
 不可通行，第一条 `goto` 将无法离开初始区域。驶向 Unknown waypoint 时，导航线速度默认

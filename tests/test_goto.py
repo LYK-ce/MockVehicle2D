@@ -352,7 +352,7 @@ class GotoTest(unittest.TestCase):
         self.assertEqual(vehicle.command, "stop")
         self.assertEqual(vehicle.body_velocities(), (0.0, 0.0))
 
-    def test_known_occupied_goal_with_safe_nearby_candidate_is_accepted(self) -> None:
+    def test_known_occupied_goal_rejects_safe_candidate_beyond_one_metre(self) -> None:
         grid = MapGrid.from_wall_set(16, 12, {(8, 5)})
         vehicle = Vehicle(
             2.5,
@@ -394,22 +394,24 @@ class GotoTest(unittest.TestCase):
                 "ts": 12.0,
                 "seq": 5,
                 "goal": {"x_m": 8.5, "y_m": 5.5},
-                "accepted": True,
+                "accepted": False,
+                "reason": "no_path",
+                "detail": "nearby_safe_goal_unavailable",
             },
         )
-        self.assertEqual(navigation.status, "active")
+        self.assertEqual(navigation.status, "blocked")
         self.assertEqual(navigation.requested_goal, (6.0, 0.0))
         self.assertEqual(navigation.reported_goal, (8.5, 5.5))
-        self.assertNotEqual(navigation.goal, navigation.requested_goal)
+        self.assertEqual(navigation.goal, navigation.requested_goal)
         snapshot = navigation.snapshot()
         self.assertEqual(snapshot["goal"], {"x_m": 8.5, "y_m": 5.5})
-        self.assertEqual(snapshot["goal_mode"], "nearby_safe")
+        self.assertEqual(snapshot["goal_mode"], "exact")
         self.assertEqual(
             snapshot["effective_goal"],
             {
                 "frame_id": "anchor_map",
-                "x_m": navigation.goal[0],
-                "y_m": navigation.goal[1],
+                "x_m": 6.0,
+                "y_m": 0.0,
             },
         )
 
