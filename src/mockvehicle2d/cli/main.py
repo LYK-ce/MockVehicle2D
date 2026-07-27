@@ -215,7 +215,7 @@ def _cmd_nl(args):
     if args.vllm:
         import asyncio
         from mockvehicle2d.instruction.llm_client import VLLMClient
-        client = VLLMClient()
+        client = VLLMClient(model=args.model, schema_validator=schema_v)
         instruction = asyncio.run(client.parse(text))
     else:
         client = FakeModelClient()
@@ -346,6 +346,8 @@ def main():
                         help="Use FakeModelClient (default)")
     nl_cmd.add_argument("--vllm", action="store_true",
                         help="Use VLLMClient (requires local vLLM)")
+    nl_cmd.add_argument("--model", type=str, default="Qwen3-8B-Q4_K_M", metavar="MODEL",
+                        help="Model name for VLLMClient (default: Qwen3-8B-Q4_K_M)")
 
     args = parser.parse_args()
 

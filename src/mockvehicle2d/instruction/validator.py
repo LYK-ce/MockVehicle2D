@@ -1,6 +1,6 @@
 """Three-layer instruction validation: schema, semantics, and safety.
 
-SchemaValidator   — JSON Schema v1 conformance (jsonschema)
+SchemaValidator   — JSON Schema v2 conformance (jsonschema)
 SemanticValidator — map bounds, passability, distance limits
 SafetyValidator   — delegates to existing SafetyRuntime
 """
@@ -17,14 +17,14 @@ from mockvehicle2d.map_grid import MapGrid
 from mockvehicle2d.safety import LocalSafetyRuntime
 
 
-_SCHEMA_PATH = Path(__file__).resolve().parent / "schemas" / "v1.json"
+_SCHEMA_PATH = Path(__file__).resolve().parent / "schemas" / "v2.json"
 
 _MAX_MAP_SIZE = 255
 _DEFAULT_MAX_DISTANCE_M = 10.0
 
 
 class SchemaValidator:
-    """Validates JSON against the v1 instruction schema using jsonschema."""
+    """Validates JSON against the v2 instruction schema using jsonschema."""
 
     def __init__(self) -> None:
         self._schema = json.loads(_SCHEMA_PATH.read_text(encoding="utf-8"))

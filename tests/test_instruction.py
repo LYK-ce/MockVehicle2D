@@ -69,16 +69,9 @@ def faulty_safety():
     return s
 
 
-def _valid_instruction(intent="stop", params=None, **overrides):
-    """Build a minimally valid instruction dict."""
-    base = {
-        "schema_version": "1.0",
-        "intent": intent,
-        "timestamp": "2026-07-24T12:00:00+08:00",
-        "parameters": params or {},
-    }
-    base.update(overrides)
-    return base
+def _valid_instruction(intent="stop", params=None):
+    """Build a minimally valid v2 instruction dict."""
+    return {"intent": intent, "parameters": params or {}}
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -123,14 +116,15 @@ class TestSchemaValidator:
         )
         assert ok, msg
 
-    def test_missing_schema_version(self):
-        inst = {"intent": "stop", "timestamp": "2026-07-24T12:00:00+08:00"}
+    def test_missing_parameters_field(self):
+        """v2 requires 'parameters' field."""
+        inst = {"intent": "stop"}
         ok, msg = self.v.validate(inst)
         assert not ok
-        assert "schema_version" in msg
+        assert "parameters" in msg
 
     def test_missing_intent(self):
-        inst = {"schema_version": "1.0", "timestamp": "2026-07-24T12:00:00+08:00"}
+        inst = {"parameters": {}}
         ok, msg = self.v.validate(inst)
         assert not ok
 
@@ -155,21 +149,17 @@ class TestSchemaValidator:
         )
         assert not ok
 
-    def test_confidence_boundary_valid(self):
-        ok, msg = self.v.validate(_valid_instruction("stop", confidence=0.0))
+    def test_extra_fields_are_allowed(self):
+        """v2 has additionalProperties: true — extra top-level fields are ignored."""
+        inst = {"intent": "stop", "parameters": {}, "confidence": 0.95, "reasoning": "test"}
+        ok, msg = self.v.validate(inst)
         assert ok, msg
-        ok, msg = self.v.validate(_valid_instruction("stop", confidence=1.0))
-        assert ok, msg
-
-    def test_confidence_out_of_bounds(self):
-        ok, msg = self.v.validate(_valid_instruction("stop", confidence=1.5))
-        assert not ok
 
     def test_injection_extra_fields(self):
-        """Extra top-level fields are rejected by additionalProperties."""
-        inst = _valid_instruction("stop", injected_field="malicious")
+        """v2 allows extra top-level fields (additionalProperties: true)."""
+        inst = {"intent": "stop", "parameters": {}, "injected_field": "malicious"}
         ok, msg = self.v.validate(inst)
-        assert not ok
+        assert ok, msg  # v2 is lenient with extra fields
 
     def test_injection_extra_param_fields(self):
         """Extra fields in parameters for stop are rejected."""
@@ -181,8 +171,9 @@ class TestSchemaValidator:
         ok, msg = self.v.validate(_valid_instruction("clarify", {}))
         assert not ok
 
-    def test_reasoning_too_long(self):
-        ok, msg = self.v.validate(_valid_instruction("stop", reasoning="x" * 501))
+    def test_unknown_intent_rejected(self):
+        """Unknown intent values are rejected."""
+        ok, msg = self.v.validate(_valid_instruction("unknown_intent"))
         assert not ok
 
 
@@ -658,9 +649,10 @@ class TestFakeModelClient:
         assert result is not None
         assert result["intent"] == "clarify"
 
-    def test_confidence_range(self):
+    def test_no_extra_fields_in_output(self):
+        """v2 output should only contain intent and parameters."""
         result = self.client.parse("停")
-        assert 0.0 <= result["confidence"] <= 1.0
+        assert set(result.keys()) == {"intent", "parameters"}
 
 
 # ═══════════════════════════════════════════════════════════════

@@ -210,9 +210,7 @@ class TestTaskCompilerPhase3:
         """goto_point with clear straight-line → GotoController."""
         compiler = TaskCompiler(empty_grid)
         inst = {
-            "schema_version": "1.0",
             "intent": "goto_point",
-            "timestamp": "2026-07-24T12:00:00+08:00",
             "parameters": {"x_m": 20, "y_m": 10},
         }
         snapshot = {"pose": {"x": 10.0, "y": 10.0, "yaw": 0.0}}
@@ -225,9 +223,7 @@ class TestTaskCompilerPhase3:
         """goto_point with obstacle → PathFollowingController with A* path."""
         compiler = TaskCompiler(grid_with_wall)
         inst = {
-            "schema_version": "1.0",
             "intent": "goto_point",
-            "timestamp": "2026-07-24T12:00:00+08:00",
             "parameters": {"x_m": 20, "y_m": 10},
         }
         snapshot = {"pose": {"x": 10.0, "y": 10.0, "yaw": 0.0}}
@@ -253,9 +249,7 @@ class TestTaskCompilerPhase3:
 
         compiler = TaskCompiler(grid)
         inst = {
-            "schema_version": "1.0",
             "intent": "goto_point",
-            "timestamp": "2026-07-24T12:00:00+08:00",
             "parameters": {"x_m": 20, "y_m": 10},
         }
         snapshot = {"pose": {"x": 5.0, "y": 5.0, "yaw": 0.0}}
@@ -268,9 +262,7 @@ class TestTaskCompilerPhase3:
         """Without grid, compiler always chooses GotoController (backward compat)."""
         compiler = TaskCompiler()  # No grid
         inst = {
-            "schema_version": "1.0",
             "intent": "goto_point",
-            "timestamp": "2026-07-24T12:00:00+08:00",
             "parameters": {"x_m": 20, "y_m": 10},
         }
         snapshot = {"pose": {"x": 10.0, "y": 10.0, "yaw": 0.0}}
@@ -281,9 +273,7 @@ class TestTaskCompilerPhase3:
         """move_distance with obstacle → PathFollowingController."""
         compiler = TaskCompiler(grid_with_wall)
         inst = {
-            "schema_version": "1.0",
             "intent": "move_distance",
-            "timestamp": "2026-07-24T12:00:00+08:00",
             "parameters": {"distance_m": 10.0, "direction": "forward"},
         }
         snapshot = {"pose": {"x": 10.0, "y": 10.0, "yaw": 0.0}}
@@ -299,9 +289,7 @@ class TestTaskCompilerPhase3:
         """move_distance without obstacle → GotoController."""
         compiler = TaskCompiler(empty_grid)
         inst = {
-            "schema_version": "1.0",
             "intent": "move_distance",
-            "timestamp": "2026-07-24T12:00:00+08:00",
             "parameters": {"distance_m": 5.0, "direction": "forward"},
         }
         snapshot = {"pose": {"x": 10.0, "y": 10.0, "yaw": 0.0}}

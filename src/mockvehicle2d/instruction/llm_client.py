@@ -7,17 +7,8 @@ VLLMClient      — async client for local vLLM (OpenAI-compatible API)
 from __future__ import annotations
 
 import json
-import math
 import re
-from datetime import datetime, timezone, timedelta
-
-# Beijing timezone (UTC+8)
-_BEIJING_TZ = timezone(timedelta(hours=8))
-
-
-def _beijing_now() -> str:
-    """Return current Beijing time as ISO 8601 string."""
-    return datetime.now(_BEIJING_TZ).isoformat()
+import traceback
 
 
 class FakeModelClient:
@@ -124,66 +115,41 @@ class FakeModelClient:
 
     @staticmethod
     def _make_instruction(intent: str, params: dict) -> dict:
-        return {
-            "schema_version": "1.0",
-            "intent": intent,
-            "timestamp": _beijing_now(),
-            "parameters": params,
-            "confidence": 0.95,
-            "reasoning": f"fake model: matched {intent} pattern",
-        }
+        return {"intent": intent, "parameters": params}
 
     @staticmethod
     def _clarify(question: str, missing: list[str]) -> dict:
         return {
-            "schema_version": "1.0",
             "intent": "clarify",
-            "timestamp": _beijing_now(),
             "parameters": {
                 "question": question,
                 "missing_parameters": missing,
             },
-            "confidence": 0.6,
-            "reasoning": "fake model: unable to match any pattern",
         }
 
 
 _SYSTEM_PROMPT = """你是一个车辆指令解析器。将用户的自然语言指令转换为 JSON 格式。
 
-你必须输出一个 JSON 对象，包含以下字段：
-- schema_version: 固定为 "1.0"
-- intent: 意图类型，取值为 stop, status, goto_point, move_distance, rotate, scan_report, clarify
-- timestamp: 当前时间 ISO 8601 格式
+只输出 JSON 对象，包含两个字段：
+- intent: 意图类型 (stop/status/goto_point/move_distance/rotate/scan_report/clarify)
 - parameters: 与 intent 对应的参数对象
-- confidence: 0.0-1.0 之间的置信度
-- reasoning: 简短的推理说明（最多500字符）
 
-意图与参数对应关系：
-- stop: 无需参数，parameters 为空对象 {}
-- status: 无需参数，parameters 为空对象 {}
-- goto_point: 需要 x_m (数字) 和 y_m (数字)
-- move_distance: 需要 distance_m (数字, 0.01-10.0) 和 direction ("forward" 或 "backward")
-- rotate: 需要 angle_deg (数字, -360到360) 和 direction ("left" 或 "right")
+意图与参数：
+- stop: 无参数，parameters 为 {}
+- status: 无参数，parameters 为 {}
+- goto_point: x_m (数字) 和 y_m (数字)
+- move_distance: distance_m (数字, 0.01-10.0) 和 direction ("forward" 或 "backward")
+- rotate: angle_deg (数字, -360到360) 和 direction ("left" 或 "right")
 - scan_report: 可选 query (字符串)
-- clarify: 需要 question (字符串)，可选 missing_parameters (字符串数组)
+- clarify: question (字符串)，可选 missing_parameters (字符串数组)
 
 示例：
-输入: "去坐标 (100, 200)"
-输出: {"schema_version": "1.0", "intent": "goto_point", "timestamp": "2026-01-01T00:00:00+08:00", "parameters": {"x_m": 100, "y_m": 200}, "confidence": 0.95, "reasoning": "用户指定了明确的目标坐标"}
-
-输入: "停"
-输出: {"schema_version": "1.0", "intent": "stop", "timestamp": "2026-01-01T00:00:00+08:00", "parameters": {}, "confidence": 0.99, "reasoning": "用户要求停止"}
-
-输入: "前进 3 米"
-输出: {"schema_version": "1.0", "intent": "move_distance", "timestamp": "2026-01-01T00:00:00+08:00", "parameters": {"distance_m": 3.0, "direction": "forward"}, "confidence": 0.95, "reasoning": "用户要求向前移动指定距离"}
-
-输入: "左转 90 度"
-输出: {"schema_version": "1.0", "intent": "rotate", "timestamp": "2026-01-01T00:00:00+08:00", "parameters": {"angle_deg": 90, "direction": "left"}, "confidence": 0.95, "reasoning": "用户要求左转指定角度"}
-
-输入: "前面有什么"
-输出: {"schema_version": "1.0", "intent": "scan_report", "timestamp": "2026-01-01T00:00:00+08:00", "parameters": {"query": "前方"}, "confidence": 0.9, "reasoning": "用户询问前方障碍物情况"}
-
-对于无法理解或模糊的指令（如"开到那边去"），使用 clarify 意图并给出澄清问题。
+"停" → {"intent": "stop", "parameters": {}}
+"状态" → {"intent": "status", "parameters": {}}
+"去坐标 (100, 200)" → {"intent": "goto_point", "parameters": {"x_m": 100, "y_m": 200}}
+"前进 3 米" → {"intent": "move_distance", "parameters": {"distance_m": 3.0, "direction": "forward"}}
+"左转 90 度" → {"intent": "rotate", "parameters": {"angle_deg": 90, "direction": "left"}}
+"前面有什么" → {"intent": "scan_report", "parameters": {"query": "前方"}}
 
 只输出 JSON，不要输出任何其他内容。"""
 
@@ -191,23 +157,29 @@ _SYSTEM_PROMPT = """你是一个车辆指令解析器。将用户的自然语言
 class VLLMClient:
     """Async client for LLM inference (llama.cpp / vLLM OpenAI-compatible API).
 
-    Currently configured for llama.cpp server.
-
     Parameters
     ----------
     base_url : str
         OpenAI-compatible API endpoint (default: llama.cpp local server).
     model : str
         Model name as registered in the server.
+    max_retries : int
+        Maximum number of retry attempts on JSON parse or schema validation failure.
+    schema_validator : optional
+        SchemaValidator instance for self-validation during retries.
     """
 
     def __init__(
         self,
         base_url: str = "http://localhost:8000/v1",
         model: str = "Qwen3-8B-Q4_K_M",
+        max_retries: int = 3,
+        schema_validator=None,
     ) -> None:
         self._base_url = base_url
         self._model = model
+        self._max_retries = max_retries
+        self._schema_validator = schema_validator
         self._client = None  # Lazy init
 
     @property
@@ -221,30 +193,65 @@ class VLLMClient:
     async def parse(self, text: str) -> dict | None:
         """Send text to the LLM and return parsed JSON dict.
 
-        Returns None on parse failure or timeout.
-        """
-        import re
+        Retries on JSON decode errors and schema validation failures
+        by appending error feedback to the conversation.
 
-        try:
-            response = await self._async_client.chat.completions.create(
-                model=self._model,
-                messages=[
-                    {"role": "system", "content": _SYSTEM_PROMPT},
-                    {"role": "user", "content": text},
-                ],
-                temperature=0.1,
-                max_tokens=512,
-                extra_body={"enable_thinking": False},
-                timeout=10.0,
-            )
-            content = response.choices[0].message.content
-            if content is None:
+        Returns None on timeout or after exhausting retries.
+        """
+        messages: list[dict] = [
+            {"role": "system", "content": _SYSTEM_PROMPT},
+            {"role": "user", "content": text},
+        ]
+
+        for attempt in range(self._max_retries + 1):
+            try:
+                response = await self._async_client.chat.completions.create(
+                    model=self._model,
+                    messages=messages,
+                    temperature=0.1,
+                    max_tokens=256,
+                    extra_body={"enable_thinking": False},
+                    timeout=10.0,
+                )
+                content = response.choices[0].message.content
+                if content is None:
+                    return None
+
+                # Strip <think>...</think> tags if present (Qwen3 thinking mode)
+                content = re.sub(r"<think>.*?</think>\s*", "", content, flags=re.DOTALL).strip()
+                # Strip markdown code fences if present
+                content = re.sub(r"^```(?:json)?\s*", "", content)
+                content = re.sub(r"\s*```$", "", content)
+
+                try:
+                    result = json.loads(content)
+                except json.JSONDecodeError as e:
+                    if attempt < self._max_retries:
+                        messages.append({"role": "assistant", "content": content})
+                        messages.append({
+                            "role": "user",
+                            "content": f"你的回复不是合法的 JSON。错误: {e}。请只输出 JSON。",
+                        })
+                        continue
+                    return None
+
+                # Schema validation retry
+                if self._schema_validator is not None:
+                    valid, error = self._schema_validator.validate(result)
+                    if not valid:
+                        if attempt < self._max_retries:
+                            messages.append({"role": "assistant", "content": content})
+                            messages.append({
+                                "role": "user",
+                                "content": f"你的 JSON 不符合 schema。错误: {error}。请修正后重新输出。",
+                            })
+                            continue
+                        return None
+
+                return result
+
+            except Exception:
+                # Non-JSONDecodeError (e.g. timeout, connection error) — do NOT retry
                 return None
-            # Strip <think>...</think> tags if present (Qwen3 thinking mode)
-            content = re.sub(r"<think>.*?</think>\s*", "", content, flags=re.DOTALL).strip()
-            # Strip markdown code fences if present
-            content = re.sub(r"^```(?:json)?\s*", "", content)
-            content = re.sub(r"\s*```$", "", content)
-            return json.loads(content)
-        except Exception:
-            return None
+
+        return None
