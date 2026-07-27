@@ -20,6 +20,7 @@ from mockvehicle2d.local_state import (
     MapCellUpdate,
     OCCUPIED,
     ObservedGrid,
+    UNKNOWN,
 )
 from mockvehicle2d.map_grid import MapGrid
 from mockvehicle2d.pathfinding.d_star_lite import DStarLitePlanner, _key_less
@@ -183,6 +184,105 @@ def test_floating_tangency_matches_runtime_but_real_penetration_blocks() -> None
     )
     assert not search.is_segment_passable(penetration[:2], penetration[2:])
     assert not is_swept_circle_passable(truth, *penetration, 0.5)
+
+
+def test_confirmed_free_clearance_rejects_unknown_and_occupied_envelopes() -> None:
+    observed = ObservedGrid(AnchorSpec("dstar-anchor", 0.0, 0.0, 0.0))
+    search = DStarLitePlanner(observed, vehicle_radius_m=0.5)
+    point = (0.5, 0.5)
+    search.plan(
+        (0, 0),
+        (0, 0),
+        changed_cells=(MapCellUpdate(0, 0, FREE),),
+    )
+
+    assert search.is_segment_passable(
+        point,
+        point,
+        extra_clearance_m=0.25,
+    )
+    assert not search.is_segment_passable(
+        point,
+        point,
+        extra_clearance_m=0.25,
+        require_observed=True,
+    )
+
+    search.plan(
+        (0, 0),
+        (0, 0),
+        changed_cells=tuple(
+            MapCellUpdate(gx, gy, FREE)
+            for gx in range(-1, 2)
+            for gy in range(-1, 2)
+            if (gx, gy) != (0, 0)
+        ),
+    )
+    assert search.is_segment_passable(
+        point,
+        point,
+        extra_clearance_m=0.25,
+        require_observed=True,
+    )
+
+    search.plan(
+        (0, 0),
+        (0, 0),
+        changed_cells=(MapCellUpdate(1, 0, OCCUPIED),),
+    )
+    assert not search.is_segment_passable(
+        point,
+        point,
+        extra_clearance_m=0.25,
+        require_observed=True,
+    )
+
+
+@pytest.mark.parametrize("offset", ((-1, 0), (1, 0), (0, -1), (0, 1)))
+@pytest.mark.parametrize("state", (UNKNOWN, OCCUPIED, FORBIDDEN))
+def test_confirmed_clearance_tangent_is_symmetric(
+    offset: tuple[int, int],
+    state: int,
+) -> None:
+    point = (0.5, 0.5)
+    updates = [
+        MapCellUpdate(gx, gy, FREE)
+        for gx in range(-1, 2)
+        for gy in range(-1, 2)
+        if (gx, gy) != offset
+    ]
+    if state != UNKNOWN:
+        updates.append(MapCellUpdate(*offset, state))
+    search = DStarLitePlanner(ObservedGrid(ANCHOR), vehicle_radius_m=0.25)
+    search.plan((0, 0), (0, 0), changed_cells=updates)
+
+    assert not search.is_segment_passable(
+        point,
+        point,
+        extra_clearance_m=0.25,
+        require_observed=True,
+    )
+
+    strict_tangent = DStarLitePlanner(
+        ObservedGrid(ANCHOR),
+        vehicle_radius_m=0.5,
+    )
+    strict_tangent.plan((0, 0), (0, 0), changed_cells=updates)
+    assert strict_tangent.is_segment_passable(point, point)
+
+
+def test_planning_budget_query_covers_distance_and_cell_limits() -> None:
+    distance_limited = DStarLitePlanner(ObservedGrid(ANCHOR))
+    cells_limited = DStarLitePlanner(
+        ObservedGrid(ANCHOR),
+        bounds_margin_m=3.0,
+        max_cells=100,
+    )
+
+    assert distance_limited.planning_budget_allows((0, 0), (256, 0))
+    assert not distance_limited.planning_budget_allows((0, 0), (257, 0))
+    assert cells_limited.planning_budget_allows((0, 0), (2, 2))
+    assert not cells_limited.planning_budget_allows((0, 0), (4, 4))
 
 
 def test_forbidden_egress_only_allows_immediate_motion_away() -> None:

@@ -223,6 +223,15 @@ def _started_nl_task_seq(replies: list[dict[str, object]]) -> int | None:
     return None
 
 
+def _nl_completion_reason(navigation: GotoController) -> str:
+    if (
+        navigation.goal_mode == "nearby_safe"
+        and navigation.reason == "nearby_safe_stop"
+    ):
+        return "nearby_safe_stop"
+    return "goal_reached"
+
+
 def _bounded_json_int(value: str) -> int:
     if len(value.lstrip("-")) > MAX_JSON_INTEGER_DIGITS:
         raise ValueError("JSON integer is too long")
@@ -509,6 +518,8 @@ def _log_navigation_transition(
         snapshot["reason"],
         snapshot["detail"],
         json.dumps(snapshot["goal"], sort_keys=True),
+        snapshot.get("goal_mode"),
+        json.dumps(snapshot.get("effective_goal"), sort_keys=True),
     )
     if key == previous or (previous is None and snapshot["status"] == "idle"):
         return key
@@ -536,6 +547,8 @@ def _log_navigation_transition(
             "yaw_rad": global_yaw_rad,
         },
         "global_goal": snapshot["goal"],
+        "goal_mode": snapshot.get("goal_mode"),
+        "effective_goal": snapshot.get("effective_goal"),
         "local_start_cell": {
             "gx": math.floor(pose.x_m / resolution_m),
             "gy": math.floor(pose.y_m / resolution_m),
@@ -1287,7 +1300,7 @@ async def handler(
                             "ts": timestamp,
                             "seq": active_nl_seq if active_nl_seq is not None else 0,
                             "status": "completed",
-                            "reason": "goal_reached",
+                            "reason": _nl_completion_reason(navigation),
                         }))
                         state_machine.transition(InstructionState.IDLE)
                         active_nl_seq = None

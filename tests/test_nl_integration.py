@@ -22,6 +22,7 @@ from mockvehicle2d.navigation import GotoController
 from mockvehicle2d.safety import LocalSafetyRuntime, SafetyAdvanceResult
 from mockvehicle2d.server import (
     _handle_nl_command,
+    _nl_completion_reason,
     _summarize_scan_for_nl,
     _cancel_nl_task,
     handle_command_message,
@@ -726,6 +727,33 @@ class TestTaskCompletion:
         state_machine.transition(InstructionState.IDLE)
         assert state_machine.current_state == InstructionState.IDLE
 
+    @pytest.mark.parametrize(
+        ("mode", "goal_mode", "reason", "expected"),
+        (
+            ("position", "exact", "goal_tolerance", "goal_reached"),
+            ("rotation", None, "yaw_tolerance", "goal_reached"),
+            (
+                "position",
+                "nearby_safe",
+                "nearby_safe_stop",
+                "nearby_safe_stop",
+            ),
+        ),
+    )
+    def test_nl_completion_reason_preserves_exact_and_marks_nearby(
+        self,
+        mode,
+        goal_mode,
+        reason,
+        expected,
+    ):
+        navigation = GotoController()
+        navigation.mode = mode
+        navigation.goal_mode = goal_mode
+        navigation.reason = reason
+
+        assert _nl_completion_reason(navigation) == expected
+
 
 # ═══════════════════════════════════════════════════════════════
 # Validation failure tests
@@ -863,6 +891,8 @@ class TestValidationFailures:
         assert busy and busy[-1]["seq"] == 2
         assert "busy" in busy[-1]["reason"]
         assert terminal and terminal[-1]["seq"] == 1
+        if outcome == "completed":
+            assert terminal[-1]["reason"] == "goal_reached"
 
     def test_busy_state_rejected(self, vehicle, empty_grid, navigation, nl_client,
                                   schema_v, semantic_v, state_machine):

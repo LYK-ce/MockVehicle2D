@@ -43,10 +43,17 @@ D* Lite（增量修复路径）──► 局部 waypoint ──► 速度控制 
 | Footprint | Occupied 按 `vehicle_radius_m` 膨胀 |
 | 规划范围 | 起点和目标包围框加默认 `16 m` margin |
 | 资源限制 | 默认目标最远 `256 m`、最多 `100000` 格 |
+| 不可达目标 | 在原目标 `3 m` 内选择安全包络均已确认 Free 且 D* 可达的最近 cell center |
 
 Unknown 可以通行是启动探索所必需：车辆开始时除出生附近外没有地图。如果要求 Unknown
 不可通行，第一条 `goto` 将无法离开初始区域。驶向 Unknown waypoint 时，导航线速度默认
 缩放到 `0.4`；最终仍受实时安全门控。
+
+Unknown 不能作为不可达目标的安全停车点。候选的车辆 footprint 加 `0.25 m` 硬净空所覆盖
+的所有格都必须已经是 Free；候选按距原目标的距离和 cell 坐标确定性排序，再由同一个
+D* Lite 验证从当前估计位姿可达。选中后执行目标保持稳定，除非它也变得危险或不可达。
+到达候选仍使用终态 `reached`，但原因为 `nearby_safe_stop`，不会伪报
+`goal_tolerance`。
 
 地图 delta 可包含 Unknown → Free、Unknown → Occupied、Occupied → Free 等双向变化。
 规划器保留 `g`、`rhs`、优先队列与起点移动的 key modifier，只更新受变化格及 footprint
@@ -57,6 +64,12 @@ Unknown 可以通行是启动探索所必需：车辆开始时除出生附近外
 ```json
 {
   "algorithm": "d_star_lite",
+  "goal_mode": "nearby_safe",
+  "effective_goal": {
+    "frame_id": "anchor_map",
+    "x_m": 8.5,
+    "y_m": 3.5
+  },
   "path_revision": 4,
   "replan_count": 2,
   "current_waypoint": {"x_m": 8.5, "y_m": 3.5},
@@ -71,8 +84,9 @@ Unknown 可以通行是启动探索所必需：车辆开始时除出生附近外
 }
 ```
 
-公开路径和目标使用米；整数 cell 只存在于规划器内部。为限制遥测大小，`path` 最多报告
-前 64 个点。
+公开路径和目标使用米；整数 cell 只存在于规划器内部。`goal` 保留原始 global-map 请求，
+`effective_goal` 是实际执行的 `anchor_map` 目标，`goal_mode` 为 `exact` 或
+`nearby_safe`。为限制遥测大小，`path` 最多报告前 64 个点。
 
 ## Scan matching 与局部 SLAM 边界
 

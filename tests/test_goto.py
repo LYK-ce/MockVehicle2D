@@ -14,7 +14,7 @@ sys.path.insert(0, str(REPO_ROOT / "src"))
 from mockvehicle2d.map_grid import MapGrid
 from mockvehicle2d.local_state import AnchorSpec, AnchoredLocalState, ObservedGrid, PoseEstimate
 from mockvehicle2d.navigation import GotoController
-from mockvehicle2d.scan import LaserPoint, TMINI_SCAN_CONFIG
+from mockvehicle2d.scan import LaserPoint, TMINI_SCAN_CONFIG, scan_grid
 from mockvehicle2d.server import (
     CommandMessageError,
     handler,
@@ -310,7 +310,7 @@ class GotoTest(unittest.TestCase):
         self.assertEqual(pose["control_mode"], "manual")
         self.assertEqual(pose["navigation"]["status"], "cancelled")
 
-    def test_known_occupied_goal_is_rejected_immediately(self) -> None:
+    def test_known_occupied_goal_without_safe_nearby_candidate_is_rejected(self) -> None:
         vehicle = self.vehicle()
         navigation = GotoController()
         local_state = self.local_state(vehicle)
@@ -340,17 +340,78 @@ class GotoTest(unittest.TestCase):
                 "goal": {"x_m": 6.0, "y_m": 5.0},
                 "accepted": False,
                 "reason": "no_path",
-                "detail": "goal_blocked",
+                "detail": "nearby_safe_goal_unavailable",
             },
         )
         self.assertEqual(
             (navigation.status, navigation.reason, navigation.detail),
-            ("blocked", "no_path", "goal_blocked"),
+            ("blocked", "no_path", "nearby_safe_goal_unavailable"),
         )
         self.assertEqual(navigation.snapshot()["path"], [])
         self.assertIsNone(navigation.snapshot()["current_waypoint"])
         self.assertEqual(vehicle.command, "stop")
         self.assertEqual(vehicle.body_velocities(), (0.0, 0.0))
+
+    def test_known_occupied_goal_with_safe_nearby_candidate_is_accepted(self) -> None:
+        grid = MapGrid.from_wall_set(16, 12, {(8, 5)})
+        vehicle = Vehicle(
+            2.5,
+            5.5,
+            radius=0.5,
+            command_timeout=1.0,
+            now=0.0,
+        )
+        navigation = GotoController()
+        local_state = self.local_state(vehicle)
+        local_state.integrate_scan(
+            tuple(
+                scan_grid(
+                    grid,
+                    vehicle.x,
+                    vehicle.y,
+                    vehicle.yaw,
+                    TMINI_SCAN_CONFIG,
+                )
+            ),
+            0.0,
+            TMINI_SCAN_CONFIG,
+        )
+
+        ack = handle_command_message(
+            '{"type":"goto","seq":5,"x_m":8.5,"y_m":5.5}',
+            vehicle,
+            grid,
+            0.0,
+            12.0,
+            navigation,
+            local_state=local_state,
+        )
+
+        self.assertEqual(
+            ack,
+            {
+                "type": "goto_ack",
+                "ts": 12.0,
+                "seq": 5,
+                "goal": {"x_m": 8.5, "y_m": 5.5},
+                "accepted": True,
+            },
+        )
+        self.assertEqual(navigation.status, "active")
+        self.assertEqual(navigation.requested_goal, (6.0, 0.0))
+        self.assertEqual(navigation.reported_goal, (8.5, 5.5))
+        self.assertNotEqual(navigation.goal, navigation.requested_goal)
+        snapshot = navigation.snapshot()
+        self.assertEqual(snapshot["goal"], {"x_m": 8.5, "y_m": 5.5})
+        self.assertEqual(snapshot["goal_mode"], "nearby_safe")
+        self.assertEqual(
+            snapshot["effective_goal"],
+            {
+                "frame_id": "anchor_map",
+                "x_m": navigation.goal[0],
+                "y_m": navigation.goal[1],
+            },
+        )
 
     def test_known_free_goal_remains_accepted(self) -> None:
         vehicle = self.vehicle()
@@ -375,6 +436,7 @@ class GotoTest(unittest.TestCase):
 
         self.assertTrue(ack["accepted"])
         self.assertEqual(navigation.status, "active")
+        self.assertEqual(navigation.snapshot()["goal_mode"], "exact")
 
     def test_goto_handoff_collision_blocks_replacement_goal(self) -> None:
         grid = MapGrid.from_wall_set(30, 30, {(7, y) for y in range(30)})

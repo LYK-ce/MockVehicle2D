@@ -121,6 +121,80 @@ def test_dynamic_obstacle_clear_restores_shorter_path_without_reset() -> None:
     assert navigation.snapshot()["planner_stats"]["resets"] == resets
 
 
+def test_unreachable_exact_goal_uses_nearby_confirmed_free_candidate() -> None:
+    observed = ObservedGrid(
+        AnchorSpec("nav-anchor", 0.0, 0.0, 0.0),
+        resolution_m=0.5,
+    )
+    navigation = GotoController()
+    vehicle = Vehicle(10.0, 10.0, radius=0.25, now=0.0)
+    navigation.start(
+        3.75,
+        0.25,
+        local_map=observed,
+        pose=pose(),
+        vehicle_radius_m=vehicle.radius,
+    )
+    updates = tuple(
+        MapCellUpdate(gx, gy, FREE)
+        for gx in range(1, 4)
+        for gy in range(-1, 2)
+    ) + tuple(
+        MapCellUpdate(4, gy, OCCUPIED)
+        for gy in range(-32, 33)
+    )
+
+    navigation.update(
+        vehicle,
+        MapGrid.from_wall_set(30, 30, set()),
+        0.0,
+        pose=pose(),
+        advance_result=SafetyAdvanceResult(),
+        local_map=observed,
+        map_delta=delta(*updates),
+    )
+
+    assert navigation.status == "active"
+    assert navigation.goal_mode == "nearby_safe"
+    assert navigation.requested_goal == (3.75, 0.25)
+    assert navigation.goal == (1.25, 0.25)
+    assert navigation._nearby_detail == "goal_unreachable"
+
+
+def test_nearby_candidate_outside_planning_budget_blocks_without_error() -> None:
+    observed = ObservedGrid(AnchorSpec("nav-anchor", 0.0, 0.0, 0.0))
+    navigation = GotoController()
+    vehicle = Vehicle(10.0, 10.0, radius=0.01, now=0.0)
+    navigation.start(
+        256.0,
+        0.5,
+        local_map=observed,
+        pose=pose(),
+        vehicle_radius_m=vehicle.radius,
+    )
+
+    navigation.update(
+        vehicle,
+        MapGrid.from_wall_set(30, 30, set()),
+        0.0,
+        pose=pose(),
+        advance_result=SafetyAdvanceResult(),
+        local_map=observed,
+        map_delta=delta(
+            MapCellUpdate(256, 0, OCCUPIED),
+            MapCellUpdate(257, 0, FREE),
+        ),
+    )
+
+    assert (
+        navigation.status,
+        navigation.reason,
+        navigation.detail,
+    ) == ("blocked", "no_path", "nearby_safe_goal_unavailable")
+    assert vehicle.command == "stop"
+    assert vehicle.body_velocities() == (0.0, 0.0)
+
+
 def test_unobstructed_off_centre_pose_keeps_the_next_planned_waypoint() -> None:
     observed = ObservedGrid(AnchorSpec("nav-anchor", 0.0, 0.0, 0.0))
     navigation = GotoController()
@@ -305,7 +379,7 @@ def test_runtime_maps_a_hidden_drop_and_replans_around_it() -> None:
     assert math.hypot(runtime.vehicle.x - 12.5, runtime.vehicle.y - 5.5) <= 0.2
 
 
-def test_runtime_blocks_goal_when_observed_obstacle_makes_arrival_unsafe() -> None:
+def test_runtime_detours_to_sticky_safe_stop_when_exact_goal_becomes_unsafe() -> None:
     world = MapGrid.from_wall_set(16, 12, {(8, 5)})
     vehicle = Vehicle(2.5, 5.5, radius=0.5, command_timeout=1.0, now=0.0)
     anchor = AnchorSpec("nav-anchor", vehicle.x, vehicle.y, 0.0)
@@ -334,8 +408,13 @@ def test_runtime_blocks_goal_when_observed_obstacle_makes_arrival_unsafe() -> No
     )
     assert runtime.navigation.status == "active"
 
-    for tick in range(1, 121):
+    fallback_goals = []
+    positions = []
+    for tick in range(1, 900):
         runtime.update(tick / 6, tick / 6)
+        positions.append((runtime.vehicle.x, runtime.vehicle.y))
+        if runtime.navigation.snapshot()["goal_mode"] == "nearby_safe":
+            fallback_goals.append(runtime.navigation.goal)
         if runtime.navigation.status != "active":
             break
     assert runtime.local_state.local_map.occupied_cells()
@@ -343,7 +422,18 @@ def test_runtime_blocks_goal_when_observed_obstacle_makes_arrival_unsafe() -> No
         runtime.navigation.status,
         runtime.navigation.reason,
         runtime.navigation.detail,
-    ) == ("blocked", "no_path", "goal_blocked")
+    ) == ("reached", "nearby_safe_stop", "goal_blocked")
+    assert fallback_goals
+    assert len(set(fallback_goals)) == 1
+    assert runtime.navigation.requested_goal == goal
+    assert runtime.navigation.reported_goal == (9.5, 6.0)
+    assert runtime.navigation.goal != goal
+    assert math.dist(runtime.navigation.goal, goal) <= 3.0
+    assert math.hypot(
+        runtime.local_state.pose.x_m - runtime.navigation.goal[0],
+        runtime.local_state.pose.y_m - runtime.navigation.goal[1],
+    ) <= runtime.navigation.goal_tolerance_m
+    assert max(x_m for x_m, _ in positions) > 9 + vehicle.radius
     assert runtime.vehicle.command == "stop"
     assert runtime.vehicle.body_velocities() == (0.0, 0.0)
 

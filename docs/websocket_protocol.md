@@ -122,6 +122,12 @@ Pictor 仅在收到 `hello` 后才认为连接可用，之后才开始处理 `po
     "navigation": {
         "status": "active",
         "goal": {"x_m": 8.0, "y_m": 3.5},
+        "goal_mode": "exact",
+        "effective_goal": {
+            "frame_id": "anchor_map",
+            "x_m": 8.0,
+            "y_m": 3.5
+        },
         "reason": null,
         "algorithm": "d_star_lite",
         "path_revision": 3,
@@ -153,7 +159,7 @@ Pictor 仅在收到 `hello` 后才认为连接可用，之后才开始处理 `po
 | `command` | string | — | 当前有效命令；看门狗超时后为 `stop` |
 | `localization` | object | — | `anchor_map` 中的局部位姿、协方差对角线、质量和 revision |
 | `control_mode` | string | — | `navigation.status=active` 时为 `autonomous`，否则为 `manual` |
-| `navigation` | object | — | `status`、当前或最后一个 `goal`，以及终止 `reason` |
+| `navigation` | object | — | `status`、原请求 `goal`、实际执行 `effective_goal`、`goal_mode` 和终止原因 |
 | `safety` | object | — | 最新安全状态、原因、前进方向障碍净空和边缘净空；未发现时净空为 `null` |
 
 `pose` 不再发送绝对仿真真值。小车只保存已知出生锚点
@@ -316,9 +322,15 @@ D* Lite 在有限规划窗中经过高代价 Unknown、避开按车体半径膨�
 `lost` 时 `goto_ack.accepted=false` 或活动任务变为 `blocked`，原因为
 `localization_lost`；未结算的旧自动运动不会再积分，但新的人工 `cmd` / `drive` 仍可接管。
 安全硬停止或安全输入故障也会立即停车。
-目标最初为 Unknown 时仍可接受并探索；一旦本地观测确认目标位置无法容纳车体及
-`0.25 m` 硬安全净空，任务立即停车并转为
-`blocked`（`reason=no_path`、`detail=goal_blocked`）。
+目标最初为 Unknown 时仍可接受并探索。一旦本地观测确认精确目标无法容纳车体及
+`0.25 m` 硬安全净空，或 D* Lite 确认精确目标不可达，控制器会在原目标 `3 m` 内按距离
+和 cell 坐标确定性搜索候选。候选的完整车体与硬净空包络必须均为已观测 Free，且同一个
+D* Lite 必须确认从当前估计位姿可达；Unknown 不能作为安全停车点。找到候选后任务继续
+执行，`goal` 保留原 global-map 请求，`goal_mode=nearby_safe`，`effective_goal` 以
+`anchor_map` 米坐标明确实际停车点。到达后为 `status=reached`、
+`reason=nearby_safe_stop`，`detail` 说明原目标是 `goal_blocked` 或
+`goal_unreachable`。附近没有候选时才转为 `blocked`（`reason=no_path`、
+`detail=nearby_safe_goal_unavailable`）。
 
 新的 `goto` 会替换旧目标。任何 `cmd` 或 `drive`（包括 `stop`），以及任何非法输入，都会永久取消当前目标；除非客户端重新发送 `goto`，否则不会恢复自动行驶。连接断开也会停车并取消活动目标。
 

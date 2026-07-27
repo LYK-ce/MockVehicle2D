@@ -101,12 +101,24 @@ class DStarLitePlanner:
     def bounds(self) -> tuple[int, int, int, int] | None:
         return self._bounds
 
+    def planning_budget_allows(self, start: Cell, goal: Cell) -> bool:
+        self._validate_cell(start, "start")
+        self._validate_cell(goal, "goal")
+        if math.hypot(goal[0] - start[0], goal[1] - start[1]) * (
+            self.resolution_m
+        ) > self.max_goal_distance_m:
+            return False
+        return self._bounds_cell_count(
+            self._planning_bounds(start, goal)
+        ) <= self.max_cells
+
     def is_segment_passable(
         self,
         source_m: tuple[float, float],
         destination_m: tuple[float, float],
         *,
         extra_clearance_m: float = 0.0,
+        require_observed: bool = False,
     ) -> bool:
         if (
             not isinstance(source_m, tuple)
@@ -121,10 +133,10 @@ class DStarLitePlanner:
             or not isinstance(value, (int, float))
             or not math.isfinite(value)
             for value in values
-        ) or extra_clearance_m < 0:
+        ) or extra_clearance_m < 0 or type(require_observed) is not bool:
             raise ValueError(
                 "segment endpoints and clearance must be finite; "
-                "clearance cannot be negative"
+                "clearance cannot be negative and require_observed must be boolean"
             )
         return not self._segment_blocked(
             (
@@ -139,6 +151,7 @@ class DStarLitePlanner:
                 self.vehicle_radius_m + extra_clearance_m
             ) / self.resolution_m,
             block_tangent=extra_clearance_m > 0,
+            require_observed=require_observed,
         )
 
     def best_start_connection(
@@ -241,15 +254,8 @@ class DStarLitePlanner:
         return path
 
     def _reset(self, start: Cell, goal: Cell) -> None:
-        margin = self._bounds_margin_cells
-        bounds = (
-            min(start[0], goal[0]) - margin,
-            min(start[1], goal[1]) - margin,
-            max(start[0], goal[0]) + margin,
-            max(start[1], goal[1]) + margin,
-        )
-        cell_count = (bounds[2] - bounds[0] + 1) * (bounds[3] - bounds[1] + 1)
-        if cell_count > self.max_cells:
+        bounds = self._planning_bounds(start, goal)
+        if self._bounds_cell_count(bounds) > self.max_cells:
             raise ValueError("planning cell budget exceeded")
         self._bounds = bounds
         self._start = self._last_start = start
@@ -376,6 +382,7 @@ class DStarLitePlanner:
         allow_forbidden_egress: bool = False,
         radius_cells: float | None = None,
         block_tangent: bool = False,
+        require_observed: bool = False,
     ) -> bool:
         source_x, source_y = source
         destination_x, destination_y = destination
@@ -386,18 +393,17 @@ class DStarLitePlanner:
         )
         radius_squared = radius**2
         for gy in range(
-            math.floor(min(source_y, destination_y) - radius),
+            math.floor(min(source_y, destination_y) - radius) - 1,
             math.floor(max(source_y, destination_y) + radius) + 1,
         ):
             for gx in range(
-                math.floor(min(source_x, destination_x) - radius),
+                math.floor(min(source_x, destination_x) - radius) - 1,
                 math.floor(max(source_x, destination_x) + radius) + 1,
             ):
                 state = self._states.get((gx, gy), UNKNOWN)
-                if state not in {
-                    OCCUPIED,
-                    FORBIDDEN,
-                }:
+                if state not in {OCCUPIED, FORBIDDEN} and not (
+                    require_observed and state != FREE
+                ):
                     continue
                 distance_squared = segment_aabb_distance_squared(
                     source_x,
@@ -562,8 +568,25 @@ class DStarLitePlanner:
 
     def _cell_count(self) -> int:
         assert self._bounds is not None
-        return (self._bounds[2] - self._bounds[0] + 1) * (
-            self._bounds[3] - self._bounds[1] + 1
+        return self._bounds_cell_count(self._bounds)
+
+    def _planning_bounds(
+        self,
+        start: Cell,
+        goal: Cell,
+    ) -> tuple[int, int, int, int]:
+        margin = self._bounds_margin_cells
+        return (
+            min(start[0], goal[0]) - margin,
+            min(start[1], goal[1]) - margin,
+            max(start[0], goal[0]) + margin,
+            max(start[1], goal[1]) + margin,
+        )
+
+    @staticmethod
+    def _bounds_cell_count(bounds: tuple[int, int, int, int]) -> int:
+        return (bounds[2] - bounds[0] + 1) * (
+            bounds[3] - bounds[1] + 1
         )
 
     @staticmethod

@@ -21,6 +21,7 @@ if TYPE_CHECKING:
 DEGRADED_LINEAR_SCALE = 0.5
 UNKNOWN_LINEAR_SCALE = 0.4
 MAX_REPORTED_PATH_CELLS = 64
+NEARBY_SAFE_GOAL_RADIUS_M = 3.0
 
 
 class GotoController:
@@ -33,8 +34,10 @@ class GotoController:
     def __init__(self) -> None:
         self.status = "idle"
         self.mode = "position"
+        self.requested_goal: tuple[float, float] | None = None
         self.goal: tuple[float, float] | None = None
         self.reported_goal: tuple[float, float] | None = None
+        self.goal_mode: str | None = None
         self.yaw_goal_rad: float | None = None
         self.reported_yaw_goal_rad: float | None = None
         self.reason: str | None = None
@@ -45,6 +48,7 @@ class GotoController:
         self._replan_count = 0
         self._current_waypoint: tuple[float, float] | None = None
         self._path_resolution_m = 1.0
+        self._nearby_detail: str | None = None
 
     @property
     def control_mode(self) -> str:
@@ -61,8 +65,10 @@ class GotoController:
         vehicle_radius_m: float = 0.5,
     ) -> None:
         self.mode = "position"
-        self.goal = (x_m, y_m)
+        self.requested_goal = (x_m, y_m)
+        self.goal = self.requested_goal
         self.reported_goal = self.goal if reported_goal is None else reported_goal
+        self.goal_mode = "exact"
         self.yaw_goal_rad = None
         self.reported_yaw_goal_rad = None
         self.status = "active"
@@ -74,6 +80,7 @@ class GotoController:
         self._replan_count = 0
         self._current_waypoint = None
         self._path_resolution_m = local_map.resolution_m
+        self._nearby_detail = None
         self._planner = DStarLitePlanner(
             local_map, vehicle_radius_m=vehicle_radius_m
         )
@@ -83,7 +90,7 @@ class GotoController:
                 self._goal_cell(local_map),
             )
         )
-        self._block_if_goal_unsafe()
+        self._resolve_execution_goal(pose, local_map)
 
     def start_rotation(
         self,
@@ -96,8 +103,10 @@ class GotoController:
         ):
             raise ValueError("yaw goal must be finite")
         self.mode = "rotation"
+        self.requested_goal = None
         self.goal = None
         self.reported_goal = None
+        self.goal_mode = None
         self.yaw_goal_rad = _wrap_angle(yaw_goal_rad)
         self.reported_yaw_goal_rad = _wrap_angle(
             self.yaw_goal_rad
@@ -112,6 +121,7 @@ class GotoController:
         self._path_revision = 0
         self._replan_count = 0
         self._current_waypoint = None
+        self._nearby_detail = None
 
     def cancel(self, reason: str) -> None:
         if self.status == "active":
@@ -143,6 +153,16 @@ class GotoController:
             "status": self.status,
             "mode": self.mode,
             "goal": goal,
+            "goal_mode": self.goal_mode,
+            "effective_goal": (
+                None
+                if self.goal is None
+                else {
+                    "frame_id": "anchor_map",
+                    "x_m": self.goal[0],
+                    "y_m": self.goal[1],
+                }
+            ),
             "reason": self.reason,
             "detail": self.detail,
         }
@@ -287,7 +307,7 @@ class GotoController:
             map_delta is not None and map_delta.changed_cells
         ):
             self.replan(pose, map_delta, local_map)
-        if self._block_if_goal_unsafe():
+        if not self._resolve_execution_goal(pose, local_map):
             vehicle.stop()
             return
         if not self._path:
@@ -300,8 +320,12 @@ class GotoController:
         distance = math.hypot(dx, dy)
         if distance <= self.goal_tolerance_m:
             self.status = "reached"
-            self.reason = "goal_tolerance"
-            self.detail = None
+            if self.goal_mode == "nearby_safe":
+                self.reason = "nearby_safe_stop"
+                self.detail = self._nearby_detail
+            else:
+                self.reason = "goal_tolerance"
+                self.detail = None
             vehicle.stop()
             return
 
@@ -366,23 +390,99 @@ class GotoController:
             linear_mps, angular_rps = decision.linear_mps, decision.angular_rps
         vehicle.install_drive(linear_mps, angular_rps, now)
 
-    def _block_if_goal_unsafe(self) -> bool:
+    def _resolve_execution_goal(
+        self,
+        pose: PoseEstimate,
+        local_map: ObservedGrid,
+    ) -> bool:
+        assert (
+            self.goal is not None
+            and self.requested_goal is not None
+            and self._planner is not None
+        )
+        failure = self._execution_goal_failure()
+        if failure is None:
+            return True
+        nearby = self._nearest_safe_goal(pose, local_map)
+        if nearby is None:
+            self._set_path(None)
+            self.status = "blocked"
+            self.reason = "no_path"
+            self.detail = "nearby_safe_goal_unavailable"
+            self._current_waypoint = None
+            return False
+        self.goal, path = nearby
+        self.goal_mode = "nearby_safe"
+        if self._nearby_detail is None:
+            self._nearby_detail = failure
+        self.status = "active"
+        self.reason = None
+        self.detail = None
+        self._current_waypoint = None
+        self._set_path(path)
+        return True
+
+    def _execution_goal_failure(self) -> str | None:
         assert self.goal is not None and self._planner is not None
         if (
-            self._planner.last_failure != "goal_blocked"
-            and self._planner.is_segment_passable(
+            self._planner.last_failure == "goal_blocked"
+            or not self._planner.is_segment_passable(
                 self.goal,
                 self.goal,
                 extra_clearance_m=HARD_STOP_CLEARANCE_M,
             )
         ):
-            return False
-        self._set_path(None)
-        self.status = "blocked"
-        self.reason = "no_path"
-        self.detail = "goal_blocked"
-        self._current_waypoint = None
-        return True
+            return "goal_blocked"
+        if not self._path and self._planner.last_failure in {
+            "search_exhausted",
+            "path_extraction",
+        }:
+            return "goal_unreachable"
+        return None
+
+    def _nearest_safe_goal(
+        self,
+        pose: PoseEstimate,
+        local_map: ObservedGrid,
+    ) -> tuple[tuple[float, float], list[tuple[int, int]]] | None:
+        assert self.requested_goal is not None and self._planner is not None
+        resolution = local_map.resolution_m
+        requested_x, requested_y = self.requested_goal
+        radius = NEARBY_SAFE_GOAL_RADIUS_M
+        candidates = []
+        for gx in range(
+            math.floor((requested_x - radius) / resolution),
+            math.floor((requested_x + radius) / resolution) + 1,
+        ):
+            for gy in range(
+                math.floor((requested_y - radius) / resolution),
+                math.floor((requested_y + radius) / resolution) + 1,
+            ):
+                point = (gx + 0.5) * resolution, (gy + 0.5) * resolution
+                distance_squared = (
+                    (point[0] - requested_x) ** 2
+                    + (point[1] - requested_y) ** 2
+                )
+                if distance_squared <= radius**2:
+                    candidates.append((distance_squared, gy, gx, point))
+        start = self._pose_cell(pose, local_map)
+        source = pose.x_m, pose.y_m
+        for _, gy, gx, point in sorted(candidates):
+            if not self._planner.planning_budget_allows(start, (gx, gy)):
+                continue
+            if not self._planner.is_segment_passable(
+                point,
+                point,
+                extra_clearance_m=HARD_STOP_CLEARANCE_M,
+                require_observed=True,
+            ):
+                continue
+            path = self._planner.plan(start, (gx, gy))
+            if path is not None and self._planner.best_start_connection(
+                source, path[0]
+            ) is not None:
+                return point, path
+        return None
 
     def _set_path(self, path: list[tuple[int, int]] | None) -> None:
         new_path = [] if path is None else path
