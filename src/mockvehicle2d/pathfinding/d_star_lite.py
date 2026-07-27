@@ -93,6 +93,7 @@ class DStarLitePlanner:
         self._replans = 0
         self._resets = 0
         self._planning_pending = False
+        self._planning_expansions = 0
         self.last_failure: str | None = None
 
     @property
@@ -263,6 +264,11 @@ class DStarLitePlanner:
             else:
                 self._states[(change.gx, change.gy)] = change.state
 
+        new_planning_session = (
+            not self._planning_pending or self._goal != goal
+        )
+        if new_planning_session:
+            self._planning_expansions = 0
         continuing = (
             self._planning_pending
             and self._goal == goal
@@ -293,7 +299,22 @@ class DStarLitePlanner:
             self.last_failure = "goal_blocked"
             self._planning_pending = False
             return PlanProgress("unreachable")
-        if not self._advance_shortest_path(expansion_budget):
+        expansion_limit = self._cell_count() * 20
+        remaining_expansions = expansion_limit - self._planning_expansions
+        if remaining_expansions <= 0:
+            self.last_failure = "expansion_limit"
+            self._planning_pending = False
+            return PlanProgress("unreachable")
+        before = self._expansions
+        complete = self._advance_shortest_path(
+            min(expansion_budget, remaining_expansions)
+        )
+        self._planning_expansions += self._expansions - before
+        if not complete:
+            if self._planning_expansions >= expansion_limit:
+                self.last_failure = "expansion_limit"
+                self._planning_pending = False
+                return PlanProgress("unreachable")
             self._planning_pending = True
             return PlanProgress("pending")
         self._planning_pending = False

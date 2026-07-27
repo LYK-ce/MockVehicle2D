@@ -25,7 +25,7 @@ from mockvehicle2d.local_state import (
 from mockvehicle2d.map_grid import MapGrid, VOID
 import mockvehicle2d.navigation as navigation_module
 from mockvehicle2d.navigation import GotoController
-from mockvehicle2d.pathfinding.d_star_lite import DStarLitePlanner
+from mockvehicle2d.pathfinding.d_star_lite import DStarLitePlanner, PlanProgress
 from mockvehicle2d.safety import LocalSafetyRuntime, SafetyAdvanceResult
 from mockvehicle2d.server import VehicleRuntime, handle_command_message
 from mockvehicle2d.vehicle import Vehicle
@@ -240,7 +240,15 @@ def test_nearby_safe_goal_is_reselected_when_new_evidence_blocks_it() -> None:
     assert navigation.goal != first_goal
 
 
-def test_fully_blocked_nearby_body_edge_region_stops_as_unavailable() -> None:
+def test_fully_blocked_nearby_body_edge_region_stops_as_unavailable(
+    monkeypatch,
+) -> None:
+    monkeypatch.setattr(
+        navigation_module,
+        "CANDIDATE_INSPECTIONS_PER_UPDATE",
+        4,
+        raising=False,
+    )
     observed = ObservedGrid(AnchorSpec("nav-anchor", 0.0, 0.0, 0.0))
     navigation = GotoController()
     vehicle = Vehicle(10.0, 10.0, radius=0.5, now=0.0)
@@ -252,9 +260,11 @@ def test_fully_blocked_nearby_body_edge_region_stops_as_unavailable() -> None:
         vehicle_radius_m=vehicle.radius,
     )
 
+    world = MapGrid.from_wall_set(30, 30, set())
+    inspections = navigation.snapshot()["planner_stats"]["candidate_inspections"]
     navigation.update(
         vehicle,
-        MapGrid.from_wall_set(30, 30, set()),
+        world,
         0.0,
         pose=pose(),
         advance_result=SafetyAdvanceResult(),
@@ -267,6 +277,29 @@ def test_fully_blocked_nearby_body_edge_region_stops_as_unavailable() -> None:
             ),
         ),
     )
+
+    current_inspections = navigation.snapshot()["planner_stats"][
+        "candidate_inspections"
+    ]
+    assert current_inspections - inspections <= 4
+    assert navigation.status == "active"
+    assert navigation.snapshot()["planning"] is True
+    for tick in range(1, 100):
+        inspections = current_inspections
+        navigation.update(
+            vehicle,
+            world,
+            tick / 6,
+            pose=pose(),
+            advance_result=SafetyAdvanceResult(),
+            local_map=observed,
+        )
+        current_inspections = navigation.snapshot()["planner_stats"][
+            "candidate_inspections"
+        ]
+        assert current_inspections - inspections <= 4
+        if navigation.status == "blocked":
+            break
 
     assert (
         navigation.status,
@@ -364,6 +397,79 @@ def test_manual_command_cancels_pending_planning() -> None:
     )
     assert navigation.snapshot()["planning"] is False
     assert vehicle.command == "drive"
+
+
+def test_expansion_limit_blocks_instead_of_searching_fallbacks(monkeypatch) -> None:
+    def exhausted(planner, *args, **kwargs) -> PlanProgress:
+        planner.last_failure = "expansion_limit"
+        return PlanProgress("unreachable")
+
+    monkeypatch.setattr(DStarLitePlanner, "advance_plan", exhausted)
+    navigation = GotoController()
+    navigation.start(
+        4.0,
+        0.0,
+        local_map=ObservedGrid(AnchorSpec("nav-anchor", 0.0, 0.0, 0.0)),
+        pose=pose(),
+    )
+
+    assert (
+        navigation.status,
+        navigation.reason,
+        navigation.detail,
+    ) == ("blocked", "no_path", "expansion_limit")
+    assert navigation.snapshot()["planning"] is False
+
+
+def test_replan_does_not_restart_cancelled_goal() -> None:
+    observed = ObservedGrid(AnchorSpec("nav-anchor", 0.0, 0.0, 0.0))
+    navigation = GotoController()
+    navigation.start(
+        256.0,
+        0.5,
+        local_map=observed,
+        pose=pose(),
+        vehicle_radius_m=0.01,
+    )
+    navigation.cancel("manual_override")
+
+    navigation.replan(pose(), None, observed)
+
+    assert (navigation.status, navigation.reason) == (
+        "cancelled",
+        "manual_override",
+    )
+    assert navigation.snapshot()["planning"] is False
+
+
+def test_replan_does_not_restart_collision_or_localization_block() -> None:
+    observed = ObservedGrid(AnchorSpec("nav-anchor", 0.0, 0.0, 0.0))
+    world = MapGrid.from_wall_set(30, 30, set())
+
+    for reason in ("collision", "localization_lost"):
+        navigation = GotoController()
+        vehicle = Vehicle(10.0, 10.0, now=0.0)
+        navigation.start(4.0, 0.0, local_map=observed, pose=pose())
+        if reason == "collision":
+            navigation.update(
+                vehicle,
+                world,
+                0.0,
+                pose=pose(),
+                advance_result=SafetyAdvanceResult(collided=True),
+                local_map=observed,
+            )
+        else:
+            assert navigation.block_for_localization_loss(
+                vehicle,
+                pose(quality="lost"),
+                0.0,
+            )
+
+        navigation.replan(pose(), None, observed)
+
+        assert (navigation.status, navigation.reason) == ("blocked", reason)
+        assert navigation.snapshot()["planning"] is False
 
 
 def test_unobstructed_off_centre_pose_keeps_the_next_planned_waypoint() -> None:

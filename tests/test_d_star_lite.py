@@ -138,6 +138,33 @@ def test_bounded_planning_reports_unreachable_after_pending() -> None:
     assert search.last_failure == "search_exhausted"
 
 
+def test_bounded_planning_stops_at_the_cross_frame_expansion_limit(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    search = planner(bounds_margin_m=0.0, max_cells=3)
+
+    def never_finishes(expansion_budget: int) -> bool:
+        search._expansions += expansion_budget
+        return False
+
+    monkeypatch.setattr(search, "_advance_shortest_path", never_finishes)
+    for _ in range(20):
+        before = search.stats["expansions"]
+        progress = search.advance_plan(
+            (0, 0),
+            (2, 0),
+            expansion_budget=4,
+        )
+        assert search.stats["expansions"] - before <= 4
+        if progress.status != "pending":
+            break
+
+    assert progress.status == "unreachable"
+    assert progress.path is None
+    assert search.last_failure == "expansion_limit"
+    assert search.stats["expansions"] == 3 * 20
+
+
 def test_obstacle_insert_and_remove_reuses_search_state() -> None:
     search = planner(bounds_margin_m=2.0)
     original = search.plan((0, 0), (6, 0))

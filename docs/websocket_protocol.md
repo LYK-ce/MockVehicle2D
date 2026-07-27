@@ -134,6 +134,7 @@ Pictor 仅在收到 `hello` 后才认为连接可用，之后才开始处理 `po
             "y_m": 3.5
         },
         "approach_distance_m": 0.0,
+        "planning": false,
         "reason": null,
         "algorithm": "d_star_lite",
         "path_revision": 3,
@@ -165,7 +166,7 @@ Pictor 仅在收到 `hello` 后才认为连接可用，之后才开始处理 `po
 | `command` | string | — | 当前有效命令；看门狗超时后为 `stop` |
 | `localization` | object | — | `anchor_map` 中的局部位姿、协方差对角线、质量和 revision |
 | `control_mode` | string | — | `navigation.status=active` 时为 `autonomous`，否则为 `manual` |
-| `navigation` | object | — | `status`、兼容请求 `goal`、`anchor_map` 中的 `requested_goal` / `effective_goal`、`goal_mode`、车体外缘 `approach_distance_m` 和终止原因 |
+| `navigation` | object | — | `status`、`planning`、兼容请求 `goal`、`anchor_map` 中的 `requested_goal` / `effective_goal`、`goal_mode`、车体外缘 `approach_distance_m` 和终止原因 |
 | `safety` | object | — | 最新安全状态、原因、前进方向障碍净空和边缘净空；未发现时净空为 `null` |
 
 `pose` 不再发送绝对仿真真值。小车只保存已知出生锚点
@@ -175,6 +176,8 @@ SLAM 前端不含回环、地点识别、位姿图或全局优化，仍可能长
 `localization.quality` 为 `nominal`、`degraded` 或 `lost`；`lost` 会阻止自动任务和本地地图写入。
 `localization.timestamp_s` 是规范秒时间戳；`localization.timestamp` 是值相同的弃用别名。
 `navigation.status` 为 `idle`、`active`、`reached`、`blocked` 或 `cancelled`；结束后仍保留目标与原因，便于客户端确认结果。
+`navigation.planning=true` 表示目标已受理但当前规划切片尚未完成；车辆此时保持
+`stop`。遥测中的旧 `path` 仅供显示，不会在 pending 期间执行。
 
 ---
 
@@ -328,6 +331,10 @@ D* Lite 在有限规划窗中经过高代价 Unknown、避开按车体半径膨�
 `lost` 时 `goto_ack.accepted=false` 或活动任务变为 `blocked`，原因为
 `localization_lost`；未结算的旧自动运动不会再积分，但新的人工 `cmd` / `drive` 仍可接管。
 安全硬停止或安全输入故障也会立即停车。
+规划和地图变化后的重规划都按控制帧推进，默认每帧最多 256 次 D* 扩展和 256 个安全停车
+候选检查；因此长距离 `goto` 可在若干帧内保持 `accepted=true`、`status=active`、
+`planning=true`。跨帧累计扩展达到当前有限规划窗格数的 20 倍时，以
+`detail=expansion_limit` 终止，而不会无限规划。
 目标最初为 Unknown 时仍可接受并探索。一旦本地观测确认精确目标无法容纳车体及
 `0.25 m` 硬安全净空，或 D* Lite 确认精确目标不可达，控制器会在车体外缘距原目标
 `1 m` 的限制内搜索连续候选；候选中心搜索半径因此为
@@ -347,7 +354,7 @@ Occupied/Forbidden 满足车体和硬净空、D* 规划格与预算合法、格�
 `approach_distance_m=max(0, distance(requested_goal,effective_goal)-vehicle_radius_m)`
 是车体外缘到原目标的距离，单位为米。
 
-新的 `goto` 会替换旧目标。任何 `cmd` 或 `drive`（包括 `stop`），以及任何非法输入，都会永久取消当前目标；除非客户端重新发送 `goto`，否则不会恢复自动行驶。连接断开也会停车并取消活动目标。
+新的 `goto` 会替换旧目标。任何 `cmd` 或 `drive`（包括 `stop`），以及任何非法输入，都会永久取消当前目标；碰撞、安全阻断、定位丢失和连接断开也会停止任务并清除 pending 规划。终止后内部重规划不会重新激活旧目标；除非客户端重新发送 `goto`，否则不会恢复自动行驶。
 
 确认消息独立为：
 
@@ -361,7 +368,8 @@ Occupied/Forbidden 满足车体和硬净空、D* 规划格与预算合法、格�
 }
 ```
 
-`accepted` 只有在目标已进入 `active` 状态时才为 `true`。若旧运动在命令交接时
+`accepted` 只有在目标已进入 `active` 状态时才为 `true`，不表示首个规划切片已经完成；
+客户端应结合后续 `navigation.planning` 判断。若旧运动在命令交接时
 已因碰撞或安全门控停止，则返回 `accepted: false`，并以 `reason` 报告
 `collision`、`safety_obstacle`、`safety_edge`、`safety_sensor_fault` 或
 `localization_lost`。超过规划距离/格数预算或缺少本地定位/地图时也会拒绝，而不会让

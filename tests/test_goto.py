@@ -14,7 +14,7 @@ sys.path.insert(0, str(REPO_ROOT / "src"))
 from mockvehicle2d.map_grid import MapGrid
 from mockvehicle2d.local_state import AnchorSpec, AnchoredLocalState, ObservedGrid, PoseEstimate
 from mockvehicle2d.navigation import GotoController
-from mockvehicle2d.safety import SafetyAdvanceResult
+from mockvehicle2d.safety import LocalSafetyRuntime, SafetyAdvanceResult
 from mockvehicle2d.scan import LaserPoint, TMINI_SCAN_CONFIG, scan_grid
 from mockvehicle2d.server import (
     CommandMessageError,
@@ -475,7 +475,7 @@ class GotoTest(unittest.TestCase):
         )
 
         ack = handle_command_message(
-            '{"type":"goto","seq":6,"x_m":4,"y_m":5}',
+            '{"type":"goto","seq":6,"x_m":250,"y_m":5}',
             vehicle,
             grid,
             0.25,
@@ -490,13 +490,14 @@ class GotoTest(unittest.TestCase):
                 "type": "goto_ack",
                 "ts": 12.25,
                 "seq": 6,
-                "goal": {"x_m": 4.0, "y_m": 5.0},
+                "goal": {"x_m": 250.0, "y_m": 5.0},
                 "accepted": False,
                 "reason": "collision",
             },
         )
-        self.assertEqual(navigation.reported_goal, (4.0, 5.0))
+        self.assertEqual(navigation.reported_goal, (250.0, 5.0))
         self.assertEqual((navigation.status, navigation.reason), ("blocked", "collision"))
+        self.assertFalse(navigation.snapshot()["planning"])
         self.assertEqual(vehicle.velocities(), (0.0, 0.0, 0.0))
         stopped_pose = (vehicle.x, vehicle.y, vehicle.yaw)
         navigation.update(
@@ -508,6 +509,46 @@ class GotoTest(unittest.TestCase):
         )
         self.assertEqual((vehicle.x, vehicle.y, vehicle.yaw), stopped_pose)
         self.assertEqual(vehicle.velocities(), (0.0, 0.0, 0.0))
+
+    def test_goto_handoff_safety_stop_clears_replacement_planning(self) -> None:
+        vehicle = self.vehicle()
+        navigation = GotoController()
+        local_state = self.local_state(vehicle)
+        handle_command_message(
+            '{"type":"goto","seq":5,"x_m":10,"y_m":5}',
+            vehicle,
+            self.grid,
+            0.0,
+            12.0,
+            navigation,
+            local_state=local_state,
+        )
+        navigation.update(
+            vehicle,
+            self.grid,
+            0.0,
+            pose=local_state.pose,
+            local_map=local_state.local_map,
+        )
+
+        ack = handle_command_message(
+            '{"type":"goto","seq":6,"x_m":250,"y_m":5}',
+            vehicle,
+            self.grid,
+            0.25,
+            12.25,
+            navigation,
+            LocalSafetyRuntime(healthy=False),
+            local_state=local_state,
+        )
+
+        self.assertFalse(ack["accepted"])
+        self.assertEqual(ack["reason"], "safety_sensor_fault")
+        self.assertEqual(
+            (navigation.status, navigation.reason),
+            ("blocked", "safety_sensor_fault"),
+        )
+        self.assertFalse(navigation.snapshot()["planning"])
 
     def test_websocket_goto_ack_precedes_autonomous_pose(self) -> None:
         clock = _Clock()

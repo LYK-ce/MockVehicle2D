@@ -43,6 +43,8 @@ D* Lite（增量修复路径）──► 局部 waypoint ──► 速度控制 
 | Footprint | Occupied 按 `vehicle_radius_m` 膨胀 |
 | 规划范围 | 起点和目标包围框加默认 `16 m` margin |
 | 资源限制 | 默认目标最远 `256 m`、最多 `100000` 格 |
+| 单帧工作 | 最多 256 次 D* 扩展、256 个安全停车候选检查 |
+| 跨帧扩展上限 | 当前有限规划窗格数 ×20；达到后报告 `expansion_limit` |
 | 不可达目标 | 车体外缘距原目标不超过 `1 m`；在 `1 m + vehicle_radius_m` 中确定性采样连续候选 |
 
 Unknown 可以通行是启动探索所必需：车辆开始时除出生附近外没有地图。如果要求 Unknown
@@ -63,6 +65,12 @@ Free；选中后保持稳定，并在每帧证据更新后重新验证。
 规划器保留 `g`、`rhs`、优先队列与起点移动的 key modifier，只更新受变化格及 footprint
 影响的顶点。更换目标或起点走出有限规划窗才重置搜索。
 
+规划按控制帧增量推进。`goto` 已受理但当前切片尚未完成时，任务保持 `active`，
+`planning=true` 且车辆保持 `stop`；旧 `path` 可继续出现在遥测中供 UI 对比，但不会被
+执行。地图变化触发的 `replan()` 使用相同的每帧额度，可能需要多个 `update` 才完成。
+手动接管、碰撞、安全阻断、定位丢失及其他终止态会清除 pending；终止后的 `replan()`
+不会恢复任务，必须重新下发 `goto`。
+
 遥测 `navigation` 中可观察：
 
 ```json
@@ -81,6 +89,7 @@ Free；选中后保持稳定，并在每帧证据更新后重新验证。
     "y_m": 3.5
   },
   "approach_distance_m": 0.207,
+  "planning": false,
   "path_revision": 4,
   "replan_count": 2,
   "current_waypoint": {"x_m": 8.5, "y_m": 3.5},
@@ -90,7 +99,8 @@ Free；选中后保持稳定，并在每帧证据更新后重新验证。
     "incremental_updates": 43,
     "replans": 12,
     "resets": 1,
-    "key_modifier_cost": 3.0
+    "key_modifier_cost": 3.0,
+    "candidate_inspections": 24
   }
 }
 ```
@@ -100,7 +110,8 @@ Free；选中后保持稳定，并在每帧证据更新后重新验证。
 `anchor_map` 坐标。`goal_mode` 为 `exact`、`approaching_safe_stop` 或 `nearby_safe`。
 `approach_distance_m` 是实际目标到原请求目标的中心距离减去车体半径（下限为零），即
 车体外缘距离，单位为米；因此车体中心允许距原目标超过 `1 m`。为限制遥测大小，`path`
-最多报告前 64 个点。
+最多报告前 64 个点。`planner_stats.candidate_inspections` 是当前 `goto` 已检查的安全
+停车候选累计数。
 
 ## Scan matching 与局部 SLAM 边界
 

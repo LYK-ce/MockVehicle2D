@@ -30,6 +30,7 @@ NEARBY_SAFE_BODY_DISTANCE_M = 1.0
 # Hardware calibration knob: lower this if one 6 Hz planning slice misses its
 # deadline on the target Jetson.
 PLANNING_EXPANSIONS_PER_UPDATE = 256
+CANDIDATE_INSPECTIONS_PER_UPDATE = 256
 SafeCandidate = tuple[tuple[float, float], tuple[int, int], bool]
 
 
@@ -65,6 +66,7 @@ class GotoController:
         self._safe_candidates: list[SafeCandidate] = []
         self._safe_candidate_index = 0
         self._pending_candidate: SafeCandidate | None = None
+        self._candidate_inspections = 0
 
     @property
     def control_mode(self) -> str:
@@ -104,6 +106,7 @@ class GotoController:
         self._safe_candidates = []
         self._safe_candidate_index = 0
         self._pending_candidate = None
+        self._candidate_inspections = 0
         self._planner = DStarLitePlanner(
             local_map, vehicle_radius_m=vehicle_radius_m
         )
@@ -153,16 +156,19 @@ class GotoController:
             self.detail = None
             self._clear_pending_planning()
 
+    def block(self, reason: str, detail: str | None = None) -> None:
+        self.status = "blocked"
+        self.reason = reason
+        self.detail = detail
+        self._clear_pending_planning()
+
     def block_for_localization_loss(
         self, vehicle: Vehicle, pose: PoseEstimate, now: float | None = None
     ) -> bool:
         if self.status != "active" or pose.quality != "lost":
             return False
         vehicle.stop(now)
-        self.status = "blocked"
-        self.reason = "localization_lost"
-        self.detail = None
-        self._clear_pending_planning()
+        self.block("localization_lost")
         return True
 
     def snapshot(self) -> dict[str, object]:
@@ -220,7 +226,10 @@ class GotoController:
                 }
                 for gx, gy in self._path[:MAX_REPORTED_PATH_CELLS]
             ],
-            "planner_stats": self._planner.stats,
+            "planner_stats": {
+                **self._planner.stats,
+                "candidate_inspections": self._candidate_inspections,
+            },
         })
         return snapshot
 
@@ -230,6 +239,8 @@ class GotoController:
         map_delta: LocalMapDelta | None,
         local_map: ObservedGrid,
     ) -> None:
+        if self.status != "active":
+            return
         if self._planner is None:
             raise RuntimeError("active navigation has no D* Lite planner")
         changes = () if map_delta is None else map_delta.changed_cells
@@ -509,7 +520,7 @@ class GotoController:
                     failure = "goal_blocked"
             else:
                 failure = self._planner_failure()
-                if failure == "start_blocked":
+                if failure in {"start_blocked", "expansion_limit"}:
                     self._block_no_path(failure)
                     return
             if self._nearby_detail is None:
@@ -540,16 +551,21 @@ class GotoController:
     ) -> None:
         assert self._planner is not None
         remaining = expansion_budget
+        inspections_remaining = CANDIDATE_INSPECTIONS_PER_UPDATE
         changes = changed_cells
-        while True:
+        while inspections_remaining > 0:
             if self._pending_candidate is None:
-                self._pending_candidate = self._next_safe_candidate(
+                candidate, inspected = self._next_safe_candidate(
                     pose,
                     local_map,
                     allow_stale_geometry=bool(changes),
+                    inspection_budget=inspections_remaining,
                 )
-                if self._pending_candidate is None:
-                    self._block_no_path("nearby_safe_goal_unavailable")
+                inspections_remaining -= inspected
+                self._pending_candidate = candidate
+                if candidate is None:
+                    if self._safe_candidate_index == len(self._safe_candidates):
+                        self._block_no_path("nearby_safe_goal_unavailable")
                     return
                 self.goal = self._pending_candidate[0]
                 self.goal_mode = "approaching_safe_stop"
@@ -609,12 +625,19 @@ class GotoController:
         local_map: ObservedGrid,
         *,
         allow_stale_geometry: bool,
-    ) -> SafeCandidate | None:
+        inspection_budget: int,
+    ) -> tuple[SafeCandidate | None, int]:
         assert self._planner is not None
         start = self._pose_cell(pose, local_map)
-        while self._safe_candidate_index < len(self._safe_candidates):
+        inspected = 0
+        while (
+            self._safe_candidate_index < len(self._safe_candidates)
+            and inspected < inspection_budget
+        ):
             candidate = self._safe_candidates[self._safe_candidate_index]
             self._safe_candidate_index += 1
+            inspected += 1
+            self._candidate_inspections += 1
             point, goal_cell, confirmed = candidate
             if not self._planner.planning_budget_allows(start, goal_cell):
                 continue
@@ -623,8 +646,8 @@ class GotoController:
                 goal_cell,
                 require_observed=confirmed,
             ):
-                return candidate
-        return None
+                return candidate, inspected
+        return None, inspected
 
     def _build_safe_candidates(
         self,

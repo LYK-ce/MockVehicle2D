@@ -402,9 +402,7 @@ def handle_command_message(
             if path_following is not None:
                 path_following.cancel("manual_override")
             if local_state is not None and local_state.pose.quality == "lost":
-                navigation.status = "blocked"
-                navigation.reason = "localization_lost"
-                navigation.detail = None
+                navigation.block("localization_lost")
             elif local_state is None:
                 raise CommandMessageError(
                     "goto_unavailable",
@@ -427,13 +425,9 @@ def handle_command_message(
                         "invalid_goto", str(error), seq
                     ) from error
             if navigation.status == "active" and handoff_collided:
-                navigation.status = "blocked"
-                navigation.reason = "collision"
-                navigation.detail = None
+                navigation.block("collision")
             elif navigation.status == "active" and handoff_safety_stop is not None:
-                navigation.status = "blocked"
-                navigation.reason = handoff_safety_stop
-                navigation.detail = None
+                navigation.block(handoff_safety_stop)
             accepted = navigation.status == "active"
             reply = {
                 "type": "goto_ack",
@@ -572,9 +566,7 @@ def _start_estimated_goto(
     y_m: float,
 ) -> None:
     if local_state.pose.quality == "lost":
-        navigation.status = "blocked"
-        navigation.reason = "localization_lost"
-        navigation.detail = None
+        navigation.block("localization_lost")
         return
     local_x_m, local_y_m, _ = local_state.anchor.global_to_anchor(x_m, y_m)
     try:
@@ -587,9 +579,7 @@ def _start_estimated_goto(
             vehicle_radius_m=vehicle.radius,
         )
     except ValueError as error:
-        navigation.status = "blocked"
-        navigation.reason = f"invalid_goal: {error}"
-        navigation.detail = None
+        navigation.block(f"invalid_goal: {error}")
 
 
 def _start_estimated_rotation(
@@ -598,9 +588,7 @@ def _start_estimated_rotation(
     delta_yaw_rad: float,
 ) -> None:
     if local_state.pose.quality == "lost":
-        navigation.status = "blocked"
-        navigation.reason = "localization_lost"
-        navigation.detail = None
+        navigation.block("localization_lost")
         return
     target_yaw_rad = math.atan2(
         math.sin(local_state.pose.yaw_rad + delta_yaw_rad),
