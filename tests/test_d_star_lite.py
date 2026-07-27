@@ -60,6 +60,84 @@ def test_unknown_space_is_explorable_and_deterministic() -> None:
     assert first.stats["resets"] == 1
 
 
+def test_bounded_planning_preserves_state_until_the_path_is_ready() -> None:
+    search = planner(bounds_margin_m=6.0)
+    statuses = []
+
+    while True:
+        before = search.stats["expansions"]
+        progress = search.advance_plan(
+            (0, 0),
+            (80, 0),
+            expansion_budget=7,
+        )
+        statuses.append(progress.status)
+        assert search.stats["expansions"] - before <= 7
+        if progress.status != "pending":
+            break
+
+    assert "pending" in statuses
+    assert progress.status == "ready"
+    assert progress.path == planner(bounds_margin_m=6.0).plan((0, 0), (80, 0))
+    assert search.stats["resets"] == 1
+
+
+def test_bounded_planning_absorbs_pose_and_map_changes_while_pending() -> None:
+    search = planner(bounds_margin_m=6.0)
+    assert search.advance_plan(
+        (0, 0),
+        (80, 0),
+        expansion_budget=1,
+    ).status == "pending"
+    obstacle = MapCellUpdate(40, 0, OCCUPIED)
+
+    progress = search.advance_plan(
+        (1, 0),
+        (80, 0),
+        changed_cells=(obstacle,),
+        expansion_budget=7,
+    )
+    while progress.status == "pending":
+        progress = search.advance_plan(
+            (1, 0),
+            (80, 0),
+            expansion_budget=7,
+        )
+
+    expected = planner(bounds_margin_m=6.0).plan(
+        (1, 0),
+        (80, 0),
+        changed_cells=(obstacle,),
+    )
+    assert progress.status == "ready"
+    assert progress.path == expected
+    assert search.stats["resets"] == 1
+    assert search.stats["key_modifier_cost"] == pytest.approx(1.0)
+
+
+def test_bounded_planning_reports_unreachable_after_pending() -> None:
+    search = planner(bounds_margin_m=0.0)
+    wall = tuple(MapCellUpdate(2, y, OCCUPIED) for y in range(4))
+    progress = search.advance_plan(
+        (0, 0),
+        (4, 3),
+        changed_cells=wall,
+        expansion_budget=1,
+    )
+    assert progress.status == "pending"
+
+    while progress.status == "pending":
+        progress = search.advance_plan(
+            (0, 0),
+            (4, 3),
+            expansion_budget=1,
+        )
+
+    assert progress.status == "unreachable"
+    assert progress.path is None
+    assert search.last_failure == "search_exhausted"
+
+
 def test_obstacle_insert_and_remove_reuses_search_state() -> None:
     search = planner(bounds_margin_m=2.0)
     original = search.plan((0, 0), (6, 0))

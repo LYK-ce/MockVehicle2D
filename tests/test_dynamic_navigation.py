@@ -4,6 +4,7 @@ from collections import deque
 import math
 from pathlib import Path
 import sys
+from time import perf_counter
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -22,10 +23,11 @@ from mockvehicle2d.local_state import (
     PoseEstimate,
 )
 from mockvehicle2d.map_grid import MapGrid, VOID
+import mockvehicle2d.navigation as navigation_module
 from mockvehicle2d.navigation import GotoController
 from mockvehicle2d.pathfinding.d_star_lite import DStarLitePlanner
 from mockvehicle2d.safety import LocalSafetyRuntime, SafetyAdvanceResult
-from mockvehicle2d.server import VehicleRuntime
+from mockvehicle2d.server import VehicleRuntime, handle_command_message
 from mockvehicle2d.vehicle import Vehicle
 
 
@@ -153,6 +155,17 @@ def test_nearby_safe_goal_is_within_one_metre_of_the_vehicle_body() -> None:
             local_map=observed,
             map_delta=delta(*updates),
         )
+        for _ in range(10):
+            if navigation.snapshot()["planning"] is False:
+                break
+            navigation.update(
+                vehicle,
+                MapGrid.from_wall_set(30, 30, set()),
+                0.0,
+                pose=pose(),
+                advance_result=SafetyAdvanceResult(),
+                local_map=observed,
+            )
         return navigation
 
     at_limit = resolve(2.25)
@@ -163,7 +176,12 @@ def test_nearby_safe_goal_is_within_one_metre_of_the_vehicle_body() -> None:
 
     body_edge_limit = resolve(2.75)
     assert body_edge_limit.status == "active"
-    assert body_edge_limit.goal_mode == "approaching_safe_stop"
+    assert body_edge_limit.goal_mode == "approaching_safe_stop", (
+        body_edge_limit.snapshot()["planning"],
+        body_edge_limit.snapshot()["planner_stats"],
+        body_edge_limit.snapshot()["detail"],
+        body_edge_limit.snapshot()["path"],
+    )
     assert body_edge_limit.snapshot()["approach_distance_m"] <= 1.0
 
 
@@ -259,10 +277,20 @@ def test_fully_blocked_nearby_body_edge_region_stops_as_unavailable() -> None:
     assert vehicle.body_velocities() == (0.0, 0.0)
 
 
-def test_nearby_candidate_at_planning_range_limit_stays_within_budget() -> None:
+def test_nearby_candidate_at_planning_range_limit_stays_within_budget(
+    monkeypatch,
+) -> None:
+    budget = 256
+    monkeypatch.setattr(
+        navigation_module,
+        "PLANNING_EXPANSIONS_PER_UPDATE",
+        budget,
+        raising=False,
+    )
     observed = ObservedGrid(AnchorSpec("nav-anchor", 0.0, 0.0, 0.0))
     navigation = GotoController()
     vehicle = Vehicle(10.0, 10.0, radius=0.01, now=0.0)
+    started = perf_counter()
     navigation.start(
         256.0,
         0.5,
@@ -270,20 +298,72 @@ def test_nearby_candidate_at_planning_range_limit_stays_within_budget() -> None:
         pose=pose(),
         vehicle_radius_m=vehicle.radius,
     )
+    durations = [perf_counter() - started]
+    assert navigation.snapshot()["planner_stats"]["expansions"] <= budget
+    assert navigation.snapshot()["planning"] is True
+    assert vehicle.command == "stop"
 
-    navigation.update(
-        vehicle,
-        MapGrid.from_wall_set(30, 30, set()),
-        0.0,
-        pose=pose(),
-        advance_result=SafetyAdvanceResult(),
-        local_map=observed,
-        map_delta=delta(MapCellUpdate(256, 0, OCCUPIED)),
-    )
+    world = MapGrid.from_wall_set(30, 30, set())
+    for tick in range(1, 100):
+        before = navigation.snapshot()["planner_stats"]["expansions"]
+        vehicle.advance(world, tick / 6)
+        started = perf_counter()
+        navigation.update(
+            vehicle,
+            world,
+            tick / 6,
+            pose=pose(),
+            advance_result=SafetyAdvanceResult(),
+            local_map=observed,
+            map_delta=(
+                delta(MapCellUpdate(256, 0, OCCUPIED))
+                if tick == 1
+                else None
+            ),
+        )
+        durations.append(perf_counter() - started)
+        after = navigation.snapshot()["planner_stats"]["expansions"]
+        assert after - before <= budget
+        if navigation.snapshot()["planning"] is False:
+            break
 
     assert navigation.status == "active"
     assert navigation.goal_mode == "approaching_safe_stop"
     assert navigation.snapshot()["approach_distance_m"] <= 1.0
+    assert navigation.snapshot()["planning"] is False
+    assert max(durations) < 0.5
+
+
+def test_manual_command_cancels_pending_planning() -> None:
+    observed = ObservedGrid(AnchorSpec("nav-anchor", 0.0, 0.0, 0.0))
+    navigation = GotoController()
+    vehicle = Vehicle(10.0, 10.0, radius=0.01, now=0.0)
+    world = MapGrid.from_wall_set(30, 30, set())
+    navigation.start(
+        256.0,
+        0.5,
+        local_map=observed,
+        pose=pose(),
+        vehicle_radius_m=vehicle.radius,
+    )
+    assert navigation.snapshot()["planning"] is True
+
+    reply = handle_command_message(
+        '{"type":"drive","seq":2,"linear_mps":0.1,"angular_rps":0}',
+        vehicle,
+        world,
+        0.0,
+        1.0,
+        navigation,
+    )
+
+    assert reply["accepted"] is True
+    assert (navigation.status, navigation.reason) == (
+        "cancelled",
+        "manual_override",
+    )
+    assert navigation.snapshot()["planning"] is False
+    assert vehicle.command == "drive"
 
 
 def test_unobstructed_off_centre_pose_keeps_the_next_planned_waypoint() -> None:

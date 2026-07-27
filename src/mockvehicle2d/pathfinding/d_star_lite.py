@@ -2,9 +2,10 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 import heapq
 import math
-from typing import Iterable
+from typing import Iterable, Literal
 
 from mockvehicle2d.collision import (
     cell_overlaps_circle,
@@ -31,6 +32,12 @@ MOVES = tuple(
     for dy in (-1, 0, 1)
     if dx or dy
 )
+
+
+@dataclass(frozen=True)
+class PlanProgress:
+    status: Literal["pending", "ready", "unreachable"]
+    path: list[Cell] | None = None
 
 
 class DStarLitePlanner:
@@ -85,6 +92,7 @@ class DStarLitePlanner:
         self._incremental_updates = 0
         self._replans = 0
         self._resets = 0
+        self._planning_pending = False
         self.last_failure: str | None = None
 
     @property
@@ -206,8 +214,41 @@ class DStarLitePlanner:
         *,
         changed_cells: Iterable[MapCellUpdate] = (),
     ) -> list[Cell] | None:
+        progress = self.advance_plan(
+            start,
+            goal,
+            changed_cells=changed_cells,
+            expansion_budget=1,
+        )
+        total_expansions = 1 if progress.status == "pending" else 0
+        while progress.status == "pending":
+            limit = self._cell_count() * 20
+            before = self._expansions
+            progress = self.advance_plan(
+                start,
+                goal,
+                expansion_budget=max(1, limit - total_expansions + 1),
+            )
+            consumed = self._expansions - before
+            total_expansions += consumed
+            if total_expansions > limit or (
+                progress.status == "pending" and consumed == 0
+            ):
+                raise RuntimeError("D* Lite expansion limit exceeded")
+        return progress.path
+
+    def advance_plan(
+        self,
+        start: Cell,
+        goal: Cell,
+        *,
+        changed_cells: Iterable[MapCellUpdate] = (),
+        expansion_budget: int,
+    ) -> PlanProgress:
         self._validate_cell(start, "start")
         self._validate_cell(goal, "goal")
+        if type(expansion_budget) is not int or expansion_budget <= 0:
+            raise ValueError("expansion budget must be a positive integer")
         self.last_failure = None
         if math.hypot(goal[0] - start[0], goal[1] - start[1]) * self.resolution_m > (
             self.max_goal_distance_m
@@ -222,6 +263,14 @@ class DStarLitePlanner:
             else:
                 self._states[(change.gx, change.gy)] = change.state
 
+        continuing = (
+            self._planning_pending
+            and self._goal == goal
+            and self._start == start
+            and not changes
+        )
+        if not continuing:
+            self._replans += 1
         needs_reset = self._goal != goal or self._bounds is None
         if not needs_reset and not self._inside(start):
             needs_reset = True
@@ -236,14 +285,18 @@ class DStarLitePlanner:
             self._last_start = start
             if changes:
                 self._apply_changes(changes)
-        self._replans += 1
         if self._blocked(start):
             self.last_failure = "start_blocked"
-            return None
+            self._planning_pending = False
+            return PlanProgress("unreachable")
         if self._blocked(goal):
             self.last_failure = "goal_blocked"
-            return None
-        self._compute_shortest_path()
+            self._planning_pending = False
+            return PlanProgress("unreachable")
+        if not self._advance_shortest_path(expansion_budget):
+            self._planning_pending = True
+            return PlanProgress("pending")
+        self._planning_pending = False
         path = self._extract_path()
         if path is None:
             self.last_failure = (
@@ -251,7 +304,8 @@ class DStarLitePlanner:
                 if math.isinf(self._g_value(start))
                 else "path_extraction"
             )
-        return path
+            return PlanProgress("unreachable")
+        return PlanProgress("ready", path)
 
     def _reset(self, start: Cell, goal: Cell) -> None:
         bounds = self._planning_bounds(start, goal)
@@ -282,14 +336,16 @@ class DStarLitePlanner:
             self._update_vertex(cell)
         self._incremental_updates += len(affected)
 
-    def _compute_shortest_path(self) -> None:
+    def _advance_shortest_path(self, expansion_budget: int) -> bool:
         assert self._start is not None
-        limit = self._cell_count() * 20
         expansions = 0
         while (
             _key_less(self._top_key(), self._calculate_key(self._start))
             or not math.isclose(self._rhs_value(self._start), self._g_value(self._start))
         ):
+            if expansions >= expansion_budget:
+                self._expansions += expansions
+                return False
             popped = self._pop()
             if popped is None:
                 break
@@ -307,9 +363,8 @@ class DStarLitePlanner:
                 for predecessor in self._neighbours(current):
                     self._update_vertex(predecessor)
             expansions += 1
-            if expansions > limit:
-                raise RuntimeError("D* Lite expansion limit exceeded")
         self._expansions += expansions
+        return True
 
     def _extract_path(self) -> list[Cell] | None:
         assert self._start is not None and self._goal is not None

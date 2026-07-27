@@ -15,13 +15,22 @@ from mockvehicle2d.safety import (
 from mockvehicle2d.vehicle import Vehicle
 
 if TYPE_CHECKING:
-    from mockvehicle2d.local_state import LocalMapDelta, ObservedGrid, PoseEstimate
+    from mockvehicle2d.local_state import (
+        LocalMapDelta,
+        MapCellUpdate,
+        ObservedGrid,
+        PoseEstimate,
+    )
 
 
 DEGRADED_LINEAR_SCALE = 0.5
 UNKNOWN_LINEAR_SCALE = 0.4
 MAX_REPORTED_PATH_CELLS = 64
 NEARBY_SAFE_BODY_DISTANCE_M = 1.0
+# Hardware calibration knob: lower this if one 6 Hz planning slice misses its
+# deadline on the target Jetson.
+PLANNING_EXPANSIONS_PER_UPDATE = 256
+SafeCandidate = tuple[tuple[float, float], tuple[int, int], bool]
 
 
 class GotoController:
@@ -50,6 +59,12 @@ class GotoController:
         self._path_resolution_m = 1.0
         self._nearby_detail: str | None = None
         self._vehicle_radius_m = 0.5
+        self._planning_kind: str | None = None
+        self._planning_map_changed = False
+        self._planning_previous_path: list[tuple[int, int]] = []
+        self._safe_candidates: list[SafeCandidate] = []
+        self._safe_candidate_index = 0
+        self._pending_candidate: SafeCandidate | None = None
 
     @property
     def control_mode(self) -> str:
@@ -83,16 +98,21 @@ class GotoController:
         self._path_resolution_m = local_map.resolution_m
         self._nearby_detail = None
         self._vehicle_radius_m = vehicle_radius_m
+        self._planning_kind = "goal"
+        self._planning_map_changed = False
+        self._planning_previous_path = []
+        self._safe_candidates = []
+        self._safe_candidate_index = 0
+        self._pending_candidate = None
         self._planner = DStarLitePlanner(
             local_map, vehicle_radius_m=vehicle_radius_m
         )
-        self._set_path(
-            self._planner.plan(
-                self._pose_cell(pose, local_map),
-                self._goal_cell(local_map),
-            )
+        self._advance_planning(
+            pose,
+            local_map,
+            (),
+            PLANNING_EXPANSIONS_PER_UPDATE,
         )
-        self._resolve_execution_goal(pose, local_map)
 
     def start_rotation(
         self,
@@ -124,12 +144,14 @@ class GotoController:
         self._replan_count = 0
         self._current_waypoint = None
         self._nearby_detail = None
+        self._clear_pending_planning()
 
     def cancel(self, reason: str) -> None:
         if self.status == "active":
             self.status = "cancelled"
             self.reason = reason
             self.detail = None
+            self._clear_pending_planning()
 
     def block_for_localization_loss(
         self, vehicle: Vehicle, pose: PoseEstimate, now: float | None = None
@@ -140,6 +162,7 @@ class GotoController:
         self.status = "blocked"
         self.reason = "localization_lost"
         self.detail = None
+        self._clear_pending_planning()
         return True
 
     def snapshot(self) -> dict[str, object]:
@@ -177,6 +200,7 @@ class GotoController:
             "reason": self.reason,
             "detail": self.detail,
             "approach_distance_m": self._approach_distance_m(),
+            "planning": self._planning_kind is not None,
         }
         if self._planner is None:
             return snapshot
@@ -208,15 +232,17 @@ class GotoController:
     ) -> None:
         if self._planner is None:
             raise RuntimeError("active navigation has no D* Lite planner")
-        old_path = self._path
-        new_path = self._planner.plan(
-            self._pose_cell(pose, local_map),
-            self._goal_cell(local_map),
-            changed_cells=() if map_delta is None else map_delta.changed_cells,
+        changes = () if map_delta is None else map_delta.changed_cells
+        if self._planning_kind is None:
+            self._planning_kind = "goal"
+            self._planning_previous_path = list(self._path)
+        self._planning_map_changed |= bool(changes)
+        self._advance_planning(
+            pose,
+            local_map,
+            changes,
+            PLANNING_EXPANSIONS_PER_UPDATE,
         )
-        self._set_path(new_path)
-        if map_delta is not None and map_delta.changed_cells and self._path != old_path:
-            self._replan_count += 1
 
     def update(
         self,
@@ -239,6 +265,7 @@ class GotoController:
             self.status = "blocked"
             self.reason = "local_state_unavailable"
             self.detail = None
+            self._clear_pending_planning()
             return
         if was_active:
             assert pose is not None
@@ -260,6 +287,7 @@ class GotoController:
             self.status = "blocked"
             self.reason = "collision"
             self.detail = None
+            self._clear_pending_planning()
             vehicle.stop()
             return
         if safety_stop is not None and not (
@@ -278,6 +306,7 @@ class GotoController:
             self.status = "blocked"
             self.reason = safety_stop
             self.detail = None
+            self._clear_pending_planning()
             vehicle.stop()
             return
 
@@ -288,6 +317,7 @@ class GotoController:
                 self.status = "reached"
                 self.reason = "yaw_tolerance"
                 self.detail = None
+                self._clear_pending_planning()
                 vehicle.stop()
                 return
             angular_rps = max(
@@ -302,6 +332,7 @@ class GotoController:
                     self.status = "blocked"
                     self.reason = decision.reason
                     self.detail = None
+                    self._clear_pending_planning()
                     vehicle.stop()
                     return
                 angular_rps = decision.angular_rps
@@ -315,16 +346,26 @@ class GotoController:
             not self._path
             or self._path[0] != self._pose_cell(pose, local_map)
         )
-        if start_changed or (
-            map_delta is not None and map_delta.changed_cells
-        ):
-            self.replan(pose, map_delta, local_map)
-        if not self._resolve_execution_goal(pose, local_map):
+        changes = () if map_delta is None else map_delta.changed_cells
+        if self._planning_kind is None and (start_changed or changes):
+            self._planning_kind = "goal"
+            self._planning_previous_path = list(self._path)
+            self._current_waypoint = None
+        self._planning_map_changed |= bool(changes)
+        if self._planning_kind is not None:
+            self._advance_planning(
+                pose,
+                local_map,
+                changes,
+                PLANNING_EXPANSIONS_PER_UPDATE,
+            )
+        if self._planning_kind is not None or self.status != "active":
             vehicle.stop()
             return
         if not self._path:
             self.status = "blocked"
             self.reason = "no_path"
+            self._clear_pending_planning()
             vehicle.stop()
             return
 
@@ -346,6 +387,7 @@ class GotoController:
             else:
                 self.reason = "goal_tolerance"
                 self.detail = None
+            self._clear_pending_planning()
             vehicle.stop()
             return
 
@@ -367,6 +409,7 @@ class GotoController:
                     self.reason = "no_path"
                     self.detail = "start_connection_unsafe"
                     self._current_waypoint = None
+                    self._clear_pending_planning()
                     vehicle.stop()
                     return
                 target_x = (target_cell[0] + 0.5) * local_map.resolution_m
@@ -406,71 +449,256 @@ class GotoController:
                 self.status = "blocked"
                 self.reason = decision.reason
                 self.detail = None
+                self._clear_pending_planning()
                 return
             linear_mps, angular_rps = decision.linear_mps, decision.angular_rps
         vehicle.install_drive(linear_mps, angular_rps, now)
 
-    def _resolve_execution_goal(
+    def _advance_planning(
         self,
         pose: PoseEstimate,
         local_map: ObservedGrid,
-    ) -> bool:
+        changed_cells: tuple[MapCellUpdate, ...],
+        expansion_budget: int,
+    ) -> None:
         assert (
             self.goal is not None
             and self.requested_goal is not None
             and self._planner is not None
         )
-        failure = self._execution_goal_failure()
-        if self.goal_mode == "exact" and failure is None:
-            return True
-        if self.goal_mode == "nearby_safe" and self._confirmed_goal_remains_safe(
-            pose, local_map
-        ):
-            return True
-        nearby = self._nearest_safe_goal(pose, local_map)
-        if nearby is None:
-            self._set_path(None)
-            self.status = "blocked"
-            self.reason = "no_path"
-            self.detail = "nearby_safe_goal_unavailable"
-            self._current_waypoint = None
-            return False
-        self.goal, path, confirmed = nearby
-        self.goal_mode = "nearby_safe" if confirmed else "approaching_safe_stop"
-        if self._nearby_detail is None:
-            self._nearby_detail = failure
-        self.status = "active"
-        self.reason = None
-        self.detail = None
-        self._current_waypoint = None
-        self._set_path(path)
-        return True
+        remaining = expansion_budget
+        changes = changed_cells
+        if self._planning_kind == "goal":
+            before = self._planner.stats["expansions"]
+            progress = self._planner.advance_plan(
+                self._pose_cell(pose, local_map),
+                self._goal_cell(local_map),
+                changed_cells=changes,
+                expansion_budget=remaining,
+            )
+            remaining -= self._planner.stats["expansions"] - before
+            changes = ()
+            if progress.status == "pending":
+                return
+            if progress.status == "ready":
+                assert progress.path is not None
+                self._set_path(progress.path)
+                if self.goal_mode == "exact":
+                    failure = self._execution_goal_failure()
+                    if failure is None:
+                        self._complete_planning()
+                        return
+                elif self._safe_execution_goal_remains_safe(
+                    pose,
+                    local_map,
+                    require_observed=False,
+                ):
+                    confirmed = self._safe_execution_goal_remains_safe(
+                        pose,
+                        local_map,
+                        require_observed=True,
+                    )
+                    self.goal_mode = (
+                        "nearby_safe"
+                        if confirmed
+                        else "approaching_safe_stop"
+                    )
+                    self._complete_planning()
+                    return
+                else:
+                    failure = "goal_blocked"
+            else:
+                failure = self._planner_failure()
+                if failure == "start_blocked":
+                    self._block_no_path(failure)
+                    return
+            if self._nearby_detail is None:
+                self._nearby_detail = failure
+            self._begin_safe_goal_search(local_map)
+        if self._planning_kind == "candidate":
+            self._advance_safe_candidate(
+                pose,
+                local_map,
+                changes,
+                remaining,
+            )
 
-    def _confirmed_goal_remains_safe(
+    def _begin_safe_goal_search(self, local_map: ObservedGrid) -> None:
+        self._planning_kind = "candidate"
+        self.goal_mode = "approaching_safe_stop"
+        self._safe_candidates = self._build_safe_candidates(local_map)
+        self._safe_candidate_index = 0
+        self._pending_candidate = None
+        self._current_waypoint = None
+
+    def _advance_safe_candidate(
         self,
         pose: PoseEstimate,
         local_map: ObservedGrid,
+        changed_cells: tuple[MapCellUpdate, ...],
+        expansion_budget: int,
+    ) -> None:
+        assert self._planner is not None
+        remaining = expansion_budget
+        changes = changed_cells
+        while True:
+            if self._pending_candidate is None:
+                self._pending_candidate = self._next_safe_candidate(
+                    pose,
+                    local_map,
+                    allow_stale_geometry=bool(changes),
+                )
+                if self._pending_candidate is None:
+                    self._block_no_path("nearby_safe_goal_unavailable")
+                    return
+                self.goal = self._pending_candidate[0]
+                self.goal_mode = "approaching_safe_stop"
+            if remaining <= 0:
+                return
+            point, goal_cell, requested_confirmed = self._pending_candidate
+            before = self._planner.stats["expansions"]
+            progress = self._planner.advance_plan(
+                self._pose_cell(pose, local_map),
+                goal_cell,
+                changed_cells=changes,
+                expansion_budget=remaining,
+            )
+            remaining -= self._planner.stats["expansions"] - before
+            changes = ()
+            generally_safe = self._candidate_is_safe(
+                point,
+                goal_cell,
+                require_observed=False,
+            )
+            requested_safe = generally_safe and (
+                not requested_confirmed
+                or self._candidate_is_safe(
+                    point,
+                    goal_cell,
+                    require_observed=True,
+                )
+            )
+            if not requested_safe or progress.status == "unreachable":
+                self._pending_candidate = None
+                continue
+            if progress.status == "pending":
+                return
+            assert progress.path is not None
+            if self._planner.best_start_connection(
+                (pose.x_m, pose.y_m),
+                progress.path[0],
+            ) is None:
+                self._pending_candidate = None
+                continue
+            confirmed = self._candidate_is_safe(
+                point,
+                goal_cell,
+                require_observed=True,
+            )
+            self.goal = point
+            self.goal_mode = (
+                "nearby_safe" if confirmed else "approaching_safe_stop"
+            )
+            self._set_path(progress.path)
+            self._complete_planning()
+            return
+
+    def _next_safe_candidate(
+        self,
+        pose: PoseEstimate,
+        local_map: ObservedGrid,
+        *,
+        allow_stale_geometry: bool,
+    ) -> SafeCandidate | None:
+        assert self._planner is not None
+        start = self._pose_cell(pose, local_map)
+        while self._safe_candidate_index < len(self._safe_candidates):
+            candidate = self._safe_candidates[self._safe_candidate_index]
+            self._safe_candidate_index += 1
+            point, goal_cell, confirmed = candidate
+            if not self._planner.planning_budget_allows(start, goal_cell):
+                continue
+            if allow_stale_geometry or self._candidate_is_safe(
+                point,
+                goal_cell,
+                require_observed=confirmed,
+            ):
+                return candidate
+        return None
+
+    def _build_safe_candidates(
+        self,
+        local_map: ObservedGrid,
+    ) -> list[SafeCandidate]:
+        assert self.requested_goal is not None
+        resolution = local_map.resolution_m
+        requested_x, requested_y = self.requested_goal
+        radius = NEARBY_SAFE_BODY_DISTANCE_M + self._vehicle_radius_m
+        sample_step = min(resolution, HARD_STOP_CLEARANCE_M)
+        candidates = []
+        for offset_x in _axis_offsets(radius, sample_step):
+            for offset_y in _axis_offsets(radius, sample_step):
+                distance_squared = offset_x**2 + offset_y**2
+                if distance_squared > radius**2:
+                    continue
+                point = requested_x + offset_x, requested_y + offset_y
+                goal_cell = (
+                    math.floor(point[0] / resolution),
+                    math.floor(point[1] / resolution),
+                )
+                candidates.append(
+                    (distance_squared, point[1], point[0], point, goal_cell)
+                )
+        ordered = [
+            (point, goal_cell)
+            for _, _, _, point, goal_cell in sorted(candidates)
+        ]
+        return [
+            (point, goal_cell, confirmed)
+            for confirmed in (True, False)
+            for point, goal_cell in ordered
+        ]
+
+    def _candidate_is_safe(
+        self,
+        point: tuple[float, float],
+        goal_cell: tuple[int, int],
+        *,
+        require_observed: bool,
+    ) -> bool:
+        assert self._planner is not None
+        cell_center = (
+            (goal_cell[0] + 0.5) * self._path_resolution_m,
+            (goal_cell[1] + 0.5) * self._path_resolution_m,
+        )
+        return self._planner.is_segment_passable(
+            point,
+            point,
+            extra_clearance_m=HARD_STOP_CLEARANCE_M,
+            require_observed=require_observed,
+        ) and self._planner.is_segment_passable(
+            cell_center,
+            point,
+            extra_clearance_m=HARD_STOP_CLEARANCE_M,
+            require_observed=require_observed,
+        )
+
+    def _safe_execution_goal_remains_safe(
+        self,
+        pose: PoseEstimate,
+        local_map: ObservedGrid,
+        *,
+        require_observed: bool,
     ) -> bool:
         assert self.goal is not None and self._planner is not None
         goal_cell = self._goal_cell(local_map)
-        cell_center = (
-            (goal_cell[0] + 0.5) * local_map.resolution_m,
-            (goal_cell[1] + 0.5) * local_map.resolution_m,
-        )
         return (
             bool(self._path)
             and self._path[-1] == goal_cell
-            and self._planner.is_segment_passable(
+            and self._candidate_is_safe(
                 self.goal,
-                self.goal,
-                extra_clearance_m=HARD_STOP_CLEARANCE_M,
-                require_observed=True,
-            )
-            and self._planner.is_segment_passable(
-                cell_center,
-                self.goal,
-                extra_clearance_m=HARD_STOP_CLEARANCE_M,
-                require_observed=True,
+                goal_cell,
+                require_observed=require_observed,
             )
             and self._planner.best_start_connection(
                 (pose.x_m, pose.y_m),
@@ -490,66 +718,48 @@ class GotoController:
             )
         ):
             return "goal_blocked"
-        if not self._path and self._planner.last_failure in {
+        if self._planner.last_failure in {
             "search_exhausted",
             "path_extraction",
         }:
             return "goal_unreachable"
         return None
 
-    def _nearest_safe_goal(
-        self,
-        pose: PoseEstimate,
-        local_map: ObservedGrid,
-    ) -> tuple[tuple[float, float], list[tuple[int, int]], bool] | None:
-        assert self.requested_goal is not None and self._planner is not None
-        resolution = local_map.resolution_m
-        requested_x, requested_y = self.requested_goal
-        radius = NEARBY_SAFE_BODY_DISTANCE_M + self._vehicle_radius_m
-        candidates = []
-        sample_step = min(resolution, HARD_STOP_CLEARANCE_M)
-        for offset_x in _axis_offsets(radius, sample_step):
-            for offset_y in _axis_offsets(radius, sample_step):
-                point = requested_x + offset_x, requested_y + offset_y
-                distance_squared = (
-                    offset_x**2
-                    + offset_y**2
-                )
-                if distance_squared <= radius**2:
-                    gx = math.floor(point[0] / resolution)
-                    gy = math.floor(point[1] / resolution)
-                    candidates.append(
-                        (distance_squared, point[1], point[0], gx, gy, point)
-                    )
-        start = self._pose_cell(pose, local_map)
-        source = pose.x_m, pose.y_m
-        for confirmed in (True, False):
-            for _, _, _, gx, gy, point in sorted(candidates):
-                goal_cell = gx, gy
-                cell_center = (
-                    (gx + 0.5) * resolution,
-                    (gy + 0.5) * resolution,
-                )
-                if not self._planner.planning_budget_allows(start, goal_cell):
-                    continue
-                if not self._planner.is_segment_passable(
-                    point,
-                    point,
-                    extra_clearance_m=HARD_STOP_CLEARANCE_M,
-                    require_observed=confirmed,
-                ) or not self._planner.is_segment_passable(
-                    cell_center,
-                    point,
-                    extra_clearance_m=HARD_STOP_CLEARANCE_M,
-                    require_observed=confirmed,
-                ):
-                    continue
-                path = self._planner.plan(start, goal_cell)
-                if path is not None and self._planner.best_start_connection(
-                    source, path[0]
-                ) is not None:
-                    return point, path, confirmed
-        return None
+    def _planner_failure(self) -> str:
+        assert self._planner is not None
+        if self._planner.last_failure == "goal_blocked":
+            return "goal_blocked"
+        if self._planner.last_failure in {"search_exhausted", "path_extraction"}:
+            return "goal_unreachable"
+        return self._planner.last_failure or "goal_unreachable"
+
+    def _complete_planning(self) -> None:
+        if (
+            self._planning_map_changed
+            and self._path != self._planning_previous_path
+        ):
+            self._replan_count += 1
+        self.status = "active"
+        self.reason = None
+        self.detail = None
+        self._current_waypoint = None
+        self._clear_pending_planning()
+
+    def _block_no_path(self, detail: str) -> None:
+        self._set_path(None)
+        self.status = "blocked"
+        self.reason = "no_path"
+        self.detail = detail
+        self._current_waypoint = None
+        self._clear_pending_planning()
+
+    def _clear_pending_planning(self) -> None:
+        self._planning_kind = None
+        self._planning_map_changed = False
+        self._planning_previous_path = list(self._path)
+        self._safe_candidates = []
+        self._safe_candidate_index = 0
+        self._pending_candidate = None
 
     def _approach_distance_m(self) -> float | None:
         if self.requested_goal is None or self.goal is None:
