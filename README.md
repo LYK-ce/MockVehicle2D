@@ -69,7 +69,7 @@ MockVehicle2D/
 │   │   ├── compiler.py     ← JSON 指令 → 可执行任务
 │   │   ├── authority.py    ← 5 级权限仲裁
 │   │   └── schemas/
-│   │       └── v2.json     ← JSON Schema v2（仅 intent + parameters）
+│   │       └── v3.json     ← JSON Schema v3（仅 intent + parameters）
 │   ├── pathfinding/        ← A* 寻路 + 路径跟随
 │   │   ├── a_star.py
 │   │   ├── waypoint_follower.py
@@ -149,7 +149,7 @@ AABB vs Circle 圆形碰撞
 ## 测试
 
 `mockvehicle2d test` 会运行栅格/碰撞、Tmini 扫描、车辆运动、WebSocket
-协议、`goto`、安全策略、延迟执行、NL 指令解析与集成回归测试（247 条）。
+协议、`goto`、安全策略、延迟执行、NL 指令解析与集成回归测试（214 条）。
 
 ## 自然语言指令系统（NL→JSON）
 
@@ -167,7 +167,7 @@ AABB vs Circle 圆形碰撞
 └──────────┬───────────────┘
            │
            ▼
-    {"intent": "goto_point", "parameters": {"x_m": 100, "y_m": 200}}
+    {"intent": "goto", "parameters": {"x_m": 100, "y_m": 200}}
            │
            ▼
 ┌──────────────────────────┐
@@ -180,27 +180,24 @@ AABB vs Circle 圆形碰撞
            ▼
 ┌──────────────────────────┐
 │ TaskCompiler              │
-│ goto_point → GotoController│
+│ goto → GotoController     │
 │         或 A* + PathFollow│
-│ rotate    → 航向计算       │
-│ stop      → 立即停车       │
+│ stop  → 立即停车           │
+│ patrol→ 启动巡逻           │
 └──────────┬───────────────┘
            │
            ▼
        车辆执行
 ```
 
-### 支持的意图 (7 种)
+### 支持的意图 (4 种)
 
 | 意图 | 中文示例 | JSON 参数 |
 |------|---------|----------|
 | `stop` | "停下"、"紧急停止" | `{}` |
-| `status` | "现在什么状态"、"在哪" | `{}` |
-| `goto_point` | "去 (100, 200)"、"开到 10, 20" | `{"x_m": 100, "y_m": 200}` |
-| `move_distance` | "前进 3 米"、"后退 1.5 米" | `{"distance_m": 3.0, "direction": "forward"}` |
-| `rotate` | "左转 90 度"、"右转 45 度" | `{"angle_deg": 90, "direction": "left"}` |
-| `scan_report` | "前面有什么"、"扫一圈" | `{"query": "前方"}` |
+| `goto` | "去 (100, 200)"、"开到 10, 20" | `{"x_m": 100, "y_m": 200}` |
 | `clarify` | "开到那边去" → 反问坐标 | `{"question": "请指定坐标", "missing_parameters": [...]}` |
+| `patrol` | "开始巡逻"、"启动巡逻" | `{}` |
 
 ### 运行模式
 
@@ -216,12 +213,12 @@ mockvehicle2d nl "去坐标 (100, 200)"
 mockvehicle2d nl --model Qwen3-14B-Q4_K_M "去坐标 (100, 200)"
 ```
 
-### JSON Schema v2（最小化设计）
+### JSON Schema v3（最小化设计）
 
 LLM 仅需输出 2 个字段——大幅降低小模型出错概率：
 
 ```json
-{"intent": "goto_point", "parameters": {"x_m": 100, "y_m": 200}}
+{"intent": "goto", "parameters": {"x_m": 100, "y_m": 200}}
 ```
 
 移除了 `schema_version`、`timestamp`、`confidence`、`reasoning`（均不被下游消费）。
@@ -241,7 +238,7 @@ LLM 输出 JSON 解析失败或 Schema 校验失败时，自动将错误反馈�
 mockvehicle2d nl --eval
 ```
 
-51 条测试覆盖全部 7 种意图 + 边界情况（越界坐标、注入攻击、乱码输入）。
+51 条测试覆盖全部 4 种意图 + 边界情况（越界坐标、注入攻击、乱码输入）。
 
 ## 通信协议
 

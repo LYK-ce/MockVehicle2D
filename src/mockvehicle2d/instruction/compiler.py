@@ -7,7 +7,6 @@ Phase 3: A* path planning for blocked straight-line targets.
 
 from __future__ import annotations
 
-import math
 from typing import Any
 
 from mockvehicle2d.collision import is_swept_circle_passable
@@ -66,13 +65,7 @@ class TaskCompiler:
             "cancel_active_task": True,
         })
 
-    def _compile_status(self, params: dict, snapshot: dict) -> dict:
-        return self._make_task("query", {
-            "action": "status",
-            "snapshot": snapshot,
-        })
-
-    def _compile_goto_point(self, params: dict, snapshot: dict) -> dict:
+    def _compile_goto(self, params: dict, snapshot: dict) -> dict:
         x_m, y_m = params["x_m"], params["y_m"]
         # Phase 3: check if straight-line path is clear
         pose = snapshot.get("pose", {})
@@ -83,87 +76,26 @@ class TaskCompiler:
                 path = self._plan_path(start_x, start_y, x_m, y_m)
                 if path is not None:
                     return self._make_task("navigation", {
-                        "action": "goto_point",
+                        "action": "goto",
                         "controller": "PathFollowingController",
                         "goal": {"x_m": x_m, "y_m": y_m},
                         "path": path,
                     })
                 return self._make_task("navigation", {
-                    "action": "goto_point",
+                    "action": "goto",
                     "controller": "blocked",
                     "goal": {"x_m": x_m, "y_m": y_m},
                     "reason": "no path found",
                 })
         return self._make_task("navigation", {
-            "action": "goto_point",
+            "action": "goto",
             "controller": "GotoController",
             "goal": {"x_m": x_m, "y_m": y_m},
         })
 
-    def _compile_move_distance(self, params: dict, snapshot: dict) -> dict:
-        distance_m = params["distance_m"]
-        direction = params["direction"]
-        # Compute relative goal from current pose if available
-        pose = snapshot.get("pose", {})
-        current_x = pose.get("x", 0.0)
-        current_y = pose.get("y", 0.0)
-        current_yaw = pose.get("yaw", 0.0)
-        sign = 1.0 if direction == "forward" else -1.0
-        goal_x = current_x + sign * distance_m * math.cos(current_yaw)
-        goal_y = current_y + sign * distance_m * math.sin(current_yaw)
-        # Phase 3: check if straight-line path is clear
-        if self.grid is not None:
-            if not _is_straight_path_clear(self.grid, current_x, current_y, goal_x, goal_y):
-                path = self._plan_path(current_x, current_y, goal_x, goal_y)
-                if path is not None:
-                    return self._make_task("navigation", {
-                        "action": "move_distance",
-                        "controller": "PathFollowingController",
-                        "distance_m": distance_m,
-                        "direction": direction,
-                        "goal": {"x_m": round(goal_x, 4), "y_m": round(goal_y, 4)},
-                        "path": path,
-                    })
-                return self._make_task("navigation", {
-                    "action": "move_distance",
-                    "controller": "blocked",
-                    "distance_m": distance_m,
-                    "direction": direction,
-                    "goal": {"x_m": round(goal_x, 4), "y_m": round(goal_y, 4)},
-                    "reason": "no path found",
-                })
+    def _compile_patrol(self, params: dict, snapshot: dict) -> dict:
         return self._make_task("navigation", {
-            "action": "move_distance",
-            "controller": "GotoController",
-            "distance_m": distance_m,
-            "direction": direction,
-            "goal": {"x_m": round(goal_x, 4), "y_m": round(goal_y, 4)},
-        })
-
-    def _compile_rotate(self, params: dict, snapshot: dict) -> dict:
-        angle_deg = params["angle_deg"]
-        direction = params["direction"]
-        # Compute target yaw
-        pose = snapshot.get("pose", {})
-        current_yaw = pose.get("yaw", 0.0)
-        sign = 1.0 if direction == "left" else -1.0
-        target_yaw = current_yaw + sign * math.radians(angle_deg)
-        target_yaw = math.atan2(math.sin(target_yaw), math.cos(target_yaw))
-        return self._make_task("rotation", {
-            "action": "rotate",
-            "angle_deg": angle_deg,
-            "direction": direction,
-            "target_yaw_rad": round(target_yaw, 4),
-        })
-
-    def _compile_scan_report(self, params: dict, snapshot: dict) -> dict:
-        query = params.get("query", "")
-        scan_data = snapshot.get("scan", {})
-        summary = self._summarize_scan(scan_data, query)
-        return self._make_task("query", {
-            "action": "scan_report",
-            "query": query,
-            "summary": summary,
+            "action": "patrol",
         })
 
     def _compile_clarify(self, params: dict, snapshot: dict) -> dict:
@@ -180,46 +112,6 @@ class TaskCompiler:
     @staticmethod
     def _make_task(task_type: str, details: dict[str, Any]) -> dict:
         return {"type": task_type, **details}
-
-    @staticmethod
-    def _summarize_scan(scan_data: dict, query: str = "") -> dict[str, Any]:
-        """Summarize a scan frame: obstacle distances by sector.
-
-        In Phase 1 this uses scan_data dict; in Phase 2 it will consume
-        real LaserPoint lists from the scanner.
-        """
-        points = scan_data.get("points", [])
-        if not points:
-            return {"sectors": {}, "total_points": 0}
-
-        sectors = {"front": [], "left": [], "right": [], "back": []}
-        for pt in points:
-            angle = pt.get("angle", 0.0)
-            rng = pt.get("range", 0.0)
-            if rng <= 0:
-                continue
-            # sector classification by angle (forward = 0 rad, +x)
-            if -math.pi / 4 <= angle < math.pi / 4:
-                sectors["front"].append(rng)
-            elif math.pi / 4 <= angle < 3 * math.pi / 4:
-                sectors["left"].append(rng)
-            elif -3 * math.pi / 4 <= angle < -math.pi / 4:
-                sectors["right"].append(rng)
-            else:
-                sectors["back"].append(rng)
-
-        summary = {}
-        for sector, ranges in sectors.items():
-            if ranges:
-                summary[sector] = {
-                    "min_m": round(min(ranges), 2),
-                    "avg_m": round(sum(ranges) / len(ranges), 2),
-                    "count": len(ranges),
-                }
-            else:
-                summary[sector] = {"min_m": None, "avg_m": None, "count": 0}
-
-        return {"sectors": summary, "total_points": len(points)}
 
     # ── Phase 3: path planning helpers ───────────────────────
 

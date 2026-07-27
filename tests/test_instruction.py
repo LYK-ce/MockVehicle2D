@@ -69,12 +69,12 @@ def faulty_safety():
 
 
 def _valid_instruction(intent="stop", params=None):
-    """Build a minimally valid v2 instruction dict."""
+    """Build a minimally valid v3 instruction dict."""
     return {"intent": intent, "parameters": params or {}}
 
 
 # ═══════════════════════════════════════════════════════════════
-# SchemaValidator tests (15+)
+# SchemaValidator tests
 # ═══════════════════════════════════════════════════════════════
 
 class TestSchemaValidator:
@@ -85,28 +85,12 @@ class TestSchemaValidator:
         ok, msg = self.v.validate(_valid_instruction("stop"))
         assert ok, msg
 
-    def test_valid_status(self):
-        ok, msg = self.v.validate(_valid_instruction("status"))
+    def test_valid_goto(self):
+        ok, msg = self.v.validate(_valid_instruction("goto", {"x_m": 100, "y_m": 200}))
         assert ok, msg
 
-    def test_valid_goto_point(self):
-        ok, msg = self.v.validate(_valid_instruction("goto_point", {"x_m": 100, "y_m": 200}))
-        assert ok, msg
-
-    def test_valid_move_distance(self):
-        ok, msg = self.v.validate(
-            _valid_instruction("move_distance", {"distance_m": 5.0, "direction": "forward"})
-        )
-        assert ok, msg
-
-    def test_valid_rotate(self):
-        ok, msg = self.v.validate(
-            _valid_instruction("rotate", {"angle_deg": 90, "direction": "left"})
-        )
-        assert ok, msg
-
-    def test_valid_scan_report(self):
-        ok, msg = self.v.validate(_valid_instruction("scan_report", {}))
+    def test_valid_patrol(self):
+        ok, msg = self.v.validate(_valid_instruction("patrol"))
         assert ok, msg
 
     def test_valid_clarify(self):
@@ -116,7 +100,7 @@ class TestSchemaValidator:
         assert ok, msg
 
     def test_missing_parameters_field(self):
-        """v2 requires 'parameters' field."""
+        """v3 requires 'parameters' field."""
         inst = {"intent": "stop"}
         ok, msg = self.v.validate(inst)
         assert not ok
@@ -131,34 +115,22 @@ class TestSchemaValidator:
         ok, msg = self.v.validate(_valid_instruction("fly"))
         assert not ok
 
-    def test_goto_point_missing_params(self):
-        ok, msg = self.v.validate(_valid_instruction("goto_point", {}))
+    def test_goto_missing_params(self):
+        ok, msg = self.v.validate(_valid_instruction("goto", {}))
         assert not ok
         assert "x_m" in msg
 
-    def test_move_distance_out_of_range(self):
-        ok, msg = self.v.validate(
-            _valid_instruction("move_distance", {"distance_m": 999.0, "direction": "forward"})
-        )
-        assert not ok
-
-    def test_rotate_angle_out_of_bounds(self):
-        ok, msg = self.v.validate(
-            _valid_instruction("rotate", {"angle_deg": 999, "direction": "left"})
-        )
-        assert not ok
-
     def test_extra_fields_are_allowed(self):
-        """v2 has additionalProperties: true — extra top-level fields are ignored."""
+        """v3 has additionalProperties: true — extra top-level fields are ignored."""
         inst = {"intent": "stop", "parameters": {}, "confidence": 0.95, "reasoning": "test"}
         ok, msg = self.v.validate(inst)
         assert ok, msg
 
     def test_injection_extra_fields(self):
-        """v2 allows extra top-level fields (additionalProperties: true)."""
+        """v3 allows extra top-level fields (additionalProperties: true)."""
         inst = {"intent": "stop", "parameters": {}, "injected_field": "malicious"}
         ok, msg = self.v.validate(inst)
-        assert ok, msg  # v2 is lenient with extra fields
+        assert ok, msg  # v3 is lenient with extra fields
 
     def test_injection_extra_param_fields(self):
         """Extra fields in parameters for stop are rejected."""
@@ -175,9 +147,15 @@ class TestSchemaValidator:
         ok, msg = self.v.validate(_valid_instruction("unknown_intent"))
         assert not ok
 
+    def test_old_intents_rejected(self):
+        """v2 intents (status, goto_point, move_distance, rotate, scan_report) are rejected in v3."""
+        for old in ("status", "goto_point", "move_distance", "rotate", "scan_report"):
+            ok, msg = self.v.validate(_valid_instruction(old))
+            assert not ok, f"{old} should be rejected in v3"
+
 
 # ═══════════════════════════════════════════════════════════════
-# SemanticValidator tests (10+)
+# SemanticValidator tests
 # ═══════════════════════════════════════════════════════════════
 
 class TestSemanticValidator:
@@ -185,74 +163,41 @@ class TestSemanticValidator:
         self.grid = MapGrid(256, 256)
         self.v = SemanticValidator(self.grid)
 
-    def test_goto_point_in_bounds(self):
-        ok, msg = self.v.validate(_valid_instruction("goto_point", {"x_m": 100, "y_m": 200}))
+    def test_goto_in_bounds(self):
+        ok, msg = self.v.validate(_valid_instruction("goto", {"x_m": 100, "y_m": 200}))
         assert ok, msg
 
-    def test_goto_point_negative_x(self):
-        ok, msg = self.v.validate(_valid_instruction("goto_point", {"x_m": -10, "y_m": 100}))
+    def test_goto_negative_x(self):
+        ok, msg = self.v.validate(_valid_instruction("goto", {"x_m": -10, "y_m": 100}))
         assert not ok
         assert "out of map bounds" in msg
 
-    def test_goto_point_too_large(self):
-        ok, msg = self.v.validate(_valid_instruction("goto_point", {"x_m": 300, "y_m": 100}))
+    def test_goto_too_large(self):
+        ok, msg = self.v.validate(_valid_instruction("goto", {"x_m": 300, "y_m": 100}))
         assert not ok
 
-    def test_goto_point_is_wall(self, grid_with_obstacles):
+    def test_goto_is_wall(self, grid_with_obstacles):
         v = SemanticValidator(grid_with_obstacles)
-        ok, msg = v.validate(_valid_instruction("goto_point", {"x_m": 50, "y_m": 50}))
+        ok, msg = v.validate(_valid_instruction("goto", {"x_m": 50, "y_m": 50}))
         assert not ok
         assert "wall" in msg
 
-    def test_goto_point_is_void(self, grid_with_obstacles):
+    def test_goto_is_void(self, grid_with_obstacles):
         v = SemanticValidator(grid_with_obstacles)
-        ok, msg = v.validate(_valid_instruction("goto_point", {"x_m": 24, "y_m": 10}))
+        ok, msg = v.validate(_valid_instruction("goto", {"x_m": 24, "y_m": 10}))
         assert not ok
         assert "void" in msg
-
-    def test_move_distance_valid(self):
-        ok, msg = self.v.validate(
-            _valid_instruction("move_distance", {"distance_m": 3.0, "direction": "forward"})
-        )
-        assert ok, msg
-
-    def test_move_distance_zero(self):
-        ok, msg = self.v.validate(
-            _valid_instruction("move_distance", {"distance_m": 0.0, "direction": "forward"})
-        )
-        assert not ok
-
-    def test_move_distance_exceeds_max(self):
-        v = SemanticValidator(self.grid, max_distance_m=5.0)
-        ok, msg = v.validate(
-            _valid_instruction("move_distance", {"distance_m": 8.0, "direction": "forward"})
-        )
-        assert not ok
-
-    def test_move_distance_invalid_direction(self):
-        ok, msg = self.v.validate(
-            _valid_instruction("move_distance", {"distance_m": 1.0, "direction": "sideways"})
-        )
-        assert not ok
-
-    def test_rotate_non_zero(self):
-        ok, msg = self.v.validate(
-            _valid_instruction("rotate", {"angle_deg": 45, "direction": "right"})
-        )
-        assert ok, msg
-
-    def test_rotate_zero_angle(self):
-        ok, msg = self.v.validate(
-            _valid_instruction("rotate", {"angle_deg": 0, "direction": "left"})
-        )
-        assert not ok
 
     def test_stop_no_semantic_check(self):
         ok, msg = self.v.validate(_valid_instruction("stop"))
         assert ok, msg
 
-    def test_scan_report_no_semantic_check(self):
-        ok, msg = self.v.validate(_valid_instruction("scan_report", {"query": "front"}))
+    def test_patrol_no_semantic_check(self):
+        ok, msg = self.v.validate(_valid_instruction("patrol"))
+        assert ok, msg
+
+    def test_clarify_no_semantic_check(self):
+        ok, msg = self.v.validate(_valid_instruction("clarify", {"question": "test"}))
         assert ok, msg
 
 
@@ -274,7 +219,7 @@ class TestSafetyValidator:
 
 
 # ═══════════════════════════════════════════════════════════════
-# InstructionStateMachine tests (10+)
+# InstructionStateMachine tests
 # ═══════════════════════════════════════════════════════════════
 
 class TestInstructionStateMachine:
@@ -414,7 +359,7 @@ class TestInstructionStateMachine:
 
 
 # ═══════════════════════════════════════════════════════════════
-# TaskCompiler tests (7+)
+# TaskCompiler tests
 # ═══════════════════════════════════════════════════════════════
 
 class TestTaskCompiler:
@@ -428,49 +373,18 @@ class TestTaskCompiler:
         assert task["action"] == "stop"
         assert task["cancel_active_task"] is True
 
-    def test_compile_status(self):
-        inst = _valid_instruction("status")
-        task = self.compiler.compile(inst)
-        assert task["type"] == "query"
-        assert task["action"] == "status"
-
-    def test_compile_goto_point(self):
-        inst = _valid_instruction("goto_point", {"x_m": 100, "y_m": 200})
+    def test_compile_goto(self):
+        inst = _valid_instruction("goto", {"x_m": 100, "y_m": 200})
         task = self.compiler.compile(inst)
         assert task["type"] == "navigation"
-        assert task["action"] == "goto_point"
+        assert task["action"] == "goto"
         assert task["goal"] == {"x_m": 100, "y_m": 200}
 
-    def test_compile_move_distance(self):
-        inst = _valid_instruction("move_distance", {"distance_m": 5.0, "direction": "forward"})
-        # Provide a pose snapshot
-        snapshot = {"pose": {"x": 10.0, "y": 20.0, "yaw": 0.0}}
-        task = self.compiler.compile(inst, snapshot)
-        assert task["type"] == "navigation"
-        assert task["action"] == "move_distance"
-        assert task["distance_m"] == 5.0
-        assert task["direction"] == "forward"
-        # x + 5*cos(0) = 15, y + 5*sin(0) = 20
-        assert task["goal"]["x_m"] == 15.0
-        assert task["goal"]["y_m"] == 20.0
-
-    def test_compile_rotate(self):
-        inst = _valid_instruction("rotate", {"angle_deg": 90, "direction": "left"})
-        snapshot = {"pose": {"yaw": 0.0}}
-        task = self.compiler.compile(inst, snapshot)
-        assert task["type"] == "rotation"
-        assert task["action"] == "rotate"
-        assert task["angle_deg"] == 90
-        assert task["direction"] == "left"
-        assert abs(task["target_yaw_rad"] - math.pi / 2) < 1e-5
-
-    def test_compile_scan_report(self):
-        inst = _valid_instruction("scan_report", {"query": "前方"})
+    def test_compile_patrol(self):
+        inst = _valid_instruction("patrol")
         task = self.compiler.compile(inst)
-        assert task["type"] == "query"
-        assert task["action"] == "scan_report"
-        assert task["query"] == "前方"
-        assert "summary" in task
+        assert task["type"] == "navigation"
+        assert task["action"] == "patrol"
 
     def test_compile_clarify(self):
         inst = _valid_instruction("clarify", {
@@ -483,30 +397,14 @@ class TestTaskCompiler:
         assert task["question"] == "请指定坐标"
         assert "x_m" in task["missing_parameters"]
 
-    def test_compile_scan_with_points(self):
-        """Test scan summarization with actual points."""
-        inst = _valid_instruction("scan_report", {"query": ""})
-        points = [
-            {"angle": 0.0, "range": 1.5},
-            {"angle": 0.3, "range": 2.0},
-            {"angle": math.pi / 2, "range": 3.0},   # left
-            {"angle": -math.pi / 2, "range": 4.0},  # right
-            {"angle": math.pi, "range": 5.0},        # back
-        ]
-        snapshot = {"scan": {"points": points}}
-        task = self.compiler.compile(inst, snapshot)
-        summary = task["summary"]
-        assert summary["total_points"] == 5
-        sectors = summary["sectors"]
-        assert sectors["front"]["count"] == 2
-        assert sectors["left"]["count"] == 1
-        assert sectors["right"]["count"] == 1
-        assert sectors["back"]["count"] == 1
-        assert sectors["front"]["min_m"] == 1.5
+    def test_compile_unknown_intent(self):
+        inst = _valid_instruction("some_new_intent")
+        task = self.compiler.compile(inst)
+        assert task["type"] == "unknown"
 
 
 # ═══════════════════════════════════════════════════════════════
-# AuthorityManager tests (5+)
+# AuthorityManager tests
 # ═══════════════════════════════════════════════════════════════
 
 class TestAuthorityManager:
@@ -559,7 +457,7 @@ class TestAuthorityManager:
 
 
 # ═══════════════════════════════════════════════════════════════
-# Integration tests (3+)
+# Integration tests
 # ═══════════════════════════════════════════════════════════════
 
 class TestIntegration:
@@ -571,16 +469,21 @@ class TestIntegration:
 
     def test_full_pipeline_goto_valid(self, empty_grid):
         semantic = SemanticValidator(empty_grid)
-        instruction = {"intent": "goto_point", "parameters": {"x_m": 100, "y_m": 100}}
+        instruction = {"intent": "goto", "parameters": {"x_m": 100, "y_m": 100}}
         result = run_validation_pipeline(instruction, semantic_validator=semantic)
         assert result.valid, result.message
 
     def test_full_pipeline_goto_wall(self, grid_with_obstacles):
         semantic = SemanticValidator(grid_with_obstacles)
-        instruction = {"intent": "goto_point", "parameters": {"x_m": 50, "y_m": 50}}
+        instruction = {"intent": "goto", "parameters": {"x_m": 50, "y_m": 50}}
         result = run_validation_pipeline(instruction, semantic_validator=semantic)
         assert not result.valid
         assert result.layer == "semantic"
+
+    def test_full_pipeline_patrol(self):
+        instruction = {"intent": "patrol", "parameters": {}}
+        result = run_validation_pipeline(instruction)
+        assert result.valid, result.message
 
     def test_full_pipeline_with_safety(self, healthy_safety):
         safety_v = SafetyValidator(healthy_safety)

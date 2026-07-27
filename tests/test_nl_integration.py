@@ -35,14 +35,13 @@ import re as _re
 class _TestParser:
     """Minimal deterministic NL parser for integration testing.
 
-    Replaces FakeModelClient with a simple regex-based parser
+    Replaces LLMClient with a simple regex-based parser
     that covers the inputs used in these tests.
     """
 
     _STOP_WORDS = {"停", "停下", "停止", "紧急停止", "别动了"}
-    _STATUS_WORDS = {"现在什么状态", "到哪了", "状态", "在哪"}
     _GOTO_PAT = _re.compile(r"去.*?(\d+(?:\.\d+)?).*?(\d+(?:\.\d+)?)")
-    _SCAN_WORDS = {"看一下", "扫一圈", "扫描一下", "扫描", "前面有什么"}
+    _PATROL_WORDS = {"开始巡逻", "巡逻", "启动巡逻"}
     _CLARIFY_WORDS = {"开到那边去"}
 
     def parse(self, text: str) -> dict | None:
@@ -53,37 +52,18 @@ class _TestParser:
         if text in self._STOP_WORDS:
             return {"intent": "stop", "parameters": {}}
 
-        if text in self._STATUS_WORDS:
-            return {"intent": "status", "parameters": {}}
-
-        if text in self._SCAN_WORDS:
-            return {"intent": "scan_report", "parameters": {}}
+        if text in self._PATROL_WORDS:
+            return {"intent": "patrol", "parameters": {}}
 
         if text in self._CLARIFY_WORDS:
             return {"intent": "clarify", "parameters": {"question": "请指定坐标"}}
 
-        # goto_point patterns
+        # goto patterns
         m = self._GOTO_PAT.search(text)
         if m:
             x = float(m.group(1))
             y = float(m.group(2))
-            return {"intent": "goto_point", "parameters": {"x_m": x, "y_m": y}}
-
-        # move_distance
-        m = _re.search(r"前进\s*(\d+(?:\.\d+)?)", text)
-        if m:
-            return {"intent": "move_distance", "parameters": {"distance_m": float(m.group(1)), "direction": "forward"}}
-        m = _re.search(r"后退\s*(\d+(?:\.\d+)?)", text)
-        if m:
-            return {"intent": "move_distance", "parameters": {"distance_m": float(m.group(1)), "direction": "backward"}}
-
-        # rotate
-        m = _re.search(r"左转\s*(\d+(?:\.\d+)?)", text)
-        if m:
-            return {"intent": "rotate", "parameters": {"angle_deg": int(m.group(1)), "direction": "left"}}
-        m = _re.search(r"右转\s*(\d+(?:\.\d+)?)", text)
-        if m:
-            return {"intent": "rotate", "parameters": {"angle_deg": int(m.group(1)), "direction": "right"}}
+            return {"intent": "goto", "parameters": {"x_m": x, "y_m": y}}
 
         return {"intent": "clarify", "parameters": {"question": "请指定坐标"}}
 
@@ -213,61 +193,6 @@ class TestNlCommandGoto:
         assert navigation.status == "active"
 
 
-class TestNlCommandMoveDistance:
-    """NL '前进 5 米' → GotoController with relative goal."""
-
-    def test_move_forward_computes_goal(self, vehicle, empty_grid, navigation, nl_client,
-                                         schema_v, semantic_v, state_machine, task_compiler):
-        # Vehicle at (10, 10), yaw=0 (faces +x)
-        vehicle.yaw = 0.0
-        msg = {"type": "nl_command", "seq": 4, "text": "前进 5 米"}
-        replies = _handle_nl_command(
-            msg, vehicle, empty_grid, navigation,
-            time.time(), time.monotonic(),
-            nl_client, schema_v, semantic_v,
-            state_machine, task_compiler,
-        )
-
-        assert navigation.status == "active"
-        goal_x, goal_y = navigation.goal
-        assert abs(goal_x - 15.0) < 0.1, f"expected goal_x ~15.0, got {goal_x}"
-        assert abs(goal_y - 10.0) < 0.1, f"expected goal_y ~10.0, got {goal_y}"
-
-    def test_move_backward_computes_goal(self, vehicle, empty_grid, navigation, nl_client,
-                                          schema_v, semantic_v, state_machine, task_compiler):
-        vehicle.yaw = 0.0
-        msg = {"type": "nl_command", "seq": 5, "text": "后退 3 米"}
-        replies = _handle_nl_command(
-            msg, vehicle, empty_grid, navigation,
-            time.time(), time.monotonic(),
-            nl_client, schema_v, semantic_v,
-            state_machine, task_compiler,
-        )
-
-        assert navigation.status == "active"
-        goal_x, goal_y = navigation.goal
-        assert abs(goal_x - 7.0) < 0.1, f"expected goal_x ~7.0, got {goal_x}"
-        assert abs(goal_y - 10.0) < 0.1, f"expected goal_y ~10.0, got {goal_y}"
-
-    def test_move_with_yaw_45deg(self, vehicle, empty_grid, navigation, nl_client,
-                                  schema_v, semantic_v, state_machine, task_compiler):
-        vehicle.yaw = math.pi / 4  # 45 degrees
-        msg = {"type": "nl_command", "seq": 6, "text": "前进 5 米"}
-        replies = _handle_nl_command(
-            msg, vehicle, empty_grid, navigation,
-            time.time(), time.monotonic(),
-            nl_client, schema_v, semantic_v,
-            state_machine, task_compiler,
-        )
-
-        assert navigation.status == "active"
-        goal_x, goal_y = navigation.goal
-        expected_x = 10.0 + 5.0 * math.cos(math.pi / 4)
-        expected_y = 10.0 + 5.0 * math.sin(math.pi / 4)
-        assert abs(goal_x - expected_x) < 0.1
-        assert abs(goal_y - expected_y) < 0.1
-
-
 class TestNlCommandClarify:
     """NL '开到那边去' → clarify response."""
 
@@ -288,13 +213,12 @@ class TestNlCommandClarify:
         assert isinstance(replies[0]["missing"], list)
 
 
-class TestNlCommandRotate:
-    """NL '左转 90 度' → rotates vehicle."""
+class TestNlCommandPatrol:
+    """NL '开始巡逻' → patrol started."""
 
-    def test_rotate_left_computes_goal(self, vehicle, empty_grid, navigation, nl_client,
-                                        schema_v, semantic_v, state_machine, task_compiler):
-        vehicle.yaw = 0.0
-        msg = {"type": "nl_command", "seq": 8, "text": "左转 90 度"}
+    def test_patrol_starts(self, vehicle, empty_grid, navigation, nl_client,
+                            schema_v, semantic_v, state_machine, task_compiler):
+        msg = {"type": "nl_command", "seq": 20, "text": "开始巡逻"}
         replies = _handle_nl_command(
             msg, vehicle, empty_grid, navigation,
             time.time(), time.monotonic(),
@@ -302,63 +226,11 @@ class TestNlCommandRotate:
             state_machine, task_compiler,
         )
 
-        assert navigation.status == "active"
-        goal_x, goal_y = navigation.goal
-        # Target yaw = 0 + pi/2 → goal should be ~(10, 10.1) (0.1m ahead in +y)
-        assert abs(goal_x - 10.0) < 0.15
-        assert goal_y > 10.0
-
-
-class TestNlCommandScan:
-    """NL '看一下' → scan report."""
-
-    def test_scan_sends_report(self, vehicle, empty_grid, navigation, nl_client,
-                                schema_v, semantic_v, state_machine, task_compiler):
-        # Build a simple scan frame with a few points
-        scan_data = {
-            "type": "scan",
-            "points": [
-                {"angle": 0.0, "range": 1.5, "intensity": 1.0},
-                {"angle": 0.5, "range": 2.0, "intensity": 1.0},
-                {"angle": math.pi / 2, "range": 3.0, "intensity": 1.0},
-            ],
-        }
-
-        msg = {"type": "nl_command", "seq": 9, "text": "看一下"}
-        replies = _handle_nl_command(
-            msg, vehicle, empty_grid, navigation,
-            time.time(), time.monotonic(),
-            nl_client, schema_v, semantic_v,
-            state_machine, task_compiler,
-            scan_data=scan_data,
-        )
-
-        scan_reports = [r for r in replies if r["type"] == "nl_scan_report"]
-        assert len(scan_reports) == 1
-        report = scan_reports[0]
-        assert "summary" in report
-        assert "points_summary" in report
-        # front should have min 1.5
-        assert report["points_summary"].get("front") == 1.5
-
-
-class TestNlCommandStatus:
-    """NL '状态' → status report."""
-
-    def test_status_reports_position(self, vehicle, empty_grid, navigation, nl_client,
-                                      schema_v, semantic_v, state_machine, task_compiler):
-        msg = {"type": "nl_command", "seq": 10, "text": "状态"}
-        replies = _handle_nl_command(
-            msg, vehicle, empty_grid, navigation,
-            time.time(), time.monotonic(),
-            nl_client, schema_v, semantic_v,
-            state_machine, task_compiler,
-        )
-
+        assert state_machine.current_state == InstructionState.ACTIVE
         task_updates = [r for r in replies if r["type"] == "nl_task_update"]
-        assert len(task_updates) >= 1
-        assert task_updates[0]["status"] == "completed"
-        assert "position" in str(task_updates[0].get("reason", ""))
+        assert len(task_updates) == 1
+        assert task_updates[0]["status"] == "active"
+        assert "patrol" in str(task_updates[0].get("reason", ""))
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -620,37 +492,14 @@ class TestFullPipeline:
         assert navigation.status == "active"
         assert state_machine.current_state == InstructionState.ACTIVE
 
-    def test_pipeline_move_distance_then_wait_completion(self, vehicle, empty_grid,
-                                                          navigation, nl_client, schema_v,
-                                                          semantic_v, state_machine, task_compiler):
-        """Test that move_distance with GotoController reaches goal."""
-        vehicle.yaw = 0.0
-        msg = {"type": "nl_command", "seq": 24, "text": "前进 1 米"}
-        _handle_nl_command(
+    def test_pipeline_patrol(self, vehicle, empty_grid, navigation,
+                              nl_client, schema_v, semantic_v, state_machine, task_compiler):
+        msg = {"type": "nl_command", "seq": 24, "text": "开始巡逻"}
+        replies = _handle_nl_command(
             msg, vehicle, empty_grid, navigation,
             time.time(), time.monotonic(),
             nl_client, schema_v, semantic_v,
             state_machine, task_compiler,
         )
-        assert navigation.status == "active"
-        goal_x, goal_y = navigation.goal
-        assert abs(goal_x - 11.0) < 0.1
-        assert abs(goal_y - 10.0) < 0.1
-
-    def test_pipeline_rotate_computes_goal_nearby(self, vehicle, empty_grid,
-                                                   navigation, nl_client, schema_v,
-                                                   semantic_v, state_machine, task_compiler):
-        """Rotate should set a goal very close to current position."""
-        vehicle.yaw = 0.0
-        msg = {"type": "nl_command", "seq": 25, "text": "右转 90 度"}
-        _handle_nl_command(
-            msg, vehicle, empty_grid, navigation,
-            time.time(), time.monotonic(),
-            nl_client, schema_v, semantic_v,
-            state_machine, task_compiler,
-        )
-        assert navigation.status == "active"
-        goal_x, goal_y = navigation.goal
-        # Goal should be ~0.1m from vehicle
-        dist = math.hypot(goal_x - 10.0, goal_y - 10.0)
-        assert 0.05 < dist < 0.2, f"expected goal ~0.1m from vehicle, got {dist:.3f}m"
+        assert state_machine.current_state == InstructionState.ACTIVE
+        assert any(r["type"] == "nl_task_update" and r["status"] == "active" for r in replies)

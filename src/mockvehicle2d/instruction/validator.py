@@ -17,14 +17,14 @@ from mockvehicle2d.map_grid import MapGrid
 from mockvehicle2d.safety import LocalSafetyRuntime
 
 
-_SCHEMA_PATH = Path(__file__).resolve().parent / "schemas" / "v2.json"
+_SCHEMA_PATH = Path(__file__).resolve().parent / "schemas" / "v3.json"
 
 _MAX_MAP_SIZE = 255
 _DEFAULT_MAX_DISTANCE_M = 10.0
 
 
 class SchemaValidator:
-    """Validates JSON against the v2 instruction schema using jsonschema."""
+    """Validates JSON against the v3 instruction schema using jsonschema."""
 
     def __init__(self) -> None:
         self._schema = json.loads(_SCHEMA_PATH.read_text(encoding="utf-8"))
@@ -72,7 +72,7 @@ class SemanticValidator:
     grid : MapGrid
         The map for bounds and passability checks.
     max_distance_m : float
-        Maximum allowed move_distance (default 10.0).
+        Maximum allowed distance (default 10.0). For future use with distance-based intents.
     """
 
     def __init__(self, grid: MapGrid, max_distance_m: float = _DEFAULT_MAX_DISTANCE_M) -> None:
@@ -83,19 +83,15 @@ class SemanticValidator:
         """Return (is_valid, error_message)."""
         intent = instruction.get("intent")
         params = instruction.get("parameters", {}) or {}
-        if intent == "goto_point":
-            return self._validate_goto_point(params)
-        if intent == "move_distance":
-            return self._validate_move_distance(params)
-        if intent == "rotate":
-            return self._validate_rotate(params)
+        if intent == "goto":
+            return self._validate_goto(params)
         return True, ""
 
-    def _validate_goto_point(self, params: dict) -> tuple[bool, str]:
+    def _validate_goto(self, params: dict) -> tuple[bool, str]:
         x_m = params.get("x_m")
         y_m = params.get("y_m")
         if x_m is None or y_m is None:
-            return False, "goto_point requires x_m and y_m"
+            return False, "goto requires x_m and y_m"
         if not (0 <= x_m <= _MAX_MAP_SIZE and 0 <= y_m <= _MAX_MAP_SIZE):
             return False, f"target ({x_m}, {y_m}) out of map bounds [0, {_MAX_MAP_SIZE}]"
         gx, gy = int(x_m), int(y_m)
@@ -107,24 +103,7 @@ class SemanticValidator:
             return False, f"target cell ({gx}, {gy}) is void (no ground)"
         return True, ""
 
-    def _validate_move_distance(self, params: dict) -> tuple[bool, str]:
-        distance = params.get("distance_m", 0)
-        direction = params.get("direction")
-        if direction not in ("forward", "backward"):
-            return False, f"invalid direction: {direction!r}"
-        if not (0.01 <= distance <= self._max_distance_m):
-            return False, (
-                f"distance {distance}m outside allowed range "
-                f"[0.01, {self._max_distance_m}]"
-            )
-        return True, ""
 
-    @staticmethod
-    def _validate_rotate(params: dict) -> tuple[bool, str]:
-        angle = params.get("angle_deg", 0)
-        if angle == 0:
-            return False, "rotate angle must be non-zero"
-        return True, ""
 
 
 class SafetyValidator:

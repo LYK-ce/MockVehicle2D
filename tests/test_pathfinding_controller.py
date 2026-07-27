@@ -43,21 +43,7 @@ class _TestParser:
 
         m = self._GOTO_PAT.search(text)
         if m:
-            return {"intent": "goto_point", "parameters": {"x_m": float(m.group(1)), "y_m": float(m.group(2))}}
-
-        m = _re.search(r"前进\s*(\d+(?:\.\d+)?)", text)
-        if m:
-            return {"intent": "move_distance", "parameters": {"distance_m": float(m.group(1)), "direction": "forward"}}
-        m = _re.search(r"后退\s*(\d+(?:\.\d+)?)", text)
-        if m:
-            return {"intent": "move_distance", "parameters": {"distance_m": float(m.group(1)), "direction": "backward"}}
-
-        m = _re.search(r"左转\s*(\d+(?:\.\d+)?)", text)
-        if m:
-            return {"intent": "rotate", "parameters": {"angle_deg": int(m.group(1)), "direction": "left"}}
-        m = _re.search(r"右转\s*(\d+(?:\.\d+)?)", text)
-        if m:
-            return {"intent": "rotate", "parameters": {"angle_deg": int(m.group(1)), "direction": "right"}}
+            return {"intent": "goto", "parameters": {"x_m": float(m.group(1)), "y_m": float(m.group(2))}}
 
         if text in {"停"}:
             return {"intent": "stop", "parameters": {}}
@@ -246,10 +232,10 @@ class TestTaskCompilerPhase3:
     """TaskCompiler with grid uses A* fallback."""
 
     def test_compiler_uses_goto_when_clear(self, empty_grid):
-        """goto_point with clear straight-line → GotoController."""
+        """goto with clear straight-line → GotoController."""
         compiler = TaskCompiler(empty_grid)
         inst = {
-            "intent": "goto_point",
+            "intent": "goto",
             "parameters": {"x_m": 20, "y_m": 10},
         }
         snapshot = {"pose": {"x": 10.0, "y": 10.0, "yaw": 0.0}}
@@ -259,10 +245,10 @@ class TestTaskCompilerPhase3:
         assert task["goal"] == {"x_m": 20, "y_m": 10}
 
     def test_compiler_uses_astar_when_blocked(self, grid_with_wall):
-        """goto_point with obstacle → PathFollowingController with A* path."""
+        """goto with obstacle → PathFollowingController with A* path."""
         compiler = TaskCompiler(grid_with_wall)
         inst = {
-            "intent": "goto_point",
+            "intent": "goto",
             "parameters": {"x_m": 20, "y_m": 10},
         }
         snapshot = {"pose": {"x": 10.0, "y": 10.0, "yaw": 0.0}}
@@ -277,7 +263,7 @@ class TestTaskCompilerPhase3:
         assert path[-1] == (20, 10)
 
     def test_compiler_blocked_when_no_path(self):
-        """goto_point with unreachable goal → blocked."""
+        """goto with unreachable goal → blocked."""
         grid = MapGrid(256, 256)
         # Surround goal at (20, 10) with walls but keep (20,10) free
         for x in range(19, 22):
@@ -288,7 +274,7 @@ class TestTaskCompilerPhase3:
 
         compiler = TaskCompiler(grid)
         inst = {
-            "intent": "goto_point",
+            "intent": "goto",
             "parameters": {"x_m": 20, "y_m": 10},
         }
         snapshot = {"pose": {"x": 5.0, "y": 5.0, "yaw": 0.0}}
@@ -301,35 +287,8 @@ class TestTaskCompilerPhase3:
         """Without grid, compiler always chooses GotoController (backward compat)."""
         compiler = TaskCompiler()  # No grid
         inst = {
-            "intent": "goto_point",
+            "intent": "goto",
             "parameters": {"x_m": 20, "y_m": 10},
-        }
-        snapshot = {"pose": {"x": 10.0, "y": 10.0, "yaw": 0.0}}
-        task = compiler.compile(inst, snapshot)
-        assert task["controller"] == "GotoController"
-
-    def test_move_distance_uses_astar_when_blocked(self, grid_with_wall):
-        """move_distance with obstacle → PathFollowingController."""
-        compiler = TaskCompiler(grid_with_wall)
-        inst = {
-            "intent": "move_distance",
-            "parameters": {"distance_m": 10.0, "direction": "forward"},
-        }
-        snapshot = {"pose": {"x": 10.0, "y": 10.0, "yaw": 0.0}}
-        task = compiler.compile(inst, snapshot)
-        assert task["type"] == "navigation"
-        # Straight line from (10,10) to (20,10) crosses wall at x=15
-        assert task["controller"] == "PathFollowingController"
-        assert "path" in task
-        path = task["path"]
-        assert len(path) > 2
-
-    def test_move_distance_uses_goto_when_clear(self, empty_grid):
-        """move_distance without obstacle → GotoController."""
-        compiler = TaskCompiler(empty_grid)
-        inst = {
-            "intent": "move_distance",
-            "parameters": {"distance_m": 5.0, "direction": "forward"},
         }
         snapshot = {"pose": {"x": 10.0, "y": 10.0, "yaw": 0.0}}
         task = compiler.compile(inst, snapshot)
@@ -442,26 +401,3 @@ class TestNLPipelinePhase3:
         assert len(task_updates) >= 1
         assert task_updates[0]["status"] == "blocked"
         assert "no path" in str(task_updates[0].get("reason", ""))
-
-    def test_nl_move_distance_uses_path_following(
-        self, vehicle, grid_with_wall, navigation, path_following, nl_client,
-        schema_v, state_machine
-    ):
-        """NL '前进 10 米' with wall in path → PathFollowingController."""
-        vehicle.yaw = 0.0  # facing +x
-        semantic_v = SemanticValidator(grid_with_wall)
-        compiler = TaskCompiler(grid_with_wall)
-
-        msg = {"type": "nl_command", "seq": 33, "text": "前进 10 米"}
-        replies = _handle_nl_command(
-            msg, vehicle, grid_with_wall, navigation,
-            time.time(), time.monotonic(),
-            nl_client, schema_v, semantic_v,
-            state_machine, compiler,
-            path_following=path_following,
-        )
-
-        task_updates = [r for r in replies if r["type"] == "nl_task_update"]
-        assert task_updates[0]["status"] == "active"
-        # Should use path following since wall at x=15 blocks route
-        assert path_following.status == "active"

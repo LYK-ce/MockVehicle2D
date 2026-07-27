@@ -408,35 +408,18 @@ def _handle_nl_command(
         state_machine.transition(InstructionState.IDLE)
         return replies
 
-    if intent == "status":
+    if intent == "patrol":
         state_machine.transition(InstructionState.ACTIVE)
-        nav_snap = navigation.snapshot()
         replies.append({
             "type": "nl_task_update",
             "ts": wall_timestamp,
             "seq": seq,
-            "status": "completed",
-            "reason": f"position: ({vehicle.x:.2f}, {vehicle.y:.2f}), nav: {nav_snap.get('status')}",
+            "status": "active",
+            "reason": "patrol started",
         })
-        state_machine.transition(InstructionState.COMPLETED)
-        state_machine.transition(InstructionState.IDLE)
         return replies
 
-    if intent == "scan_report":
-        state_machine.transition(InstructionState.ACTIVE)
-        summary = _summarize_scan_for_nl(scan_data) if scan_data else {}
-        replies.append({
-            "type": "nl_scan_report",
-            "ts": wall_timestamp,
-            "seq": seq,
-            "summary": summary.get("text", "扫描完成"),
-            "points_summary": summary.get("sectors", {}),
-        })
-        state_machine.transition(InstructionState.COMPLETED)
-        state_machine.transition(InstructionState.IDLE)
-        return replies
-
-    if intent == "goto_point":
+    if intent == "goto":
         x_m = params["x_m"]
         y_m = params["y_m"]
         # Phase 3: use task compiler to decide controller
@@ -520,128 +503,6 @@ def _handle_nl_command(
             "seq": seq,
             "status": "active",
             "reason": f"navigating to ({x_m}, {y_m})",
-        })
-        return replies
-
-    if intent == "move_distance":
-        distance_m = params["distance_m"]
-        direction = params["direction"]
-        sign = 1.0 if direction == "forward" else -1.0
-        goal_x = vehicle.x + sign * distance_m * math.cos(vehicle.yaw)
-        goal_y = vehicle.y + sign * distance_m * math.sin(vehicle.yaw)
-        # Phase 3: use task compiler to decide controller
-        pose_snap = {"pose": {"x": vehicle.x, "y": vehicle.y, "yaw": vehicle.yaw}}
-        task = task_compiler.compile(instruction, pose_snap)
-        controller_choice = task.get("controller", "GotoController")
-
-        if controller_choice == "blocked":
-            state_machine.transition(InstructionState.ACTIVE)
-            state_machine.transition(InstructionState.BLOCKED)
-            replies.append({
-                "type": "nl_task_update",
-                "ts": wall_timestamp,
-                "seq": seq,
-                "status": "blocked",
-                "reason": task.get("reason", "no path found"),
-            })
-            state_machine.transition(InstructionState.IDLE)
-            return replies
-
-        vehicle.stop()
-        if controller_choice == "PathFollowingController" and path_following is not None:
-            path = task.get("path")
-            if not path or len(path) < 2:
-                state_machine.transition(InstructionState.ACTIVE)
-                state_machine.transition(InstructionState.BLOCKED)
-                replies.append({
-                    "type": "nl_task_update",
-                    "ts": wall_timestamp,
-                    "seq": seq,
-                    "status": "blocked",
-                    "reason": "invalid path",
-                })
-                state_machine.transition(InstructionState.IDLE)
-                return replies
-            navigation.cancel("path_following_active")
-            path_following.start(path)
-            if path_following.status != "active":
-                state_machine.transition(InstructionState.ACTIVE)
-                state_machine.transition(InstructionState.BLOCKED)
-                replies.append({
-                    "type": "nl_task_update",
-                    "ts": wall_timestamp,
-                    "seq": seq,
-                    "status": "blocked",
-                    "reason": path_following.reason or "move_distance path rejected",
-                })
-                state_machine.transition(InstructionState.IDLE)
-                return replies
-            state_machine.transition(InstructionState.ACTIVE)
-            replies.append({
-                "type": "nl_task_update",
-                "ts": wall_timestamp,
-                "seq": seq,
-                "status": "active",
-                "reason": f"path-following {direction} {distance_m}m via {len(path)} waypoints",
-            })
-            return replies
-
-        # Default: GotoController
-        if path_following is not None:
-            path_following.cancel("goto_active")
-        navigation.start(goal_x, goal_y)
-        if navigation.status != "active":
-            state_machine.transition(InstructionState.ACTIVE)
-            state_machine.transition(InstructionState.BLOCKED)
-            replies.append({
-                "type": "nl_task_update",
-                "ts": wall_timestamp,
-                "seq": seq,
-                "status": "blocked",
-                "reason": navigation.reason or "move_distance rejected",
-            })
-            state_machine.transition(InstructionState.IDLE)
-            return replies
-        state_machine.transition(InstructionState.ACTIVE)
-        replies.append({
-            "type": "nl_task_update",
-            "ts": wall_timestamp,
-            "seq": seq,
-            "status": "active",
-            "reason": f"moving {direction} {distance_m}m",
-        })
-        return replies
-
-    if intent == "rotate":
-        angle_deg = params["angle_deg"]
-        direction = params["direction"]
-        sign = 1.0 if direction == "left" else -1.0
-        target_yaw = vehicle.yaw + sign * math.radians(angle_deg)
-        # Set a virtual goal 0.1m ahead in the target direction
-        goal_x = vehicle.x + 0.1 * math.cos(target_yaw)
-        goal_y = vehicle.y + 0.1 * math.sin(target_yaw)
-        vehicle.stop()
-        if path_following is not None:
-            path_following.cancel("manual_override")
-        navigation.start(goal_x, goal_y)
-        if navigation.status != "active":
-            state_machine.transition(InstructionState.BLOCKED)
-            replies.append({
-                "type": "nl_task_update",
-                "ts": wall_timestamp,
-                "seq": seq,
-                "status": "blocked",
-                "reason": navigation.reason or "rotate rejected",
-            })
-            state_machine.transition(InstructionState.IDLE)
-            return replies
-        state_machine.transition(InstructionState.ACTIVE)
-        replies.append({
-            "type": "nl_task_update",
-            "ts": wall_timestamp,
-            "seq": seq,
-            "status": "active",
-            "reason": f"rotating {direction} {angle_deg}°",
         })
         return replies
 
