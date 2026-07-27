@@ -10,6 +10,19 @@ import json
 import re
 
 
+def _strip_thinking(content: str) -> str:
+    """Strip <think>...</think> tags from LLM output.
+
+    Handles both closed and unclosed (truncated) think blocks.
+    After stripping, extracts remaining text for JSON parsing.
+    """
+    # Remove closed think blocks
+    content = re.sub(r"<think>.*?</think>\s*", "", content, flags=re.DOTALL)
+    # If an unclosed <think> remains (truncated output), remove it and everything after
+    content = re.sub(r"<think>.*$", "", content, flags=re.DOTALL)
+    return content.strip()
+
+
 class FakeModelClient:
     """Rule-based deterministic parser for offline testing.
 
@@ -208,16 +221,16 @@ class LLMClient:
                     model=self._model,
                     messages=messages,
                     temperature=0.1,
-                    max_tokens=256,
-                    extra_body={"enable_thinking": False},
-                    timeout=10.0,
+                    max_tokens=1024,
+                    extra_body={"enable_thinking": True},
+                    timeout=30.0,
                 )
                 content = response.choices[0].message.content
                 if content is None:
                     return None
 
-                # Strip <think>...</think> tags if present (Qwen3 thinking mode)
-                content = re.sub(r"<think>.*?</think>\s*", "", content, flags=re.DOTALL).strip()
+                # Strip <think>...</think> tags (even unclosed ones)
+                content = _strip_thinking(content)
                 # Strip markdown code fences if present
                 content = re.sub(r"^```(?:json)?\s*", "", content)
                 content = re.sub(r"\s*```$", "", content)
