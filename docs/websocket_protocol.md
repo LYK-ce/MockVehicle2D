@@ -123,11 +123,17 @@ Pictor 仅在收到 `hello` 后才认为连接可用，之后才开始处理 `po
         "status": "active",
         "goal": {"x_m": 8.0, "y_m": 3.5},
         "goal_mode": "exact",
+        "requested_goal": {
+            "frame_id": "anchor_map",
+            "x_m": 8.0,
+            "y_m": 3.5
+        },
         "effective_goal": {
             "frame_id": "anchor_map",
             "x_m": 8.0,
             "y_m": 3.5
         },
+        "approach_distance_m": 0.0,
         "reason": null,
         "algorithm": "d_star_lite",
         "path_revision": 3,
@@ -159,7 +165,7 @@ Pictor 仅在收到 `hello` 后才认为连接可用，之后才开始处理 `po
 | `command` | string | — | 当前有效命令；看门狗超时后为 `stop` |
 | `localization` | object | — | `anchor_map` 中的局部位姿、协方差对角线、质量和 revision |
 | `control_mode` | string | — | `navigation.status=active` 时为 `autonomous`，否则为 `manual` |
-| `navigation` | object | — | `status`、原请求 `goal`、实际执行 `effective_goal`、`goal_mode` 和终止原因 |
+| `navigation` | object | — | `status`、兼容请求 `goal`、`anchor_map` 中的 `requested_goal` / `effective_goal`、`goal_mode`、车体外缘 `approach_distance_m` 和终止原因 |
 | `safety` | object | — | 最新安全状态、原因、前进方向障碍净空和边缘净空；未发现时净空为 `null` |
 
 `pose` 不再发送绝对仿真真值。小车只保存已知出生锚点
@@ -323,14 +329,23 @@ D* Lite 在有限规划窗中经过高代价 Unknown、避开按车体半径膨�
 `localization_lost`；未结算的旧自动运动不会再积分，但新的人工 `cmd` / `drive` 仍可接管。
 安全硬停止或安全输入故障也会立即停车。
 目标最初为 Unknown 时仍可接受并探索。一旦本地观测确认精确目标无法容纳车体及
-`0.25 m` 硬安全净空，或 D* Lite 确认精确目标不可达，控制器会在原目标 `1 m` 内按距离
-和 cell 坐标确定性搜索候选。候选的完整车体与硬净空包络必须均为已观测 Free，且同一个
-D* Lite 必须确认从当前估计位姿可达；Unknown 不能作为安全停车点。找到候选后任务继续
-执行，`goal` 保留原 global-map 请求，`goal_mode=nearby_safe`，`effective_goal` 以
-`anchor_map` 米坐标明确实际停车点。到达后为 `status=reached`、
-`reason=nearby_safe_stop`，`detail` 说明原目标是 `goal_blocked` 或
-`goal_unreachable`。附近没有候选时才转为 `blocked`（`reason=no_path`、
-`detail=nearby_safe_goal_unavailable`）。
+`0.25 m` 硬安全净空，或 D* Lite 确认精确目标不可达，控制器会在车体外缘距原目标
+`1 m` 的限制内搜索连续候选；候选中心搜索半径因此为
+`1 m + vehicle_radius_m`，并不要求车体中心也在 `1 m` 内。候选必须对已知
+Occupied/Forbidden 满足车体和硬净空、D* 规划格与预算合法、格中心到连续候选的末段
+安全且从当前估计位姿可达。
+
+完整安全包络已确认 Free 时使用 `goal_mode=nearby_safe`。只有未确认但对已知障碍安全的
+候选时使用 `goal_mode=approaching_safe_stop`：车辆可在 Unknown 中受安全门控继续抵近，
+每帧扫描后重新验证；抵达未确认候选只停车等待，不会报告 `reached`。包络确认后才以
+`status=reached`、`reason=nearby_safe_stop` 完成，`detail` 说明原目标是
+`goal_blocked` 或 `goal_unreachable`。不存在任何安全且可达候选时才转为 `blocked`
+（`reason=no_path`、`detail=nearby_safe_goal_unavailable`）。
+
+`goal` 保留原 `global_map` 请求以兼容既有客户端；`requested_goal` 和
+`effective_goal` 明确给出 `anchor_map` 中的原目标与执行目标。
+`approach_distance_m=max(0, distance(requested_goal,effective_goal)-vehicle_radius_m)`
+是车体外缘到原目标的距离，单位为米。
 
 新的 `goto` 会替换旧目标。任何 `cmd` 或 `drive`（包括 `stop`），以及任何非法输入，都会永久取消当前目标；除非客户端重新发送 `goto`，否则不会恢复自动行驶。连接断开也会停车并取消活动目标。
 

@@ -14,6 +14,7 @@ sys.path.insert(0, str(REPO_ROOT / "src"))
 from mockvehicle2d.map_grid import MapGrid
 from mockvehicle2d.local_state import AnchorSpec, AnchoredLocalState, ObservedGrid, PoseEstimate
 from mockvehicle2d.navigation import GotoController
+from mockvehicle2d.safety import SafetyAdvanceResult
 from mockvehicle2d.scan import LaserPoint, TMINI_SCAN_CONFIG, scan_grid
 from mockvehicle2d.server import (
     CommandMessageError,
@@ -310,7 +311,7 @@ class GotoTest(unittest.TestCase):
         self.assertEqual(pose["control_mode"], "manual")
         self.assertEqual(pose["navigation"]["status"], "cancelled")
 
-    def test_known_occupied_goal_without_safe_nearby_candidate_is_rejected(self) -> None:
+    def test_known_occupied_goal_uses_provisional_stop_without_false_completion(self) -> None:
         vehicle = self.vehicle()
         navigation = GotoController()
         local_state = self.local_state(vehicle)
@@ -338,21 +339,38 @@ class GotoTest(unittest.TestCase):
                 "ts": 12.0,
                 "seq": 5,
                 "goal": {"x_m": 6.0, "y_m": 5.0},
-                "accepted": False,
-                "reason": "no_path",
-                "detail": "nearby_safe_goal_unavailable",
+                "accepted": True,
             },
         )
-        self.assertEqual(
-            (navigation.status, navigation.reason, navigation.detail),
-            ("blocked", "no_path", "nearby_safe_goal_unavailable"),
+        snapshot = navigation.snapshot()
+        self.assertEqual(snapshot["status"], "active")
+        self.assertEqual(snapshot["goal_mode"], "approaching_safe_stop")
+        effective = snapshot["effective_goal"]
+        self.assertIsNotNone(effective)
+        navigation.update(
+            vehicle,
+            self.grid,
+            0.1,
+            pose=PoseEstimate(
+                local_state.anchor.anchor_id,
+                effective["x_m"],
+                effective["y_m"],
+                0.0,
+                (0.0, 0.0, 0.0),
+                "nominal",
+                0.1,
+                1,
+            ),
+            advance_result=SafetyAdvanceResult(),
+            local_map=local_state.local_map,
         )
-        self.assertEqual(navigation.snapshot()["path"], [])
-        self.assertIsNone(navigation.snapshot()["current_waypoint"])
+        self.assertEqual(navigation.status, "active")
+        self.assertEqual(navigation.snapshot()["goal_mode"], "approaching_safe_stop")
+        self.assertIsNone(navigation.reason)
         self.assertEqual(vehicle.command, "stop")
         self.assertEqual(vehicle.body_velocities(), (0.0, 0.0))
 
-    def test_known_occupied_goal_rejects_safe_candidate_beyond_one_metre(self) -> None:
+    def test_known_occupied_goal_accepts_body_edge_safe_candidate(self) -> None:
         grid = MapGrid.from_wall_set(16, 12, {(8, 5)})
         vehicle = Vehicle(
             2.5,
@@ -394,26 +412,20 @@ class GotoTest(unittest.TestCase):
                 "ts": 12.0,
                 "seq": 5,
                 "goal": {"x_m": 8.5, "y_m": 5.5},
-                "accepted": False,
-                "reason": "no_path",
-                "detail": "nearby_safe_goal_unavailable",
+                "accepted": True,
             },
         )
-        self.assertEqual(navigation.status, "blocked")
+        self.assertEqual(navigation.status, "active")
         self.assertEqual(navigation.requested_goal, (6.0, 0.0))
         self.assertEqual(navigation.reported_goal, (8.5, 5.5))
-        self.assertEqual(navigation.goal, navigation.requested_goal)
+        self.assertNotEqual(navigation.goal, navigation.requested_goal)
         snapshot = navigation.snapshot()
         self.assertEqual(snapshot["goal"], {"x_m": 8.5, "y_m": 5.5})
-        self.assertEqual(snapshot["goal_mode"], "exact")
-        self.assertEqual(
-            snapshot["effective_goal"],
-            {
-                "frame_id": "anchor_map",
-                "x_m": 6.0,
-                "y_m": 0.0,
-            },
+        self.assertIn(
+            snapshot["goal_mode"],
+            {"approaching_safe_stop", "nearby_safe"},
         )
+        self.assertLessEqual(snapshot["approach_distance_m"], 1.0)
 
     def test_known_free_goal_remains_accepted(self) -> None:
         vehicle = self.vehicle()

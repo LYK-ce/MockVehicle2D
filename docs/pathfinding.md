@@ -43,17 +43,21 @@ D* Lite（增量修复路径）──► 局部 waypoint ──► 速度控制 
 | Footprint | Occupied 按 `vehicle_radius_m` 膨胀 |
 | 规划范围 | 起点和目标包围框加默认 `16 m` margin |
 | 资源限制 | 默认目标最远 `256 m`、最多 `100000` 格 |
-| 不可达目标 | 在原目标 `1 m` 内选择安全包络均已确认 Free 且 D* 可达的最近 cell center |
+| 不可达目标 | 车体外缘距原目标不超过 `1 m`；在 `1 m + vehicle_radius_m` 中确定性采样连续候选 |
 
 Unknown 可以通行是启动探索所必需：车辆开始时除出生附近外没有地图。如果要求 Unknown
 不可通行，第一条 `goto` 将无法离开初始区域。驶向 Unknown waypoint 时，导航线速度默认
 缩放到 `0.4`；最终仍受实时安全门控。
 
-Unknown 不能作为不可达目标的安全停车点。候选的车辆 footprint 加 `0.25 m` 硬净空所覆盖
-的所有格都必须已经是 Free；候选按距原目标的距离和 cell 坐标确定性排序，再由同一个
-D* Lite 验证从当前估计位姿可达。选中后执行目标保持稳定，除非它也变得危险或不可达。
-到达候选仍使用终态 `reached`，但原因为 `nearby_safe_stop`，不会伪报
-`goal_tolerance`。
+Unknown 不能作为最终安全停车点。候选的车辆 footprint 加 `0.25 m` 硬净空、候选所在
+规划格以及该格中心到连续候选的末段连接都必须合法。已确认候选的整个包络还必须是
+Free；选中后保持稳定，并在每帧证据更新后重新验证。
+
+精确目标已确认危险、但附近只有对已知障碍安全且 D* 可达的未确认候选时，任务保持
+`active`，进入 `goal_mode=approaching_safe_stop`，在 Unknown 中受安全门控抵近并随每帧
+证据重新选点。抵达未确认候选只会停车等待扫描，不会伪报完成；包络确认 Free 后才转为
+`nearby_safe`。到达已确认候选使用 `status=reached`、`reason=nearby_safe_stop`。
+不存在任何几何安全且可达的候选时才报告 `nearby_safe_goal_unavailable`。
 
 地图 delta 可包含 Unknown → Free、Unknown → Occupied、Occupied → Free 等双向变化。
 规划器保留 `g`、`rhs`、优先队列与起点移动的 key modifier，只更新受变化格及 footprint
@@ -65,11 +69,18 @@ D* Lite 验证从当前估计位姿可达。选中后执行目标保持稳定，
 {
   "algorithm": "d_star_lite",
   "goal_mode": "nearby_safe",
+  "goal": {"x_m": 9.0, "y_m": 4.0},
+  "requested_goal": {
+    "frame_id": "anchor_map",
+    "x_m": 9.0,
+    "y_m": 4.0
+  },
   "effective_goal": {
     "frame_id": "anchor_map",
     "x_m": 8.5,
     "y_m": 3.5
   },
+  "approach_distance_m": 0.207,
   "path_revision": 4,
   "replan_count": 2,
   "current_waypoint": {"x_m": 8.5, "y_m": 3.5},
@@ -84,9 +95,12 @@ D* Lite 验证从当前估计位姿可达。选中后执行目标保持稳定，
 }
 ```
 
-公开路径和目标使用米；整数 cell 只存在于规划器内部。`goal` 保留原始 global-map 请求，
-`effective_goal` 是实际执行的 `anchor_map` 目标，`goal_mode` 为 `exact` 或
-`nearby_safe`。为限制遥测大小，`path` 最多报告前 64 个点。
+公开路径和目标使用米；整数 cell 只存在于规划器内部。`goal` 保留兼容的原始
+`global_map` 请求，`requested_goal` 与 `effective_goal` 分别明确原请求和实际执行的
+`anchor_map` 坐标。`goal_mode` 为 `exact`、`approaching_safe_stop` 或 `nearby_safe`。
+`approach_distance_m` 是实际目标到原请求目标的中心距离减去车体半径（下限为零），即
+车体外缘距离，单位为米；因此车体中心允许距原目标超过 `1 m`。为限制遥测大小，`path`
+最多报告前 64 个点。
 
 ## Scan matching 与局部 SLAM 边界
 
