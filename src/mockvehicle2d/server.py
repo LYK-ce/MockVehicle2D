@@ -91,7 +91,7 @@ class VehicleRuntime:
                 TMINI_SCAN_CONFIG,
             )
         )
-        pose = self.local_state.update_from_truth(
+        self.local_state.update_from_truth(
             self.vehicle.x,
             self.vehicle.y,
             self.vehicle.yaw,
@@ -1323,7 +1323,7 @@ async def handler(
                         }))
                         state_machine.transition(InstructionState.IDLE)
                         active_nl_seq = None
-                        print(f"[NL] task completed: goal reached")
+                        print("[NL] task completed: goal reached")
                     elif nav_status == "blocked":
                         reason = navigation.reason
                         state_machine.transition(InstructionState.BLOCKED)
@@ -1425,7 +1425,7 @@ async def handler(
                     "reason": "manual_override",
                 }))
                 active_nl_seq = None
-                print(f"[NL] task cancelled by manual override")
+                print("[NL] task cancelled by manual override")
 
             reply = handle_command_message(
                 raw,

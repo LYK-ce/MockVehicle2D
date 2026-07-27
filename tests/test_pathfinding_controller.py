@@ -15,7 +15,7 @@ import pytest
 
 from mockvehicle2d.instruction.compiler import TaskCompiler
 from mockvehicle2d.instruction.llm_client import FakeModelClient
-from mockvehicle2d.instruction.state_machine import InstructionState, InstructionStateMachine
+from mockvehicle2d.instruction.state_machine import InstructionStateMachine
 from mockvehicle2d.instruction.validator import SchemaValidator, SemanticValidator
 from mockvehicle2d.map_grid import MapGrid, WALL
 from mockvehicle2d.local_state import AnchorSpec, AnchoredLocalState

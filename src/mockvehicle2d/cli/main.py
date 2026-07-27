@@ -205,7 +205,7 @@ def _cmd_nl(args):
                 instruction, schema_validator=schema_v, semantic_validator=semantic_v
             )
             if result.valid:
-                print(f"  ✓ valid")
+                print("  ✓ valid")
             else:
                 print(f"  ✗ {result.layer}: {result.message}")
         return
@@ -254,8 +254,6 @@ def _cmd_nl(args):
 
 def _run_eval(dataset, schema_v, semantic_v):
     """Run offline evaluation: compare FakeModelClient parse vs expected."""
-    import json
-
     from mockvehicle2d.instruction.llm_client import FakeModelClient
     from mockvehicle2d.instruction.validator import run_validation_pipeline
 

@@ -286,7 +286,7 @@ class TestNlCommandGoto:
     def test_goto_respects_goal(self, vehicle, empty_grid, navigation, nl_client,
                                  schema_v, semantic_v, state_machine):
         msg = {"type": "nl_command", "seq": 3, "text": "去 (100, 200)"}
-        replies = _handle_nl_command(
+        _handle_nl_command(
             msg, vehicle, empty_grid, navigation,
             time.time(), time.monotonic(),
             nl_client, schema_v, semantic_v,
@@ -305,7 +305,7 @@ class TestNlCommandMoveDistance:
         # Vehicle at (10, 10), yaw=0 (faces +x)
         vehicle.yaw = 0.0
         msg = {"type": "nl_command", "seq": 4, "text": "前进 5 米"}
-        replies = _handle_nl_command(
+        _handle_nl_command(
             msg, vehicle, empty_grid, navigation,
             time.time(), time.monotonic(),
             nl_client, schema_v, semantic_v,
@@ -321,7 +321,7 @@ class TestNlCommandMoveDistance:
                                           schema_v, semantic_v, state_machine):
         vehicle.yaw = 0.0
         msg = {"type": "nl_command", "seq": 5, "text": "后退 3 米"}
-        replies = _handle_nl_command(
+        _handle_nl_command(
             msg, vehicle, empty_grid, navigation,
             time.time(), time.monotonic(),
             nl_client, schema_v, semantic_v,
@@ -337,7 +337,7 @@ class TestNlCommandMoveDistance:
                                   schema_v, semantic_v, state_machine):
         vehicle.yaw = math.pi / 4  # 45 degrees
         msg = {"type": "nl_command", "seq": 6, "text": "前进 5 米"}
-        replies = _handle_nl_command(
+        _handle_nl_command(
             msg, vehicle, empty_grid, navigation,
             time.time(), time.monotonic(),
             nl_client, schema_v, semantic_v,
@@ -1159,7 +1159,7 @@ class TestFullPipeline:
                                          nl_client, schema_v, semantic_v, state_machine):
         # First: clarify
         msg1 = {"type": "nl_command", "seq": 22, "text": "开到那边去"}
-        replies1 = _handle_nl_command(
+        _handle_nl_command(
             msg1, vehicle, empty_grid, navigation,
             time.time(), time.monotonic(),
             nl_client, schema_v, semantic_v,
@@ -1169,7 +1169,7 @@ class TestFullPipeline:
 
         # Second: provide real command (from CONFIRMING, a new nl_command is allowed)
         msg2 = {"type": "nl_command", "seq": 23, "text": "去坐标 (30, 40)"}
-        replies2 = _handle_nl_command(
+        _handle_nl_command(
             msg2, vehicle, empty_grid, navigation,
             time.time(), time.monotonic(),
             nl_client, schema_v, semantic_v,
