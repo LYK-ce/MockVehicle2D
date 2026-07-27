@@ -26,7 +26,7 @@ from mockvehicle2d.local_state import (
 )
 from mockvehicle2d.map_grid import MapGrid
 from mockvehicle2d.navigation import GotoController
-from mockvehicle2d.scan import LaserPoint, ScanConfig
+from mockvehicle2d.scan import LaserPoint, ScanConfig, scan_grid
 from mockvehicle2d.server import (
     VehicleRuntime,
     handle_command_message,
@@ -109,6 +109,27 @@ class ObservedGridTest(unittest.TestCase):
         self.assertEqual(delta.anchor_id, self.anchor.anchor_id)
         self.assertEqual({cell.state for cell in delta.changed_cells}, {FREE, OCCUPIED})
 
+    def test_quantized_hit_is_assigned_to_the_wall_cell_not_the_nearer_cell(self) -> None:
+        truth = MapGrid.from_wall_set(8, 4, {(4, 1)})
+        pose = PoseEstimate(
+            "vehicle-1",
+            1.496,
+            1.5,
+            0.0,
+            (0.0, 0.0, 0.0),
+            "nominal",
+            1.0,
+            1,
+        )
+        point = scan_grid(truth, pose.x_m, pose.y_m, pose.yaw_rad, self.config)[0]
+        observed = ObservedGrid(self.anchor)
+
+        observed.integrate_scan((point,), pose, 2.0, self.config)
+
+        self.assertAlmostEqual(point.range, 2.504)
+        self.assertEqual(observed.get_cell(3, 1), FREE)
+        self.assertEqual(observed.get_cell(4, 1), OCCUPIED)
+
     def test_hit_on_grid_boundary_uses_cell_entered_by_ray(self) -> None:
         cases = (
             ("negative x", (1.5, 0.5, 0.0), math.pi, 0.5, (0, 0), (1, 0)),
@@ -181,7 +202,34 @@ class ObservedGridTest(unittest.TestCase):
             self.config,
         )
 
+        self.assertEqual(grid.get_cell(2, 0), FORBIDDEN)
         self.assertEqual(grid.get_cell(3, 0), FORBIDDEN)
+
+    def test_non_boundary_edge_evidence_marks_one_cell_and_repeats_stably(self) -> None:
+        grid = ObservedGrid(self.anchor, resolution_m=1.0)
+        first = grid.integrate_scan(
+            [LaserPoint(0.0, 0.0, 0.0)],
+            self.pose,
+            2.0,
+            self.config,
+            forbidden_points_vehicle_m=((2.25, 0.25),),
+        )
+        second = grid.integrate_scan(
+            [LaserPoint(0.0, 0.0, 0.0)],
+            self.pose,
+            3.0,
+            self.config,
+            forbidden_points_vehicle_m=((2.25, 0.25),),
+        )
+
+        forbidden = {
+            (cell["gx"], cell["gy"])
+            for cell in grid.snapshot()["cells"]
+            if cell["state"] == FORBIDDEN
+        }
+        self.assertEqual(forbidden, {(2, 0)})
+        self.assertTrue(first.changed_cells)
+        self.assertEqual(second.changed_cells, ())
 
     def test_revision_changes_only_when_cells_change_and_snapshot_is_stable(self) -> None:
         grid = ObservedGrid(self.anchor, resolution_m=1.0)
@@ -308,6 +356,32 @@ class RuntimeIntegrationTest(unittest.TestCase):
             ("blocked", "localization_lost"),
         )
         self.assertEqual(runtime.vehicle.body_velocities(), (0.0, 0.0))
+
+    def test_default_noiseless_scan_never_marks_a_truth_free_hit_occupied(self) -> None:
+        runtime = VehicleRuntime.create(
+            started_at=0.0,
+            timestamp=0.0,
+            anchor=self.anchor,
+            odometry_config=OdometryConfig(),
+        )
+
+        runtime.update(1 / 6, 1 / 6)
+
+        occupied = {
+            (cell["gx"], cell["gy"])
+            for cell in runtime.local_state.local_map.snapshot()["cells"]
+            if cell["state"] == OCCUPIED
+        }
+        self.assertTrue(occupied)
+        false_hits = {
+            (gx, gy)
+            for gx, gy in occupied
+            if not runtime.grid.is_wall(
+                gx + int(self.anchor.global_x_m),
+                gy + int(self.anchor.global_y_m),
+            )
+        }
+        self.assertFalse(false_hits, false_hits)
 
     def test_pose_uses_anchor_estimate_and_never_labels_truth(self) -> None:
         self.state.update_from_truth(11.0, 10.0, 0.0, timestamp=1.0)

@@ -12,8 +12,17 @@ import pytest
 REPO_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO_ROOT / "src"))
 
-from mockvehicle2d.local_state import AnchorSpec, FREE, MapCellUpdate, OCCUPIED, ObservedGrid
-from mockvehicle2d.pathfinding.d_star_lite import DStarLitePlanner
+from mockvehicle2d.collision import is_swept_circle_passable
+from mockvehicle2d.local_state import (
+    AnchorSpec,
+    FORBIDDEN,
+    FREE,
+    MapCellUpdate,
+    OCCUPIED,
+    ObservedGrid,
+)
+from mockvehicle2d.map_grid import MapGrid
+from mockvehicle2d.pathfinding.d_star_lite import DStarLitePlanner, _key_less
 
 
 ANCHOR = AnchorSpec("planner-test", 0.0, 0.0, 0.0)
@@ -107,10 +116,117 @@ def test_vehicle_radius_inflates_obstacles() -> None:
     assert all(max(abs(x - 3), abs(y - 1)) > 1 for x, y in path)
 
 
+def test_vehicle_radius_uses_circle_geometry_at_touching_cell_boundary() -> None:
+    search = DStarLitePlanner(
+        ObservedGrid(ANCHOR),
+        vehicle_radius_m=0.5,
+        bounds_margin_m=2.0,
+    )
+
+    path = search.plan(
+        (-2, 0),
+        (0, 0),
+        changed_cells=(MapCellUpdate(1, 0, OCCUPIED),),
+    )
+
+    assert path is not None and path[-1] == (0, 0)
+
+
+def test_exact_off_centre_segment_can_recentre_before_safe_grid_edge() -> None:
+    search = DStarLitePlanner(
+        ObservedGrid(ANCHOR),
+        vehicle_radius_m=0.5,
+        bounds_margin_m=2.0,
+    )
+    search.plan(
+        (0, 0),
+        (2, 2),
+        changed_cells=(MapCellUpdate(1, -1, OCCUPIED),),
+    )
+
+    assert search.is_segment_passable((0.5, 0.5), (1.5, 1.5))
+    assert not search.is_segment_passable(
+        (0.483010918, 0.054379872),
+        (1.5, 1.5),
+    )
+    assert search.is_segment_passable(
+        (0.483010918, 0.054379872),
+        (0.5, 0.5),
+    )
+
+
+def test_floating_tangency_matches_runtime_but_real_penetration_blocks() -> None:
+    search = DStarLitePlanner(
+        ObservedGrid(ANCHOR),
+        vehicle_radius_m=0.5,
+        bounds_margin_m=2.0,
+    )
+    search.plan(
+        (0, 0),
+        (0, 2),
+        changed_cells=(MapCellUpdate(1, 0, OCCUPIED),),
+    )
+    truth = MapGrid.from_wall_set(4, 4, {(1, 0)})
+    tangent = (0.5 + 7e-15, 0.5, 0.5, 1.5)
+    penetration = (0.51, 0.5, 0.51, 1.5)
+
+    assert search.is_segment_passable(tangent[:2], tangent[2:])
+    assert is_swept_circle_passable(truth, *tangent, 0.5)
+    assert not search.is_segment_passable(penetration[:2], penetration[2:])
+    assert not is_swept_circle_passable(truth, *penetration, 0.5)
+
+
+def test_forbidden_egress_only_allows_immediate_motion_away() -> None:
+    edge = DStarLitePlanner(
+        ObservedGrid(ANCHOR),
+        vehicle_radius_m=0.5,
+        bounds_margin_m=2.0,
+    )
+    edge.plan(
+        (0, 0),
+        (-2, 0),
+        changed_cells=(MapCellUpdate(1, 0, FORBIDDEN),),
+    )
+    source = (0.75, 0.5)
+
+    assert not edge._segment_blocked(
+        source,
+        (0.5, 0.5),
+        allow_forbidden_egress=True,
+    )
+    assert edge._segment_blocked(
+        source,
+        (0.9, 0.5),
+        allow_forbidden_egress=True,
+    )
+    assert edge._segment_blocked(
+        source,
+        (0.75, 1.5),
+        allow_forbidden_egress=True,
+    )
+
+    wall = DStarLitePlanner(
+        ObservedGrid(ANCHOR),
+        vehicle_radius_m=0.5,
+        bounds_margin_m=2.0,
+    )
+    wall.plan(
+        (0, 0),
+        (-2, 0),
+        changed_cells=(MapCellUpdate(1, 0, OCCUPIED),),
+    )
+    assert wall._segment_blocked(
+        source,
+        (0.5, 0.5),
+        allow_forbidden_egress=True,
+    )
+
+
 def test_no_route_returns_none() -> None:
     search = planner(bounds_margin_m=0.0)
     wall = tuple(MapCellUpdate(2, y, OCCUPIED) for y in range(0, 4))
     assert search.plan((0, 0), (4, 3), changed_cells=wall) is None
+    assert search.last_failure == "search_exhausted"
 
 
 @pytest.mark.parametrize("blocked", [(0, 0), (4, 0)])
@@ -121,6 +237,19 @@ def test_occupied_start_or_goal_returns_none(blocked: tuple[int, int]) -> None:
         (4, 0),
         changed_cells=(MapCellUpdate(*blocked, OCCUPIED),),
     ) is None
+    assert search.last_failure == (
+        "start_blocked" if blocked == (0, 0) else "goal_blocked"
+    )
+
+
+def test_finite_search_without_extractable_path_is_classified(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    search = planner()
+    monkeypatch.setattr(search, "_extract_path", lambda: None)
+
+    assert search.plan((0, 0), (4, 0)) is None
+    assert search.last_failure == "path_extraction"
 
 
 def test_blocked_start_equals_goal_returns_none_but_free_returns_singleton() -> None:
@@ -253,3 +382,24 @@ def test_local_change_expands_less_state_than_a_fresh_long_route() -> None:
 
     assert incremental.stats["resets"] == 1
     assert incremental_expansions < fresh.stats["expansions"]
+
+
+def test_near_equal_key_keeps_lexicographic_second_component_order() -> None:
+    lower_second = (57.154328932550705, 46.42640687119285)
+    higher_second = (57.154328932550684, 55.154328932550705)
+
+    assert lower_second > higher_second
+    assert _key_less(lower_second, higher_second)
+
+
+def test_long_start_movement_reuses_one_search_and_accumulates_key_modifier() -> None:
+    search = planner(bounds_margin_m=6.0)
+
+    for start_x in range(41):
+        path = search.plan((start_x, 0), (80, 0))
+        assert path is not None
+        assert path[0] == (start_x, 0)
+        assert path[-1] == (80, 0)
+
+    assert search.stats["resets"] == 1
+    assert search.stats["key_modifier_cost"] == pytest.approx(40.0)

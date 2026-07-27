@@ -5,7 +5,6 @@ from __future__ import annotations
 import math
 from typing import TYPE_CHECKING
 
-from mockvehicle2d.local_state import FORBIDDEN
 from mockvehicle2d.map_grid import MapGrid
 from mockvehicle2d.pathfinding.d_star_lite import DStarLitePlanner
 from mockvehicle2d.safety import LocalSafetyRuntime, SafetyAdvanceResult
@@ -35,6 +34,7 @@ class GotoController:
         self.yaw_goal_rad: float | None = None
         self.reported_yaw_goal_rad: float | None = None
         self.reason: str | None = None
+        self.detail: str | None = None
         self._planner: DStarLitePlanner | None = None
         self._path: list[tuple[int, int]] = []
         self._path_revision = 0
@@ -63,6 +63,7 @@ class GotoController:
         self.reported_yaw_goal_rad = None
         self.status = "active"
         self.reason = None
+        self.detail = None
         self._planner = None
         self._path = []
         self._path_revision = 0
@@ -100,6 +101,7 @@ class GotoController:
         )
         self.status = "active"
         self.reason = None
+        self.detail = None
         self._planner = None
         self._path = []
         self._path_revision = 0
@@ -110,6 +112,7 @@ class GotoController:
         if self.status == "active":
             self.status = "cancelled"
             self.reason = reason
+            self.detail = None
 
     def block_for_localization_loss(
         self, vehicle: Vehicle, pose: PoseEstimate, now: float | None = None
@@ -119,6 +122,7 @@ class GotoController:
         vehicle.stop(now)
         self.status = "blocked"
         self.reason = "localization_lost"
+        self.detail = None
         return True
 
     def snapshot(self) -> dict[str, object]:
@@ -135,6 +139,7 @@ class GotoController:
             "mode": self.mode,
             "goal": goal,
             "reason": self.reason,
+            "detail": self.detail,
         }
         if self._planner is None:
             return snapshot
@@ -196,6 +201,7 @@ class GotoController:
             vehicle.stop(now)
             self.status = "blocked"
             self.reason = "local_state_unavailable"
+            self.detail = None
             return
         if was_active:
             assert pose is not None
@@ -216,6 +222,7 @@ class GotoController:
         if collided:
             self.status = "blocked"
             self.reason = "collision"
+            self.detail = None
             vehicle.stop()
             return
         if safety_stop is not None and not (
@@ -224,15 +231,16 @@ class GotoController:
                 safety_stop == "safety_obstacle"
                 or (
                     safety_stop == "safety_edge"
-                    and map_delta is not None
-                    and any(
-                        cell.state == FORBIDDEN for cell in map_delta.changed_cells
-                    )
+                    and safety is not None
+                    and pose is not None
+                    and local_map is not None
+                    and _edge_evidence_is_mapped(safety, pose, local_map)
                 )
             )
         ):
             self.status = "blocked"
             self.reason = safety_stop
+            self.detail = None
             vehicle.stop()
             return
 
@@ -242,6 +250,7 @@ class GotoController:
             if abs(yaw_error) <= self.yaw_tolerance_rad:
                 self.status = "reached"
                 self.reason = "yaw_tolerance"
+                self.detail = None
                 vehicle.stop()
                 return
             angular_rps = max(
@@ -255,6 +264,7 @@ class GotoController:
                 if decision.state in {"stopped", "fault"}:
                     self.status = "blocked"
                     self.reason = decision.reason
+                    self.detail = None
                     vehicle.stop()
                     return
                 angular_rps = decision.angular_rps
@@ -283,6 +293,7 @@ class GotoController:
         if distance <= self.goal_tolerance_m:
             self.status = "reached"
             self.reason = "goal_tolerance"
+            self.detail = None
             vehicle.stop()
             return
 
@@ -292,6 +303,22 @@ class GotoController:
             target_cell = self._path[1]
             target_x = (target_cell[0] + 0.5) * local_map.resolution_m
             target_y = (target_cell[1] + 0.5) * local_map.resolution_m
+            if not self._planner.is_segment_passable(
+                (x_m, y_m), (target_x, target_y)
+            ):
+                target_cell = self._planner.best_start_connection(
+                    (x_m, y_m),
+                    self._path[0],
+                )
+                if target_cell is None:
+                    self.status = "blocked"
+                    self.reason = "no_path"
+                    self.detail = "start_connection_unsafe"
+                    self._current_waypoint = None
+                    vehicle.stop()
+                    return
+                target_x = (target_cell[0] + 0.5) * local_map.resolution_m
+                target_y = (target_cell[1] + 0.5) * local_map.resolution_m
         self._current_waypoint = target_x, target_y
         target_distance = math.hypot(target_x - x_m, target_y - y_m)
         desired_yaw = math.atan2(target_y - y_m, target_x - x_m)
@@ -316,15 +343,28 @@ class GotoController:
                 vehicle, grid, linear_mps, angular_rps, automatic=True
             )
             if decision.state in {"stopped", "fault"}:
+                vehicle.stop()
+                if (
+                    decision.reason == "safety_edge"
+                    and safety.observation.edge_point_vehicle_m is not None
+                    and map_delta is not None
+                    and _edge_evidence_is_mapped(safety, pose, local_map)
+                ):
+                    return
                 self.status = "blocked"
                 self.reason = decision.reason
-                vehicle.stop()
+                self.detail = None
                 return
             linear_mps, angular_rps = decision.linear_mps, decision.angular_rps
         vehicle.install_drive(linear_mps, angular_rps, now)
 
     def _set_path(self, path: list[tuple[int, int]] | None) -> None:
         new_path = [] if path is None else path
+        self.detail = (
+            None
+            if path is not None or self._planner is None
+            else self._planner.last_failure
+        )
         if new_path != self._path:
             self._path = new_path
             self._path_revision += 1
@@ -348,3 +388,20 @@ class GotoController:
 
 def _wrap_angle(angle_rad: float) -> float:
     return math.atan2(math.sin(angle_rad), math.cos(angle_rad))
+
+
+def _edge_evidence_is_mapped(
+    safety: LocalSafetyRuntime,
+    pose: PoseEstimate,
+    local_map: ObservedGrid,
+) -> bool:
+    point = safety.observation.edge_point_vehicle_m
+    if point is None:
+        return False
+    cosine, sine = math.cos(pose.yaw_rad), math.sin(pose.yaw_rad)
+    x_m = pose.x_m + cosine * point[0] - sine * point[1]
+    y_m = pose.y_m + sine * point[0] + cosine * point[1]
+    return local_map.is_forbidden(
+        math.floor(x_m / local_map.resolution_m),
+        math.floor(y_m / local_map.resolution_m),
+    )

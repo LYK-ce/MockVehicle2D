@@ -395,6 +395,7 @@ def handle_command_message(
             if local_state is not None and local_state.pose.quality == "lost":
                 navigation.status = "blocked"
                 navigation.reason = "localization_lost"
+                navigation.detail = None
             elif local_state is None:
                 raise CommandMessageError(
                     "goto_unavailable",
@@ -419,9 +420,11 @@ def handle_command_message(
             if navigation.status == "active" and handoff_collided:
                 navigation.status = "blocked"
                 navigation.reason = "collision"
+                navigation.detail = None
             elif navigation.status == "active" and handoff_safety_stop is not None:
                 navigation.status = "blocked"
                 navigation.reason = handoff_safety_stop
+                navigation.detail = None
             accepted = navigation.status == "active"
             reply = {
                 "type": "goto_ack",
@@ -432,6 +435,8 @@ def handle_command_message(
             }
             if not accepted:
                 reply["reason"] = navigation.reason
+                if navigation.detail is not None:
+                    reply["detail"] = navigation.detail
             return reply
         if message.get("type") == "drive":
             linear_mps, angular_rps, seq = _parse_drive_object(
@@ -493,6 +498,59 @@ def _estimated_global_pose(
     )
 
 
+def _log_navigation_transition(
+    runtime: VehicleRuntime,
+    previous: tuple[object, ...] | None,
+) -> tuple[object, ...]:
+    navigation = runtime.navigation
+    snapshot = navigation.snapshot()
+    key = (
+        snapshot["status"],
+        snapshot["reason"],
+        snapshot["detail"],
+        json.dumps(snapshot["goal"], sort_keys=True),
+    )
+    if key == previous or (previous is None and snapshot["status"] == "idle"):
+        return key
+
+    pose = runtime.local_state.pose
+    resolution_m = runtime.local_state.local_map.resolution_m
+    global_x_m, global_y_m, global_yaw_rad = _estimated_global_pose(
+        runtime.local_state
+    )
+    local_goal_cell = (
+        None
+        if navigation.goal is None
+        else {
+            "gx": math.floor(navigation.goal[0] / resolution_m),
+            "gy": math.floor(navigation.goal[1] / resolution_m),
+        }
+    )
+    event = {
+        "status": snapshot["status"],
+        "reason": snapshot["reason"],
+        "detail": snapshot["detail"],
+        "global_pose": {
+            "x_m": global_x_m,
+            "y_m": global_y_m,
+            "yaw_rad": global_yaw_rad,
+        },
+        "global_goal": snapshot["goal"],
+        "local_start_cell": {
+            "gx": math.floor(pose.x_m / resolution_m),
+            "gy": math.floor(pose.y_m / resolution_m),
+        },
+        "local_goal_cell": local_goal_cell,
+        "map_revision": runtime.local_state.local_map.revision,
+        "replan_count": snapshot.get("replan_count", 0),
+    }
+    print(
+        "[navigation] "
+        + json.dumps(event, ensure_ascii=False, separators=(",", ":"), sort_keys=True)
+    )
+    return key
+
+
 def _start_estimated_goto(
     navigation: GotoController,
     vehicle: Vehicle,
@@ -503,6 +561,7 @@ def _start_estimated_goto(
     if local_state.pose.quality == "lost":
         navigation.status = "blocked"
         navigation.reason = "localization_lost"
+        navigation.detail = None
         return
     local_x_m, local_y_m, _ = local_state.anchor.global_to_anchor(x_m, y_m)
     try:
@@ -517,6 +576,7 @@ def _start_estimated_goto(
     except ValueError as error:
         navigation.status = "blocked"
         navigation.reason = f"invalid_goal: {error}"
+        navigation.detail = None
 
 
 def _start_estimated_rotation(
@@ -527,6 +587,7 @@ def _start_estimated_rotation(
     if local_state.pose.quality == "lost":
         navigation.status = "blocked"
         navigation.reason = "localization_lost"
+        navigation.detail = None
         return
     target_yaw_rad = math.atan2(
         math.sin(local_state.pose.yaw_rad + delta_yaw_rad),
@@ -1045,7 +1106,12 @@ def telemetry_messages(
         nav_snapshot = navigation.snapshot()
     else:
         control_mode = "manual"
-        nav_snapshot = {"status": "idle", "goal": None, "reason": None}
+        nav_snapshot = {
+            "status": "idle",
+            "goal": None,
+            "reason": None,
+            "detail": None,
+        }
     pose = {
         "type": "pose",
         "timestamp_s": timestamp,
@@ -1163,6 +1229,7 @@ async def handler(
         next_deadline = started_at
         active_nl_seq: int | None = None
         last_scan_data: dict[str, object] | None = None
+        last_navigation_log_key: tuple[object, ...] | None = None
 
         if (
             _localization_quality is not None
@@ -1188,6 +1255,9 @@ async def handler(
             if now >= next_deadline:
                 timestamp = _wall_time()
                 frame = runtime.update(now, timestamp)
+                last_navigation_log_key = _log_navigation_transition(
+                    runtime, last_navigation_log_key
+                )
                 pose, scan = telemetry_messages(
                     vehicle,
                     grid,

@@ -17,7 +17,11 @@ class LaserPoint:
     intensity: float
 
     def as_dict(self) -> dict[str, float]:
-        return {"angle": self.angle, "range": self.range, "intensity": self.intensity}
+        return {
+            "angle": self.angle,
+            "range": round(self.range, 2),
+            "intensity": self.intensity,
+        }
 
 
 @dataclass(frozen=True)
@@ -175,7 +179,7 @@ def scan_grid(
         points.append(
             LaserPoint(
                 angle,
-                round(distance, 2) if distance is not None else 0.0,
+                distance if distance is not None else 0.0,
                 1.0 if distance is not None else 0.0,
             )
         )

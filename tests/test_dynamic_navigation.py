@@ -1,5 +1,6 @@
 """Finite-view goto closes scan, local SLAM, D* Lite, and safety in one loop."""
 
+from collections import deque
 import math
 from pathlib import Path
 import sys
@@ -22,6 +23,7 @@ from mockvehicle2d.local_state import (
 )
 from mockvehicle2d.map_grid import MapGrid, VOID
 from mockvehicle2d.navigation import GotoController
+from mockvehicle2d.pathfinding.d_star_lite import DStarLitePlanner
 from mockvehicle2d.safety import LocalSafetyRuntime, SafetyAdvanceResult
 from mockvehicle2d.server import VehicleRuntime
 from mockvehicle2d.vehicle import Vehicle
@@ -33,6 +35,29 @@ def pose(x: float = 0.0, y: float = 0.0, quality: str = "nominal") -> PoseEstima
 
 def delta(*updates: MapCellUpdate, revision: int = 1) -> LocalMapDelta:
     return LocalMapDelta("nav-anchor", revision, 1, 1.0, updates)
+
+
+def reference_reachable(
+    planner: DStarLitePlanner,
+    start: tuple[int, int],
+    goal: tuple[int, int],
+) -> bool:
+    if planner._blocked(start) or planner._blocked(goal):
+        return False
+    frontier = deque((start,))
+    visited = {start}
+    while frontier:
+        current = frontier.popleft()
+        if current == goal:
+            return True
+        for neighbour in planner._neighbours(current):
+            if (
+                neighbour not in visited
+                and math.isfinite(planner._cost(current, neighbour))
+            ):
+                visited.add(neighbour)
+                frontier.append(neighbour)
+    return False
 
 
 def test_goto_plans_through_unknown_then_incrementally_detours() -> None:
@@ -94,6 +119,67 @@ def test_dynamic_obstacle_clear_restores_shorter_path_without_reset() -> None:
 
     assert len(restored) < len(detour)
     assert navigation.snapshot()["planner_stats"]["resets"] == resets
+
+
+def test_unobstructed_off_centre_pose_keeps_the_next_planned_waypoint() -> None:
+    observed = ObservedGrid(AnchorSpec("nav-anchor", 0.0, 0.0, 0.0))
+    navigation = GotoController()
+    vehicle = Vehicle(10.0, 10.0, now=0.0)
+    off_centre = pose(0.1, 0.1)
+    navigation.start(
+        3.0,
+        2.0,
+        local_map=observed,
+        pose=off_centre,
+        vehicle_radius_m=0.5,
+    )
+    next_cell = navigation._path[1]
+    world = MapGrid.from_wall_set(30, 30, set())
+    vehicle.advance(world, 0.1)
+
+    navigation.update(
+        vehicle,
+        world,
+        0.1,
+        pose=off_centre,
+        advance_result=SafetyAdvanceResult(),
+        local_map=observed,
+    )
+
+    assert navigation._current_waypoint == (
+        next_cell[0] + 0.5,
+        next_cell[1] + 0.5,
+    )
+
+
+def test_unsafe_exact_pose_connection_blocks_instead_of_moving_blindly() -> None:
+    observed = ObservedGrid(AnchorSpec("nav-anchor", 0.0, 0.0, 0.0))
+    navigation = GotoController()
+    vehicle = Vehicle(10.0, 10.0, now=0.0)
+    navigation.start(
+        3.0,
+        2.0,
+        local_map=observed,
+        pose=pose(),
+        vehicle_radius_m=0.5,
+    )
+
+    navigation.update(
+        vehicle,
+        MapGrid.from_wall_set(30, 30, set()),
+        0.1,
+        pose=pose(0.9, 0.1),
+        advance_result=SafetyAdvanceResult(),
+        local_map=observed,
+        map_delta=delta(MapCellUpdate(1, -1, OCCUPIED)),
+    )
+
+    assert (
+        navigation.status,
+        navigation.reason,
+        navigation.detail,
+    ) == ("blocked", "no_path", "start_connection_unsafe")
+    assert vehicle.body_velocities() == (0.0, 0.0)
 
 
 def test_lost_pose_blocks_and_does_not_reuse_old_velocity() -> None:
@@ -217,3 +303,58 @@ def test_runtime_maps_a_hidden_drop_and_replans_around_it() -> None:
     assert runtime.navigation.snapshot()["replan_count"] >= 1
     assert runtime.navigation.status == "reached"
     assert math.hypot(runtime.vehicle.x - 12.5, runtime.vehicle.y - 5.5) <= 0.2
+
+
+def test_default_runtime_long_goto_does_not_end_in_no_path() -> None:
+    runtime = VehicleRuntime.create(
+        started_at=0.0,
+        timestamp=0.0,
+        anchor=AnchorSpec("mock_vehicle_01_anchor", 10.0, 10.0, 0.0),
+        odometry_config=OdometryConfig(),
+    )
+    for tick in range(1, 7):
+        runtime.update(tick / 6, tick / 6)
+
+    def drive_to_global(x_m: float, y_m: float) -> None:
+        nonlocal tick
+        local_x_m, local_y_m, _ = runtime.local_state.anchor.global_to_anchor(
+            x_m, y_m
+        )
+        runtime.navigation.start(
+            local_x_m,
+            local_y_m,
+            reported_goal=(x_m, y_m),
+            local_map=runtime.local_state.local_map,
+            pose=runtime.local_state.pose,
+            vehicle_radius_m=runtime.vehicle.radius,
+        )
+        deadline = tick + 1200
+        while runtime.navigation.status == "active" and tick < deadline:
+            tick += 1
+            runtime.update(tick / 6, tick / 6)
+
+        planner = runtime.navigation._planner
+        assert planner is not None
+        start = runtime.navigation._pose_cell(
+            runtime.local_state.pose, runtime.local_state.local_map
+        )
+        goal = runtime.navigation._goal_cell(runtime.local_state.local_map)
+        fresh = DStarLitePlanner(
+            runtime.local_state.local_map,
+            vehicle_radius_m=runtime.vehicle.radius,
+        )
+        differential = (
+            reference_reachable(planner, start, goal),
+            fresh.plan(start, goal) is not None,
+            planner._extract_path() is not None,
+        )
+        assert runtime.navigation.status == "reached", (
+            (x_m, y_m),
+            runtime.navigation.snapshot(),
+            differential,
+        )
+        assert differential == (True, True, True)
+        assert planner.stats["resets"] == 1
+
+    for goal in ((30.0, 30.0), (20.0, 20.0), (22.0, 28.0)):
+        drive_to_global(*goal)

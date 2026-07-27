@@ -6,6 +6,11 @@ import heapq
 import math
 from typing import Iterable
 
+from mockvehicle2d.collision import (
+    cell_overlaps_circle,
+    is_strict_overlap,
+    segment_aabb_distance_squared,
+)
 from mockvehicle2d.local_state import (
     FORBIDDEN,
     FREE,
@@ -19,6 +24,7 @@ from mockvehicle2d.local_state import (
 Cell = tuple[int, int]
 Key = tuple[float, float]
 SQRT_2 = math.sqrt(2)
+EGRESS_PROBE_FRACTION = 1e-6
 MOVES = tuple(
     (dx, dy, SQRT_2 if dx and dy else 1.0)
     for dx in (-1, 0, 1)
@@ -60,7 +66,8 @@ class DStarLitePlanner:
         self._bounds_margin_cells = math.ceil(bounds_margin_m / grid.resolution_m)
         self.max_goal_distance_m = max_goal_distance_m
         self.max_cells = max_cells
-        self._inflation_cells = math.ceil(vehicle_radius_m / grid.resolution_m)
+        self._vehicle_radius_cells = vehicle_radius_m / grid.resolution_m
+        self._inflation_cells = math.ceil(self._vehicle_radius_cells)
         self._states = {
             (cell["gx"], cell["gy"]): cell["state"]
             for cell in grid.snapshot()["cells"]
@@ -78,6 +85,7 @@ class DStarLitePlanner:
         self._incremental_updates = 0
         self._replans = 0
         self._resets = 0
+        self.last_failure: str | None = None
 
     @property
     def stats(self) -> dict[str, float | int]:
@@ -93,6 +101,82 @@ class DStarLitePlanner:
     def bounds(self) -> tuple[int, int, int, int] | None:
         return self._bounds
 
+    def is_segment_passable(
+        self,
+        source_m: tuple[float, float],
+        destination_m: tuple[float, float],
+    ) -> bool:
+        if (
+            not isinstance(source_m, tuple)
+            or len(source_m) != 2
+            or not isinstance(destination_m, tuple)
+            or len(destination_m) != 2
+        ):
+            raise ValueError("segment endpoints must be finite metric pairs")
+        values = (*source_m, *destination_m)
+        if any(
+            isinstance(value, bool)
+            or not isinstance(value, (int, float))
+            or not math.isfinite(value)
+            for value in values
+        ):
+            raise ValueError("segment endpoints must be finite metric pairs")
+        return not self._segment_blocked(
+            (
+                source_m[0] / self.resolution_m,
+                source_m[1] / self.resolution_m,
+            ),
+            (
+                destination_m[0] / self.resolution_m,
+                destination_m[1] / self.resolution_m,
+            ),
+        )
+
+    def best_start_connection(
+        self,
+        source_m: tuple[float, float],
+        current: Cell,
+    ) -> Cell | None:
+        self._validate_cell(current, "current")
+        if self._goal is None or not self._inside(current):
+            return None
+        candidates = (current, *self._neighbours(current))
+        source = (
+            source_m[0] / self.resolution_m,
+            source_m[1] / self.resolution_m,
+        )
+        choices = []
+        for candidate in candidates:
+            if self._blocked(candidate) or math.isinf(self._g_value(candidate)):
+                continue
+            destination = candidate[0] + 0.5, candidate[1] + 0.5
+            if self._segment_blocked(
+                source,
+                destination,
+                allow_forbidden_egress=True,
+            ):
+                continue
+            connector = (
+                math.hypot(
+                    destination[0] - source[0],
+                    destination[1] - source[1],
+                )
+                * self.resolution_m
+                * (
+                    1.0
+                    if self._states.get(candidate, UNKNOWN) == FREE
+                    else self.unknown_cost
+                )
+            )
+            choices.append(
+                (
+                    connector + self._g_value(candidate),
+                    _octile(candidate, self._goal, self.resolution_m),
+                    candidate,
+                )
+            )
+        return None if not choices else min(choices)[2]
+
     def plan(
         self,
         start: Cell,
@@ -102,6 +186,7 @@ class DStarLitePlanner:
     ) -> list[Cell] | None:
         self._validate_cell(start, "start")
         self._validate_cell(goal, "goal")
+        self.last_failure = None
         if math.hypot(goal[0] - start[0], goal[1] - start[1]) * self.resolution_m > (
             self.max_goal_distance_m
         ):
@@ -130,10 +215,21 @@ class DStarLitePlanner:
             if changes:
                 self._apply_changes(changes)
         self._replans += 1
-        if self._blocked(start) or self._blocked(goal):
+        if self._blocked(start):
+            self.last_failure = "start_blocked"
+            return None
+        if self._blocked(goal):
+            self.last_failure = "goal_blocked"
             return None
         self._compute_shortest_path()
-        return self._extract_path()
+        path = self._extract_path()
+        if path is None:
+            self.last_failure = (
+                "search_exhausted"
+                if math.isinf(self._g_value(start))
+                else "path_extraction"
+            )
+        return path
 
     def _reset(self, start: Cell, goal: Cell) -> None:
         margin = self._bounds_margin_cells
@@ -176,7 +272,7 @@ class DStarLitePlanner:
         limit = self._cell_count() * 20
         expansions = 0
         while (
-            self._top_key() < self._calculate_key(self._start)
+            _key_less(self._top_key(), self._calculate_key(self._start))
             or not math.isclose(self._rhs_value(self._start), self._g_value(self._start))
         ):
             popped = self._pop()
@@ -184,7 +280,7 @@ class DStarLitePlanner:
                 break
             old_key, current = popped
             new_key = self._calculate_key(current)
-            if old_key < new_key:
+            if _key_less(old_key, new_key):
                 self._push(current)
             elif self._g_value(current) > self._rhs_value(current):
                 self._g[current] = self._rhs_value(current)
@@ -254,16 +350,132 @@ class DStarLitePlanner:
             or self._blocked((source[0], source[1] + dy))
         ):
             return math.inf
+        if self._segment_blocked(
+            (source[0] + 0.5, source[1] + 0.5),
+            (destination[0] + 0.5, destination[1] + 0.5),
+        ):
+            return math.inf
         step = self.resolution_m * (SQRT_2 if dx and dy else 1.0)
         state = self._states.get(destination, UNKNOWN)
         return step * (1.0 if state == FREE else self.unknown_cost)
+
+    def _segment_blocked(
+        self,
+        source: tuple[float, float],
+        destination: tuple[float, float],
+        *,
+        allow_forbidden_egress: bool = False,
+    ) -> bool:
+        source_x, source_y = source
+        destination_x, destination_y = destination
+        radius = self._vehicle_radius_cells
+        radius_squared = radius**2
+        for gy in range(
+            math.floor(min(source_y, destination_y) - radius),
+            math.floor(max(source_y, destination_y) + radius) + 1,
+        ):
+            for gx in range(
+                math.floor(min(source_x, destination_x) - radius),
+                math.floor(max(source_x, destination_x) + radius) + 1,
+            ):
+                state = self._states.get((gx, gy), UNKNOWN)
+                if state not in {
+                    OCCUPIED,
+                    FORBIDDEN,
+                }:
+                    continue
+                distance_squared = segment_aabb_distance_squared(
+                    source_x,
+                    source_y,
+                    destination_x,
+                    destination_y,
+                    gx,
+                    gy,
+                    gx + 1,
+                    gy + 1,
+                )
+                if is_strict_overlap(distance_squared, radius_squared):
+                    if allow_forbidden_egress and state == FORBIDDEN:
+                        source_distance_squared = segment_aabb_distance_squared(
+                            source_x,
+                            source_y,
+                            source_x,
+                            source_y,
+                            gx,
+                            gy,
+                            gx + 1,
+                            gy + 1,
+                        )
+                        destination_distance_squared = (
+                            segment_aabb_distance_squared(
+                                destination_x,
+                                destination_y,
+                                destination_x,
+                                destination_y,
+                                gx,
+                                gy,
+                                gx + 1,
+                                gy + 1,
+                            )
+                        )
+                        probe_x = source_x + EGRESS_PROBE_FRACTION * (
+                            destination_x - source_x
+                        )
+                        probe_y = source_y + EGRESS_PROBE_FRACTION * (
+                            destination_y - source_y
+                        )
+                        probe_distance_squared = segment_aabb_distance_squared(
+                            probe_x,
+                            probe_y,
+                            probe_x,
+                            probe_y,
+                            gx,
+                            gy,
+                            gx + 1,
+                            gy + 1,
+                        )
+                        if (
+                            math.isclose(
+                                distance_squared,
+                                source_distance_squared,
+                                rel_tol=1e-12,
+                                abs_tol=1e-12,
+                            )
+                            and probe_distance_squared
+                            > source_distance_squared
+                            and not math.isclose(
+                                probe_distance_squared,
+                                source_distance_squared,
+                                rel_tol=1e-12,
+                                abs_tol=1e-12,
+                            )
+                            and destination_distance_squared
+                            > source_distance_squared
+                            and not math.isclose(
+                                destination_distance_squared,
+                                source_distance_squared,
+                                rel_tol=1e-12,
+                                abs_tol=1e-12,
+                            )
+                        ):
+                            continue
+                    return True
+        return False
 
     def _blocked(self, cell: Cell) -> bool:
         if not self._inside(cell):
             return True
         radius = self._inflation_cells
+        centre_x, centre_y = cell[0] + 0.5, cell[1] + 0.5
+        radius_squared = self._vehicle_radius_cells**2
         return any(
             self._states.get((gx, gy), UNKNOWN) in {OCCUPIED, FORBIDDEN}
+            and (
+                (gx, gy) == cell
+                or cell_overlaps_circle(
+                    gx, gy, centre_x, centre_y, radius_squared
+                )
+            )
             for gx in range(cell[0] - radius, cell[0] + radius + 1)
             for gy in range(cell[1] - radius, cell[1] + radius + 1)
         )
@@ -352,3 +564,9 @@ class DStarLitePlanner:
 def _octile(first: Cell, second: Cell, resolution_m: float) -> float:
     dx, dy = abs(first[0] - second[0]), abs(first[1] - second[1])
     return resolution_m * (max(dx, dy) + (SQRT_2 - 1) * min(dx, dy))
+
+
+def _key_less(first: Key, second: Key) -> bool:
+    if not math.isclose(first[0], second[0]):
+        return first[0] < second[0]
+    return not math.isclose(first[1], second[1]) and first[1] < second[1]

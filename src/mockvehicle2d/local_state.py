@@ -584,6 +584,9 @@ class ObservedGrid:
     def is_unknown(self, gx: int, gy: int) -> bool:
         return self.get_cell(gx, gy) == UNKNOWN
 
+    def is_forbidden(self, gx: int, gy: int) -> bool:
+        return self.get_cell(gx, gy) == FORBIDDEN
+
     def occupied_cells(self) -> tuple[tuple[int, int], ...]:
         return tuple(sorted(cell for cell, state in self._cells.items() if state == OCCUPIED))
 
@@ -619,11 +622,12 @@ class ObservedGrid:
             end_x = pose.x_m + distance * direction_x
             end_y = pose.y_m + distance * direction_y
             if hit:
-                if direction_x:
-                    end_x = math.nextafter(end_x, math.copysign(math.inf, direction_x))
-                if direction_y:
-                    end_y = math.nextafter(end_y, math.copysign(math.inf, direction_y))
-            end = self._cell(end_x, end_y)
+                end = (
+                    _hit_axis_cell(end_x, direction_x, self.resolution_m),
+                    _hit_axis_cell(end_y, direction_y, self.resolution_m),
+                )
+            else:
+                end = self._cell(end_x, end_y)
             ray = tuple(_bresenham(*start, *end))
             for cell in ray[:-1] if hit else ray:
                 updates.setdefault(cell, FREE)
@@ -639,12 +643,11 @@ class ObservedGrid:
             ):
                 raise ValueError("forbidden evidence must be finite vehicle-frame points")
             vehicle_x, vehicle_y = point
-            updates[
-                self._cell(
-                    pose.x_m + cosine * vehicle_x - sine * vehicle_y,
-                    pose.y_m + sine * vehicle_x + cosine * vehicle_y,
-                )
-            ] = FORBIDDEN
+            evidence_x = pose.x_m + cosine * vehicle_x - sine * vehicle_y
+            evidence_y = pose.y_m + sine * vehicle_x + cosine * vehicle_y
+            for gx in _axis_cells_at_point(evidence_x, self.resolution_m):
+                for gy in _axis_cells_at_point(evidence_y, self.resolution_m):
+                    updates[gx, gy] = FORBIDDEN
 
         updates = {
             cell: state
@@ -701,6 +704,44 @@ def _bresenham(x0: int, y0: int, x1: int, y1: int):
         if doubled <= dx:
             error += dx
             y0 += sy
+
+
+def _hit_axis_cell(
+    coordinate_m: float,
+    direction: float,
+    resolution_m: float,
+) -> int:
+    coordinate_cells = coordinate_m / resolution_m
+    nearest_boundary = round(coordinate_cells)
+    if math.isclose(
+        coordinate_cells,
+        nearest_boundary,
+        rel_tol=0.0,
+        abs_tol=1e-12,
+    ):
+        coordinate_cells = float(nearest_boundary)
+    if direction:
+        coordinate_cells = math.nextafter(
+            coordinate_cells,
+            math.copysign(math.inf, direction),
+        )
+    return math.floor(coordinate_cells)
+
+
+def _axis_cells_at_point(
+    coordinate_m: float,
+    resolution_m: float,
+) -> tuple[int, ...]:
+    coordinate_cells = coordinate_m / resolution_m
+    nearest_boundary = round(coordinate_cells)
+    if math.isclose(
+        coordinate_cells,
+        nearest_boundary,
+        rel_tol=0.0,
+        abs_tol=1e-12,
+    ):
+        return nearest_boundary - 1, nearest_boundary
+    return (math.floor(coordinate_cells),)
 
 
 class AnchoredLocalState:

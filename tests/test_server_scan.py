@@ -17,8 +17,10 @@ from mockvehicle2d.cli.main import _port
 from mockvehicle2d.collision import is_circle_passable
 from mockvehicle2d.map_grid import MapGrid
 from mockvehicle2d.scan import scan_message
-from mockvehicle2d.local_state import AnchorSpec
+from mockvehicle2d.local_state import AnchorSpec, OdometryConfig
 from mockvehicle2d.server import (
+    VehicleRuntime,
+    _log_navigation_transition,
     _map_metadata,
     _next_deadline,
     generate_map,
@@ -241,6 +243,50 @@ class ScanMessageTest(unittest.TestCase):
             [message["type"] for message in websocket.messages],
             ["hello", "pose", "scan", "pose", "scan"],
         )
+
+    def test_navigation_log_emits_each_active_terminal_transition_once(self) -> None:
+        def log_flow(status: str, reason: str, detail: str | None) -> None:
+            runtime = VehicleRuntime.create(
+                started_at=0.0,
+                timestamp=0.0,
+                anchor=AnchorSpec("log-anchor", 10.0, 10.0, 0.0),
+                odometry_config=OdometryConfig(),
+            )
+            previous = _log_navigation_transition(runtime, None)
+            runtime.navigation.start(
+                3.0,
+                2.0,
+                reported_goal=(13.0, 12.0),
+                local_map=runtime.local_state.local_map,
+                pose=runtime.local_state.pose,
+                vehicle_radius_m=runtime.vehicle.radius,
+            )
+            previous = _log_navigation_transition(runtime, previous)
+            previous = _log_navigation_transition(runtime, previous)
+            runtime.navigation.status = status
+            runtime.navigation.reason = reason
+            runtime.navigation.detail = detail
+            previous = _log_navigation_transition(runtime, previous)
+            _log_navigation_transition(runtime, previous)
+
+        with patch("builtins.print") as output:
+            log_flow("reached", "goal_tolerance", None)
+            log_flow("blocked", "no_path", "search_exhausted")
+
+        events = [
+            json.loads(call.args[0].removeprefix("[navigation] "))
+            for call in output.call_args_list
+        ]
+        self.assertEqual(
+            [event["status"] for event in events],
+            ["active", "reached", "active", "blocked"],
+        )
+        self.assertEqual(events[-1]["detail"], "search_exhausted")
+        self.assertEqual(events[-1]["global_goal"], {"x_m": 13.0, "y_m": 12.0})
+        self.assertEqual(events[-1]["local_start_cell"], {"gx": 0, "gy": 0})
+        self.assertEqual(events[-1]["local_goal_cell"], {"gx": 3, "gy": 2})
+        self.assertEqual(events[-1]["map_revision"], 0)
+        self.assertEqual(events[-1]["replan_count"], 0)
 
 
 def main() -> int:
