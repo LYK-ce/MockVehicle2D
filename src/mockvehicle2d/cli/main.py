@@ -212,10 +212,10 @@ def _cmd_nl(args):
         print("error: missing NL text (use --interactive or provide text argument)")
         sys.exit(1)
 
-    if args.vllm:
+    if args.llm:
         import asyncio
-        from mockvehicle2d.instruction.llm_client import VLLMClient
-        client = VLLMClient(model=args.model, schema_validator=schema_v)
+        from mockvehicle2d.instruction.llm_client import LLMClient
+        client = LLMClient(model=args.model, schema_validator=schema_v)
         instruction = asyncio.run(client.parse(text))
     else:
         client = FakeModelClient()
@@ -344,10 +344,10 @@ def main():
                         help="Path to evaluation dataset JSON")
     nl_cmd.add_argument("--fake", action="store_true", default=True,
                         help="Use FakeModelClient (default)")
-    nl_cmd.add_argument("--vllm", action="store_true",
-                        help="Use VLLMClient (requires local vLLM)")
+    nl_cmd.add_argument("--llm", action="store_true",
+                        help="Use LLMClient (requires local llama.cpp server)")
     nl_cmd.add_argument("--model", type=str, default="Qwen3-8B-Q4_K_M", metavar="MODEL",
-                        help="Model name for VLLMClient (default: Qwen3-8B-Q4_K_M)")
+                        help="Model name for LLMClient (default: Qwen3-8B-Q4_K_M)")
 
     args = parser.parse_args()
 

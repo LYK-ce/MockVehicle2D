@@ -33,9 +33,9 @@ mockvehicle2d nl "前进 3 米"
 mockvehicle2d nl "左转 90 度"
 mockvehicle2d nl --interactive
 
-# 自然语言指令（LLM 模式 - 需要本地 vLLM/llama.cpp server）
-mockvehicle2d nl --vllm "去坐标 (100, 200)"
-mockvehicle2d nl --vllm --model Qwen3-14B-Q4_K_M "前面有什么"
+# 自然语言指令（LLM 模式 - 需要本地 llama.cpp server）
+mockvehicle2d nl --llm "去坐标 (100, 200)"
+mockvehicle2d nl --llm --model Qwen3-14B-Q4_K_M "前面有什么"
 
 # 离线评测
 mockvehicle2d nl --eval
@@ -57,7 +57,7 @@ MockVehicle2D/
 │   ├── cli/                ← 统一 CLI 入口 (argparse)
 │   │   └── main.py
 │   ├── instruction/        ← NL→JSON 自然语言指令系统
-│   │   ├── llm_client.py   ← FakeModelClient + VLLMClient (Qwen via llama.cpp)
+│   │   ├── llm_client.py   ← FakeModelClient + LLMClient (Qwen via llama.cpp)
 │   │   ├── validator.py    ← 三层校验：Schema → 语义 → 安全
 │   │   ├── state_machine.py← 11 状态指令生命周期
 │   │   ├── compiler.py     ← JSON 指令 → 可执行任务
@@ -158,7 +158,7 @@ AABB vs Circle 圆形碰撞
 ┌──────────────────────────┐
 │ LLM Client               │
 │ FakeModelClient (regex)  │  ← 离线模式，确定性，零依赖
-│ VLLMClient (Qwen 8B/14B) │  ← LLM 模式，需要 llama.cpp server
+│ LLMClient (Qwen 8B/14B) │  ← LLM 模式，需要 llama.cpp server
 └──────────┬───────────────┘
            │
            ▼
@@ -202,16 +202,16 @@ AABB vs Circle 圆形碰撞
 | 模式 | 客户端 | 命令 | 说明 |
 |------|--------|------|------|
 | **离线** | `FakeModelClient` | `mockvehicle2d nl` | 正则匹配，确定性，零外部依赖 |
-| **LLM** | `VLLMClient` | `mockvehicle2d nl --vllm` | 需要本地 llama.cpp server（`localhost:8000`） |
+| **LLM** | `LLMClient` | `mockvehicle2d nl --llm` | 需要本地 llama.cpp server（`localhost:8000`） |
 
 ### LLM 配置
 
 ```bash
 # 默认 Qwen3-8B (8-bit 量化)
-mockvehicle2d nl --vllm "去坐标 (100, 200)"
+mockvehicle2d nl --llm "去坐标 (100, 200)"
 
 # 切换到 Qwen3-14B
-mockvehicle2d nl --vllm --model Qwen3-14B-Q4_K_M "去坐标 (100, 200)"
+mockvehicle2d nl --llm --model Qwen3-14B-Q4_K_M "去坐标 (100, 200)"
 ```
 
 ### JSON Schema v2（最小化设计）

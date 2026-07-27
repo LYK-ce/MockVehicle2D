@@ -1,7 +1,7 @@
 """LLM clients for natural language instruction parsing.
 
 FakeModelClient — rule-based deterministic parser for offline testing
-VLLMClient      — async client for local vLLM (OpenAI-compatible API)
+LLMClient       — async client for llama.cpp server (OpenAI-compatible API)
 """
 
 from __future__ import annotations
@@ -153,8 +153,8 @@ _SYSTEM_PROMPT = """你是一个车辆指令解析器。将用户的自然语言
 只输出 JSON，不要输出任何其他内容。"""
 
 
-class VLLMClient:
-    """Async client for LLM inference (llama.cpp / vLLM OpenAI-compatible API).
+class LLMClient:
+    """Async client for llama.cpp LLM inference (OpenAI-compatible API).
 
     Parameters
     ----------
