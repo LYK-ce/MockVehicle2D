@@ -105,6 +105,8 @@ class DStarLitePlanner:
         self,
         source_m: tuple[float, float],
         destination_m: tuple[float, float],
+        *,
+        extra_clearance_m: float = 0.0,
     ) -> bool:
         if (
             not isinstance(source_m, tuple)
@@ -113,14 +115,17 @@ class DStarLitePlanner:
             or len(destination_m) != 2
         ):
             raise ValueError("segment endpoints must be finite metric pairs")
-        values = (*source_m, *destination_m)
+        values = (*source_m, *destination_m, extra_clearance_m)
         if any(
             isinstance(value, bool)
             or not isinstance(value, (int, float))
             or not math.isfinite(value)
             for value in values
-        ):
-            raise ValueError("segment endpoints must be finite metric pairs")
+        ) or extra_clearance_m < 0:
+            raise ValueError(
+                "segment endpoints and clearance must be finite; "
+                "clearance cannot be negative"
+            )
         return not self._segment_blocked(
             (
                 source_m[0] / self.resolution_m,
@@ -130,6 +135,10 @@ class DStarLitePlanner:
                 destination_m[0] / self.resolution_m,
                 destination_m[1] / self.resolution_m,
             ),
+            radius_cells=(
+                self.vehicle_radius_m + extra_clearance_m
+            ) / self.resolution_m,
+            block_tangent=extra_clearance_m > 0,
         )
 
     def best_start_connection(
@@ -365,10 +374,16 @@ class DStarLitePlanner:
         destination: tuple[float, float],
         *,
         allow_forbidden_egress: bool = False,
+        radius_cells: float | None = None,
+        block_tangent: bool = False,
     ) -> bool:
         source_x, source_y = source
         destination_x, destination_y = destination
-        radius = self._vehicle_radius_cells
+        radius = (
+            self._vehicle_radius_cells
+            if radius_cells is None
+            else radius_cells
+        )
         radius_squared = radius**2
         for gy in range(
             math.floor(min(source_y, destination_y) - radius),
@@ -394,7 +409,17 @@ class DStarLitePlanner:
                     gx + 1,
                     gy + 1,
                 )
-                if is_strict_overlap(distance_squared, radius_squared):
+                if is_strict_overlap(
+                    distance_squared, radius_squared
+                ) or (
+                    block_tangent
+                    and math.isclose(
+                        distance_squared,
+                        radius_squared,
+                        rel_tol=1e-12,
+                        abs_tol=1e-12,
+                    )
+                ):
                     if allow_forbidden_egress and state == FORBIDDEN:
                         source_distance_squared = segment_aabb_distance_squared(
                             source_x,

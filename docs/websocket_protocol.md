@@ -316,6 +316,9 @@ D* Lite 在有限规划窗中经过高代价 Unknown、避开按车体半径膨�
 `lost` 时 `goto_ack.accepted=false` 或活动任务变为 `blocked`，原因为
 `localization_lost`；未结算的旧自动运动不会再积分，但新的人工 `cmd` / `drive` 仍可接管。
 安全硬停止或安全输入故障也会立即停车。
+目标最初为 Unknown 时仍可接受并探索；一旦本地观测确认目标位置无法容纳车体及
+`0.25 m` 硬安全净空，任务立即停车并转为
+`blocked`（`reason=no_path`、`detail=goal_blocked`）。
 
 新的 `goto` 会替换旧目标。任何 `cmd` 或 `drive`（包括 `stop`），以及任何非法输入，都会永久取消当前目标；除非客户端重新发送 `goto`，否则不会恢复自动行驶。连接断开也会停车并取消活动目标。
 

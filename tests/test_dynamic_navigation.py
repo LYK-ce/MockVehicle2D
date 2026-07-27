@@ -305,6 +305,49 @@ def test_runtime_maps_a_hidden_drop_and_replans_around_it() -> None:
     assert math.hypot(runtime.vehicle.x - 12.5, runtime.vehicle.y - 5.5) <= 0.2
 
 
+def test_runtime_blocks_goal_when_observed_obstacle_makes_arrival_unsafe() -> None:
+    world = MapGrid.from_wall_set(16, 12, {(8, 5)})
+    vehicle = Vehicle(2.5, 5.5, radius=0.5, command_timeout=1.0, now=0.0)
+    anchor = AnchorSpec("nav-anchor", vehicle.x, vehicle.y, 0.0)
+    runtime = VehicleRuntime(
+        [],
+        world,
+        vehicle,
+        GotoController(),
+        LocalSafetyRuntime(),
+        AnchoredLocalState(
+            anchor,
+            truth_x_m=vehicle.x,
+            truth_y_m=vehicle.y,
+            truth_yaw_rad=vehicle.yaw,
+            timestamp=0.0,
+        ),
+    )
+    goal = (7.0, 0.5)
+    assert runtime.local_state.local_map.is_unknown(7, 0)
+    runtime.navigation.start(
+        *goal,
+        reported_goal=(9.5, 6.0),
+        local_map=runtime.local_state.local_map,
+        pose=runtime.local_state.pose,
+        vehicle_radius_m=vehicle.radius,
+    )
+    assert runtime.navigation.status == "active"
+
+    for tick in range(1, 121):
+        runtime.update(tick / 6, tick / 6)
+        if runtime.navigation.status != "active":
+            break
+    assert runtime.local_state.local_map.occupied_cells()
+    assert (
+        runtime.navigation.status,
+        runtime.navigation.reason,
+        runtime.navigation.detail,
+    ) == ("blocked", "no_path", "goal_blocked")
+    assert runtime.vehicle.command == "stop"
+    assert runtime.vehicle.body_velocities() == (0.0, 0.0)
+
+
 def test_default_runtime_long_goto_does_not_end_in_no_path() -> None:
     runtime = VehicleRuntime.create(
         started_at=0.0,

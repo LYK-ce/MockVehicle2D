@@ -7,7 +7,11 @@ from typing import TYPE_CHECKING
 
 from mockvehicle2d.map_grid import MapGrid
 from mockvehicle2d.pathfinding.d_star_lite import DStarLitePlanner
-from mockvehicle2d.safety import LocalSafetyRuntime, SafetyAdvanceResult
+from mockvehicle2d.safety import (
+    HARD_STOP_CLEARANCE_M,
+    LocalSafetyRuntime,
+    SafetyAdvanceResult,
+)
 from mockvehicle2d.vehicle import Vehicle
 
 if TYPE_CHECKING:
@@ -282,6 +286,17 @@ class GotoController:
             map_delta is not None and map_delta.changed_cells
         ):
             self.replan(pose, map_delta, local_map)
+        if not self._planner.is_segment_passable(
+            self.goal,
+            self.goal,
+            extra_clearance_m=HARD_STOP_CLEARANCE_M,
+        ):
+            self.status = "blocked"
+            self.reason = "no_path"
+            self.detail = "goal_blocked"
+            self._current_waypoint = None
+            vehicle.stop()
+            return
         if not self._path:
             self.status = "blocked"
             self.reason = "no_path"

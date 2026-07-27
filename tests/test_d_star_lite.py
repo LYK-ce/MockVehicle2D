@@ -168,10 +168,19 @@ def test_floating_tangency_matches_runtime_but_real_penetration_blocks() -> None
     )
     truth = MapGrid.from_wall_set(4, 4, {(1, 0)})
     tangent = (0.5 + 7e-15, 0.5, 0.5, 1.5)
+    safety_tangent = (0.25 + 7e-15, 0.5, 0.25 + 7e-15, 1.5)
     penetration = (0.51, 0.5, 0.51, 1.5)
 
     assert search.is_segment_passable(tangent[:2], tangent[2:])
     assert is_swept_circle_passable(truth, *tangent, 0.5)
+    assert search.is_segment_passable(
+        safety_tangent[:2], safety_tangent[2:]
+    )
+    assert not search.is_segment_passable(
+        safety_tangent[:2],
+        safety_tangent[2:],
+        extra_clearance_m=0.25,
+    )
     assert not search.is_segment_passable(penetration[:2], penetration[2:])
     assert not is_swept_circle_passable(truth, *penetration, 0.5)
 
