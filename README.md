@@ -34,6 +34,15 @@ mockvehicle2d nl "左转 90 度"
 mockvehicle2d nl --interactive
 
 # 自然语言指令（LLM 模式 - 需要本地 llama.cpp server）
+# 方式一：通过 CLI 一键启动 server
+mockvehicle2d serve-llm                         # 默认 GPU 0, Qwen3-8B
+mockvehicle2d serve-llm --gpu 0 --model Qwen3-14B-Q4_K_M  # 14B 模型
+
+# 方式二：手动启动 server（脚本）
+bash scripts/start_llm_server.sh                # 默认
+bash scripts/start_llm_server.sh 0 Qwen3-14B-Q4_K_M  # 14B
+
+# 然后执行 NL 指令
 mockvehicle2d nl --llm "去坐标 (100, 200)"
 mockvehicle2d nl --llm --model Qwen3-14B-Q4_K_M "前面有什么"
 
