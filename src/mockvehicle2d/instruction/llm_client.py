@@ -28,15 +28,20 @@ _SYSTEM_PROMPT = """你是一个车辆指令解析器。将用户的自然语言
 - intent: 意图类型 (stop/goto/clarify/patrol)
 - parameters: 与 intent 对应的参数对象
 
-意图与参数：
-- stop: 无参数，parameters 为 {}
-- goto: x_m (数字) 和 y_m (数字)
-- patrol: 无参数，parameters 为 {}
-- clarify: question (字符串)，可选 missing_parameters (字符串数组)
+意图定义：
+- stop: 用户要求立即停车。parameters 为 {}
+- goto: 用户提供了明确的目标坐标 x_m 和 y_m（范围 0–255）。
+  支持多种坐标格式："(100, 200)"、"100, 200"、"x=50 y=80" 等。
+  注意：只有相对移动描述（如"前进3米"、"往左走"）而没有绝对坐标的，归为 clarify。
+- patrol: 用户要求开始自动巡逻。parameters 为 {}
+- clarify: 指令模糊、缺少关键参数、或无法匹配以上意图时使用。
+  例如：缺少坐标的 goto、缺少角度的旋转、无意义输入、闲聊。
 
 示例：
 "停" → {"intent": "stop", "parameters": {}}
 "去坐标 (100, 200)" → {"intent": "goto", "parameters": {"x_m": 100, "y_m": 200}}
+"开到 10, 20" → {"intent": "goto", "parameters": {"x_m": 10, "y_m": 20}}
+"前进 3 米" → {"intent": "clarify", "parameters": {"question": "请提供目标坐标", "missing_parameters": ["x_m", "y_m"]}}
 "开到那边去" → {"intent": "clarify", "parameters": {"question": "请提供目标坐标", "missing_parameters": ["x_m", "y_m"]}}
 "开始巡逻" → {"intent": "patrol", "parameters": {}}
 
