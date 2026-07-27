@@ -300,6 +300,7 @@ def _handle_nl_command(
 
     # Reset state machine if in terminal state or CONFIRMING
     current = state_machine.current_state
+    was_clarify_response = (current == InstructionState.CONFIRMING)
     if current == InstructionState.CONFIRMING:
         # Cancel the pending confirmation and restart
         state_machine.transition(InstructionState.CANCELLED)
@@ -317,9 +318,56 @@ def _handle_nl_command(
 
     replies: list[dict[str, object]] = []
 
-    # 1. Parse
+    # 1. Parse — now returns list[dict]
     state_machine.transition(InstructionState.PARSING)
-    instruction = nl_client.parse(text)
+    result = nl_client.parse(text)
+    if asyncio.iscoroutine(result):
+        instructions = asyncio.run(result)
+    else:
+        instructions = result
+    if not instructions:
+        state_machine.transition(InstructionState.FAILED)
+        replies.append({
+            "type": "nl_parse_result",
+            "ts": wall_timestamp,
+            "seq": seq,
+            "instruction": None,
+            "accepted": False,
+            "reason": "parse failed: no result",
+        })
+        state_machine.transition(InstructionState.IDLE)
+        return replies
+
+    # Multi-instruction: enqueue + dequeue first, unless this is a clarify response
+    # mid-sequence (preserve existing queue).
+    if was_clarify_response and state_machine.has_more():
+        # Clarify response mid-sequence: don't touch the queue, just process
+        # the first parsed instruction directly.
+        instruction = instructions[0]
+        sequence_index = state_machine.current_index  # 1-based via dequeue happened before
+        sequence_total = state_machine.queue_size
+        replies.extend(_execute_parsed_instruction(
+            instruction, vehicle, grid, navigation, wall_timestamp, monotonic_now,
+            schema_v, semantic_v, state_machine, task_compiler, seq,
+            path_following=path_following,
+        ))
+        # Patch sequence info into nl_parse_result
+        for r in replies:
+            if r.get("type") == "nl_parse_result":
+                r["sequence_index"] = sequence_index
+                r["sequence_total"] = sequence_total
+        return replies
+
+    # Clear old queue if this is a standalone clarify response (no remaining items)
+    if was_clarify_response:
+        state_machine.clear_queue()
+
+    # Normal flow: enqueue all, dequeue first
+    state_machine.enqueue(instructions)
+    instruction = state_machine.dequeue_next()
+    sequence_index = state_machine.current_index  # 1-based, since dequeue_next advanced it
+    sequence_total = state_machine.queue_size
+
     if instruction is None:
         state_machine.transition(InstructionState.FAILED)
         replies.append({
@@ -332,6 +380,40 @@ def _handle_nl_command(
         })
         state_machine.transition(InstructionState.IDLE)
         return replies
+
+    replies.extend(_execute_parsed_instruction(
+        instruction, vehicle, grid, navigation, wall_timestamp, monotonic_now,
+        schema_v, semantic_v, state_machine, task_compiler, seq,
+        path_following=path_following,
+    ))
+    # Add sequence info to nl_parse_result
+    for r in replies:
+        if r.get("type") == "nl_parse_result":
+            r["sequence_index"] = sequence_index
+            r["sequence_total"] = sequence_total
+
+    return replies
+
+
+def _execute_parsed_instruction(
+    instruction: dict[str, object],
+    vehicle: Vehicle,
+    grid: MapGrid,
+    navigation: GotoController,
+    wall_timestamp: float,
+    monotonic_now: float,
+    schema_v: SchemaValidator,
+    semantic_v: SemanticValidator,
+    state_machine: InstructionStateMachine,
+    task_compiler: TaskCompiler,
+    seq: int,
+    path_following: PathFollowingController | None = None,
+) -> list[dict[str, object]]:
+    """Execute an already-parsed instruction through validate → accept → execute pipeline.
+
+    Returns a list of reply dicts to send.
+    """
+    replies: list[dict[str, object]] = []
 
     # 2. Validate (always go through VALIDATING, even for clarify)
     state_machine.transition(InstructionState.VALIDATING)
@@ -431,6 +513,7 @@ def _handle_nl_command(
             # Go through ACTIVE first (state machine: ACCEPTED→ACTIVE→BLOCKED)
             state_machine.transition(InstructionState.ACTIVE)
             state_machine.transition(InstructionState.BLOCKED)
+            state_machine.clear_queue()
             replies.append({
                 "type": "nl_task_update",
                 "ts": wall_timestamp,
@@ -447,6 +530,7 @@ def _handle_nl_command(
             if not path or len(path) < 2:
                 state_machine.transition(InstructionState.ACTIVE)
                 state_machine.transition(InstructionState.BLOCKED)
+                state_machine.clear_queue()
                 replies.append({
                     "type": "nl_task_update",
                     "ts": wall_timestamp,
@@ -461,6 +545,7 @@ def _handle_nl_command(
             if path_following.status != "active":
                 state_machine.transition(InstructionState.ACTIVE)
                 state_machine.transition(InstructionState.BLOCKED)
+                state_machine.clear_queue()
                 replies.append({
                     "type": "nl_task_update",
                     "ts": wall_timestamp,
@@ -487,6 +572,7 @@ def _handle_nl_command(
         if navigation.status != "active":
             state_machine.transition(InstructionState.ACTIVE)
             state_machine.transition(InstructionState.BLOCKED)
+            state_machine.clear_queue()
             replies.append({
                 "type": "nl_task_update",
                 "ts": wall_timestamp,
@@ -507,6 +593,7 @@ def _handle_nl_command(
         return replies
 
     # Unknown intent
+    state_machine.clear_queue()
     state_machine.transition(InstructionState.FAILED)
     replies.append({
         "type": "nl_task_update",
@@ -517,6 +604,44 @@ def _handle_nl_command(
     })
     state_machine.transition(InstructionState.IDLE)
     return replies
+
+
+async def _process_next_in_queue(
+    websocket,
+    vehicle: Vehicle,
+    grid: MapGrid,
+    navigation: GotoController,
+    wall_timestamp: float,
+    monotonic_now: float,
+    schema_v: SchemaValidator,
+    semantic_v: SemanticValidator,
+    state_machine: InstructionStateMachine,
+    task_compiler: TaskCompiler,
+    path_following: PathFollowingController | None = None,
+) -> None:
+    """Dequeue the next instruction from the queue and execute it.
+
+    Used for auto-continuing multi-instruction sequences.
+    Sends replies directly to the websocket.
+    """
+    instruction = state_machine.dequeue_next()
+    if instruction is None:
+        return
+    sequence_index = state_machine.current_index
+    sequence_total = state_machine.queue_size
+
+    replies = _execute_parsed_instruction(
+        instruction, vehicle, grid, navigation, wall_timestamp, monotonic_now,
+        schema_v, semantic_v, state_machine, task_compiler, 0,
+        path_following=path_following,
+    )
+    for r in replies:
+        if r.get("type") == "nl_parse_result":
+            r["sequence_index"] = sequence_index
+            r["sequence_total"] = sequence_total
+        await websocket.send(json.dumps(r))
+
+    print(f"[NL] auto-dequeued instruction {sequence_index}/{sequence_total}: {instruction.get('intent')}")
 
 
 def _summarize_scan_for_nl(scan_data: dict[str, object] | None) -> dict[str, object]:
@@ -568,12 +693,13 @@ def _cancel_nl_task(
     reason: str,
     path_following: PathFollowingController | None = None,
 ) -> dict[str, object] | None:
-    """Cancel any active NL task and return the nl_task_update to send, or None."""
+    """Cancel any active NL task and clear the queue. Returns nl_task_update to send, or None."""
     current = state_machine.current_state
     if current in (InstructionState.ACCEPTED, InstructionState.ACTIVE, InstructionState.CONFIRMING):
         navigation.cancel(reason)
         if path_following is not None:
             path_following.cancel(reason)
+        state_machine.clear_queue()
         state_machine.transition(InstructionState.CANCELLED)
         update: dict[str, object] = {
             "type": "nl_task_update",
@@ -793,6 +919,13 @@ async def handler(
                         state_machine.transition(InstructionState.IDLE)
                         active_nl_seq = None
                         print(f"[NL] task completed: goal reached")
+                        # Auto-dequeue next in sequence
+                        if state_machine.has_more():
+                            await _process_next_in_queue(
+                                websocket, vehicle, grid, navigation, timestamp, now,
+                                schema_v, semantic_v, state_machine, task_compiler,
+                                path_following=path_following,
+                            )
                     elif pf_status == "blocked" or nav_status == "blocked":
                         reason = path_following.reason if pf_status == "blocked" else navigation.reason
                         state_machine.transition(InstructionState.BLOCKED)
@@ -803,9 +936,10 @@ async def handler(
                             "status": "blocked",
                             "reason": reason or "unknown",
                         }))
+                        state_machine.clear_queue()
                         state_machine.transition(InstructionState.IDLE)
                         active_nl_seq = None
-                        print(f"[NL] task blocked: {reason}")
+                        print(f"[NL] task blocked: {reason} (queue cleared)")
                     elif pf_status == "cancelled" or nav_status == "cancelled":
                         reason = path_following.reason if pf_status == "cancelled" else navigation.reason
                         state_machine.transition(InstructionState.CANCELLED)
@@ -816,9 +950,10 @@ async def handler(
                             "status": "cancelled",
                             "reason": reason or "unknown",
                         }))
+                        state_machine.clear_queue()
                         state_machine.transition(InstructionState.IDLE)
                         active_nl_seq = None
-                        print(f"[NL] task cancelled: {reason}")
+                        print(f"[NL] task cancelled: {reason} (queue cleared)")
 
                 frame_sequence += 1
                 next_deadline = _next_deadline(next_deadline, _monotonic(), TMINI_SCAN_CONFIG.scan_time)
@@ -846,6 +981,13 @@ async def handler(
                     # Track active seq
                     if state_machine.current_state == InstructionState.ACTIVE:
                         active_nl_seq = message.get("seq")
+                    # Auto-dequeue next if instruction completed synchronously (e.g. stop)
+                    elif state_machine.current_state == InstructionState.IDLE and state_machine.has_more():
+                        await _process_next_in_queue(
+                            websocket, vehicle, grid, navigation, _wall_time(), _monotonic(),
+                            schema_v, semantic_v, state_machine, task_compiler,
+                            path_following=path_following,
+                        )
                     continue
                 if message.get("type") == "nl_clarify_response":
                     # Treat as a follow-up nl_command with the response text
@@ -864,6 +1006,14 @@ async def handler(
                             await websocket.send(json.dumps(r))
                         if state_machine.current_state == InstructionState.ACTIVE:
                             active_nl_seq = message.get("seq")
+                        # After clarify response, continue remaining queue if not active
+                        elif state_machine.is_terminal() and state_machine.has_more():
+                            state_machine.transition(InstructionState.IDLE)
+                            await _process_next_in_queue(
+                                websocket, vehicle, grid, navigation, _wall_time(), _monotonic(),
+                                schema_v, semantic_v, state_machine, task_compiler,
+                                path_following=path_following,
+                            )
                     else:
                         await websocket.send(json.dumps({
                             "type": "nl_parse_result",
@@ -883,6 +1033,7 @@ async def handler(
                 navigation.cancel("manual_override")
                 path_following.cancel("manual_override")
                 state_machine.transition(InstructionState.CANCELLED)
+                state_machine.clear_queue()
                 await websocket.send(json.dumps({
                     "type": "nl_task_update",
                     "ts": _wall_time(),
@@ -891,7 +1042,7 @@ async def handler(
                     "reason": "manual_override",
                 }))
                 active_nl_seq = None
-                print(f"[NL] task cancelled by manual override")
+                print(f"[NL] task cancelled by manual override (queue cleared)")
 
             reply = handle_command_message(
                 raw, vehicle, grid, _monotonic(), _wall_time(), navigation, safety, path_following=path_following

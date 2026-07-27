@@ -233,19 +233,21 @@ def _cmd_nl(args):
                 break
             if not text.strip():
                 continue
-            instruction = asyncio.run(client.parse(text))
-            if instruction is None:
+            instructions = asyncio.run(client.parse(text))
+            if not instructions:
                 print("  parse failed: no result")
                 continue
-            print(f"  intent: {instruction.get('intent')}")
-            print(f"  params: {json.dumps(instruction.get('parameters', {}), ensure_ascii=False)}")
-            result = run_validation_pipeline(
-                instruction, schema_validator=schema_v, semantic_validator=semantic_v
-            )
-            if result.valid:
-                print(f"  ✓ valid")
-            else:
-                print(f"  ✗ {result.layer}: {result.message}")
+            for i, inst in enumerate(instructions):
+                prefix = f"  [{i+1}/{len(instructions)}]" if len(instructions) > 1 else "  "
+                print(f"{prefix} intent: {inst.get('intent')}")
+                print(f"{prefix} params: {json.dumps(inst.get('parameters', {}), ensure_ascii=False)}")
+                result = run_validation_pipeline(
+                    inst, schema_validator=schema_v, semantic_validator=semantic_v
+                )
+                if result.valid:
+                    print(f"{prefix} ✓ valid")
+                else:
+                    print(f"{prefix} ✗ {result.layer}: {result.message}")
         return
 
     # --- eval mode ---
@@ -267,27 +269,34 @@ def _cmd_nl(args):
     import asyncio
     from mockvehicle2d.instruction.llm_client import LLMClient
     client = LLMClient(model=args.model, schema_validator=schema_v)
-    instruction = asyncio.run(client.parse(text))
+    instructions = asyncio.run(client.parse(text))
 
-    if instruction is None:
+    if not instructions:
         print("parse failed: no result")
         sys.exit(1)
 
-    print(json.dumps(instruction, ensure_ascii=False, indent=2))
+    all_valid = True
+    for i, inst in enumerate(instructions):
+        prefix = f"[{i+1}/{len(instructions)}] " if len(instructions) > 1 else ""
+        print(f"{prefix}{json.dumps(inst, ensure_ascii=False, indent=2)}")
 
-    result = run_validation_pipeline(
-        instruction, schema_validator=schema_v, semantic_validator=semantic_v
-    )
-    if result.valid:
-        print("validation: ✓ passed")
-        sys.exit(0)
-    else:
-        print(f"validation: ✗ {result.layer} — {result.message}")
-        sys.exit(1)
+        result = run_validation_pipeline(
+            inst, schema_validator=schema_v, semantic_validator=semantic_v
+        )
+        if result.valid:
+            print(f"{prefix}validation: ✓ passed")
+        else:
+            print(f"{prefix}validation: ✗ {result.layer} — {result.message}")
+            all_valid = False
+
+    sys.exit(0 if all_valid else 1)
 
 
 def _run_eval(dataset, schema_v, semantic_v):
-    """Run offline evaluation: compare LLMClient parse vs expected."""
+    """Run offline evaluation: compare LLMClient parse vs expected.
+
+    expected can be a single dict or a list of dicts for multi-instruction cases.
+    """
     import asyncio
     import json
 
@@ -304,32 +313,58 @@ def _run_eval(dataset, schema_v, semantic_v):
     for entry in dataset:
         text = entry["input"]
         expected = entry["expected"]
-        instruction = asyncio.run(client.parse(text))
-        parsed_intent = instruction.get("intent") if instruction else None
-        expected_intent = expected.get("intent")
+        instructions = asyncio.run(client.parse(text))
 
-        intent_ok = parsed_intent == expected_intent
+        # Normalize expected to list for comparison
+        if isinstance(expected, dict):
+            expected_list = [expected]
+        else:
+            expected_list = expected
+
+        intent_ok = True
+        schema_ok = True
+        semantic_ok = True
+        parsed_intents = []
+
+        if not instructions:
+            intent_ok = False
+            schema_ok = False
+            semantic_ok = False
+            parsed_intents = []
+        else:
+            parsed_intents = [inst.get("intent") for inst in instructions]
+
+            # Check intent sequence match
+            if len(instructions) != len(expected_list):
+                intent_ok = False
+            else:
+                for inst, exp in zip(instructions, expected_list):
+                    if inst.get("intent") != exp.get("intent"):
+                        intent_ok = False
+                        break
+
+            # Validate each instruction
+            for inst in instructions:
+                result = run_validation_pipeline(
+                    inst, schema_validator=schema_v, semantic_validator=semantic_v
+                )
+                if result.layer == "schema":
+                    schema_ok = False
+                if not result.valid:
+                    semantic_ok = False
+
         if intent_ok:
             intent_correct += 1
-
-        schema_ok = False
-        semantic_ok = False
-        if instruction is not None:
-            result = run_validation_pipeline(
-                instruction, schema_validator=schema_v, semantic_validator=semantic_v
-            )
-            schema_ok = result.layer != "schema"
-            semantic_ok = result.valid
-
         if schema_ok:
             schema_pass += 1
         if semantic_ok:
             semantic_pass += 1
 
+        expected_intents = [e.get("intent") for e in expected_list]
         details.append({
             "input": text,
-            "expected_intent": expected_intent,
-            "parsed_intent": parsed_intent,
+            "expected_intents": expected_intents,
+            "parsed_intents": parsed_intents,
             "intent_ok": intent_ok,
             "schema_ok": schema_ok,
             "semantic_ok": semantic_ok,
@@ -350,7 +385,7 @@ def _run_eval(dataset, schema_v, semantic_v):
     if failures:
         print(f"\nIntent mismatches ({len(failures)}):")
         for d in failures[:10]:
-            print(f"  '{d['input']}' → expected {d['expected_intent']}, got {d['parsed_intent']}")
+            print(f"  '{d['input']}' → expected {d['expected_intents']}, got {d['parsed_intents']}")
 
     sys.exit(0 if intent_acc >= 90 else 1)
 

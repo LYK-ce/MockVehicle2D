@@ -44,5 +44,13 @@
   {"input": "开到 (100, 200)", "expected": {"intent": "goto", "parameters": {"x_m": 100, "y_m": 200}}},
   {"input": "扫描", "expected": {"intent": "clarify"}},
   {"input": "状态", "expected": {"intent": "clarify"}},
-  {"input": "去坐标 (10, 20)", "expected": {"intent": "goto", "parameters": {"x_m": 10, "y_m": 20}}}
+  {"input": "去坐标 (10, 20)", "expected": {"intent": "goto", "parameters": {"x_m": 10, "y_m": 20}}},
+  {"input": "去（200，100）巡逻", "expected": [{"intent": "goto", "parameters": {"x_m": 200, "y_m": 100}}, {"intent": "patrol", "parameters": {}}]},
+  {"input": "去 (10, 20) 然后去 (30, 40)", "expected": [{"intent": "goto", "parameters": {"x_m": 10, "y_m": 20}}, {"intent": "goto", "parameters": {"x_m": 30, "y_m": 40}}]},
+  {"input": "巡逻，然后去 (50, 50)", "expected": [{"intent": "patrol", "parameters": {}}, {"intent": "goto", "parameters": {"x_m": 50, "y_m": 50}}]},
+  {"input": "去 (5, 5) 接着停", "expected": [{"intent": "goto", "parameters": {"x_m": 5, "y_m": 5}}, {"intent": "stop", "parameters": {}}]},
+  {"input": "去 (100, 200)；巡逻", "expected": [{"intent": "goto", "parameters": {"x_m": 100, "y_m": 200}}, {"intent": "patrol", "parameters": {}}]},
+  {"input": "去 (10, 10) 然后去 (20, 20) 再去 (30, 30)", "expected": [{"intent": "goto", "parameters": {"x_m": 10, "y_m": 10}}, {"intent": "goto", "parameters": {"x_m": 20, "y_m": 20}}, {"intent": "goto", "parameters": {"x_m": 30, "y_m": 30}}]},
+  {"input": "去 (1, 2) 然后去 (3, 4) 并且巡逻", "expected": [{"intent": "goto", "parameters": {"x_m": 1, "y_m": 2}}, {"intent": "goto", "parameters": {"x_m": 3, "y_m": 4}}, {"intent": "patrol", "parameters": {}}]},
+  {"input": "去 (100, 100) 然后巡逻然后停", "expected": [{"intent": "goto", "parameters": {"x_m": 100, "y_m": 100}}, {"intent": "patrol", "parameters": {}}, {"intent": "stop", "parameters": {}}]}
 ]

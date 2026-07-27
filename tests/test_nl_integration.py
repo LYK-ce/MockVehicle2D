@@ -44,28 +44,28 @@ class _TestParser:
     _PATROL_WORDS = {"开始巡逻", "巡逻", "启动巡逻"}
     _CLARIFY_WORDS = {"开到那边去"}
 
-    def parse(self, text: str) -> dict | None:
+    def parse(self, text: str) -> list[dict]:
         text = text.strip()
         if not text:
-            return {"intent": "clarify", "parameters": {"question": "请输入指令"}}
+            return [{"intent": "clarify", "parameters": {"question": "请输入指令"}}]
 
         if text in self._STOP_WORDS:
-            return {"intent": "stop", "parameters": {}}
+            return [{"intent": "stop", "parameters": {}}]
 
         if text in self._PATROL_WORDS:
-            return {"intent": "patrol", "parameters": {}}
+            return [{"intent": "patrol", "parameters": {}}]
 
         if text in self._CLARIFY_WORDS:
-            return {"intent": "clarify", "parameters": {"question": "请指定坐标"}}
+            return [{"intent": "clarify", "parameters": {"question": "请指定坐标"}}]
 
         # goto patterns
         m = self._GOTO_PAT.search(text)
         if m:
             x = float(m.group(1))
             y = float(m.group(2))
-            return {"intent": "goto", "parameters": {"x_m": x, "y_m": y}}
+            return [{"intent": "goto", "parameters": {"x_m": x, "y_m": y}}]
 
-        return {"intent": "clarify", "parameters": {"question": "请指定坐标"}}
+        return [{"intent": "clarify", "parameters": {"question": "请指定坐标"}}]
 
 
 # ═══════════════════════════════════════════════════════════════
