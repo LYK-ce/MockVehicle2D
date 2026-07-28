@@ -53,6 +53,30 @@ class Socket:
         return next(self.commands)
 
 
+class AckCountSocket:
+    remote_address = ("test", 0)
+
+    def __init__(self, commands: list[str], stop_after: int) -> None:
+        self.commands = iter(commands)
+        self.stop_after = stop_after
+        self.messages: list[dict[str, object]] = []
+
+    async def send(self, payload: str | bytes) -> None:
+        if isinstance(payload, bytes):
+            return
+        message = json.loads(payload)
+        self.messages.append(message)
+        if (
+            message["type"] == "command_ack"
+            and sum(item["type"] == "command_ack" for item in self.messages)
+            == self.stop_after
+        ):
+            raise RuntimeError("test complete")
+
+    async def recv(self) -> str:
+        return next(self.commands)
+
+
 class Clock:
     def __init__(self) -> None:
         self.now = 0.0
@@ -68,25 +92,29 @@ class TestControllerProtocol(unittest.TestCase):
             ModeCommand(1, ModeAction.SWITCH_TO_AUTO),
         )
         self.assertEqual(
-            parse(
-                '{"type":"manual","seq":2,"action":"drive",'
-                '"linear_mps":0.2,"angular_rps":-0.3}'
-            ),
-            ManualCommand(2, ManualAction.DRIVE, 0.2, -0.3),
+            parse('{"type":"mode","seq":2,"action":"stop_motion"}'),
+            ModeCommand(2, ModeAction.STOP_MOTION),
         )
         self.assertEqual(
-            parse('{"type":"manual","seq":3,"action":"stop"}'),
-            ManualCommand(3, ManualAction.STOP),
+            parse(
+                '{"type":"manual","seq":3,"action":"drive",'
+                '"linear_mps":0.2,"angular_rps":-0.3}'
+            ),
+            ManualCommand(3, ManualAction.DRIVE, 0.2, -0.3),
+        )
+        self.assertEqual(
+            parse('{"type":"manual","seq":4,"action":"stop"}'),
+            ManualCommand(4, ManualAction.STOP),
         )
         command = parse(
-            '{"type":"auto","seq":4,"action":"push","missions":['
+            '{"type":"auto","seq":5,"action":"push","missions":['
             '{"mission_id":"goto-1","type":"goto","frame_id":"global_map",'
             '"x_m":12.5,"y_m":8.25}]}'
         )
         self.assertIsInstance(command, AutoCommand)
         self.assertIs(command.action, AutoAction.PUSH)
         self.assertEqual(command.missions[0].mission_id, "goto-1")
-        self.assertEqual(command.missions[0].submitted_seq, 4)
+        self.assertEqual(command.missions[0].submitted_seq, 5)
 
     def test_rejects_legacy_ambiguous_or_unsafe_messages(self) -> None:
         cases = [
@@ -271,6 +299,43 @@ class TestControllerProtocol(unittest.TestCase):
             runtime.controller_lease.release()
 
         asyncio.run(scenario())
+
+    def test_handler_stop_motion_pauses_auto_without_mode_assumptions(self) -> None:
+        socket = AckCountSocket(
+            [
+                '{"type":"mode","seq":1,"action":"switch_to_auto"}',
+                '{"type":"auto","seq":2,"action":"push","missions":['
+                '{"mission_id":"hold","type":"goto","frame_id":"global_map",'
+                '"x_m":12,"y_m":10}]}',
+                '{"type":"mode","seq":3,"action":"stop_motion"}',
+            ],
+            3,
+        )
+        clock = Clock()
+        asyncio.run(
+            handler(
+                socket,
+                _monotonic=clock.monotonic,
+                _wall_time=clock.monotonic,
+            )
+        )
+        acknowledgements = [
+            message
+            for message in socket.messages
+            if message["type"] == "command_ack"
+        ]
+        stopped = acknowledgements[-1]
+        self.assertTrue(stopped["accepted"])
+        self.assertEqual(
+            stopped["command"],
+            {"type": "mode", "action": "stop_motion"},
+        )
+        self.assertEqual(stopped["controller"]["mode"], "auto")
+        self.assertEqual(stopped["controller"]["auto_state"], "paused")
+        self.assertEqual(
+            stopped["controller"]["mission_queue"]["mission_ids"],
+            ["hold"],
+        )
 
 
 if __name__ == "__main__":

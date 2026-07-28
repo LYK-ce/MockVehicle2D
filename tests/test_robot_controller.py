@@ -372,6 +372,65 @@ def case_disconnect_pauses_auto_and_stops_manual() -> None:
     assert harness.vehicle.body_velocities() == (0.0, 0.0)
 
 
+def case_stop_motion_is_global_task_preserving_and_idempotent() -> None:
+    harness = Harness(capacity=3)
+    harness.manual(1, ManualAction.DRIVE, 0.2, 0.1)
+
+    assert harness.mode(2, ModeAction.STOP_MOTION).accepted
+    assert harness.controller.mode is OpMode.MANUAL
+    assert harness.vehicle.body_velocities() == (0.0, 0.0)
+    assert not harness.controller.snapshot()["manual_setpoint_active"]
+    assert harness.mode(3, ModeAction.STOP_MOTION).accepted
+    assert harness.controller.drain_events() == ()
+
+    harness.mode(4, ModeAction.SWITCH_TO_AUTO)
+    harness.auto(
+        5,
+        AutoAction.PUSH,
+        (mission("active", 14.0), mission("queued", 18.0)),
+    )
+    harness.tick(0.0)
+    harness.controller.drain_events()
+
+    assert harness.mode(6, ModeAction.STOP_MOTION).accepted
+    assert harness.controller.mode is OpMode.AUTO
+    assert harness.controller.auto_state is AutoState.PAUSED
+    assert harness.controller.active_mission.mission_id == "active"
+    assert harness.controller.snapshot()["mission_queue"]["mission_ids"] == [
+        "queued"
+    ]
+    assert harness.vehicle.body_velocities() == (0.0, 0.0)
+    paused = harness.controller.drain_events()
+    assert [(event.status, event.reason) for event in paused] == [
+        ("paused", "stop_motion")
+    ]
+
+    assert harness.mode(7, ModeAction.STOP_MOTION).accepted
+    assert harness.controller.drain_events() == ()
+
+
+def case_resume_is_idempotent_while_auto_is_active() -> None:
+    harness = Harness()
+    harness.mode(1, ModeAction.SWITCH_TO_AUTO)
+    harness.auto(2, AutoAction.PUSH, (mission("active", 14.0),))
+    harness.tick(0.0)
+    harness.controller.drain_events()
+    before = (
+        harness.controller.active_mission,
+        harness.controller.navigation.snapshot(),
+        harness.vehicle.body_velocities(),
+    )
+
+    assert harness.auto(3, AutoAction.RESUME).accepted
+    after = (
+        harness.controller.active_mission,
+        harness.controller.navigation.snapshot(),
+        harness.vehicle.body_velocities(),
+    )
+    assert after == before
+    assert harness.controller.drain_events() == ()
+
+
 class TestRobotController(unittest.TestCase):
     test_defaults = staticmethod(case_defaults_to_manual_with_no_hidden_task_authority)
     test_wrong_mode = staticmethod(
@@ -393,6 +452,10 @@ class TestRobotController(unittest.TestCase):
     )
     test_safety_gate = staticmethod(case_manual_and_auto_are_both_gated_by_safety)
     test_disconnect = staticmethod(case_disconnect_pauses_auto_and_stops_manual)
+    test_stop_motion = staticmethod(
+        case_stop_motion_is_global_task_preserving_and_idempotent
+    )
+    test_active_resume = staticmethod(case_resume_is_idempotent_while_auto_is_active)
 
 
 if __name__ == "__main__":

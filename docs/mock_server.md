@@ -66,6 +66,7 @@ AutoState
 | Manual → Auto（有保留任务） | `Auto/Paused`，需 `resume` |
 | Auto → Manual | 先停车，活动任务转为 paused，队列保留 |
 | 重复切换到当前模式 | 幂等，无额外停车和事件 |
+| 任意模式 → `stop_motion` | 立即停车并清除手动租约；Auto 任务暂停保留 |
 | 控制连接断开 | 停车；自动任务暂停；释放独占连接 |
 | 非法协议输入 | 停车；自动任务暂停，原因 `invalid_command` |
 
@@ -91,6 +92,9 @@ Server 以 Tmini 名义扫描周期（约 6 Hz）执行：
 `command-timeout-s` 租约内有效；客户端长按时应重复发送 `drive`，松手发送 `stop`。
 看门狗到期、碰撞、边缘/障碍硬停止或安全输入故障都会停车。
 
+控制端不能假设自己掌握最新模式来完成安全停车。`mode/stop_motion` 是模式无关的停车
+入口：它在 Manual 清除速度租约，在 Auto 暂停并保留任务；重复调用保持幂等。
+
 ## 自动控制
 
 Auto `push` 只写入任务队列。控制帧启动当前 `goto`，将 `global_map` 目标通过出生锚点
@@ -99,6 +103,7 @@ Auto `push` 只写入任务队列。控制帧启动当前 `goto`，将 `global_m
 
 同一 `mission_id` 和同一目标可用新的 `seq` 安全重试；不会生成第二个任务。相同 ID
 对应不同目标会返回 `mission_id_conflict`。
+Auto 已为 Active 时重复 `resume` 也是幂等操作，不会重启 D* 搜索。
 
 ## 连接与故障语义
 

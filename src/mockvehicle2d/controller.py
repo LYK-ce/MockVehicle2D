@@ -43,6 +43,7 @@ class AutoState(str, Enum):
 class ModeAction(str, Enum):
     SWITCH_TO_MANUAL = "switch_to_manual"
     SWITCH_TO_AUTO = "switch_to_auto"
+    STOP_MOTION = "stop_motion"
 
 
 class ManualAction(str, Enum):
@@ -312,6 +313,17 @@ class RobotController:
         vehicle: Vehicle,
         now: float,
     ) -> CommandResult:
+        if command.action is ModeAction.STOP_MOTION:
+            vehicle.stop(now)
+            self._manual_setpoint = None
+            self._manual_deadline = None
+            if self.mode is OpMode.AUTO:
+                if self.active_mission is not None or self._pending:
+                    self._pause_active("stop_motion")
+                else:
+                    self.auto_state = AutoState.IDLE
+            return CommandResult(True)
+
         if command.action is ModeAction.SWITCH_TO_MANUAL:
             if self.mode is OpMode.MANUAL:
                 return CommandResult(True)
@@ -382,6 +394,8 @@ class RobotController:
             self.auto_state = AutoState.PAUSED
             return CommandResult(True)
         if command.action is AutoAction.RESUME:
+            if self.auto_state is AutoState.ACTIVE:
+                return CommandResult(True)
             vehicle.stop(now)
             if self.active_mission is None and not self._pending:
                 self.auto_state = AutoState.IDLE
@@ -532,6 +546,9 @@ class RobotController:
         )
 
     def _pause_active(self, reason: str) -> None:
+        if self.auto_state is AutoState.PAUSED:
+            self._needs_start = False
+            return
         if self.active_mission is not None:
             if self.navigation.status == "active":
                 self.navigation.cancel(reason)

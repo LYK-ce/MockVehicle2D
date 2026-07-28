@@ -53,18 +53,26 @@ Client ◄──── mission_update ───── Vehicle  （有状态变�
 ```json
 {"type":"mode","seq":1,"action":"switch_to_auto"}
 {"type":"mode","seq":2,"action":"switch_to_manual"}
+{"type":"mode","seq":3,"action":"stop_motion"}
 ```
 
 模式命令不受当前模式限制。实际切换先停车；重复切到当前模式是幂等操作。
 Auto → Manual 暂停并保留任务。Manual → Auto 若有保留任务仍停在 `paused`，需要
 `auto/resume`。
 
+`stop_motion` 是模式无关的安全停车入口：
+
+- 在 Manual 中立即停车并清除手动速度租约，模式仍为 Manual；
+- 在 Auto 中立即停车，活动任务和队列保留，状态变为 `paused`；
+- 在 Auto Idle 中保持 Idle；
+- 重复调用不重复发布 paused 事件。
+
 ### 手动速度
 
 ```json
 {
   "type": "manual",
-  "seq": 3,
+  "seq": 4,
   "action": "drive",
   "linear_mps": 0.25,
   "angular_rps": -0.4
@@ -72,7 +80,7 @@ Auto → Manual 暂停并保留任务。Manual → Auto 若有保留任务仍停
 ```
 
 ```json
-{"type":"manual","seq":4,"action":"stop"}
+{"type":"manual","seq":5,"action":"stop"}
 ```
 
 仅在 `manual` 模式有效。线速度与角速度必须是有限 JSON 数字，绝对值不得超过 Server
@@ -130,7 +138,7 @@ Auto → Manual 暂停并保留任务。Manual → Auto 若有保留任务仍停
 | action | 语义 |
 |--------|------|
 | `pause` | 停车，保留活动任务和队列 |
-| `resume` | 从当前定位和地图重新启动活动任务；无任务时进入 idle |
+| `resume` | 从 Paused/Blocked 重新启动；已为 Active 时幂等，无任务时进入 idle |
 | `cancel_all` | 停车，取消活动任务并清空队列 |
 
 任务 `blocked` 后不会自动跳到下一项。控制端可以修复条件后 `resume` 重试，或
@@ -207,7 +215,7 @@ Auto → Manual 暂停并保留任务。Manual → Auto 若有保留任务仍停
 |--------|------|
 | `queued` | 新任务已进入队列 |
 | `active` | 任务已成为活动项并开始规划 |
-| `paused` | 模式接管、显式暂停、非法输入或连接断开 |
+| `paused` | `stop_motion`、模式接管、显式暂停、非法输入或连接断开 |
 | `reached` | 精确目标或附近安全目标已到达 |
 | `blocked` | 无路、定位丢失、安全故障或目标超出规划硬限制 |
 | `cancelled` | `cancel_all` 取消 |

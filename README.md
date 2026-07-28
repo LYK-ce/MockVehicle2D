@@ -75,25 +75,29 @@ mockvehicle2d pathfind --start-m 10,10 --goal-m 200,200
 {"type":"mode","seq":1,"action":"switch_to_manual"}
 {"type":"manual","seq":2,"action":"drive","linear_mps":0.3,"angular_rps":-0.4}
 {"type":"manual","seq":3,"action":"stop"}
+{"type":"mode","seq":4,"action":"stop_motion"}
 
-{"type":"mode","seq":4,"action":"switch_to_auto"}
-{"type":"auto","seq":5,"action":"push","missions":[
+{"type":"mode","seq":5,"action":"switch_to_auto"}
+{"type":"auto","seq":6,"action":"push","missions":[
   {"mission_id":"goto-001","type":"goto","frame_id":"global_map","x_m":20.0,"y_m":30.0}
 ]}
-{"type":"auto","seq":6,"action":"pause"}
-{"type":"auto","seq":7,"action":"resume"}
-{"type":"auto","seq":8,"action":"cancel_all"}
+{"type":"auto","seq":7,"action":"pause"}
+{"type":"auto","seq":8,"action":"resume"}
+{"type":"auto","seq":9,"action":"cancel_all"}
 ```
 
 模式语义：
 
 - 模式切换先停车；重复切到当前模式是无副作用的幂等操作。
+- `mode/stop_motion` 在 Manual、Auto 或模式切换竞态中都立即停车；Auto 任务暂停并
+  保留，重复调用不产生重复事件。
 - 手动命令只在 `manual` 模式有效，自动命令只在 `auto` 模式有效。
 - 手动 `drive` 是有租约的连续速度设定值；客户端需在
   `command-timeout-s` 内持续刷新，松手发送 `stop`。
 - Auto → Manual 会暂停当前任务并保留队列；切回 Auto 后仍为 `paused`，需要显式
   `resume`。
 - `pause` 保留活动任务和队列；`cancel_all` 才会清空它们。
+- Auto 已在执行时重复 `resume` 是无副作用操作，不会停车或重启规划。
 - `mission_id` 是幂等键。相同 ID 和相同目标的重试不会重复入队；相同 ID 携带不同目标
   会被拒绝。
 - 控制连接断开时车辆立即停车，自动任务暂停而不是丢弃；重连后可显式恢复。
