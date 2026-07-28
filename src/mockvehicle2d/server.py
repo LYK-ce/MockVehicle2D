@@ -11,7 +11,6 @@ import signal
 import struct
 import time
 
-from mockvehicle2d.instruction.compiler import TaskCompiler
 from mockvehicle2d.instruction.llm_client import LLMClient
 from mockvehicle2d.instruction.state_machine import InstructionState, InstructionStateMachine
 from mockvehicle2d.instruction.validator import SchemaValidator, SemanticValidator
@@ -30,7 +29,6 @@ from mockvehicle2d.scan import (
     TMINI_SCAN_CONFIG,
     scan_grid,
     scan_message,
-    scan_summary_sample,
 )
 from mockvehicle2d.vehicle import COMMANDS, Vehicle
 
@@ -594,27 +592,6 @@ def _start_estimated_goto(
         navigation.block(f"invalid_goal: {error}")
 
 
-def _start_estimated_rotation(
-    navigation: GotoController,
-    local_state: AnchoredLocalState,
-    delta_yaw_rad: float,
-) -> None:
-    if local_state.pose.quality == "lost":
-        navigation.block("localization_lost")
-        return
-    target_yaw_rad = math.atan2(
-        math.sin(local_state.pose.yaw_rad + delta_yaw_rad),
-        math.cos(local_state.pose.yaw_rad + delta_yaw_rad),
-    )
-    _, _, reported_yaw_rad = local_state.anchor.anchor_to_global(
-        0.0, 0.0, target_yaw_rad
-    )
-    navigation.start_rotation(
-        target_yaw_rad,
-        reported_yaw_rad=reported_yaw_rad,
-    )
-
-
 def _handle_nl_command(
     message: dict[str, object],
     vehicle: Vehicle,
@@ -626,8 +603,6 @@ def _handle_nl_command(
     schema_v: SchemaValidator,
     semantic_v: SemanticValidator,
     state_machine: InstructionStateMachine,
-    task_compiler: TaskCompiler | None = None,
-    scan_data: dict[str, object] | None = None,
     path_following: PathFollowingController | None = None,
     local_state: AnchoredLocalState | None = None,
     safety: LocalSafetyRuntime | None = None,
@@ -715,7 +690,7 @@ def _handle_nl_command(
         sequence_total = state_machine.queue_size
         replies.extend(_execute_parsed_instruction(
             instruction, vehicle, grid, navigation, wall_timestamp, monotonic_now,
-            schema_v, semantic_v, state_machine, task_compiler, seq,
+            schema_v, semantic_v, state_machine, seq,
             path_following=path_following,
             local_state=local_state,
             handoff_reason=handoff_reason,
@@ -753,7 +728,7 @@ def _handle_nl_command(
 
     replies.extend(_execute_parsed_instruction(
         instruction, vehicle, grid, navigation, wall_timestamp, monotonic_now,
-        schema_v, semantic_v, state_machine, task_compiler, seq,
+        schema_v, semantic_v, state_machine, seq,
         path_following=path_following,
         local_state=local_state,
         handoff_reason=handoff_reason,
@@ -777,7 +752,6 @@ def _execute_parsed_instruction(
     schema_v: SchemaValidator,
     semantic_v: SemanticValidator,
     state_machine: InstructionStateMachine,
-    task_compiler: TaskCompiler | None,
     seq: int,
     path_following: PathFollowingController | None = None,
     local_state: AnchoredLocalState | None = None,
@@ -903,7 +877,7 @@ def _execute_parsed_instruction(
         if path_following is not None:
             path_following.cancel("goto_active")
         if local_state is None:
-            navigation.start(x_m, y_m)
+            navigation.block("local_state_unavailable")
         else:
             _start_estimated_goto(navigation, vehicle, local_state, x_m, y_m)
         if navigation.status != "active":
@@ -953,7 +927,6 @@ async def _process_next_in_queue(
     schema_v: SchemaValidator,
     semantic_v: SemanticValidator,
     state_machine: InstructionStateMachine,
-    task_compiler: TaskCompiler,
     path_following: PathFollowingController | None = None,
     local_state: AnchoredLocalState | None = None,
 ) -> None:
@@ -971,7 +944,7 @@ async def _process_next_in_queue(
     state_machine.transition(InstructionState.PARSING)
     replies = _execute_parsed_instruction(
         instruction, vehicle, grid, navigation, wall_timestamp, monotonic_now,
-        schema_v, semantic_v, state_machine, task_compiler, 0,
+        schema_v, semantic_v, state_machine, 0,
         path_following=path_following,
         local_state=local_state,
     )
@@ -982,67 +955,6 @@ async def _process_next_in_queue(
         await websocket.send(json.dumps(r))
 
     print(f"[NL] auto-dequeued instruction {sequence_index}/{sequence_total}: {instruction.get('intent')}")
-
-
-def _summarize_scan_for_nl(scan_data: dict[str, object] | None) -> dict[str, object]:
-    """Build a human-readable NL scan summary from raw scan frame."""
-    if scan_data is None:
-        return {"text": "无扫描数据", "sectors": {}}
-    points = scan_data.get("points", [])
-    if not isinstance(points, list) or not points:
-        return {"text": "无扫描点", "sectors": {}}
-
-    sectors: dict[str, list[float]] = {"front": [], "left": [], "right": [], "back": []}
-    for pt in points:
-        sample = scan_summary_sample(pt)
-        if sample is None:
-            continue
-        sector, range_m = sample
-        sectors[sector].append(range_m)
-
-    summary: dict[str, float] = {}
-    for sector, ranges in sectors.items():
-        if ranges:
-            summary[sector] = round(min(ranges), 2)
-
-    # Build human-readable text
-    parts = []
-    for sector in ("front", "left", "right", "back"):
-        label = {"front": "前方", "left": "左侧", "right": "右侧", "back": "后方"}[sector]
-        if sector in summary:
-            parts.append(f"{label} {summary[sector]:.1f}m")
-        else:
-            parts.append(f"{label} 无数据")
-    text = "障碍物距离 — " + "，".join(parts)
-
-    return {"text": text, "sectors": summary}
-
-
-def _cancel_nl_task(
-    navigation: GotoController,
-    state_machine: InstructionStateMachine,
-    reason: str,
-    path_following: PathFollowingController | None = None,
-) -> dict[str, object] | None:
-    """Cancel any active NL task and clear the queue. Returns nl_task_update to send, or None."""
-    current = state_machine.current_state
-    if current in (InstructionState.ACCEPTED, InstructionState.ACTIVE, InstructionState.CONFIRMING):
-        navigation.cancel(reason)
-        if path_following is not None:
-            path_following.cancel(reason)
-        state_machine.clear_queue()
-        state_machine.transition(InstructionState.CANCELLED)
-        update: dict[str, object] = {
-            "type": "nl_task_update",
-            "seq": 0,
-            "status": "cancelled",
-            "reason": reason,
-        }
-        # Allow going back to IDLE after cancelling
-        if state_machine.current_state == InstructionState.CANCELLED:
-            pass  # Will be reset by next nl_command
-        return update
-    return None
 
 
 def _encode_map_chunks(voxels: list[dict[str, object]], map_size: int) -> list[bytes]:
@@ -1300,11 +1212,9 @@ async def handler(
         nl_client = _nl_client or LLMClient(schema_validator=schema_v)
         semantic_v = SemanticValidator(None)
         state_machine = InstructionStateMachine()
-        task_compiler = TaskCompiler()
         path_following = None
         next_deadline = started_at
         active_nl_seq: int | None = None
-        last_scan_data: dict[str, object] | None = None
         last_navigation_log_key: tuple[object, ...] | None = None
 
         if (
@@ -1348,7 +1258,6 @@ async def handler(
                 )
                 await websocket.send(json.dumps(pose))
                 await websocket.send(json.dumps(scan))
-                last_scan_data = scan
                 print(
                     f"[→] pose #{runtime.frame_sequence}: "
                     f"x={pose['x']:.2f} y={pose['y']:.2f} cmd={vehicle.command}"
@@ -1372,7 +1281,7 @@ async def handler(
                         if state_machine.has_more():
                             await _process_next_in_queue(
                                 websocket, vehicle, grid, navigation, timestamp, now,
-                                schema_v, semantic_v, state_machine, task_compiler,
+                                schema_v, semantic_v, state_machine,
                                 path_following=path_following,
                                 local_state=runtime.local_state,
                             )
@@ -1429,8 +1338,6 @@ async def handler(
                         _wall_time(), _monotonic(),
                         nl_client, schema_v, semantic_v,
                         state_machine,
-                        task_compiler=task_compiler,
-                        scan_data=last_scan_data,
                         local_state=runtime.local_state,
                         safety=safety,
                         parsed_instructions=parsed_instructions,
@@ -1443,7 +1350,7 @@ async def handler(
                     elif state_machine.current_state == InstructionState.IDLE and state_machine.has_more():
                         await _process_next_in_queue(
                             websocket, vehicle, grid, navigation, _wall_time(), _monotonic(),
-                            schema_v, semantic_v, state_machine, task_compiler,
+                            schema_v, semantic_v, state_machine,
                             path_following=path_following,
                             local_state=runtime.local_state,
                         )
@@ -1461,8 +1368,6 @@ async def handler(
                             _wall_time(), _monotonic(),
                             nl_client, schema_v, semantic_v,
                             state_machine,
-                            task_compiler=task_compiler,
-                            scan_data=last_scan_data,
                             local_state=runtime.local_state,
                             safety=safety,
                             parsed_instructions=parsed_instructions,
@@ -1476,7 +1381,7 @@ async def handler(
                             state_machine.transition(InstructionState.IDLE)
                             await _process_next_in_queue(
                                 websocket, vehicle, grid, navigation, _wall_time(), _monotonic(),
-                                schema_v, semantic_v, state_machine, task_compiler,
+                                schema_v, semantic_v, state_machine,
                                 path_following=path_following,
                                 local_state=runtime.local_state,
                             )

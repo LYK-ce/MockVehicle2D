@@ -5,6 +5,11 @@
 > **日期**: 2026-07-24
 > **状态**: Draft for Review
 
+> **当前实现说明（2026-07-28）**：生产契约已统一为
+> `src/mockvehicle2d/instruction/schemas/v3.json`，仅支持 `stop`、`goto`、
+> `clarify`、`patrol`。本文中的 v1/v2 方案及 `goto_point`、`move_distance`
+> 等意图只记录历史设计，均已废弃，不是当前接口。
+
 ## 概述
 
 本文档是 GUIDE_v3.md Phase 0 的交付物，覆盖 GUIDE_v3.md 第 3 节全部 14 项设计要求。
@@ -54,13 +59,13 @@
 ### 2.1 设计原则
 
 - 模型输出为 JSON，结构由确定性程序定义（版本化 Schema）
-- v2 Schema 中 LLM 仅输出 `intent` + `parameters`，版本管理由确定性程序负责
+- v3 Schema 中 LLM 仅输出 `intent` + `parameters`，版本管理由确定性程序负责
 - 指令是"规范"而非"命令"——确定性程序始终拥有最终执行权
 - Schema 只定义模型能输出的内容；车辆 ID、消息序号、速度上限等由确定性程序注入
 
 ### 2.2 第一版 Schema (v1) — 历史参考
 
-> **v1 已被 v2 取代。** 当前生产 Schema 为 v2（参见 §3.7.2），LLM 仅需输出 `intent` + `parameters`。以下 v1 设计保留作为设计演进记录。
+> **v1 和 v2 均已被 v3 取代。** 当前生产 Schema 为 v3；以下 v1 设计仅作设计演进记录。
 
 ```json
 {
@@ -163,15 +168,16 @@
 
 - v1 Schema: `required: ["schema_version", "intent", "timestamp"]` — LLM 负责输出版本号
 - v2 Schema: `required: ["intent", "parameters"]` — LLM 只输出核心字段，版本由确定性程序管理
+- v3 Schema: `required: ["intent", "parameters"]` — 当前生产契约，仅支持 `stop`、`goto`、`clarify`、`patrol`
 - `additionalProperties: true`（v2）— LLM 多输出的字段被忽略，不因此拒绝指令
-- Schema 文件存放于 `src/mockvehicle2d/instruction/schemas/v2.json`
+- 当前 Schema 文件为 `src/mockvehicle2d/instruction/schemas/v3.json`
 
 ### 2.4 能力标注
 
-- ✅ **现有**: v2 Schema 已实现（LLM 仅输出 intent + parameters）
+- ✅ **现有**: v3 Schema 已实现（LLM 仅输出 intent + parameters）
 - 🆕 **本阶段新增**: JSON Schema v1.0 定义 + 校验器实现（已在 Phase 1 完成）
 - ✅ **已实现**: v2 Schema 简化 + Retry 机制 + 14B 模型支持（Phase 1b 增量）
-- ⏸️ **暂不实现**: true Schema v3.x（多车扩展时需要增加 `target_vehicle` 字段）
+- ⏸️ **暂不实现**: 后续多车 Schema 修订（需要增加 `target_vehicle` 字段）
 
 ---
 
@@ -1046,15 +1052,15 @@ class YDLidarProvider:
 | **集群急停** | N/A | 一键停止所有车辆（广播 stop 或专用消息类型） |
 | **操作者权限** | N/A | 多操作者访问控制、任务队列管理和优先级 |
 
-### 14.2 Schema v3 预留（`target_vehicle` 字段） — 未来多车扩展
+### 14.2 后续 Schema 修订预留（`target_vehicle` 字段）
 
-> 注：当前 v2 Schema 仅含 `intent` + `parameters`。以下为未来多车场景的 v3 扩展预留。
+> 注：当前生产 v3 不定义车辆寻址字段。以下仅是未来多车场景提案，不是当前接口。
 
 ```json
 {
-  "intent": "goto_point",
-  "target_vehicle": "car_2",        // 🆕 多车寻址（v3）
-  "target_vehicle_selector": {       // 🆕 或条件选择（v3）
+  "intent": "goto",
+  "target_vehicle": "car_2",
+  "target_vehicle_selector": {
     "nearest_to": {"x_m": 50, "y_m": 50},
     "status": "idle"
   },

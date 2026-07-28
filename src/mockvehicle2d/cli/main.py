@@ -152,34 +152,6 @@ def _cmd_pathfind(args):
     sys.exit(0)
 
 
-def _cmd_test(_args):
-    """Run deterministic motion, collision, and local scan tests."""
-    import os
-
-    # Add repo root to path so tests/ is importable (src/ layout)
-    repo_root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
-    if repo_root not in sys.path:
-        sys.path.insert(0, repo_root)
-
-    from tests.test_collision import main as collision_main
-    from tests.test_goto import main as goto_main
-    from tests.test_safety import main as safety_main
-    from tests.test_safety_runtime import main as safety_runtime_main
-    from tests.test_scan import main as scan_main
-    from tests.test_server_scan import main as server_scan_main
-    from tests.test_vehicle import main as vehicle_main
-
-    sys.exit(
-        collision_main()
-        or scan_main()
-        or vehicle_main()
-        or goto_main()
-        or safety_main()
-        or safety_runtime_main()
-        or server_scan_main()
-    )
-
-
 def _cmd_serve_llm(args):
     """Start llama.cpp server for NL→JSON inference."""
     import os

@@ -353,6 +353,6 @@ def test_production_navigation_source_has_no_truth_or_legacy_astar_route() -> No
         token not in planner_source
         for token in ("MapGrid", "vehicle.", "simulator_ground_truth")
     )
-    assert "task_compiler.compile" not in nl_source
+    assert "TaskCompiler" not in nl_source + handler_source
     assert "path_following.start" not in nl_source
     assert "PathFollowingController()" not in handler_source

@@ -1,8 +1,7 @@
-"""Task compiler — converts validated instructions into executable task descriptions.
+"""Offline compiler for validated production-schema v3 task descriptions.
 
-Phase 1: compiles instructions into task dicts without controlling the vehicle.
-Phase 2: will actually invoke vehicle / navigation / safety methods.
-The optional truth-grid A* branch is retained only for offline simulator debugging.
+The optional truth-grid A* branch is retained only for simulator debugging; the
+production WebSocket handler executes v3 instructions directly.
 """
 
 from __future__ import annotations
@@ -17,8 +16,8 @@ class TaskCompiler:
     """Convert validated instructions into executable task dicts.
 
     Each compile_* method returns a dict describing the action to take.
-    In Phase 1 these do NOT modify vehicle state — they describe what WOULD happen.
-    When explicitly constructed with a simulator truth grid, this legacy/debug
+    These methods do not modify vehicle state. When explicitly constructed with
+    a simulator truth grid, this legacy/debug
     compiler can produce an A* reference path. The production WebSocket handler
     never executes that controller choice; it routes navigation to finite-view
     D* Lite.

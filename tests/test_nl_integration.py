@@ -8,12 +8,11 @@ from __future__ import annotations
 
 import asyncio
 import json
-import math
 import time
 
 import pytest
 
-from mockvehicle2d.instruction.compiler import TaskCompiler
+import mockvehicle2d.server as server_module
 from mockvehicle2d.instruction.state_machine import InstructionState, InstructionStateMachine
 from mockvehicle2d.instruction.validator import SchemaValidator, SemanticValidator
 from mockvehicle2d.map_grid import MapGrid
@@ -24,8 +23,6 @@ from mockvehicle2d.server import (
     _handle_nl_command,
     _nl_completion_reason,
     _process_next_in_queue,
-    _summarize_scan_for_nl,
-    _cancel_nl_task,
     handle_command_message,
     handler,
     VehicleRuntime,
@@ -345,6 +342,91 @@ class TestNlCommandGoto:
         assert navigation.reported_goal == (100.0, 200.0)
         assert navigation.status == "active"
 
+    def test_goto_without_local_state_fails_closed(
+        self,
+        vehicle,
+        empty_grid,
+        navigation,
+        nl_client,
+        schema_v,
+        semantic_v,
+    ):
+        state_machine = InstructionStateMachine()
+
+        replies = server_module._handle_nl_command(
+            {"type": "nl_command", "seq": 4, "text": "去坐标 (20, 20)"},
+            vehicle,
+            empty_grid,
+            navigation,
+            time.time(),
+            time.monotonic(),
+            nl_client,
+            schema_v,
+            semantic_v,
+            state_machine,
+        )
+
+        assert replies[-1]["status"] == "blocked"
+        assert replies[-1]["reason"] == "local_state_unavailable"
+        assert navigation.status != "active"
+        assert navigation.snapshot()["planning"] is False
+        assert not state_machine.has_more()
+
+    def test_websocket_stays_open_after_missing_local_state_goto(self):
+        clock = _Clock()
+        runtime = VehicleRuntime.create(
+            started_at=0.0,
+            anchor=AnchorSpec("nl-missing-state", 10.0, 10.0, 0.0),
+            odometry_config=OdometryConfig(),
+        )
+
+        class Socket:
+            remote_address = ("nl-missing-state", 0)
+
+            def __init__(self):
+                self.messages = []
+                self.receive_count = 0
+
+            async def send(self, payload):
+                if isinstance(payload, bytes):
+                    return
+                message = json.loads(payload)
+                self.messages.append(message)
+                if message.get("type") == "cmd_ack":
+                    raise RuntimeError("test complete")
+
+            async def recv(self):
+                self.receive_count += 1
+                if self.receive_count == 1:
+                    runtime.local_state = None
+                    return json.dumps(
+                        {"type": "nl_command", "seq": 5, "text": "去坐标 (20, 20)"}
+                    )
+                return '{"type":"cmd","seq":6,"cmd":"stop"}'
+
+        socket = Socket()
+        asyncio.run(
+            handler(
+                socket,
+                _runtime=runtime,
+                _monotonic=clock.monotonic,
+                _wall_time=lambda: 10.0,
+                _nl_client=_TestParser(),
+            )
+        )
+
+        assert any(
+            message.get("status") == "blocked"
+            and message.get("reason") == "local_state_unavailable"
+            for message in socket.messages
+        )
+        assert any(
+            message.get("type") == "cmd_ack" and message.get("seq") == 6
+            for message in socket.messages
+        )
+        assert runtime.navigation.status != "active"
+        assert runtime.navigation.snapshot()["planning"] is False
+
 
 class TestNlCommandClarify:
     """NL '开到那边去' → clarify response."""
@@ -498,7 +580,6 @@ def test_nl_early_response_settles_terminal_goto_handoff(
         schema_v,
         SemanticValidator(grid),
         InstructionStateMachine(),
-        scan_data={"type": "scan", "points": []},
         local_state=local_state,
         safety=LocalSafetyRuntime() if use_safety else None,
     )
@@ -601,7 +682,6 @@ class TestNlCommandPatrol:
                 schema_v,
                 semantic_v,
                 state_machine,
-                TaskCompiler(),
                 local_state=estimated_nl_runtime,
             )
         )
@@ -647,50 +727,6 @@ class TestNlCommandPatrol:
         assert "schema validation failed" in replies[0]["reason"]
         assert state_machine.current_state == InstructionState.IDLE
         assert not state_machine.has_more()
-
-
-# ═══════════════════════════════════════════════════════════════
-# Authority / Preemption tests
-# ═══════════════════════════════════════════════════════════════
-
-class TestManualOverride:
-    """Manual cmd during agent task → agent cancelled."""
-
-    def test_manual_cmd_cancels_nl_task(self, vehicle, empty_grid, navigation,
-                                         nl_client, schema_v, semantic_v,
-                                         state_machine):
-        # Start an NL goto task
-        msg = {"type": "nl_command", "seq": 11, "text": "去坐标 (50, 50)"}
-        _handle_nl_command(
-            msg, vehicle, empty_grid, navigation,
-            time.time(), time.monotonic(),
-            nl_client, schema_v, semantic_v,
-            state_machine,
-        )
-        assert state_machine.current_state == InstructionState.ACTIVE
-        assert navigation.status == "active"
-
-        # Now cancel via _cancel_nl_task (simulating manual override)
-        update = _cancel_nl_task(navigation, state_machine, "manual_override")
-        assert update is not None
-        assert update["type"] == "nl_task_update"
-        assert update["status"] == "cancelled"
-        assert update["reason"] == "manual_override"
-        assert state_machine.current_state == InstructionState.CANCELLED
-        assert navigation.status == "cancelled"
-
-    def test_manual_cmd_during_accepting(self, vehicle, empty_grid, navigation,
-                                          nl_client, schema_v, semantic_v,
-                                          state_machine):
-        # Force state to ACCEPTED (simulate mid-pipeline)
-        state_machine.transition(InstructionState.PARSING)
-        state_machine.transition(InstructionState.VALIDATING)
-        state_machine.transition(InstructionState.ACCEPTED)
-        assert state_machine.current_state == InstructionState.ACCEPTED
-
-        update = _cancel_nl_task(navigation, state_machine, "manual_override")
-        assert update is not None
-        assert update["status"] == "cancelled"
 
 
 class TestSafetyBlock:
@@ -938,37 +974,6 @@ class TestValidationFailures:
 
 
 # ═══════════════════════════════════════════════════════════════
-# Scan summary tests
-# ═══════════════════════════════════════════════════════════════
-
-class TestScanSummary:
-    def test_empty_scan(self):
-        result = _summarize_scan_for_nl(None)
-        assert "无扫描数据" in result["text"]
-        assert result["sectors"] == {}
-
-    def test_no_points(self):
-        result = _summarize_scan_for_nl({"type": "scan", "points": []})
-        assert "无扫描点" in result["text"]
-
-    def test_sector_classification(self):
-        points = [
-            {"angle": 0.0, "range": 1.0},       # front
-            {"angle": 0.3, "range": 2.0},       # front
-            {"angle": math.pi / 2, "range": 3.0},  # right
-            {"angle": -math.pi / 2, "range": 4.0},  # left
-            {"angle": math.pi, "range": 5.0},    # back
-        ]
-        result = _summarize_scan_for_nl({"type": "scan", "points": points})
-        assert result["sectors"]["front"] == 1.0
-        assert result["sectors"]["left"] == 4.0
-        assert result["sectors"]["right"] == 3.0
-        assert result["sectors"]["back"] == 5.0
-        assert "前方" in result["text"]
-        assert "左侧" in result["text"]
-
-
-# ═══════════════════════════════════════════════════════════════
 # Full pipeline integration tests (parse→validate→task)
 # ═══════════════════════════════════════════════════════════════
 
@@ -990,24 +995,6 @@ class TestFullPipeline:
         assert vehicle.command == "stop"
         assert state_machine.current_state == InstructionState.IDLE
         assert any(r["type"] == "nl_task_update" and r["status"] == "completed" for r in replies)
-
-    def test_pipeline_goto_then_cancel(self, vehicle, empty_grid, navigation,
-                                        nl_client, schema_v, semantic_v, state_machine):
-        # Start goto
-        msg = {"type": "nl_command", "seq": 21, "text": "去坐标 (100, 100)"}
-        _handle_nl_command(
-            msg, vehicle, empty_grid, navigation,
-            time.time(), time.monotonic(),
-            nl_client, schema_v, semantic_v,
-            state_machine,
-        )
-        assert navigation.status == "active"
-
-        # Cancel
-        update = _cancel_nl_task(navigation, state_machine, "manual_override")
-        assert update is not None
-        assert update["status"] == "cancelled"
-        assert navigation.status == "cancelled"
 
     def test_pipeline_clarify_then_goto(self, vehicle, empty_grid, navigation,
                                          nl_client, schema_v, semantic_v, state_machine):

@@ -1,6 +1,6 @@
 """Three-layer instruction validation: schema, semantics, and safety.
 
-SchemaValidator   — JSON Schema v2 conformance (jsonschema)
+SchemaValidator   — production JSON Schema v3 conformance (jsonschema)
 SemanticValidator — map bounds, passability, distance limits
 SafetyValidator   — delegates to existing SafetyRuntime
 """

@@ -169,8 +169,6 @@ AABB vs Circle 圆形碰撞
 测试集，包括有限视野 D* Lite、动态重规划、scan matching、SI 契约、WebSocket
 协议、车辆运动、碰撞与安全回归；任一测试失败时命令返回非零状态。
 
-`mockvehicle2d test` 可运行基础运动、碰撞、扫描、`goto` 与安全自检。
-
 ## 自然语言指令系统（NL→JSON）
 
 通过 Qwen 大模型将自然语言指令转换为结构化 JSON，再编译为确定性车辆任务执行。

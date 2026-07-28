@@ -31,9 +31,8 @@ from mockvehicle2d.instruction.validator import (
     run_validation_pipeline,
 )
 from mockvehicle2d.map_grid import MapGrid, WALL, VOID
-from mockvehicle2d.scan import LaserPoint, scan_message, scan_sector
+from mockvehicle2d.scan import scan_sector
 from mockvehicle2d.safety import LocalSafetyRuntime
-from mockvehicle2d.server import _summarize_scan_for_nl
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -425,25 +424,7 @@ class TestTaskCompiler:
         task = self.compiler.compile(inst)
         assert task["type"] == "unknown"
 
-    def test_real_tmini_clockwise_angles_match_server_summary(self):
-        scan = scan_message(
-            MapGrid(1, 1),
-            0.5,
-            0.5,
-            0.0,
-            1.0,
-            points=(
-                LaserPoint(0.0, 1.0, 1.0),
-                LaserPoint(math.pi / 2, 2.0, 1.0),
-                LaserPoint(3 * math.pi / 2, 3.0, 1.0),
-                LaserPoint(7 * math.pi / 4, 4.0, 1.0),
-                LaserPoint(math.pi / 4, 5.0, 1.0),
-                LaserPoint(math.pi, 6.0, 1.0),
-            ),
-        )
-
-        server_summary = _summarize_scan_for_nl(scan)["sectors"]
-
+    def test_real_tmini_clockwise_scan_sectors(self):
         assert {
             angle: scan_sector(angle)
             for angle in (
@@ -470,12 +451,6 @@ class TestTaskCompiler:
             3 * math.pi / 4: "back",
             5 * math.pi / 4: "back",
         }
-        assert server_summary == {
-            "front": 1.0,
-            "left": 3.0,
-            "right": 2.0,
-            "back": 6.0,
-        }
 
     @pytest.mark.parametrize(
         ("angle", "expected"),
@@ -492,44 +467,6 @@ class TestTaskCompiler:
     )
     def test_scan_sector_rejects_non_finite_or_non_real_angles(self, angle, expected):
         assert scan_sector(angle) == expected
-
-    def test_scan_summary_skips_invalid_samples(self):
-        points = [
-            {"angle": 0.0, "range": 2.0},
-            {"angle": math.pi / 2, "range": 3.0},
-            {"angle": math.nan, "range": 0.1},
-            {"angle": math.inf, "range": 0.2},
-            {"angle": -math.inf, "range": 0.3},
-            {"angle": True, "range": 0.4},
-            {"angle": "0", "range": 0.5},
-            {"angle": 0.0, "range": math.nan},
-            {"angle": 0.0, "range": math.inf},
-            {"angle": 0.0, "range": -math.inf},
-            {"angle": 0.0, "range": True},
-            {"angle": 0.0, "range": "1"},
-            {"angle": 0.0, "range": None},
-            {"angle": 0.0, "range": 0.0},
-            "not-a-point",
-        ]
-        scan = {"points": points}
-
-        server_summary = _summarize_scan_for_nl(scan)["sectors"]
-        assert server_summary == {"front": 2.0, "right": 3.0}
-
-    def test_scan_summary_is_safe_when_every_sample_is_invalid(self):
-        scan = {
-            "points": [
-                {"angle": math.nan, "range": 1.0},
-                {"angle": 0.0, "range": math.inf},
-                {"angle": False, "range": 1.0},
-                {},
-                None,
-            ]
-        }
-
-        server_summary = _summarize_scan_for_nl(scan)
-        assert server_summary["sectors"] == {}
-
 
 # ═══════════════════════════════════════════════════════════════
 # AuthorityManager tests

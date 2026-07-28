@@ -375,6 +375,12 @@ Occupied/Forbidden 满足车体和硬净空、D* 规划格与预算合法、格�
 `localization_lost`。超过规划距离/格数预算或缺少本地定位/地图时也会拒绝，而不会让
 WebSocket 连接崩溃。
 
+### nl_command — 自然语言指令
+
+自然语言解析器的当前生产契约为 JSON Schema v3，只接受 `stop`、`goto`、`clarify`
+和 `patrol`。v1/v2 中的 `goto_point`、`move_distance`、`status`、`rotate` 和
+`scan_report` 已废弃，不是当前支持接口；旧 schema 文件仅保留作历史参考。
+
 ### cmd_ack — 命令确认
 
 ```json
@@ -426,8 +432,8 @@ map_delta
 `ObservedGrid`，D* Lite 在小车内部消费其 Unknown/Free/Occupied/Forbidden、revision 和 delta；
 局部地图 delta 尚未通过 WebSocket 上传。车辆 runtime 跨控制器断开重连保留，但活动
 `goto` 会取消。当前有轻量 scan matching 和局部增量规划，没有回环、位姿图、全局优化、
-地图持久化或中央地图同步。自然语言 `goto_point` / `move_distance` 也进入同一个
-GotoController，不走旧的全真值 A* / PathFollowingController。
+地图持久化或中央地图同步。自然语言 v3 的 `goto` 进入同一个 GotoController，不走旧的
+全真值 A* / PathFollowingController。
 
 ## 安全运行时
 
