@@ -16,7 +16,12 @@ test_collision.py — 碰撞检测测试用例
 """
 
 import math
+from pathlib import Path
 import sys
+
+
+REPO_ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(REPO_ROOT / "src"))
 
 from mockvehicle2d.map_grid import MapGrid
 from mockvehicle2d.collision import raycast, is_circle_passable

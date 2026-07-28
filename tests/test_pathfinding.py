@@ -1,12 +1,15 @@
-"""
-test_pathfinding.py — Tests for A* search and WaypointFollower.
-"""
+"""Tests for the full-truth A* debugging helper."""
 
-import math
+from pathlib import Path
+import sys
 import unittest
 
+
+REPO_ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(REPO_ROOT / "src"))
+
 from mockvehicle2d.map_grid import MapGrid, VOID
-from mockvehicle2d.pathfinding import a_star_search, WaypointFollower
+from mockvehicle2d.pathfinding import a_star_search
 from mockvehicle2d.pathfinding.a_star import _inflate_blocked
 
 
@@ -149,79 +152,14 @@ class TestAStar(unittest.TestCase):
             a_star_search(grid, (0, 0), (10, 5))
 
 
-# ── WaypointFollower tests ───────────────────────────────────
-
-class TestWaypointFollower(unittest.TestCase):
-
-    def test_forward_when_facing_target(self):
-        """AC6: Vehicle facing the next waypoint → cmd=forward."""
-        path = [(0, 0), (5, 0)]
-        follower = WaypointFollower(path)
-        cmd, done = follower.next_cmd(0, 0, 0.0)  # at start, facing +x
-        self.assertEqual(cmd, "forward")
-        self.assertFalse(done)
-
-    def test_spin_right_when_target_has_positive_screen_y(self):
-        path = [(0, 0), (0, 5)]  # target is +y (down in screen coords)
-        follower = WaypointFollower(path)
-        # At (0,0), facing +x (0°), target is at +y (90° clockwise)
-        # Vehicle's positive yaw is clockwise, which is its spin_right command.
-        cmd, done = follower.next_cmd(0, 0, 0.0)
-        self.assertEqual(cmd, "spin_right")
-
-    def test_spin_left_when_target_has_negative_screen_y(self):
-        path = [(0, 0), (0, -5)]  # target is -y
-        follower = WaypointFollower(path)
-        cmd, done = follower.next_cmd(0, 0, 0.0)
-        self.assertEqual(cmd, "spin_left")
-
-    def test_arrival_at_goal(self):
-        """AC6: Within arrival_distance → stop + reached_goal=True."""
-        path = [(0, 0), (5, 0)]
-        follower = WaypointFollower(path, arrival_distance=0.5)
-        cmd, done = follower.next_cmd(4.8, 0, 0.0)
-        self.assertEqual(cmd, "stop")
-        self.assertTrue(done)
-
-    def test_waypoint_advance(self):
-        """Vehicle advances to next waypoint when close enough."""
-        path = [(0, 0), (3, 0), (6, 0)]
-        follower = WaypointFollower(path, waypoint_distance=0.5)
-        # Close to first waypoint → should target second
-        cmd, done = follower.next_cmd(2.7, 0, 0.0)
-        self.assertFalse(done)
-        self.assertEqual(follower.current_target, (6, 0))
-
-    def test_reset(self):
-        path1 = [(0, 0), (5, 0)]
-        path2 = [(0, 0), (0, 5)]
-        follower = WaypointFollower(path1)
-        follower.reset(path2)
-        self.assertEqual(follower.goal, (0, 5))
-
-    def test_path_too_short_raises(self):
-        with self.assertRaises(ValueError):
-            WaypointFollower([(0, 0)])
-
-    def test_facing_opposite_direction(self):
-        """Vehicle facing away from target: should turn around (spin_left or spin_right)."""
-        path = [(0, 0), (5, 0)]
-        follower = WaypointFollower(path)
-        cmd, done = follower.next_cmd(0, 0, math.pi)  # facing -x
-        self.assertIn(cmd, ("spin_left", "spin_right"))
-        self.assertFalse(done)
-
-
 def main():
     loader = unittest.TestLoader()
     suite = unittest.TestSuite()
     suite.addTests(loader.loadTestsFromTestCase(TestAStar))
-    suite.addTests(loader.loadTestsFromTestCase(TestWaypointFollower))
     runner = unittest.TextTestRunner(verbosity=2)
     result = runner.run(suite)
     return 0 if result.wasSuccessful() else 1
 
 
 if __name__ == "__main__":
-    import sys
-    sys.exit(main())
+    raise SystemExit(main())

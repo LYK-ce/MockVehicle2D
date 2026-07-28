@@ -1,6 +1,5 @@
 """Deterministic command, motion, watchdog, and collision checks."""
 
-import json
 import math
 from pathlib import Path
 import sys
@@ -12,7 +11,6 @@ sys.path.insert(0, str(REPO_ROOT / "src"))
 
 from mockvehicle2d.collision import is_circle_passable, is_swept_circle_passable
 from mockvehicle2d.map_grid import MapGrid
-from mockvehicle2d.server import CommandMessageError, handle_command_message, parse_command_message, parse_drive_message
 from mockvehicle2d.vehicle import Vehicle, command_from_axes
 
 
@@ -215,32 +213,6 @@ class VehicleTest(unittest.TestCase):
         vehicle.advance(grid, 4.5)
         self.assertEqual((vehicle.x, vehicle.y, vehicle.yaw), stopped_at)
 
-    def test_handoff_collision_rejects_replacement_command(self) -> None:
-        grid = MapGrid.from_wall_set(20, 20, {(4, y) for y in range(20)})
-        vehicle = Vehicle(2.5, 5.5, command_timeout=5.0, now=0.0)
-        vehicle.apply_command(grid, "forward", 0.0)
-
-        ack = handle_command_message(
-            '{"type":"cmd","seq":12,"cmd":"backward"}',
-            vehicle,
-            grid,
-            4.0,
-            13.5,
-        )
-
-        self.assertEqual(
-            ack,
-            {
-                "type": "cmd_ack",
-                "ts": 13.5,
-                "seq": 12,
-                "cmd": "backward",
-                "accepted": False,
-                "reason": "collision",
-            },
-        )
-        self.assertEqual((vehicle.command, vehicle.velocities()), ("stop", (0.0, 0.0, 0.0)))
-
     def test_substeps_stop_at_last_safe_position(self) -> None:
         grid = MapGrid.from_wall_set(20, 20, {(4, y) for y in range(20)})
         vehicle = Vehicle(2.5, 5.5, linear_speed=10.0, command_timeout=2.0, now=0.0)
@@ -298,113 +270,6 @@ class VehicleTest(unittest.TestCase):
         vehicle.apply_command(grid, "backward", 0.5)
         vehicle.advance(grid, 0.75)
         self.assertFalse(vehicle.collision)
-
-    def test_canonical_and_legacy_commands_are_acknowledged(self) -> None:
-        vehicle = self.vehicle()
-        ack = handle_command_message(
-            json.dumps({"type": "cmd", "seq": 7, "cmd": "forward"}), vehicle, self.grid, 0.0, 12.5
-        )
-        self.assertEqual(
-            ack,
-            {"type": "cmd_ack", "ts": 12.5, "seq": 7, "cmd": "forward", "accepted": True},
-        )
-        legacy = handle_command_message('{"cmd":"stop"}', vehicle, self.grid, 0.1, 12.6)
-        self.assertEqual(legacy["type"], "cmd_ack")
-        self.assertIsNone(legacy["seq"])
-
-        self.assertEqual(
-            parse_command_message('{"type":"cmd","seq":8,"cmd":"forward_right"}'),
-            ("forward_right", 8),
-        )
-        self.assertEqual(parse_command_message('{"cmd":"backward_left"}'), ("backward_left", None))
-        with self.assertRaises(CommandMessageError):
-            parse_command_message('{"type":"cmd","seq":9,"cmd":"forward_up"}')
-
-    def test_drive_message_is_bounded_and_acknowledged(self) -> None:
-        self.assertEqual(
-            parse_drive_message(
-                '{"type":"drive","seq":10,"linear_mps":-0.5,"angular_rps":1.5}', 0.5, 1.5
-            ),
-            (-0.5, 1.5, 10),
-        )
-        vehicle = self.vehicle()
-        ack = handle_command_message(
-            '{"type":"drive","seq":11,"linear_mps":0.25,"angular_rps":-0.4}',
-            vehicle,
-            self.grid,
-            0.0,
-            13.0,
-        )
-        self.assertEqual(
-            ack,
-            {"type": "cmd_ack", "ts": 13.0, "seq": 11, "cmd": "drive", "accepted": True},
-        )
-        self.assertEqual(vehicle.command, "drive")
-        self.assertEqual(vehicle.velocities(), (0.25, 0.0, -0.4))
-
-    def test_drive_parser_rejects_bool_nonfinite_bounds_and_bad_fields(self) -> None:
-        invalid = [
-            '{"type":"drive","seq":1,"linear_mps":true,"angular_rps":0}',
-            '{"type":"drive","seq":1,"linear_mps":NaN,"angular_rps":0}',
-            '{"type":"drive","seq":1,"linear_mps":0,"angular_rps":Infinity}',
-            '{"type":"drive","seq":1,"linear_mps":0.51,"angular_rps":0}',
-            '{"type":"drive","seq":1,"linear_mps":0,"angular_rps":-1.51}',
-            '{"type":"drive","seq":1,"linear_mps":' + "9" * 4000 + ',"angular_rps":0}',
-            '{"type":"drive","seq":true,"linear_mps":0,"angular_rps":0}',
-            '{"type":"drive","seq":1,"linear_mps":0}',
-            '{"type":"drive","seq":1,"linear_mps":0,"angular_rps":0,"extra":1}',
-        ]
-        for raw in invalid:
-            with self.subTest(raw=raw), self.assertRaises(CommandMessageError):
-                parse_drive_message(raw, 0.5, 1.5)
-
-        vehicle = self.vehicle()
-        vehicle.apply_drive(self.grid, 0.5, 0.0, 0.0)
-        error = handle_command_message(invalid[3], vehicle, self.grid, 0.2, 13.0)
-        self.assertEqual((error["type"], error["seq"], error["code"]), ("error", 1, "drive_out_of_range"))
-        self.assertAlmostEqual(vehicle.x, 5.1)
-        self.assertEqual(vehicle.command, "stop")
-        self.assertEqual(vehicle.velocities(), (0.0, 0.0, 0.0))
-
-    def test_invalid_command_stops_and_returns_safe_sequence(self) -> None:
-        vehicle = self.vehicle()
-        vehicle.apply_command(self.grid, "forward", 0.0)
-        error = handle_command_message(
-            '{"type":"cmd","seq":9,"cmd":"fly"}', vehicle, self.grid, 0.25, 13.0
-        )
-        self.assertEqual(error["type"], "error")
-        self.assertEqual(error["seq"], 9)
-        self.assertEqual(error["code"], "invalid_cmd")
-        self.assertAlmostEqual(vehicle.x, 5.125)
-        self.assertEqual(vehicle.command, "stop")
-
-    def test_parser_strictly_rejects_invalid_shapes_and_fields(self) -> None:
-        invalid = [
-            b'{"cmd":"forward"}',
-            "not-json",
-            "[]",
-            '{"type":"pose","seq":1,"cmd":"forward"}',
-            '{"type":"cmd","seq":-1,"cmd":"forward"}',
-            '{"type":"cmd","seq":true,"cmd":"forward"}',
-            '{"type":"cmd","cmd":"forward"}',
-            '{"cmd":"forward","extra":1}',
-            '{"type":"cmd","seq":1,"cmd":"forward","extra":1}',
-        ]
-        for raw in invalid:
-            with self.subTest(raw=raw), self.assertRaises(CommandMessageError):
-                parse_command_message(raw)
-
-    def test_oversized_json_integer_fails_safe(self) -> None:
-        vehicle = self.vehicle()
-        vehicle.apply_command(self.grid, "forward", 0.0)
-        raw = '{"type":"cmd","seq":' + "1" * 5000 + ',"cmd":"forward"}'
-
-        error = handle_command_message(raw, vehicle, self.grid, 0.25, 13.0)
-
-        self.assertEqual(error["type"], "error")
-        self.assertEqual(error["code"], "invalid_json")
-        self.assertEqual(vehicle.command, "stop")
-
 
 def main() -> int:
     result = unittest.TextTestRunner(verbosity=2).run(unittest.defaultTestLoader.loadTestsFromTestCase(VehicleTest))

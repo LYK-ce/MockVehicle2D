@@ -23,4 +23,5 @@
 
 - 与 WebSocket Server 共用 `MapGrid`、`Vehicle` 和连续防穿墙检测。
 - 使用固定 25 px/cell、0.5 m 车体半径和 60 FPS。
-- 不显示 Tmini 扫描、`goto`、安全净空或 Pictor 的局部视野效果。
+- 不接入 RobotController，不显示 Tmini 扫描、自动任务、安全净空或 Pictor
+  的局部视野效果。

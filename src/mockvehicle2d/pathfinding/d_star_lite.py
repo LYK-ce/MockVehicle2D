@@ -121,6 +121,17 @@ class DStarLitePlanner:
             self._planning_bounds(start, goal)
         ) <= self.max_cells
 
+    def validate_plan_request(self, start: Cell, goal: Cell) -> None:
+        """Reject a request that cannot fit inside this planner's hard bounds."""
+        self._validate_cell(start, "start")
+        self._validate_cell(goal, "goal")
+        if math.hypot(goal[0] - start[0], goal[1] - start[1]) * (
+            self.resolution_m
+        ) > self.max_goal_distance_m:
+            raise ValueError("goal exceeds maximum distance")
+        if self._bounds_cell_count(self._planning_bounds(start, goal)) > self.max_cells:
+            raise ValueError("planning cell budget exceeded")
+
     def is_segment_passable(
         self,
         source_m: tuple[float, float],
@@ -246,15 +257,10 @@ class DStarLitePlanner:
         changed_cells: Iterable[MapCellUpdate] = (),
         expansion_budget: int,
     ) -> PlanProgress:
-        self._validate_cell(start, "start")
-        self._validate_cell(goal, "goal")
+        self.validate_plan_request(start, goal)
         if type(expansion_budget) is not int or expansion_budget <= 0:
             raise ValueError("expansion budget must be a positive integer")
         self.last_failure = None
-        if math.hypot(goal[0] - start[0], goal[1] - start[1]) * self.resolution_m > (
-            self.max_goal_distance_m
-        ):
-            raise ValueError("goal exceeds maximum distance")
 
         changes = tuple(changed_cells)
         for change in changes:
@@ -330,8 +336,6 @@ class DStarLitePlanner:
 
     def _reset(self, start: Cell, goal: Cell) -> None:
         bounds = self._planning_bounds(start, goal)
-        if self._bounds_cell_count(bounds) > self.max_cells:
-            raise ValueError("planning cell budget exceeded")
         self._bounds = bounds
         self._start = self._last_start = start
         self._goal = goal

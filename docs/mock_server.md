@@ -1,237 +1,143 @@
-# Mock Server — 架构与碰撞检测
+# Robot Controller 模拟架构
 
-## 概述
+## 职责边界
 
-MockVehicle2D 模拟小车行为：生成 2D 栅格地图、发送位姿、响应控制命令。
-通过 WebSocket 与 Pictor (Godot) 通信，并可选 Pygame 可视化窗口进行本地调试。
+MockVehicle2D 对齐真实小车的控制分层，但保留仿真环境和确定性传感器：
 
+```text
+Client
+  │ WebSocket v4
+  ▼
+Protocol
+  │ typed Command
+  ▼
+RobotController
+  ├── OpMode: Manual / Auto
+  ├── Manual lease
+  ├── active mission
+  ├── bounded pending queue
+  └── mission lifecycle
+        │
+        ├── Manual desired velocity
+        └── GotoController desired velocity
+                        │
+                        ▼
+                LocalSafetyRuntime
+                        │
+                        ▼
+                     Vehicle
 ```
-┌──────────────────────┐         WebSocket          ┌──────────────────────┐
-│     Pictor (Godot)   │ ←─────────────────────────→ │   MockVehicle2D      │
-│   WebSocketClient    │ hello / map / pose / scan / cmd│ MockVehicle2D       │
-└──────────────────────┘                             └──────────────────────┘
+
+| 模块 | 负责 | 不负责 |
+|------|------|--------|
+| `protocol.py` | 严格 JSON、字段/范围校验、类型化命令 | 模式和任务状态 |
+| `controller.py` | 模式、队列、生命周期、速度输出所有权 | WebSocket、真值地图生成 |
+| `navigation.py` | 根据局部状态生成自动期望速度 | 直接修改车辆 |
+| `safety.py` | 手动/自动安全门控、故障停车、安全推进 | 任务队列 |
+| `server.py` | 独占连接、帧调度、遥测和事件发送 | 自主决策 |
+| `vehicle.py` | 运动学、执行器设定值、看门狗 | 任务和协议 |
+
+安全运行时和碰撞检查可以直接停车，因为它们是控制器之外的独立故障保护；除此之外，
+业务路径不得绕过 `RobotController` 安装运动设定值。
+
+## 状态模型
+
+```text
+OpMode
+  Manual
+  Auto
+
+AutoState
+  Idle      没有任务
+  Active    正在启动、规划或执行当前任务
+  Paused    当前任务和队列保留，但不输出自动速度
+  Blocked   当前任务失败，等待 resume 重试或 cancel_all
 ```
 
-## 基本信息
+队列由一个活动任务和一个有界待执行队列组成。到达后自动取下一个任务；阻断后不会跳过
+当前任务。`resume` 会从当前定位和地图重新启动活动任务。`cancel_all` 清除活动任务和所有
+待执行任务。
 
-| 项目 | 值 |
+模式切换规则：
+
+| 操作 | 结果 |
 |------|------|
-| 语言 | Python 3.10+ |
-| 依赖 | `websockets` (WebSocket), `pygame` (可视化), 标准库 |
-| 默认端口 | 19090 |
-| 地图规模 | 24×24 (pygame) / 256×256 (WebSocket) |
-| 车辆 | 圆形, r=0.5, 有航向角 yaw |
-| 每格含义 | 0 = 可通行, 1 = 墙, 2 = 无地面/落差 |
+| Manual → Auto（无任务） | `Auto/Idle` |
+| Manual → Auto（有保留任务） | `Auto/Paused`，需 `resume` |
+| Auto → Manual | 先停车，活动任务转为 paused，队列保留 |
+| 重复切换到当前模式 | 幂等，无额外停车和事件 |
+| 控制连接断开 | 停车；自动任务暂停；释放独占连接 |
+| 非法协议输入 | 停车；自动任务暂停，原因 `invalid_command` |
 
----
+## 一帧的执行顺序
 
-## 文件结构
+Server 以 Tmini 名义扫描周期（约 6 Hz）执行：
 
-```
-MockVehicle2D/
-├── src/mockvehicle2d/
-│   ├── server.py           ← WebSocket Server 入口
-│   ├── vehicle.py          ← 共用车辆运动、碰撞与指令看门狗
-│   ├── local_state.py      ← 锚定里程计、scan matching 与车辆自有观测地图
-│   ├── scan.py             ← YDLidar 风格二维激光扫描
-│   ├── navigation.py       ← 有限视野 D* Lite 自动导航
-│   ├── pathfinding/
-│   │   └── d_star_lite.py  ← 增量路径规划
-│   ├── safety.py           ← 障碍/边缘净空与本地安全门控
-│   ├── map_grid.py         ← MapGrid 栅格地图数据结构
-│   ├── collision.py        ← Bresenham 线段 + AABB 圆形碰撞检测
-│   └── visual.py           ← Pygame 可视化测试
-├── tests/
-│   ├── test_collision.py   ← 碰撞检测测试 (60 条断言)
-│   ├── test_scan.py        ← 二维扫描几何测试
-│   ├── test_vehicle.py     ← 运动、组合命令与看门狗测试
-│   ├── test_goto.py        ← goto 与手动接管测试
-│   ├── test_local_state.py ← 锚点、里程计、观测地图和重连测试
-│   ├── test_safety.py      ← 安全感知和策略测试
-│   ├── test_safety_runtime.py ← 延迟推进与安全门控测试
-│   └── test_server_scan.py ← scan WebSocket 帧测试
-├── docs/
-│   ├── mock_server.md      ← 本文档
-│   └── pygame_visual.md    ← Pygame 可视化设计
-├── pyproject.toml
-├── LICENSE
-└── README.md
-```
+1. 安全运行时把上一设定值推进到当前单调时间；
+2. 从仿真真值环境生成当前 Tmini scan；
+3. 用真值运动增量更新模拟 odometry；
+4. 用旧占据证据做有限窗 scan matching；
+5. 将当前 scan 写入车辆自有 `ObservedGrid`，得到 map delta；
+6. `RobotController.tick()` 处理任务、规划和期望速度；
+7. 期望速度通过安全门控后安装到 `Vehicle`，下一周期生效；
+8. 发送同一帧的 `pose`、`scan` 和任务事件。
 
----
+命令到达时，Runtime 先把旧设定值安全推进到接收时刻，再执行命令。这样命令处理和遥测
+都不会倒退模拟时间。
 
-## 模块架构
+## 手动控制
 
-```
-mockvehicle2d serve (WebSocket Server)
-  │
-  ├── 连接握手: hello(vehicle_id)
-  ├── 地图生成: voxel 数组 → map_full
-  │
-  ├── 锚定本地状态: global_map → anchor_map → odom → base_link → lidar
-  ├── 定位前端: odometry prediction + bounded scan matching → corrected PoseEstimate
-  ├── 车辆自有地图: corrected pose + Tmini scan → Unknown / Free / Occupied + delta
-│
-  ├── goto: global goal → anchor goal → D* Lite 增量路径 → 下一周期速度
-  ├── cmd / drive: 严格校验 → 手动接管 / ack / error → 故障停车
-  ├── 本地安全: Tmini 障碍净空 + 模拟边缘净空 → 限速 / 停车
-  │
-  ├── 共用车辆状态: 实际单调时间 → 运动 / 看门狗 / 分步碰撞
-  │
-  ├── 同帧遥测: 名义 6 Hz pose → Tmini scan（相同 seq / timestamp_s）
-  │
-  └── 碰撞检测:
-        ├── map_grid.py  → MapGrid
-        └── collision.py → is_circle_passable / raycast
+手动控制直接给出 `linear_mps` 与 `angular_rps`，但仍经过安全门控。非零设定值只在
+`command-timeout-s` 租约内有效；客户端长按时应重复发送 `drive`，松手发送 `stop`。
+看门狗到期、碰撞、边缘/障碍硬停止或安全输入故障都会停车。
 
-mockvehicle2d visual (Pygame 可视化)
-  ├── import mockvehicle2d.map_grid
-  ├── import mockvehicle2d.vehicle
-  └── W/S/A/D/方向键驾驶 + 同一运动和碰撞逻辑
+## 自动控制
+
+Auto `push` 只写入任务队列。控制帧启动当前 `goto`，将 `global_map` 目标通过出生锚点
+转换为 `anchor_map` 目标，再由有限视野 D* Lite 规划。`GotoController` 返回期望速度，
+不直接控制车辆。到达、阻断、暂停和取消都通过 `mission_update` 明确发布。
+
+同一 `mission_id` 和同一目标可用新的 `seq` 安全重试；不会生成第二个任务。相同 ID
+对应不同目标会返回 `mission_id_conflict`。
+
+## 连接与故障语义
+
+- 一个 Runtime 同时只允许一个控制 WebSocket；其他连接收到 `vehicle_busy`。
+- `hello` 是业务首帧，声明协议版本、控制租约、任务坐标系、地图元数据和控制器快照。
+- JSON 发送和二进制地图 chunk 均有超时，慢客户端不会无限占用控制循环。
+- 连接断开不删除 odometry、本地地图、活动任务或队列；车辆停车并把自动状态设为
+  `Paused`。
+- 重连后客户端从 `hello.controller` 恢复视图，并显式发送
+  `switch_to_auto`（如需要）和 `resume`。
+
+## 真值与局部状态
+
+`MapGrid` 是模拟世界真值，只服务碰撞、传感器生成和调试 `map_full`。自主导航只消费：
+
+```text
+AnchorSpec
+PoseEstimate
+ObservedGrid
+LocalMapDelta
+SafetyObservation
 ```
 
----
+因此隐藏障碍在雷达观测前保持 Unknown；进入视野并写入 Occupied 后才触发 D* Lite
+重规划。当前轻量 scan matching 不包含回环、位姿图或全局优化。
 
-## 通信协议
-
-遵循 [WebSocket 通信协议](websocket_protocol.md)。
-
-| 方向 | 消息 | 状态 |
-|------|------|------|
-| 上行 (Server → Pictor) | `hello` | ✅ 已实现 |
-| 上行 (Server → Pictor) | `map_full` | ✅ 已实现 |
-| 上行 | `pose` | ✅ 已实现 |
-| 上行 | `scan` | ✅ 已实现 |
-| 上行 | `map_delta` | ⏸️ 暂不实现 |
-| 下行 (Pictor → Server) | `cmd` / `drive` / `goto` | ✅ 已实现 |
-| 上行 | `cmd_ack` / `goto_ack` / `error` | ✅ 已实现 |
-
----
-
-## 碰撞检测
-
-### MapGrid — 栅格地图
-
-2D 占据栅格，`bytearray` 一维数组，索引 `y * width + x`。
-
-```
-┌──┬──┬──┬──┬──┐
-│0 │0 │1 │0 │0 │
-├──┼──┼──┼──┼──┤
-│0 │0 │0 │1 │0 │    get_cell(x, y)  → cells[y * width + x]
-├──┼──┼──┼──┼──┤    set_cell(x, y, v) → cells[y * width + x] = v
-│0 │0 │0 │0 │0 │
-└──┴──┴──┴──┴──┘
-
-O(1) 查询, O(1) 写入, 256² = 64 KB
-```
-
-### Bresenham 线段碰撞
-
-直线路径逐格采样，途中任一 cell 不可通行（墙、落差或越界）→ 碰撞。
-
-```
-A(0,0) → B(4,3):  (0,0)→(1,0)→(2,1)→(3,2)→(4,3)
-                                     ↑ 撞墙!
-复杂度: O(max(|dx|, |dy|))
-```
-
-### AABB vs Circle 圆形碰撞
-
-车辆为圆形 (r=0.5)，检测与 cell AABB 的重叠：
-
-```
-cell [gx, gx+1] × [gy, gy+1] 到圆心 (cx, cy) 的最近点:
-
-  closest_x = clamp(cx, gx, gx+1)
-  closest_y = clamp(cy, gy, gy+1)
-
-  重叠 ⇔ (closest_x - cx)² + (closest_y - cy)² < r²
-```
-
-```
-  ┌─────┬─────┐
-  │     │  🚗 │  圆心 (5.3, 5.0), r=0.5
-  │cell │cell │  cell(4,5): closest=(5.0, 5.0), d=0.3 → 重叠
-  │(4,5)│(5,5)│  cell(5,5): closest=(5.3, 5.0), d=0 → 重叠
-  └─────┴─────┘
-```
-
----
-
-## 碰撞行为
-
-```
-直线或弧线指令 → 按实际 dt 切分短线段 → is_swept_circle_passable()
-  ├─ True  → 更新 pose 并继续
-  └─ False → 停在最后安全点，command=stop, collision=true
-```
-
-- ❌ 不滑行  ❌ 不绕行  ❌ 不反弹
-- ✅ 不穿墙并报告零实际速度
-
-## 控制与故障停车
+## 启动
 
 ```bash
 mockvehicle2d serve \
   --port 19090 \
   --vehicle-id mock_vehicle_01 \
+  --mission-capacity 16 \
   --linear-speed-mps 0.5 \
   --angular-speed-rps 1.5708 \
   --vehicle-radius-m 0.5 \
-  --command-timeout-s 1.0 \
-  --anchor-id mock_vehicle_01_anchor \
-  --anchor-x-m 10 --anchor-y-m 10 --anchor-yaw-rad 0 \
-  --odom-translation-noise-m 0 --odom-yaw-noise-rad 0 --odom-seed 0
+  --command-timeout-s 1.0
 ```
 
-公开配置使用 SI 单位：米、秒和弧度。规范命令为 `{"type":"cmd","seq":0,"cmd":"forward"}`；W+D 等组合输入发送 `forward_right`，同时使用线速度和角速度。也兼容精确 legacy 格式 `{"cmd":"forward"}`。新命令生效前先把旧命令积分到接收时刻。非法消息、看门狗超时、碰撞或连接结束都会停车。
-
-Pictor 连接 `ws://127.0.0.1:19090` 后，首帧为 `hello`，随后为 `map_full → pose → scan`。若端口被占用，可启动 `mockvehicle2d serve --port 9090`，并让 Pictor 连接 `ws://127.0.0.1:9090`。`hello` 不携带地址；Pictor 使用自己实际连接的 URL。
-
-旧版 Pictor 若忽略 `hello.map.transform_to_global_map`，只支持默认出生锚点对应的恒等
-变换；非默认 anchor 的消费者必须应用该变换后再叠加地图与位姿。
-
-每个 6 Hz deadline 只推进一次共用状态，再以相同 `seq` 和 Unix `timestamp_s` 顺序发送 `pose`、`scan`。运行循环先安全推进上一命令，再在同一时刻完成 scan、odometry prediction、scan matching、地图 delta 和 D* Lite 重规划；新速度从下一周期生效。命令接收和全部发送都在同一个连接协程内串行执行；每轮先处理已到期遥测，命令洪泛不会永久饿死遥测。车辆 runtime 由 Server 创建一次，同时只允许一个控制 WebSocket；并发连接收到 `vehicle_busy` 后结束，不能推进或清理当前控制器。当前控制器断开时停车并释放控制权；锚定 odometry、本地观测地图和 revision 不会重置，但活动 `goto` 被取消，下一连接需重新下发目标。
-
----
-
-## 测试
-
-源码仓库中的 `python -m pytest` 运行碰撞、扫描、运动、协议、`goto` 和安全运行时的
-全部确定性检查。
-
----
-
-## 当前状态
-
-| 功能 | 状态 |
-|------|------|
-| Pictor hello 握手 | ✅ |
-| 地图生成 (map_full) | ✅ |
-| 位姿发送 (pose) | ✅ |
-| 本地二维激光 (scan) | ✅ |
-| MapGrid 栅格地图 | ✅ |
-| Bresenham 线段碰撞 | ✅ |
-| AABB vs Circle 碰撞 | ✅ |
-| 碰撞检测测试 | ✅ 60/60 |
-| 二维扫描测试 | ✅ |
-| Pygame 可视化 | ✅ |
-| cmd 命令接收、确认和错误停车 | ✅ |
-| drive 连续速度与组合驾驶 | ✅ |
-| goto 有限视野 D* Lite 动态重规划与手动接管 | ✅ |
-| 障碍/边缘安全限速和停车 | ✅ |
-| 实际时间运动、看门狗和防穿墙 | ✅ |
-| 出生锚点与增量 odometry | ✅ |
-| 车辆自有 ObservedGrid / delta | ✅ 内存 |
-| bounded correlative scan matching | ✅ 局部前端 |
-| D* Lite 增量重规划 | ✅ |
-| 定位 degraded/lost 安全语义 | ✅ |
-| 回环 / 位姿图 / 全局优化 | ❌ |
-
-`map_full.source=simulator_ground_truth` 只用于物理、传感器生成和调试显示；
-`pose.source=anchored_odometry`，正常协议不发送绝对真值。默认零噪声保持 Pictor 兼容，
-可用固定 seed 注入可重放 odometry 误差。scan matching 只在旧局部占据证据上做有限窗
-SE(2) 配准，不含回环、地点识别、位姿图或全局优化。当前自有地图 delta 不通过 WebSocket
-上传，也没有地图持久化或中央地图同步。水平 Tmini 不能检测跌落，无回波按最大量程 Free
-只是当前模拟约定，接入真实硬件前必须校准。
+Pictor 或其他客户端必须实现
+[WebSocket v4 协议](websocket_protocol.md)。旧的 `cmd`、`drive`、直接 `goto` 和
+自然语言消息不会被接受。

@@ -5,14 +5,12 @@ from __future__ import annotations
 import math
 from typing import TYPE_CHECKING
 
-from mockvehicle2d.map_grid import MapGrid
 from mockvehicle2d.pathfinding.d_star_lite import DStarLitePlanner
 from mockvehicle2d.safety import (
     HARD_STOP_CLEARANCE_M,
     LocalSafetyRuntime,
     SafetyAdvanceResult,
 )
-from mockvehicle2d.vehicle import Vehicle
 
 if TYPE_CHECKING:
     from mockvehicle2d.local_state import (
@@ -38,18 +36,14 @@ class GotoController:
     """Plan from one estimated pose and observed map; never read simulator pose truth."""
 
     goal_tolerance_m = 0.1
-    yaw_tolerance_rad = math.radians(2)
     turn_in_place_threshold_rad = math.radians(20)
 
     def __init__(self) -> None:
         self.status = "idle"
-        self.mode = "position"
         self.requested_goal: tuple[float, float] | None = None
         self.goal: tuple[float, float] | None = None
         self.reported_goal: tuple[float, float] | None = None
         self.goal_mode: str | None = None
-        self.yaw_goal_rad: float | None = None
-        self.reported_yaw_goal_rad: float | None = None
         self.reason: str | None = None
         self.detail: str | None = None
         self._planner: DStarLitePlanner | None = None
@@ -68,10 +62,6 @@ class GotoController:
         self._pending_candidate: SafeCandidate | None = None
         self._candidate_inspections = 0
 
-    @property
-    def control_mode(self) -> str:
-        return "autonomous" if self.status == "active" else "manual"
-
     def start(
         self,
         x_m: float,
@@ -82,13 +72,10 @@ class GotoController:
         pose: PoseEstimate,
         vehicle_radius_m: float = 0.5,
     ) -> None:
-        self.mode = "position"
         self.requested_goal = (x_m, y_m)
         self.goal = self.requested_goal
         self.reported_goal = self.goal if reported_goal is None else reported_goal
         self.goal_mode = "exact"
-        self.yaw_goal_rad = None
-        self.reported_yaw_goal_rad = None
         self.status = "active"
         self.reason = None
         self.detail = None
@@ -110,44 +97,10 @@ class GotoController:
         self._planner = DStarLitePlanner(
             local_map, vehicle_radius_m=vehicle_radius_m
         )
-        self._advance_planning(
-            pose,
-            local_map,
-            (),
-            PLANNING_EXPANSIONS_PER_UPDATE,
+        self._planner.validate_plan_request(
+            self._pose_cell(pose, local_map),
+            self._goal_cell(local_map),
         )
-
-    def start_rotation(
-        self,
-        yaw_goal_rad: float,
-        *,
-        reported_yaw_rad: float | None = None,
-    ) -> None:
-        if not math.isfinite(yaw_goal_rad) or (
-            reported_yaw_rad is not None and not math.isfinite(reported_yaw_rad)
-        ):
-            raise ValueError("yaw goal must be finite")
-        self.mode = "rotation"
-        self.requested_goal = None
-        self.goal = None
-        self.reported_goal = None
-        self.goal_mode = None
-        self.yaw_goal_rad = _wrap_angle(yaw_goal_rad)
-        self.reported_yaw_goal_rad = _wrap_angle(
-            self.yaw_goal_rad
-            if reported_yaw_rad is None
-            else reported_yaw_rad
-        )
-        self.status = "active"
-        self.reason = None
-        self.detail = None
-        self._planner = None
-        self._path = []
-        self._path_revision = 0
-        self._replan_count = 0
-        self._current_waypoint = None
-        self._nearby_detail = None
-        self._clear_pending_planning()
 
     def cancel(self, reason: str) -> None:
         if self.status in {"active", "blocked"}:
@@ -162,27 +115,21 @@ class GotoController:
         self.detail = detail
         self._clear_pending_planning()
 
-    def block_for_localization_loss(
-        self, vehicle: Vehicle, pose: PoseEstimate, now: float | None = None
-    ) -> bool:
+    def block_for_localization_loss(self, pose: PoseEstimate) -> bool:
         if self.status != "active" or pose.quality != "lost":
             return False
-        vehicle.stop(now)
         self.block("localization_lost")
         return True
 
     def snapshot(self) -> dict[str, object]:
-        if self.mode == "rotation" and self.reported_yaw_goal_rad is not None:
-            goal = {"yaw_rad": self.reported_yaw_goal_rad}
-        else:
-            goal = (
-                None
-                if self.reported_goal is None
-                else {"x_m": self.reported_goal[0], "y_m": self.reported_goal[1]}
-            )
+        goal = (
+            None
+            if self.reported_goal is None
+            else {"x_m": self.reported_goal[0], "y_m": self.reported_goal[1]}
+        )
         snapshot: dict[str, object] = {
             "status": self.status,
-            "mode": self.mode,
+            "mode": "position",
             "goal": goal,
             "requested_goal": (
                 None
@@ -233,74 +180,53 @@ class GotoController:
         })
         return snapshot
 
-    def replan(
-        self,
-        pose: PoseEstimate,
-        map_delta: LocalMapDelta | None,
-        local_map: ObservedGrid,
-    ) -> None:
-        if self.status != "active":
-            return
-        if self._planner is None:
-            raise RuntimeError("active navigation has no D* Lite planner")
-        changes = () if map_delta is None else map_delta.changed_cells
-        if self._planning_kind is None:
-            self._planning_kind = "goal"
-            self._planning_previous_path = list(self._path)
-        self._planning_map_changed |= bool(changes)
-        self._advance_planning(
-            pose,
-            local_map,
-            changes,
-            PLANNING_EXPANSIONS_PER_UPDATE,
-        )
-
     def update(
         self,
-        vehicle: Vehicle,
-        grid: MapGrid,
-        now: float,
-        safety: LocalSafetyRuntime | None = None,
         *,
-        pose: PoseEstimate | None = None,
+        pose: PoseEstimate,
+        local_map: ObservedGrid,
+        max_linear_mps: float,
+        max_angular_rps: float,
         advance_result: SafetyAdvanceResult | None = None,
-        local_map: ObservedGrid | None = None,
         map_delta: LocalMapDelta | None = None,
-    ) -> None:
+        safety: LocalSafetyRuntime | None = None,
+    ) -> tuple[float, float]:
+        """Advance navigation state and return one desired body-velocity setpoint.
+
+        This controller never writes the simulated actuator.  RobotController is
+        the single owner that applies the returned setpoint through the safety
+        runtime.
+        """
+        limits = (max_linear_mps, max_angular_rps)
+        if (
+            any(isinstance(value, bool) or not isinstance(value, (int, float)) for value in limits)
+            or not all(math.isfinite(value) and value > 0 for value in limits)
+        ):
+            raise ValueError("navigation velocity limits must be finite and positive")
+
         was_active = self.status == "active"
-        missing_position_state = self.mode == "position" and (
-            local_map is None or self._planner is None
-        )
-        if was_active and (pose is None or missing_position_state):
-            vehicle.stop(now)
+        if was_active and self._planner is None:
             self.status = "blocked"
             self.reason = "local_state_unavailable"
             self.detail = None
             self._clear_pending_planning()
-            return
-        if was_active:
-            assert pose is not None
-            if self.block_for_localization_loss(vehicle, pose, now):
-                return
+            return 0.0, 0.0
+        if was_active and self.block_for_localization_loss(pose):
+            return 0.0, 0.0
         if advance_result is not None:
             collided = advance_result.collided
             safety_stop = advance_result.reason if advance_result.stopped else None
-        elif safety is None:
-            collided = vehicle.advance(grid, now)
-            safety_stop = None
         else:
-            result = safety.advance(vehicle, grid, now, automatic=was_active)
-            collided = result.collided
-            safety_stop = result.reason if result.stopped else None
+            collided = False
+            safety_stop = None
         if not was_active:
-            return
+            return 0.0, 0.0
         if collided:
             self.status = "blocked"
             self.reason = "collision"
             self.detail = None
             self._clear_pending_planning()
-            vehicle.stop()
-            return
+            return 0.0, 0.0
         if safety_stop is not None and not (
             self._planner is not None
             and (
@@ -318,40 +244,10 @@ class GotoController:
             self.reason = safety_stop
             self.detail = None
             self._clear_pending_planning()
-            vehicle.stop()
-            return
-
-        if self.mode == "rotation":
-            assert pose is not None and self.yaw_goal_rad is not None
-            yaw_error = _wrap_angle(self.yaw_goal_rad - pose.yaw_rad)
-            if abs(yaw_error) <= self.yaw_tolerance_rad:
-                self.status = "reached"
-                self.reason = "yaw_tolerance"
-                self.detail = None
-                self._clear_pending_planning()
-                vehicle.stop()
-                return
-            angular_rps = max(
-                -vehicle.angular_speed,
-                min(vehicle.angular_speed, 2 * yaw_error),
-            )
-            if safety is not None:
-                decision = safety.evaluate(
-                    vehicle, grid, 0.0, angular_rps, automatic=True
-                )
-                if decision.state in {"stopped", "fault"}:
-                    self.status = "blocked"
-                    self.reason = decision.reason
-                    self.detail = None
-                    self._clear_pending_planning()
-                    vehicle.stop()
-                    return
-                angular_rps = decision.angular_rps
-            vehicle.install_drive(0.0, angular_rps, now)
-            return
+            return 0.0, 0.0
 
         assert self.goal is not None
-        assert pose is not None and local_map is not None and self._planner is not None
+        assert self._planner is not None
         x_m, y_m, yaw_rad = pose.x_m, pose.y_m, pose.yaw_rad
         start_changed = (
             not self._path
@@ -371,14 +267,12 @@ class GotoController:
                 PLANNING_EXPANSIONS_PER_UPDATE,
             )
         if self._planning_kind is not None or self.status != "active":
-            vehicle.stop()
-            return
+            return 0.0, 0.0
         if not self._path:
             self.status = "blocked"
             self.reason = "no_path"
             self._clear_pending_planning()
-            vehicle.stop()
-            return
+            return 0.0, 0.0
 
         dx, dy = self.goal[0] - x_m, self.goal[1] - y_m
         distance = math.hypot(dx, dy)
@@ -389,8 +283,7 @@ class GotoController:
         )
         if distance <= self.goal_tolerance_m and within_approach_limit:
             if self.goal_mode == "approaching_safe_stop":
-                vehicle.stop()
-                return
+                return 0.0, 0.0
             self.status = "reached"
             if self.goal_mode == "nearby_safe":
                 self.reason = "nearby_safe_stop"
@@ -399,8 +292,7 @@ class GotoController:
                 self.reason = "goal_tolerance"
                 self.detail = None
             self._clear_pending_planning()
-            vehicle.stop()
-            return
+            return 0.0, 0.0
 
         target_x, target_y = self.goal
         target_cell: tuple[int, int] | None = None
@@ -421,8 +313,7 @@ class GotoController:
                     self.detail = "start_connection_unsafe"
                     self._current_waypoint = None
                     self._clear_pending_planning()
-                    vehicle.stop()
-                    return
+                    return 0.0, 0.0
                 target_x = (target_cell[0] + 0.5) * local_map.resolution_m
                 target_y = (target_cell[1] + 0.5) * local_map.resolution_m
         self._current_waypoint = target_x, target_y
@@ -431,11 +322,14 @@ class GotoController:
         heading_error = math.atan2(
             math.sin(desired_yaw - yaw_rad), math.cos(desired_yaw - yaw_rad)
         )
-        angular_rps = max(-vehicle.angular_speed, min(vehicle.angular_speed, 2 * heading_error))
+        angular_rps = max(
+            -max_angular_rps,
+            min(max_angular_rps, 2 * heading_error),
+        )
         linear_mps = (
             0.0
             if abs(heading_error) > self.turn_in_place_threshold_rad
-            else min(vehicle.linear_speed, target_distance)
+            else min(max_linear_mps, target_distance)
         )
         if pose is not None and pose.quality == "degraded":
             linear_mps *= DEGRADED_LINEAR_SCALE
@@ -444,26 +338,7 @@ class GotoController:
             and local_map.is_unknown(*target_cell)
         ):
             linear_mps *= UNKNOWN_LINEAR_SCALE
-        if safety is not None:
-            decision = safety.evaluate(
-                vehicle, grid, linear_mps, angular_rps, automatic=True
-            )
-            if decision.state in {"stopped", "fault"}:
-                vehicle.stop()
-                if (
-                    decision.reason == "safety_edge"
-                    and safety.observation.edge_point_vehicle_m is not None
-                    and map_delta is not None
-                    and _edge_evidence_is_mapped(safety, pose, local_map)
-                ):
-                    return
-                self.status = "blocked"
-                self.reason = decision.reason
-                self.detail = None
-                self._clear_pending_planning()
-                return
-            linear_mps, angular_rps = decision.linear_mps, decision.angular_rps
-        vehicle.install_drive(linear_mps, angular_rps, now)
+        return linear_mps, angular_rps
 
     def _advance_planning(
         self,
@@ -826,11 +701,6 @@ class GotoController:
             math.floor(pose.x_m / local_map.resolution_m),
             math.floor(pose.y_m / local_map.resolution_m),
         )
-
-
-def _wrap_angle(angle_rad: float) -> float:
-    return math.atan2(math.sin(angle_rad), math.cos(angle_rad))
-
 
 def _axis_offsets(radius: float, max_step: float) -> tuple[float, ...]:
     intervals = max(1, math.ceil(2 * radius / max_step))

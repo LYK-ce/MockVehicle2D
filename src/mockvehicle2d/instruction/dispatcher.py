@@ -1,129 +1,115 @@
-"""将 v3 NL 意图 JSON 翻译为函数调用和 Robot Controller 协议命令。
-
-翻译层：纯确定性查表。LLM 输出不变，服务端翻译。
-"""
+"""Translate validated intent objects into Robot Controller v4 commands."""
 
 from __future__ import annotations
 
 from dataclasses import dataclass
+import json
 from typing import Any
 
-
-class ClarifyRequest(Exception):
-    """clarify 意图：不走 Vehicle API，触发状态机 CONFIRMING。"""
-
-    def __init__(self, question: str, missing_parameters: list[str]) -> None:
-        self.question = question
-        self.missing_parameters = missing_parameters
+from mockvehicle2d.protocol import MAX_SEQUENCE, parse_command
 
 
-@dataclass
+@dataclass(frozen=True)
 class TranslatedInstruction:
-    """单条指令的翻译产物。
-
-    Attributes
-    ----------
-    function_call : dict
-        {"name": "goto", "arguments": {"x_m": 100, "y_m": 200}}
-    command : dict | None
-        Robot Controller 协议命令，clarify 时为 None。
-    instruction : dict
-        原始 v3 JSON，向后兼容。
-    """
+    """One intent, its function-call view, and an optional v4 command."""
 
     function_call: dict[str, Any]
     command: dict[str, Any] | None
     instruction: dict[str, Any]
 
 
-def translate(instruction: dict[str, Any]) -> TranslatedInstruction:
-    """v3 intent JSON → function_call + command + instruction。
+def translate(
+    instruction: dict[str, Any],
+    *,
+    seq: int,
+    mission_id: str | None = None,
+) -> TranslatedInstruction:
+    """Translate one validated v3-style intent at the client boundary.
 
-    Parameters
-    ----------
-    instruction : dict
-        单条 v3 指令，如 {"intent": "goto", "parameters": {"x_m": 100, "y_m": 200}}
-
-    Returns
-    -------
-    TranslatedInstruction
-
-    Raises
-    ------
-    ValueError
-        intent 不在翻译表中。
+    ``goto`` produces only ``auto/push``. The caller must explicitly select
+    Auto mode before sending it. ``clarify`` has no executable command.
     """
-    intent = instruction.get("intent")
-    params: dict[str, Any] = instruction.get("parameters", {}) or {}
 
-    translator = _TRANSLATORS.get(intent)
-    if translator is None:
+    if not isinstance(instruction, dict):
+        raise ValueError("instruction must be an object")
+    if isinstance(seq, bool) or not isinstance(seq, int) or not 0 <= seq <= MAX_SEQUENCE:
+        raise ValueError("seq must be an unsigned 64-bit integer")
+    parameters = instruction.get("parameters", {})
+    if not isinstance(parameters, dict):
+        raise ValueError("parameters must be an object")
+
+    intent = instruction.get("intent")
+    if intent == "stop":
+        function_call = {"name": "stop", "arguments": {}}
+        command: dict[str, Any] | None = {
+            "type": "mode",
+            "seq": seq,
+            "action": "stop_motion",
+        }
+    elif intent == "goto":
+        if mission_id is None:
+            raise ValueError("goto requires mission_id")
+        try:
+            x_m = parameters["x_m"]
+            y_m = parameters["y_m"]
+        except KeyError as error:
+            raise ValueError("goto requires x_m and y_m") from error
+        function_call = {
+            "name": "goto",
+            "arguments": {"x_m": x_m, "y_m": y_m},
+        }
+        command = {
+            "type": "auto",
+            "seq": seq,
+            "action": "push",
+            "missions": [
+                {
+                    "mission_id": mission_id,
+                    "type": "goto",
+                    "frame_id": "global_map",
+                    "x_m": x_m,
+                    "y_m": y_m,
+                }
+            ],
+        }
+    elif intent == "clarify":
+        function_call = {
+            "name": "clarify",
+            "arguments": {
+                "question": parameters.get("question", "请提供更多信息"),
+                "missing_parameters": parameters.get("missing_parameters", []),
+            },
+        }
+        command = None
+    elif intent == "patrol":
+        raise ValueError("patrol is not supported by Robot Controller v4")
+    else:
         raise ValueError(f"unknown intent: {intent}")
 
-    fc = translator(params)
-    return TranslatedInstruction(
-        function_call={"name": fc["name"], "arguments": fc["arguments"]},
-        command=fc["command"],
-        instruction=instruction,
-    )
+    if command is not None:
+        parse_command(
+            json.dumps(command),
+            linear_limit_mps=float("inf"),
+            angular_limit_rps=float("inf"),
+            mission_batch_limit=1,
+        )
+    return TranslatedInstruction(function_call, command, instruction)
 
 
-def translate_all(instructions: list[dict[str, Any]]) -> list[TranslatedInstruction]:
-    """批量翻译。"""
-    return [translate(inst) for inst in instructions]
+def translate_all(
+    instructions: list[dict[str, Any]],
+    *,
+    seqs: list[int],
+    mission_ids: list[str | None] | None = None,
+) -> list[TranslatedInstruction]:
+    """Translate a batch whose sequence numbers are owned by the caller."""
 
-
-# ── 翻译表 ────────────────────────────────────────────────────
-
-
-def _translate_stop(params: dict[str, Any]) -> dict[str, Any]:
-    return {
-        "name": "stop",
-        "arguments": {},
-        "command": {"cmd": "manual", "action": "stop"},
-    }
-
-
-def _translate_goto(params: dict[str, Any]) -> dict[str, Any]:
-    x = params["x_m"]
-    y = params["y_m"]
-    return {
-        "name": "goto",
-        "arguments": {"x_m": x, "y_m": y},
-        "command": {
-            "cmd": "auto",
-            "action": "push",
-            "missions": [{"type": "goto", "x_m": x, "y_m": y}],
-        },
-    }
-
-
-def _translate_patrol(params: dict[str, Any]) -> dict[str, Any]:
-    return {
-        "name": "patrol",
-        "arguments": {},
-        "command": {
-            "cmd": "auto",
-            "action": "push",
-            "missions": [{"type": "patrol"}],
-        },
-    }
-
-
-def _translate_clarify(params: dict[str, Any]) -> dict[str, Any]:
-    return {
-        "name": "clarify",
-        "arguments": {
-            "question": params.get("question", "请提供更多信息"),
-            "missing_parameters": params.get("missing_parameters", []),
-        },
-        "command": None,
-    }
-
-
-_TRANSLATORS: dict[str, Any] = {
-    "stop": _translate_stop,
-    "goto": _translate_goto,
-    "patrol": _translate_patrol,
-    "clarify": _translate_clarify,
-}
+    if len(instructions) != len(seqs):
+        raise ValueError("instructions and seqs must have equal lengths")
+    ids = mission_ids if mission_ids is not None else [None] * len(instructions)
+    if len(ids) != len(instructions):
+        raise ValueError("instructions and mission_ids must have equal lengths")
+    return [
+        translate(instruction, seq=seq, mission_id=mission_id)
+        for instruction, seq, mission_id in zip(instructions, seqs, ids)
+    ]
