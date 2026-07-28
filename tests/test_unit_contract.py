@@ -285,6 +285,19 @@ def test_cli_does_not_publish_repository_test_runner(monkeypatch, capsys) -> Non
     assert "invalid choice" in capsys.readouterr().err
 
 
+def test_repository_test_command_and_sequence_plan_match_current_contract() -> None:
+    workflow = (REPO_ROOT / ".github/workflows/ci.yml").read_text(encoding="utf-8")
+    template = (REPO_ROOT / ".github/pull_request_template.md").read_text(encoding="utf-8")
+    plan = (REPO_ROOT / "docs/instruction/PLAN.md").read_text(encoding="utf-8")
+
+    assert "run: python -m pytest" in workflow
+    assert "`python -m pytest`" in template
+    assert "mockvehicle2d test" not in workflow + template
+    assert "_cancel_nl_task" not in plan
+    assert "不清空队列" not in plan
+    assert "仅当前任务成功完成才会出队下一条" in plan
+
+
 def test_client_sequences_use_unsigned_64_bit_contract() -> None:
     maximum = 2**64 - 1
     assert _safe_seq({"seq": maximum}) == maximum
