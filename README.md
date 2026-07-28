@@ -1,6 +1,8 @@
 # MockVehicle2D
 
-2D 车辆模拟器，Python 实现。用于 Pictor 项目的 WebSocket 协议测试与碰撞检测验证。
+2D 车辆模拟器，Python 实现。用于 Pictor 项目的 WebSocket 协议测试、碰撞检测验证、
+以及 **Qwen3-8B/14B 驱动的自然语言车辆指令系统**（NL→JSON→执行），
+支持 stop / goto / clarify / patrol 四种意图。
 
 ## 快速开始
 
@@ -32,6 +34,25 @@ mockvehicle2d serve --anchor-id car_01_anchor --anchor-x-m 10 --anchor-y-m 10 \
 # A* 全真值调试工具（不属于 goto 运行链路）
 mockvehicle2d pathfind --start-m 10,10 --goal-m 200,200
 
+# 自然语言指令（需要本地 llama.cpp server）
+# 方式一：通过 CLI 一键启动 server
+mockvehicle2d serve-llm                         # 默认 GPU 0, Qwen3-8B
+mockvehicle2d serve-llm --gpu 0 --model Qwen3-14B-Q4_K_M  # 14B 模型
+
+# 方式二：手动启动 server（脚本）
+bash scripts/start_llm_server.sh                # 默认
+bash scripts/start_llm_server.sh 0 Qwen3-14B-Q4_K_M  # 14B
+
+# 然后执行 NL 指令
+mockvehicle2d nl "去坐标 (100, 200)"
+mockvehicle2d nl "停"
+mockvehicle2d nl "开始巡逻"
+mockvehicle2d nl --interactive
+mockvehicle2d nl --model Qwen3-14B-Q4_K_M "去坐标 (50, 30)"
+
+# 离线评测
+mockvehicle2d nl --eval
+
 # 启动 Pygame 可视化
 mockvehicle2d visual
 
@@ -46,6 +67,14 @@ MockVehicle2D/
 ├── src/mockvehicle2d/
 │   ├── cli/                ← 统一 CLI 入口 (argparse)
 │   │   └── main.py
+│   ├── instruction/        ← NL→JSON 自然语言指令系统
+│   │   ├── llm_client.py   ← LLMClient (Qwen via llama.cpp)
+│   │   ├── validator.py    ← Schema 与可选地图语义校验
+│   │   ├── state_machine.py← 指令生命周期与多指令队列
+│   │   ├── compiler.py     ← 离线 JSON 指令编译/调试
+│   │   ├── authority.py    ← 5 级权限仲裁
+│   │   └── schemas/
+│   │       └── v3.json     ← JSON Schema v3（stop/goto/clarify/patrol）
 │   ├── pathfinding/        ← D* Lite 动态规划 + A* 全真值调试 + 路径跟随
 │   │   ├── a_star.py
 │   │   ├── d_star_lite.py
@@ -57,7 +86,7 @@ MockVehicle2D/
 │   ├── local_state.py      ← 出生锚点、增量里程计与车辆自有观测地图
 │   ├── navigation.py       ← 有限视野 D* Lite 重规划、局部目标跟踪与状态
 │   ├── safety.py           ← Tmini/边缘观测、固定阈值与本地安全运行时
-│   ├── server.py           ← WebSocket Server，接收 cmd 并发送 map_full / pose / scan
+│   ├── server.py           ← WebSocket Server，接收 cmd/drive/goto/nl_command
 │   ├── scan.py             ← YDLidar Tmini 二维角度/距离/强度扫描
 │   └── visual.py           ← Pygame 可视化，支持 W+D 等组合驾驶与实时碰撞反馈
 ├── tests/
@@ -72,8 +101,14 @@ MockVehicle2D/
 │   ├── test_dynamic_navigation.py ← 有限视野发现、重规划与到达 E2E
 │   ├── test_safety.py      ← 纯安全感知与策略测试
 │   ├── test_safety_runtime.py ← 自动/手动安全运行时接入测试
-│   └── test_server_scan.py ← scan WebSocket 帧测试
+│   ├── test_server_scan.py ← scan WebSocket 帧测试
+│   ├── test_instruction.py ← NL 校验/状态机/编译器单元测试
+│   ├── test_nl_integration.py ← NL 全链路集成测试
+│   ├── nl_eval.json        ← 46 条评测数据集（stop/goto/clarify/patrol）
+│   └── test_pathfinding_controller.py
 ├── docs/
+│   ├── instruction/
+│   │   └── PLAN.md         ← NL 系统设计文档
 │   ├── mock_server.md
 │   ├── pathfinding.md
 │   ├── pygame_visual.md
@@ -134,6 +169,95 @@ AABB vs Circle 圆形碰撞
 测试集，包括有限视野 D* Lite、动态重规划、scan matching、SI 契约、WebSocket
 协议、车辆运动、碰撞与安全回归；任一测试失败时命令返回非零状态。
 
+`mockvehicle2d test` 可运行基础运动、碰撞、扫描、`goto` 与安全自检。
+
+## 自然语言指令系统（NL→JSON）
+
+通过 Qwen 大模型将自然语言指令转换为结构化 JSON，再编译为确定性车辆任务执行。
+
+### 架构
+
+```text
+用户 NL 输入 ("去坐标 (100, 200)")
+    │
+    ▼
+┌──────────────────────────┐
+│ LLM Client               │
+│ LLMClient (Qwen 8B/14B) │  ← LLM 模式，通过 llama.cpp server
+└──────────┬───────────────┘
+           │
+           ▼
+    {"intent": "goto", "parameters": {"x_m": 100, "y_m": 200}}
+           │
+           ▼
+┌──────────────────────────┐
+│ 三层校验                   │
+│ 1. Schema (JSON Schema)   │  ← intent 枚举 / parameters 类型 / 数值范围
+│ 2. Semantic (地图边界)      │  ← 坐标可通行性 / 距离上限
+│ 3. Safety (SafetyRuntime) │  ← 净空 / 急停状态
+└──────────┬───────────────┘
+           │ 通过
+           ▼
+┌──────────────────────────┐
+│ WebSocket 执行层           │
+│ goto → 锚定局部状态        │
+│      → 有限视野 D* Lite    │
+│ stop  → 立即停车           │
+│ patrol→ 启动巡逻           │
+└──────────┬───────────────┘
+           │
+           ▼
+       车辆执行
+```
+
+### 支持的意图 (4 种)
+
+| 意图 | 中文示例 | JSON 参数 |
+|------|---------|----------|
+| `stop` | "停下"、"紧急停止" | `{}` |
+| `goto` | "去 (100, 200)"、"开到 10, 20" | `{"x_m": 100, "y_m": 200}` |
+| `clarify` | "开到那边去" → 反问坐标 | `{"question": "请指定坐标", "missing_parameters": [...]}` |
+| `patrol` | "开始巡逻"、"启动巡逻" | `{}` |
+
+### 运行模式
+
+`mockvehicle2d nl` 通过 `LLMClient` 连接本地 llama.cpp server（`localhost:8000`）进行 NL→JSON 推理。默认单 GPU（`CUDA_VISIBLE_DEVICES=0`），Qwen3-8B-Q4_K_M，Thinking 模式开启。
+
+### LLM 配置
+
+```bash
+# 默认 Qwen3-8B (8-bit 量化)
+mockvehicle2d nl "去坐标 (100, 200)"
+
+# 切换到 Qwen3-14B
+mockvehicle2d nl --model Qwen3-14B-Q4_K_M "去坐标 (100, 200)"
+```
+
+### JSON Schema v3（最小化设计）
+
+LLM 仅需输出 2 个字段：
+
+```json
+{"intent": "goto", "parameters": {"x_m": 100, "y_m": 200}}
+```
+
+移除了 `schema_version`、`timestamp`、`confidence`、`reasoning`（均不被下游消费）。
+`additionalProperties: true` 确保 LLM 偶发的额外字段不会阻塞指令。
+
+### Retry 机制
+
+LLM 输出 JSON 解析失败或 Schema 校验失败时，自动将错误反馈给 LLM 进行最多 3 次重试。
+超时和连接错误不重试。
+
+### 离线评测
+
+```bash
+mockvehicle2d nl --eval
+```
+
+46 条测试覆盖全部 4 种意图 + 边界情况（越界坐标、注入攻击、乱码输入）。
+Qwen3-8B: 98% | Qwen3-14B: 100%（单 GPU A100, Q4_K_M, Thinking 开启）。
+
 ## 通信协议
 
 遵循 [WebSocket 通信协议](docs/websocket_protocol.md)。
@@ -153,7 +277,9 @@ Pictor 也应连接 `ws://127.0.0.1:9090`。连接首帧固定为
 | 上行 | `pose` | ✅ |
 | 上行 | `scan` | ✅ |
 | 上行 | `map_delta` | ⏸️ |
+| 上行 (Server→Pictor) | `nl_parse_result` / `nl_confirm_request` / `nl_task_update` / `nl_scan_report` | ✅ |
 | 下行 (Pictor→Server) | `cmd` / `drive` / `goto` | ✅ |
+| 下行 (Pictor→Server) | `nl_command` / `nl_clarify_response` | ✅ |
 
 `scan` 默认使用 Tmini 轮廓：360°、0.02–12 m、名义 4000 Hz 测距、名义 6 Hz 扫描、667 条均匀射线。有效回波按 0.01 m 量化；无回波为 `range: 0.0, intensity: 0.0`，不能当作障碍物。水平 Tmini 只返回墙体；确定性的 `state=2` 落差测试区会显示在 `map_full`，由模拟的向下地面探测输入负责安全判断。
 

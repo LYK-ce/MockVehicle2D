@@ -14,7 +14,6 @@ import time
 import pytest
 
 from mockvehicle2d.instruction.compiler import TaskCompiler
-from mockvehicle2d.instruction.llm_client import FakeModelClient
 from mockvehicle2d.instruction.state_machine import InstructionStateMachine
 from mockvehicle2d.instruction.validator import SchemaValidator, SemanticValidator
 from mockvehicle2d.map_grid import MapGrid, WALL
@@ -24,6 +23,32 @@ from mockvehicle2d.pathfinding import PathFollowingController, a_star_search
 from mockvehicle2d.safety import LocalSafetyRuntime
 from mockvehicle2d.server import _handle_nl_command
 from mockvehicle2d.vehicle import Vehicle
+
+
+# ═══════════════════════════════════════════════════════════════
+# Test helper — minimal deterministic parser for pipeline tests
+# ═══════════════════════════════════════════════════════════════
+
+import re as _re
+
+
+class _TestParser:
+    """Minimal deterministic NL parser for integration testing."""
+
+    _GOTO_PAT = _re.compile(r"去.*?(\d+(?:\.\d+)?).*?(\d+(?:\.\d+)?)")
+
+    def parse(self, text: str) -> list[dict]:
+        text = text.strip()
+        if not text:
+            return [{"intent": "clarify", "parameters": {"question": "请输入指令"}}]
+
+        m = self._GOTO_PAT.search(text)
+        if m:
+            return [{"intent": "goto", "parameters": {"x_m": float(m.group(1)), "y_m": float(m.group(2))}}]
+
+        if text in {"停"}:
+            return [{"intent": "stop", "parameters": {}}]
+        return [{"intent": "clarify", "parameters": {"question": "请指定坐标"}}]
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -231,12 +256,10 @@ class TestTaskCompilerPhase3:
     """TaskCompiler with grid uses A* fallback."""
 
     def test_compiler_uses_goto_when_clear(self, empty_grid):
-        """goto_point with clear straight-line → GotoController."""
+        """goto with clear straight-line → GotoController."""
         compiler = TaskCompiler(empty_grid)
         inst = {
-            "schema_version": "1.0",
-            "intent": "goto_point",
-            "timestamp": "2026-07-24T12:00:00+08:00",
+            "intent": "goto",
             "parameters": {"x_m": 20, "y_m": 10},
         }
         snapshot = {"pose": {"x_m": 10.0, "y_m": 10.0, "yaw_rad": 0.0}}
@@ -246,12 +269,10 @@ class TestTaskCompilerPhase3:
         assert task["goal"] == {"x_m": 20, "y_m": 10}
 
     def test_compiler_uses_astar_when_blocked(self, grid_with_wall):
-        """goto_point with obstacle → PathFollowingController with A* path."""
+        """goto with obstacle → PathFollowingController with A* path."""
         compiler = TaskCompiler(grid_with_wall)
         inst = {
-            "schema_version": "1.0",
-            "intent": "goto_point",
-            "timestamp": "2026-07-24T12:00:00+08:00",
+            "intent": "goto",
             "parameters": {"x_m": 20, "y_m": 10},
         }
         snapshot = {"pose": {"x_m": 10.0, "y_m": 10.0, "yaw_rad": 0.0}}
@@ -266,7 +287,7 @@ class TestTaskCompilerPhase3:
         assert path[-1] == {"x_m": 20.0, "y_m": 10.0}
 
     def test_compiler_blocked_when_no_path(self):
-        """goto_point with unreachable goal → blocked."""
+        """goto with unreachable goal → blocked."""
         grid = MapGrid(256, 256)
         # Surround goal at (20, 10) with walls but keep (20,10) free
         for x in range(19, 22):
@@ -277,9 +298,7 @@ class TestTaskCompilerPhase3:
 
         compiler = TaskCompiler(grid)
         inst = {
-            "schema_version": "1.0",
-            "intent": "goto_point",
-            "timestamp": "2026-07-24T12:00:00+08:00",
+            "intent": "goto",
             "parameters": {"x_m": 20, "y_m": 10},
         }
         snapshot = {"pose": {"x_m": 5.0, "y_m": 5.0, "yaw_rad": 0.0}}
@@ -292,41 +311,8 @@ class TestTaskCompilerPhase3:
         """Without grid, compiler always chooses GotoController (backward compat)."""
         compiler = TaskCompiler()  # No grid
         inst = {
-            "schema_version": "1.0",
-            "intent": "goto_point",
-            "timestamp": "2026-07-24T12:00:00+08:00",
+            "intent": "goto",
             "parameters": {"x_m": 20, "y_m": 10},
-        }
-        snapshot = {"pose": {"x_m": 10.0, "y_m": 10.0, "yaw_rad": 0.0}}
-        task = compiler.compile(inst, snapshot)
-        assert task["controller"] == "GotoController"
-
-    def test_move_distance_uses_astar_when_blocked(self, grid_with_wall):
-        """move_distance with obstacle → PathFollowingController."""
-        compiler = TaskCompiler(grid_with_wall)
-        inst = {
-            "schema_version": "1.0",
-            "intent": "move_distance",
-            "timestamp": "2026-07-24T12:00:00+08:00",
-            "parameters": {"distance_m": 10.0, "direction": "forward"},
-        }
-        snapshot = {"pose": {"x_m": 10.0, "y_m": 10.0, "yaw_rad": 0.0}}
-        task = compiler.compile(inst, snapshot)
-        assert task["type"] == "navigation"
-        # Straight line from (10,10) to (20,10) crosses wall at x=15
-        assert task["controller"] == "PathFollowingController"
-        assert "path" in task
-        path = task["path"]
-        assert len(path) > 2
-
-    def test_move_distance_uses_goto_when_clear(self, empty_grid):
-        """move_distance without obstacle → GotoController."""
-        compiler = TaskCompiler(empty_grid)
-        inst = {
-            "schema_version": "1.0",
-            "intent": "move_distance",
-            "timestamp": "2026-07-24T12:00:00+08:00",
-            "parameters": {"distance_m": 5.0, "direction": "forward"},
         }
         snapshot = {"pose": {"x_m": 10.0, "y_m": 10.0, "yaw_rad": 0.0}}
         task = compiler.compile(inst, snapshot)
@@ -342,7 +328,7 @@ class TestNLPipelineRouting:
 
     @pytest.fixture
     def nl_client(self):
-        return FakeModelClient()
+        return _TestParser()
 
     @pytest.fixture
     def schema_v(self):
@@ -438,29 +424,6 @@ class TestNLPipelineRouting:
 
         task_updates = [r for r in replies if r["type"] == "nl_task_update"]
         assert len(task_updates) >= 1
-        assert task_updates[0]["status"] == "active"
-        assert navigation.snapshot()["algorithm"] == "d_star_lite"
-        assert path_following.status != "active"
-
-    def test_nl_move_distance_uses_dstar_not_truth_path_following(
-        self, vehicle, grid_with_wall, navigation, path_following, nl_client,
-        schema_v, state_machine, local_state
-    ):
-        """NL move-distance uses finite-view D* Lite, not truth-map following."""
-        vehicle.yaw = 0.0  # facing +x
-        semantic_v = SemanticValidator(None)
-
-        msg = {"type": "nl_command", "seq": 33, "text": "前进 10 米"}
-        replies = _handle_nl_command(
-            msg, vehicle, grid_with_wall, navigation,
-            time.time(), time.monotonic(),
-            nl_client, schema_v, semantic_v,
-            state_machine,
-            path_following=path_following,
-            local_state=local_state,
-        )
-
-        task_updates = [r for r in replies if r["type"] == "nl_task_update"]
         assert task_updates[0]["status"] == "active"
         assert navigation.snapshot()["algorithm"] == "d_star_lite"
         assert path_following.status != "active"

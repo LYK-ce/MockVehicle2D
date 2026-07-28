@@ -1,6 +1,6 @@
 """Three-layer instruction validation: schema, semantics, and safety.
 
-SchemaValidator   — JSON Schema v1 conformance (jsonschema)
+SchemaValidator   — JSON Schema v2 conformance (jsonschema)
 SemanticValidator — map bounds, passability, distance limits
 SafetyValidator   — delegates to existing SafetyRuntime
 """
@@ -18,13 +18,13 @@ from mockvehicle2d.map_grid import MapGrid
 from mockvehicle2d.safety import LocalSafetyRuntime
 
 
-_SCHEMA_PATH = Path(__file__).resolve().parent / "schemas" / "v1.json"
+_SCHEMA_PATH = Path(__file__).resolve().parent / "schemas" / "v3.json"
 
 _DEFAULT_MAX_DISTANCE_M = 10.0
 
 
 class SchemaValidator:
-    """Validates JSON against the v1 instruction schema using jsonschema."""
+    """Validates JSON against the v3 instruction schema using jsonschema."""
 
     def __init__(self) -> None:
         self._schema = json.loads(_SCHEMA_PATH.read_text(encoding="utf-8"))
@@ -32,12 +32,24 @@ class SchemaValidator:
         self._validator = self._validator_cls(self._schema)
 
     def validate(self, instruction: dict) -> tuple[bool, str]:
-        """Return (is_valid, error_message)."""
+        """Return (is_valid, error_message) for a single instruction."""
         errors = list(self._validator.iter_errors(instruction))
         if not errors:
             return True, ""
         messages = [self._format_error(error) for error in errors[:5]]
         return False, "; ".join(messages)
+
+    def validate_list(self, instructions: list[dict]) -> tuple[bool, str]:
+        """Return (all_valid, error_message) for a list of instructions.
+
+        Validates each element individually. Returns the first failure
+        or (True, \"\") if all pass.
+        """
+        for i, inst in enumerate(instructions):
+            valid, error = self.validate(inst)
+            if not valid:
+                return False, f"element [{i}]: {error}"
+        return True, ""
 
     @staticmethod
     def _format_error(error: jsonschema.ValidationError) -> str:
@@ -72,7 +84,7 @@ class SemanticValidator:
     grid : MapGrid
         The map for bounds and passability checks.
     max_distance_m : float
-        Maximum allowed move_distance (default 10.0).
+        Maximum allowed distance (default 10.0). For future use with distance-based intents.
     """
 
     def __init__(
@@ -85,19 +97,15 @@ class SemanticValidator:
         """Return (is_valid, error_message)."""
         intent = instruction.get("intent")
         params = instruction.get("parameters", {}) or {}
-        if intent == "goto_point":
-            return self._validate_goto_point(params)
-        if intent == "move_distance":
-            return self._validate_move_distance(params)
-        if intent == "rotate":
-            return self._validate_rotate(params)
+        if intent == "goto":
+            return self._validate_goto(params)
         return True, ""
 
-    def _validate_goto_point(self, params: dict) -> tuple[bool, str]:
+    def _validate_goto(self, params: dict) -> tuple[bool, str]:
         x_m = params.get("x_m")
         y_m = params.get("y_m")
         if x_m is None or y_m is None:
-            return False, "goto_point requires x_m and y_m"
+            return False, "goto requires x_m and y_m"
         try:
             finite = (
                 not isinstance(x_m, bool)
@@ -122,31 +130,6 @@ class SemanticValidator:
         if self._grid.is_void(gx, gy):
             return False, f"target cell ({gx}, {gy}) is void (no ground)"
         return True, ""
-
-    def _validate_move_distance(self, params: dict) -> tuple[bool, str]:
-        distance = params.get("distance_m", 0)
-        direction = params.get("direction")
-        if direction not in ("forward", "backward"):
-            return False, f"invalid direction: {direction!r}"
-        if not (0.01 <= distance <= self._max_distance_m):
-            return False, (
-                f"distance {distance}m outside allowed range "
-                f"[0.01, {self._max_distance_m}]"
-            )
-        return True, ""
-
-    @staticmethod
-    def _validate_rotate(params: dict) -> tuple[bool, str]:
-        angle = params.get("angle_rad", 0)
-        if (
-            isinstance(angle, bool)
-            or not isinstance(angle, (int, float))
-            or not math.isfinite(angle)
-            or angle <= 0
-        ):
-            return False, "rotate angle must be positive"
-        return True, ""
-
 
 class SafetyValidator:
     """Delegates safety checks to the existing SafetyRuntime."""

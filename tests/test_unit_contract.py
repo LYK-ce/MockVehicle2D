@@ -2,7 +2,6 @@
 
 import json
 import inspect
-import math
 from pathlib import Path
 import re
 import sys
@@ -123,26 +122,12 @@ def test_navigation_and_compiler_paths_are_labelled_metric_waypoints() -> None:
     grid = MapGrid.from_wall_set(8, 8, {(2, 0)})
     task = TaskCompiler(grid).compile(
         {
-            "schema_version": "1.0",
-            "intent": "goto_point",
-            "timestamp": "2026-07-26T00:00:00+08:00",
+            "intent": "goto",
             "parameters": {"x_m": 4.0, "y_m": 0.0},
         },
         {"pose": {"x_m": 0.0, "y_m": 0.0, "yaw_rad": 0.0}},
     )
     assert all(set(waypoint) == {"x_m", "y_m"} for waypoint in task["path"])
-
-    rotation = TaskCompiler().compile(
-        {
-            "schema_version": "1.0",
-            "intent": "rotate",
-            "timestamp": "2026-07-26T00:00:00+08:00",
-            "parameters": {"angle_rad": math.pi / 2, "direction": "left"},
-        }
-    )
-    assert rotation["angle_rad"] == pytest.approx(math.pi / 2)
-    assert "angle_deg" not in rotation
-    json.dumps(rotation)
 
 
 def test_navigation_fails_closed_without_estimated_pose_or_observed_map() -> None:
@@ -228,9 +213,18 @@ def test_shifted_anchor_direct_and_nl_goto_share_relative_bounds() -> None:
     )
     assert direct["accepted"]
 
-    from mockvehicle2d.instruction.llm_client import FakeModelClient
     from mockvehicle2d.instruction.state_machine import InstructionStateMachine
     from mockvehicle2d.instruction.validator import SchemaValidator, SemanticValidator
+
+    class ParsedGoto:
+        def __init__(self, x_m: float, y_m: float) -> None:
+            self.instruction = {
+                "intent": "goto",
+                "parameters": {"x_m": x_m, "y_m": y_m},
+            }
+
+        def parse(self, _text: str) -> list[dict[str, object]]:
+            return [self.instruction]
 
     near_navigation = GotoController()
     near = _handle_nl_command(
@@ -240,7 +234,7 @@ def test_shifted_anchor_direct_and_nl_goto_share_relative_bounds() -> None:
         near_navigation,
         1.0,
         0.0,
-        FakeModelClient(),
+        ParsedGoto(1001.0, 1000.0),
         SchemaValidator(),
         SemanticValidator(None),
         InstructionStateMachine(),
@@ -267,7 +261,7 @@ def test_shifted_anchor_direct_and_nl_goto_share_relative_bounds() -> None:
         far_navigation,
         1.0,
         0.0,
-        FakeModelClient(),
+        ParsedGoto(1400.0, 1000.0),
         SchemaValidator(),
         SemanticValidator(None),
         InstructionStateMachine(),

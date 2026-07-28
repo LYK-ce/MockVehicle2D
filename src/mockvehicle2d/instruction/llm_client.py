@@ -1,224 +1,65 @@
-"""LLM clients for natural language instruction parsing.
+"""LLM client for natural language instruction parsing.
 
-FakeModelClient — rule-based deterministic parser for offline testing
-VLLMClient      — async client for local vLLM (OpenAI-compatible API)
+LLMClient — async client for llama.cpp server (OpenAI-compatible API)
 """
 
 from __future__ import annotations
 
 import json
-import math
 import re
-from datetime import datetime, timezone, timedelta
-
-# Beijing timezone (UTC+8)
-_BEIJING_TZ = timezone(timedelta(hours=8))
-_NUMBER = r"(?:\d+(?:\.\d*)?|\.\d+)"
 
 
-def _beijing_now() -> str:
-    """Return current Beijing time as ISO 8601 string."""
-    return datetime.now(_BEIJING_TZ).isoformat()
+def _strip_thinking(content: str) -> str:
+    """Strip <think>...</think> tags from LLM output.
 
-
-def _finite_number(value: str) -> float | None:
-    try:
-        number = float(value)
-    except (ValueError, OverflowError):
-        return None
-    return number if math.isfinite(number) else None
-
-
-class FakeModelClient:
-    """Rule-based deterministic parser for offline testing.
-
-    Supports basic Chinese patterns for all seven intents.
+    Handles both closed and unclosed (truncated) think blocks.
+    After stripping, extracts remaining text for JSON parsing.
     """
-
-    def parse(self, text: str) -> dict | None:
-        """Parse NL text into a structured instruction dict, or None on failure."""
-        text = text.strip()
-        if not text:
-            return self._clarify("输入为空，请提供指令", [])
-
-        result = self._try_parse(text)
-        if result is not None:
-            return result
-        return self._clarify(f"无法理解指令「{text}」，请使用坐标指定目标位置", [])
-
-    def _try_parse(self, text: str) -> dict | None:
-        # stop
-        if re.match(r"^(停|停下|停止|紧急停止|别动了)$", text):
-            return self._make_instruction("stop", {})
-
-        # status
-        if re.match(r"^(现在什么状态|到哪了|有没有问题|状态|在哪)$", text):
-            return self._make_instruction("status", {})
-
-        # goto_point
-        m = self._parse_goto_point(text)
-        if m:
-            return self._make_instruction("goto_point", {"x_m": m[0], "y_m": m[1]})
-
-        # move_distance
-        m = self._parse_move_distance(text)
-        if m:
-            return self._make_instruction("move_distance", m)
-
-        # rotate
-        m = self._parse_rotate(text)
-        if m:
-            return self._make_instruction("rotate", m)
-
-        # scan_report
-        m = self._parse_scan(text)
-        if m is not None:
-            return self._make_instruction("scan_report", m)
-
-        return None
-
-    # ── pattern parsers ──────────────────────────────────────
-
-    @staticmethod
-    def _parse_goto_point(text: str) -> tuple[float, float] | None:
-        # "去 (x, y)" / "去坐标 (x, y)" / "开到 x, y" / "前往 (x, y)"
-        patterns = [
-            rf"^去\s*\(\s*(-?{_NUMBER})\s*[,，]\s*(-?{_NUMBER})\s*\)$",
-            rf"^去坐标\s*\(\s*(-?{_NUMBER})\s*[,，]\s*(-?{_NUMBER})\s*\)$",
-            rf"^开到\s*(-?{_NUMBER})\s*[,，]\s*(-?{_NUMBER})$",
-            rf"^前往\s*\(\s*(-?{_NUMBER})\s*[,，]\s*(-?{_NUMBER})\s*\)$",
-        ]
-        for pat in patterns:
-            m = re.match(pat, text)
-            if m:
-                x_m, y_m = _finite_number(m.group(1)), _finite_number(m.group(2))
-                return None if x_m is None or y_m is None else (x_m, y_m)
-        return None
-
-    @staticmethod
-    def _parse_move_distance(text: str) -> dict | None:
-        # "前进 N 米" / "后退 N 米"
-        m = re.match(rf"^前进\s*({_NUMBER})\s*米$", text)
-        if m:
-            distance_m = _finite_number(m.group(1))
-            return (
-                None
-                if distance_m is None
-                else {"distance_m": distance_m, "direction": "forward"}
-            )
-        m = re.match(rf"^后退\s*({_NUMBER})\s*米$", text)
-        if m:
-            distance_m = _finite_number(m.group(1))
-            return (
-                None
-                if distance_m is None
-                else {"distance_m": distance_m, "direction": "backward"}
-            )
-        return None
-
-    @staticmethod
-    def _parse_rotate(text: str) -> dict | None:
-        # "左转 N 度" / "右转 N 度"
-        m = re.match(rf"^左转\s*({_NUMBER})\s*度$", text)
-        if m:
-            angle_deg = _finite_number(m.group(1))
-            return (
-                None
-                if angle_deg is None
-                else {"angle_rad": math.radians(angle_deg), "direction": "left"}
-            )
-        m = re.match(rf"^右转\s*({_NUMBER})\s*度$", text)
-        if m:
-            angle_deg = _finite_number(m.group(1))
-            return (
-                None
-                if angle_deg is None
-                else {"angle_rad": math.radians(angle_deg), "direction": "right"}
-            )
-        return None
-
-    @staticmethod
-    def _parse_scan(text: str) -> dict | None:
-        if text in ("看一下", "扫一圈", "扫描一下", "扫描"):
-            return {}
-        m = re.match(r"^(前面|左边|右边|后面|周围)(有什么|有障碍吗|有东西吗)$", text)
-        if m:
-            query_map = {"前面": "前方", "左边": "左侧", "右边": "右侧", "后面": "后方", "周围": "四周"}
-            return {"query": query_map.get(m.group(1), "")}
-        return None
-
-    # ── helpers ──────────────────────────────────────────────
-
-    @staticmethod
-    def _make_instruction(intent: str, params: dict) -> dict:
-        return {
-            "schema_version": "1.0",
-            "intent": intent,
-            "timestamp": _beijing_now(),
-            "parameters": params,
-            "confidence": 0.95,
-            "reasoning": f"fake model: matched {intent} pattern",
-        }
-
-    @staticmethod
-    def _clarify(question: str, missing: list[str]) -> dict:
-        return {
-            "schema_version": "1.0",
-            "intent": "clarify",
-            "timestamp": _beijing_now(),
-            "parameters": {
-                "question": question,
-                "missing_parameters": missing,
-            },
-            "confidence": 0.6,
-            "reasoning": "fake model: unable to match any pattern",
-        }
+    content = re.sub(r"<think>.*?</think>\s*", "", content, flags=re.DOTALL)
+    content = re.sub(r"<think>.*$", "", content, flags=re.DOTALL)
+    return content.strip()
 
 
 _SYSTEM_PROMPT = """你是一个车辆指令解析器。将用户的自然语言指令转换为 JSON 格式。
 
-你必须输出一个 JSON 对象，包含以下字段：
-- schema_version: 固定为 "1.0"
-- intent: 意图类型，取值为 stop, status, goto_point, move_distance, rotate, scan_report, clarify
-- timestamp: 当前时间 ISO 8601 格式
+当用户输入包含连接词（"然后"、"接着"、"再"、"之后"、";"、"并"、"并且"）时，表示多个连续指令。此时输出 JSON 数组 [{...}, {...}, ...]，每个元素是一个指令对象。
+当用户输入是单个指令（无连接词）时，输出单个 JSON 对象。
+
+每个指令对象包含两个字段：
+- intent: 意图类型 (stop/goto/clarify/patrol)
 - parameters: 与 intent 对应的参数对象
-- confidence: 0.0-1.0 之间的置信度
-- reasoning: 简短的推理说明（最多500字符）
 
-意图与参数对应关系：
-- stop: 无需参数，parameters 为空对象 {}
-- status: 无需参数，parameters 为空对象 {}
-- goto_point: 需要 x_m (数字) 和 y_m (数字)
-- move_distance: 需要 distance_m (数字, 0.01-10.0) 和 direction ("forward" 或 "backward")
-- rotate: 需要 angle_rad (弧度, 大于0且不超过6.283185307179586) 和 direction ("left" 或 "right")
-- scan_report: 可选 query (字符串)
-- clarify: 需要 question (字符串)，可选 missing_parameters (字符串数组)
+意图定义：
+- stop: 用户要求立即停车。parameters 为 {}
+- goto: 用户提供了明确的目标坐标 x_m 和 y_m（范围 0–255）。
+  支持多种坐标格式："(100, 200)"、"100, 200"、"x=50 y=80" 等。
+  注意：只有相对移动描述（如"前进3米"、"往左走"）而没有绝对坐标的，归为 clarify。
+- patrol: 用户要求开始自动巡逻。parameters 为 {}
+- clarify: 指令模糊、缺少关键参数、或无法匹配以上意图时使用。
+  例如：缺少坐标的 goto、缺少角度的旋转、无意义输入、闲聊。
 
-示例：
-输入: "去坐标 (100, 200)"
-输出: {"schema_version": "1.0", "intent": "goto_point", "timestamp": "2026-01-01T00:00:00+08:00", "parameters": {"x_m": 100, "y_m": 200}, "confidence": 0.95, "reasoning": "用户指定了明确的目标坐标"}
+单指令示例：
+"停" → {"intent": "stop", "parameters": {}}
+"去坐标 (100, 200)" → {"intent": "goto", "parameters": {"x_m": 100, "y_m": 200}}
+"开到 10, 20" → {"intent": "goto", "parameters": {"x_m": 10, "y_m": 20}}
+"前进 3 米" → {"intent": "clarify", "parameters": {"question": "请提供目标坐标", "missing_parameters": ["x_m", "y_m"]}}
+"开到那边去" → {"intent": "clarify", "parameters": {"question": "请提供目标坐标", "missing_parameters": ["x_m", "y_m"]}}
+"开始巡逻" → {"intent": "patrol", "parameters": {}}
 
-输入: "停"
-输出: {"schema_version": "1.0", "intent": "stop", "timestamp": "2026-01-01T00:00:00+08:00", "parameters": {}, "confidence": 0.99, "reasoning": "用户要求停止"}
-
-输入: "前进 3 米"
-输出: {"schema_version": "1.0", "intent": "move_distance", "timestamp": "2026-01-01T00:00:00+08:00", "parameters": {"distance_m": 3.0, "direction": "forward"}, "confidence": 0.95, "reasoning": "用户要求向前移动指定距离"}
-
-输入: "左转 90 度"
-输出: {"schema_version": "1.0", "intent": "rotate", "timestamp": "2026-01-01T00:00:00+08:00", "parameters": {"angle_rad": 1.5707963267948966, "direction": "left"}, "confidence": 0.95, "reasoning": "用户要求左转指定角度"}
-
-输入: "前面有什么"
-输出: {"schema_version": "1.0", "intent": "scan_report", "timestamp": "2026-01-01T00:00:00+08:00", "parameters": {"query": "前方"}, "confidence": 0.9, "reasoning": "用户询问前方障碍物情况"}
-
-对于无法理解或模糊的指令（如"开到那边去"），使用 clarify 意图并给出澄清问题。
+多指令（含连接词）示例：
+"去（200，100）巡逻" → [{"intent": "goto", "parameters": {"x_m": 200, "y_m": 100}}, {"intent": "patrol", "parameters": {}}]
+"去 (10, 20) 然后去 (30, 40)" → [{"intent": "goto", "parameters": {"x_m": 10, "y_m": 20}}, {"intent": "goto", "parameters": {"x_m": 30, "y_m": 40}}]
+"巡逻，然后去 (50, 50)" → [{"intent": "patrol", "parameters": {}}, {"intent": "goto", "parameters": {"x_m": 50, "y_m": 50}}]
+"去 (5, 5) 接着停" → [{"intent": "goto", "parameters": {"x_m": 5, "y_m": 5}}, {"intent": "stop", "parameters": {}}]
+"去 (100, 200)；巡逻" → [{"intent": "goto", "parameters": {"x_m": 100, "y_m": 200}}, {"intent": "patrol", "parameters": {}}]
+"去 (10, 10) 然后去 (20, 20) 再去 (30, 30)" → [{"intent": "goto", "parameters": {"x_m": 10, "y_m": 10}}, {"intent": "goto", "parameters": {"x_m": 20, "y_m": 20}}, {"intent": "goto", "parameters": {"x_m": 30, "y_m": 30}}]
+"去 (100, 100) 然后巡逻然后停" → [{"intent": "goto", "parameters": {"x_m": 100, "y_m": 100}}, {"intent": "patrol", "parameters": {}}, {"intent": "stop", "parameters": {}}]
 
 只输出 JSON，不要输出任何其他内容。"""
 
 
-class VLLMClient:
-    """Async client for LLM inference (llama.cpp / vLLM OpenAI-compatible API).
-
-    Currently configured for llama.cpp server.
+class LLMClient:
+    """Async client for llama.cpp LLM inference (OpenAI-compatible API).
 
     Parameters
     ----------
@@ -226,15 +67,23 @@ class VLLMClient:
         OpenAI-compatible API endpoint (default: llama.cpp local server).
     model : str
         Model name as registered in the server.
+    max_retries : int
+        Maximum number of retry attempts on JSON parse or schema validation failure.
+    schema_validator : optional
+        SchemaValidator instance for self-validation during retries.
     """
 
     def __init__(
         self,
         base_url: str = "http://localhost:8000/v1",
         model: str = "Qwen3-8B-Q4_K_M",
+        max_retries: int = 3,
+        schema_validator=None,
     ) -> None:
         self._base_url = base_url
         self._model = model
+        self._max_retries = max_retries
+        self._schema_validator = schema_validator
         self._client = None  # Lazy init
 
     @property
@@ -245,33 +94,92 @@ class VLLMClient:
             self._client = AsyncOpenAI(base_url=self._base_url, api_key="not-needed")
         return self._client
 
-    async def parse(self, text: str) -> dict | None:
-        """Send text to the LLM and return parsed JSON dict.
+    async def parse(self, text: str) -> list[dict]:
+        """Send text to the LLM and return a list of parsed JSON instruction dicts.
 
-        Returns None on parse failure or timeout.
+        Retries on JSON decode errors and schema validation failures
+        by appending error feedback to the conversation.
+
+        Always returns a list:
+        - Single instruction → len-1 list
+        - Multi-instruction (with connectors) → list of dicts
+        - Parse failure → empty list
         """
-        import re
+        messages: list[dict] = [
+            {"role": "system", "content": _SYSTEM_PROMPT},
+            {"role": "user", "content": text},
+        ]
 
-        try:
-            response = await self._async_client.chat.completions.create(
-                model=self._model,
-                messages=[
-                    {"role": "system", "content": _SYSTEM_PROMPT},
-                    {"role": "user", "content": text},
-                ],
-                temperature=0.1,
-                max_tokens=512,
-                extra_body={"enable_thinking": False},
-                timeout=10.0,
-            )
-            content = response.choices[0].message.content
-            if content is None:
-                return None
-            # Strip <think>...</think> tags if present (Qwen3 thinking mode)
-            content = re.sub(r"<think>.*?</think>\s*", "", content, flags=re.DOTALL).strip()
-            # Strip markdown code fences if present
-            content = re.sub(r"^```(?:json)?\s*", "", content)
-            content = re.sub(r"\s*```$", "", content)
-            return json.loads(content)
-        except Exception:
-            return None
+        for attempt in range(self._max_retries + 1):
+            try:
+                response = await self._async_client.chat.completions.create(
+                    model=self._model,
+                    messages=messages,
+                    temperature=0.1,
+                    max_tokens=1024,
+                    extra_body={"enable_thinking": True},
+                    timeout=30.0,
+                )
+                content = response.choices[0].message.content
+                if content is None:
+                    return []
+
+                # Strip <think>...</think> tags (even unclosed ones)
+                content = _strip_thinking(content)
+                # Strip markdown code fences if present
+                content = re.sub(r"^```(?:json)?\s*", "", content)
+                content = re.sub(r"\s*```$", "", content)
+
+                try:
+                    result = json.loads(content)
+                except json.JSONDecodeError as e:
+                    if attempt < self._max_retries:
+                        messages.append({"role": "assistant", "content": content})
+                        messages.append({
+                            "role": "user",
+                            "content": f"你的回复不是合法的 JSON。错误: {e}。请只输出 JSON。",
+                        })
+                        continue
+                    return []
+
+                # Normalize: dict → [dict], list → as-is
+                if isinstance(result, dict):
+                    instructions: list[dict] = [result]
+                elif isinstance(result, list):
+                    instructions = result
+                else:
+                    if attempt < self._max_retries:
+                        messages.append({"role": "assistant", "content": content})
+                        messages.append({
+                            "role": "user",
+                            "content": "你的回复必须是 JSON 对象或 JSON 数组。请重新输出。",
+                        })
+                        continue
+                    return []
+
+                # Schema validation: validate each element
+                if self._schema_validator is not None:
+                    all_valid = True
+                    error_messages: list[str] = []
+                    for i, inst in enumerate(instructions):
+                        valid, error = self._schema_validator.validate(inst)
+                        if not valid:
+                            all_valid = False
+                            error_messages.append(f"[{i}]: {error}")
+                    if not all_valid:
+                        if attempt < self._max_retries:
+                            messages.append({"role": "assistant", "content": content})
+                            messages.append({
+                                "role": "user",
+                                "content": f"你的 JSON 不符合 schema。错误: {'; '.join(error_messages)}。请修正后重新输出。",
+                            })
+                            continue
+                        return []
+
+                return instructions
+
+            except Exception:
+                # Non-JSONDecodeError (e.g. timeout, connection error) — do NOT retry
+                return []
+
+        return []

@@ -6,7 +6,7 @@ Covers:
 - InstructionStateMachine
 - TaskCompiler
 - AuthorityManager
-- FakeModelClient
+- LLMClient
 - Integration: nl command → parse → validate pipeline
 """
 
@@ -19,7 +19,6 @@ import pytest
 
 from mockvehicle2d.instruction.authority import AuthorityLevel, AuthorityManager
 from mockvehicle2d.instruction.compiler import TaskCompiler
-from mockvehicle2d.instruction.llm_client import FakeModelClient
 from mockvehicle2d.instruction.state_machine import (
     InstructionState,
     InstructionStateMachine,
@@ -69,20 +68,13 @@ def faulty_safety():
     return s
 
 
-def _valid_instruction(intent="stop", params=None, **overrides):
-    """Build a minimally valid instruction dict."""
-    base = {
-        "schema_version": "1.0",
-        "intent": intent,
-        "timestamp": "2026-07-24T12:00:00+08:00",
-        "parameters": params or {},
-    }
-    base.update(overrides)
-    return base
+def _valid_instruction(intent="stop", params=None):
+    """Build a minimally valid v3 instruction dict."""
+    return {"intent": intent, "parameters": params or {}}
 
 
 # ═══════════════════════════════════════════════════════════════
-# SchemaValidator tests (15+)
+# SchemaValidator tests
 # ═══════════════════════════════════════════════════════════════
 
 class TestSchemaValidator:
@@ -93,28 +85,12 @@ class TestSchemaValidator:
         ok, msg = self.v.validate(_valid_instruction("stop"))
         assert ok, msg
 
-    def test_valid_status(self):
-        ok, msg = self.v.validate(_valid_instruction("status"))
+    def test_valid_goto(self):
+        ok, msg = self.v.validate(_valid_instruction("goto", {"x_m": 100, "y_m": 200}))
         assert ok, msg
 
-    def test_valid_goto_point(self):
-        ok, msg = self.v.validate(_valid_instruction("goto_point", {"x_m": 100, "y_m": 200}))
-        assert ok, msg
-
-    def test_valid_move_distance(self):
-        ok, msg = self.v.validate(
-            _valid_instruction("move_distance", {"distance_m": 5.0, "direction": "forward"})
-        )
-        assert ok, msg
-
-    def test_valid_rotate(self):
-        ok, msg = self.v.validate(
-            _valid_instruction("rotate", {"angle_rad": math.pi / 2, "direction": "left"})
-        )
-        assert ok, msg
-
-    def test_valid_scan_report(self):
-        ok, msg = self.v.validate(_valid_instruction("scan_report", {}))
+    def test_valid_patrol(self):
+        ok, msg = self.v.validate(_valid_instruction("patrol"))
         assert ok, msg
 
     def test_valid_clarify(self):
@@ -123,14 +99,15 @@ class TestSchemaValidator:
         )
         assert ok, msg
 
-    def test_missing_schema_version(self):
-        inst = {"intent": "stop", "timestamp": "2026-07-24T12:00:00+08:00"}
+    def test_missing_parameters_field(self):
+        """v3 requires 'parameters' field."""
+        inst = {"intent": "stop"}
         ok, msg = self.v.validate(inst)
         assert not ok
-        assert "schema_version" in msg
+        assert "parameters" in msg
 
     def test_missing_intent(self):
-        inst = {"schema_version": "1.0", "timestamp": "2026-07-24T12:00:00+08:00"}
+        inst = {"parameters": {}}
         ok, msg = self.v.validate(inst)
         assert not ok
 
@@ -138,45 +115,22 @@ class TestSchemaValidator:
         ok, msg = self.v.validate(_valid_instruction("fly"))
         assert not ok
 
-    def test_goto_point_missing_params(self):
-        ok, msg = self.v.validate(_valid_instruction("goto_point", {}))
+    def test_goto_missing_params(self):
+        ok, msg = self.v.validate(_valid_instruction("goto", {}))
         assert not ok
         assert "x_m" in msg
 
-    def test_move_distance_out_of_range(self):
-        ok, msg = self.v.validate(
-            _valid_instruction("move_distance", {"distance_m": 999.0, "direction": "forward"})
-        )
-        assert not ok
-
-    def test_rotate_angle_out_of_bounds(self):
-        ok, msg = self.v.validate(
-            _valid_instruction("rotate", {"angle_rad": 999, "direction": "left"})
-        )
-        assert not ok
-
-    @pytest.mark.parametrize("angle_rad", (0, -math.pi / 4))
-    def test_rotate_angle_must_be_positive(self, angle_rad):
-        ok, msg = self.v.validate(
-            _valid_instruction("rotate", {"angle_rad": angle_rad, "direction": "left"})
-        )
-        assert not ok
-
-    def test_confidence_boundary_valid(self):
-        ok, msg = self.v.validate(_valid_instruction("stop", confidence=0.0))
+    def test_extra_fields_are_allowed(self):
+        """v3 has additionalProperties: true — extra top-level fields are ignored."""
+        inst = {"intent": "stop", "parameters": {}, "confidence": 0.95, "reasoning": "test"}
+        ok, msg = self.v.validate(inst)
         assert ok, msg
-        ok, msg = self.v.validate(_valid_instruction("stop", confidence=1.0))
-        assert ok, msg
-
-    def test_confidence_out_of_bounds(self):
-        ok, msg = self.v.validate(_valid_instruction("stop", confidence=1.5))
-        assert not ok
 
     def test_injection_extra_fields(self):
-        """Extra top-level fields are rejected by additionalProperties."""
-        inst = _valid_instruction("stop", injected_field="malicious")
+        """v3 allows extra top-level fields (additionalProperties: true)."""
+        inst = {"intent": "stop", "parameters": {}, "injected_field": "malicious"}
         ok, msg = self.v.validate(inst)
-        assert not ok
+        assert ok, msg  # v3 is lenient with extra fields
 
     def test_injection_extra_param_fields(self):
         """Extra fields in parameters for stop are rejected."""
@@ -188,13 +142,20 @@ class TestSchemaValidator:
         ok, msg = self.v.validate(_valid_instruction("clarify", {}))
         assert not ok
 
-    def test_reasoning_too_long(self):
-        ok, msg = self.v.validate(_valid_instruction("stop", reasoning="x" * 501))
+    def test_unknown_intent_rejected(self):
+        """Unknown intent values are rejected."""
+        ok, msg = self.v.validate(_valid_instruction("unknown_intent"))
         assert not ok
+
+    def test_old_intents_rejected(self):
+        """v2 intents (status, goto_point, move_distance, rotate, scan_report) are rejected in v3."""
+        for old in ("status", "goto_point", "move_distance", "rotate", "scan_report"):
+            ok, msg = self.v.validate(_valid_instruction(old))
+            assert not ok, f"{old} should be rejected in v3"
 
 
 # ═══════════════════════════════════════════════════════════════
-# SemanticValidator tests (10+)
+# SemanticValidator tests
 # ═══════════════════════════════════════════════════════════════
 
 class TestSemanticValidator:
@@ -202,98 +163,64 @@ class TestSemanticValidator:
         self.grid = MapGrid(256, 256)
         self.v = SemanticValidator(self.grid)
 
-    def test_goto_point_in_bounds(self):
-        ok, msg = self.v.validate(_valid_instruction("goto_point", {"x_m": 100, "y_m": 200}))
+    def test_goto_in_bounds(self):
+        ok, msg = self.v.validate(_valid_instruction("goto", {"x_m": 100, "y_m": 200}))
         assert ok, msg
 
-    def test_goto_point_negative_x(self):
-        ok, msg = self.v.validate(_valid_instruction("goto_point", {"x_m": -10, "y_m": 100}))
+    def test_goto_negative_x(self):
+        ok, msg = self.v.validate(_valid_instruction("goto", {"x_m": -10, "y_m": 100}))
         assert not ok
         assert "out of map bounds" in msg
 
-    def test_goto_point_too_large(self):
-        ok, msg = self.v.validate(_valid_instruction("goto_point", {"x_m": 300, "y_m": 100}))
+    def test_goto_too_large(self):
+        ok, msg = self.v.validate(_valid_instruction("goto", {"x_m": 300, "y_m": 100}))
         assert not ok
 
     def test_goto_uses_actual_grid_dimensions(self):
         validator = SemanticValidator(MapGrid(12, 7))
         assert validator.validate(
-            _valid_instruction("goto_point", {"x_m": 11.5, "y_m": 6.5})
+            _valid_instruction("goto", {"x_m": 11.5, "y_m": 6.5})
         )[0]
         assert not validator.validate(
-            _valid_instruction("goto_point", {"x_m": 12.0, "y_m": 6.5})
+            _valid_instruction("goto", {"x_m": 12.0, "y_m": 6.5})
         )[0]
 
     @pytest.mark.parametrize("coordinate", [math.nan, math.inf, -math.inf])
     def test_goto_rejects_non_finite_coordinates(self, coordinate):
         ok, msg = SemanticValidator(None).validate(
-            _valid_instruction("goto_point", {"x_m": coordinate, "y_m": 1.0})
+            _valid_instruction("goto", {"x_m": coordinate, "y_m": 1.0})
         )
         assert not ok
         assert "finite" in msg
 
     def test_goto_without_truth_grid_does_not_apply_absolute_bounds(self):
         ok, msg = SemanticValidator(None).validate(
-            _valid_instruction("goto_point", {"x_m": 1001.0, "y_m": 1000.0})
+            _valid_instruction("goto", {"x_m": 1001.0, "y_m": 1000.0})
         )
         assert ok, msg
 
-    def test_goto_point_is_wall(self, grid_with_obstacles):
+    def test_goto_is_wall(self, grid_with_obstacles):
         v = SemanticValidator(grid_with_obstacles)
-        ok, msg = v.validate(_valid_instruction("goto_point", {"x_m": 50, "y_m": 50}))
+        ok, msg = v.validate(_valid_instruction("goto", {"x_m": 50, "y_m": 50}))
         assert not ok
         assert "wall" in msg
 
-    def test_goto_point_is_void(self, grid_with_obstacles):
+    def test_goto_is_void(self, grid_with_obstacles):
         v = SemanticValidator(grid_with_obstacles)
-        ok, msg = v.validate(_valid_instruction("goto_point", {"x_m": 24, "y_m": 10}))
+        ok, msg = v.validate(_valid_instruction("goto", {"x_m": 24, "y_m": 10}))
         assert not ok
         assert "void" in msg
-
-    def test_move_distance_valid(self):
-        ok, msg = self.v.validate(
-            _valid_instruction("move_distance", {"distance_m": 3.0, "direction": "forward"})
-        )
-        assert ok, msg
-
-    def test_move_distance_zero(self):
-        ok, msg = self.v.validate(
-            _valid_instruction("move_distance", {"distance_m": 0.0, "direction": "forward"})
-        )
-        assert not ok
-
-    def test_move_distance_exceeds_max(self):
-        v = SemanticValidator(self.grid, max_distance_m=5.0)
-        ok, msg = v.validate(
-            _valid_instruction("move_distance", {"distance_m": 8.0, "direction": "forward"})
-        )
-        assert not ok
-
-    def test_move_distance_invalid_direction(self):
-        ok, msg = self.v.validate(
-            _valid_instruction("move_distance", {"distance_m": 1.0, "direction": "sideways"})
-        )
-        assert not ok
-
-    def test_rotate_non_zero(self):
-        ok, msg = self.v.validate(
-            _valid_instruction("rotate", {"angle_rad": math.pi / 4, "direction": "right"})
-        )
-        assert ok, msg
-
-    @pytest.mark.parametrize("angle_rad", (0, -math.pi / 4))
-    def test_rotate_non_positive_angle(self, angle_rad):
-        ok, msg = self.v.validate(
-            _valid_instruction("rotate", {"angle_rad": angle_rad, "direction": "left"})
-        )
-        assert not ok
 
     def test_stop_no_semantic_check(self):
         ok, msg = self.v.validate(_valid_instruction("stop"))
         assert ok, msg
 
-    def test_scan_report_no_semantic_check(self):
-        ok, msg = self.v.validate(_valid_instruction("scan_report", {"query": "front"}))
+    def test_patrol_no_semantic_check(self):
+        ok, msg = self.v.validate(_valid_instruction("patrol"))
+        assert ok, msg
+
+    def test_clarify_no_semantic_check(self):
+        ok, msg = self.v.validate(_valid_instruction("clarify", {"question": "test"}))
         assert ok, msg
 
 
@@ -315,7 +242,7 @@ class TestSafetyValidator:
 
 
 # ═══════════════════════════════════════════════════════════════
-# InstructionStateMachine tests (10+)
+# InstructionStateMachine tests
 # ═══════════════════════════════════════════════════════════════
 
 class TestInstructionStateMachine:
@@ -455,7 +382,7 @@ class TestInstructionStateMachine:
 
 
 # ═══════════════════════════════════════════════════════════════
-# TaskCompiler tests (7+)
+# TaskCompiler tests
 # ═══════════════════════════════════════════════════════════════
 
 class TestTaskCompiler:
@@ -469,67 +396,18 @@ class TestTaskCompiler:
         assert task["action"] == "stop"
         assert task["cancel_active_task"] is True
 
-    def test_compile_status(self):
-        inst = _valid_instruction("status")
-        task = self.compiler.compile(inst)
-        assert task["type"] == "query"
-        assert task["action"] == "status"
-
-    def test_compile_goto_point(self):
-        inst = _valid_instruction("goto_point", {"x_m": 100, "y_m": 200})
+    def test_compile_goto(self):
+        inst = _valid_instruction("goto", {"x_m": 100, "y_m": 200})
         task = self.compiler.compile(inst)
         assert task["type"] == "navigation"
-        assert task["action"] == "goto_point"
+        assert task["action"] == "goto"
         assert task["goal"] == {"x_m": 100, "y_m": 200}
 
-    def test_compile_move_distance(self):
-        inst = _valid_instruction("move_distance", {"distance_m": 5.0, "direction": "forward"})
-        # Provide a pose snapshot
-        snapshot = {"pose": {"x_m": 10.0, "y_m": 20.0, "yaw_rad": 0.0}}
-        task = self.compiler.compile(inst, snapshot)
-        assert task["type"] == "navigation"
-        assert task["action"] == "move_distance"
-        assert task["distance_m"] == 5.0
-        assert task["direction"] == "forward"
-        # x + 5*cos(0) = 15, y + 5*sin(0) = 20
-        assert task["goal"]["x_m"] == 15.0
-        assert task["goal"]["y_m"] == 20.0
-
-    @pytest.mark.parametrize(
-        ("direction", "current_yaw_rad", "delta_yaw_rad"),
-        [
-            ("left", 0.0, -math.pi / 2),
-            ("right", 0.0, math.pi / 2),
-            ("left", 3.0, -math.pi / 2),
-            ("right", 3.0, math.pi / 2),
-            ("left", -3.0, -math.pi / 2),
-            ("right", -3.0, math.pi / 2),
-        ],
-    )
-    def test_compile_rotate(self, direction, current_yaw_rad, delta_yaw_rad):
-        inst = _valid_instruction("rotate", {"angle_rad": math.pi / 2, "direction": direction})
-        snapshot = {"pose": {"yaw_rad": current_yaw_rad}}
-        task = self.compiler.compile(inst, snapshot)
-        expected_yaw_rad = math.atan2(
-            math.sin(current_yaw_rad + delta_yaw_rad),
-            math.cos(current_yaw_rad + delta_yaw_rad),
-        )
-        assert task["type"] == "rotation"
-        assert task["action"] == "rotate"
-        assert task["angle_rad"] == pytest.approx(math.pi / 2)
-        assert "angle_deg" not in task
-        assert task["direction"] == direction
-        assert task["target_yaw_rad"] == pytest.approx(
-            round(expected_yaw_rad, 4)
-        )
-
-    def test_compile_scan_report(self):
-        inst = _valid_instruction("scan_report", {"query": "前方"})
+    def test_compile_patrol(self):
+        inst = _valid_instruction("patrol")
         task = self.compiler.compile(inst)
-        assert task["type"] == "query"
-        assert task["action"] == "scan_report"
-        assert task["query"] == "前方"
-        assert "summary" in task
+        assert task["type"] == "navigation"
+        assert task["action"] == "patrol"
 
     def test_compile_clarify(self):
         inst = _valid_instruction("clarify", {
@@ -542,28 +420,12 @@ class TestTaskCompiler:
         assert task["question"] == "请指定坐标"
         assert "x_m" in task["missing_parameters"]
 
-    def test_compile_scan_with_points(self):
-        """Test scan summarization with actual points."""
-        inst = _valid_instruction("scan_report", {"query": ""})
-        points = [
-            {"angle": 0.0, "range": 1.5},
-            {"angle": 0.3, "range": 2.0},
-            {"angle": math.pi / 2, "range": 3.0},   # right
-            {"angle": -math.pi / 2, "range": 4.0},  # left
-            {"angle": math.pi, "range": 5.0},        # back
-        ]
-        snapshot = {"scan": {"points": points}}
-        task = self.compiler.compile(inst, snapshot)
-        summary = task["summary"]
-        assert summary["total_points"] == 5
-        sectors = summary["sectors"]
-        assert sectors["front"]["count"] == 2
-        assert sectors["left"]["count"] == 1
-        assert sectors["right"]["count"] == 1
-        assert sectors["back"]["count"] == 1
-        assert sectors["front"]["min_m"] == 1.5
+    def test_compile_unknown_intent(self):
+        inst = _valid_instruction("some_new_intent")
+        task = self.compiler.compile(inst)
+        assert task["type"] == "unknown"
 
-    def test_real_tmini_clockwise_angles_match_both_summaries(self):
+    def test_real_tmini_clockwise_angles_match_server_summary(self):
         scan = scan_message(
             MapGrid(1, 1),
             0.5,
@@ -581,10 +443,6 @@ class TestTaskCompiler:
         )
 
         server_summary = _summarize_scan_for_nl(scan)["sectors"]
-        compiler_summary = self.compiler.compile(
-            _valid_instruction("scan_report", {"query": ""}),
-            {"scan": scan},
-        )["summary"]["sectors"]
 
         assert {
             angle: scan_sector(angle)
@@ -618,10 +476,6 @@ class TestTaskCompiler:
             "right": 2.0,
             "back": 6.0,
         }
-        assert {
-            sector: values["min_m"] for sector, values in compiler_summary.items()
-        } == server_summary
-        assert compiler_summary["front"]["count"] == 3
 
     @pytest.mark.parametrize(
         ("angle", "expected"),
@@ -639,7 +493,7 @@ class TestTaskCompiler:
     def test_scan_sector_rejects_non_finite_or_non_real_angles(self, angle, expected):
         assert scan_sector(angle) == expected
 
-    def test_scan_summaries_skip_invalid_samples_consistently(self):
+    def test_scan_summary_skips_invalid_samples(self):
         points = [
             {"angle": 0.0, "range": 2.0},
             {"angle": math.pi / 2, "range": 3.0},
@@ -660,20 +514,9 @@ class TestTaskCompiler:
         scan = {"points": points}
 
         server_summary = _summarize_scan_for_nl(scan)["sectors"]
-        compiler_summary = self.compiler.compile(
-            _valid_instruction("scan_report", {"query": ""}),
-            {"scan": scan},
-        )["summary"]
-
         assert server_summary == {"front": 2.0, "right": 3.0}
-        assert {
-            sector: values["min_m"]
-            for sector, values in compiler_summary["sectors"].items()
-            if values["count"]
-        } == server_summary
-        assert compiler_summary["total_points"] == len(points)
 
-    def test_scan_summaries_are_safe_when_every_sample_is_invalid(self):
+    def test_scan_summary_is_safe_when_every_sample_is_invalid(self):
         scan = {
             "points": [
                 {"angle": math.nan, "range": 1.0},
@@ -685,21 +528,11 @@ class TestTaskCompiler:
         }
 
         server_summary = _summarize_scan_for_nl(scan)
-        compiler_summary = self.compiler.compile(
-            _valid_instruction("scan_report", {"query": ""}),
-            {"scan": scan},
-        )["summary"]
-
         assert server_summary["sectors"] == {}
-        assert all(
-            values == {"min_m": None, "avg_m": None, "count": 0}
-            for values in compiler_summary["sectors"].values()
-        )
-        assert compiler_summary["total_points"] == len(scan["points"])
 
 
 # ═══════════════════════════════════════════════════════════════
-# AuthorityManager tests (5+)
+# AuthorityManager tests
 # ═══════════════════════════════════════════════════════════════
 
 class TestAuthorityManager:
@@ -752,147 +585,231 @@ class TestAuthorityManager:
 
 
 # ═══════════════════════════════════════════════════════════════
-# FakeModelClient tests (10+)
-# ═══════════════════════════════════════════════════════════════
-
-class TestFakeModelClient:
-    def setup_method(self):
-        self.client = FakeModelClient()
-
-    def test_stop_variants(self):
-        for text in ("停", "停下", "停止", "紧急停止", "别动了"):
-            result = self.client.parse(text)
-            assert result is not None
-            assert result["intent"] == "stop", f"failed for '{text}'"
-
-    def test_status_variants(self):
-        for text in ("现在什么状态", "到哪了", "有没有问题", "状态", "在哪"):
-            result = self.client.parse(text)
-            assert result is not None
-            assert result["intent"] == "status", f"failed for '{text}'"
-
-    def test_goto_point_variants(self):
-        tests = [
-            ("去 (100, 200)", 100, 200),
-            ("去坐标 (50, 30)", 50, 30),
-            ("开到 10, 20", 10, 20),
-            ("前往 (5, 8)", 5, 8),
-        ]
-        for text, ex, ey in tests:
-            result = self.client.parse(text)
-            assert result is not None, f"no result for '{text}'"
-            assert result["intent"] == "goto_point", f"wrong intent for '{text}': {result['intent']}"
-            assert result["parameters"]["x_m"] == ex
-            assert result["parameters"]["y_m"] == ey
-
-    def test_move_distance_forward(self):
-        result = self.client.parse("前进 3 米")
-        assert result is not None
-        assert result["intent"] == "move_distance"
-        assert result["parameters"]["distance_m"] == 3.0
-        assert result["parameters"]["direction"] == "forward"
-
-    def test_move_distance_backward(self):
-        result = self.client.parse("后退 1.5 米")
-        assert result is not None
-        assert result["intent"] == "move_distance"
-        assert result["parameters"]["distance_m"] == 1.5
-        assert result["parameters"]["direction"] == "backward"
-
-    @pytest.mark.parametrize(
-        "text",
-        ("前进 .... 米", "后退 . 米", "去 (..., 1)", "左转 .... 度"),
-    )
-    def test_malformed_numeric_text_is_rejected_without_raising(self, text):
-        result = self.client.parse(text)
-        assert result is not None
-        assert result["intent"] == "clarify"
-
-    def test_rotate_left(self):
-        result = self.client.parse("左转 90 度")
-        assert result is not None
-        assert result["intent"] == "rotate"
-        assert result["parameters"]["angle_rad"] == pytest.approx(math.pi / 2)
-        assert result["parameters"]["direction"] == "left"
-
-    def test_rotate_right(self):
-        result = self.client.parse("右转 45 度")
-        assert result is not None
-        assert result["intent"] == "rotate"
-        assert result["parameters"]["angle_rad"] == pytest.approx(math.pi / 4)
-        assert result["parameters"]["direction"] == "right"
-
-    def test_scan_simple(self):
-        for text in ("看一下", "扫一圈", "扫描一下", "扫描"):
-            result = self.client.parse(text)
-            assert result is not None, f"failed for '{text}'"
-            assert result["intent"] == "scan_report", f"wrong intent for '{text}': {result['intent']}"
-
-    def test_scan_with_region(self):
-        result = self.client.parse("前面有什么")
-        assert result is not None
-        assert result["intent"] == "scan_report"
-        assert result["parameters"].get("query") == "前方"
-
-    def test_clarify_unknown(self):
-        result = self.client.parse("开到那边去")
-        assert result is not None
-        assert result["intent"] == "clarify"
-        assert "question" in result["parameters"]
-
-    def test_empty_input(self):
-        result = self.client.parse("")
-        assert result is not None
-        assert result["intent"] == "clarify"
-
-    def test_gibberish(self):
-        result = self.client.parse("asdfghjkl")
-        assert result is not None
-        assert result["intent"] == "clarify"
-
-    def test_confidence_range(self):
-        result = self.client.parse("停")
-        assert 0.0 <= result["confidence"] <= 1.0
-
-
-# ═══════════════════════════════════════════════════════════════
-# Integration tests (3+)
+# Integration tests
 # ═══════════════════════════════════════════════════════════════
 
 class TestIntegration:
     def test_full_pipeline_stop(self):
         """stop: parse → schema ✓ → semantic ✓ → accepted"""
-        client = FakeModelClient()
-        instruction = client.parse("停")
+        instruction = {"intent": "stop", "parameters": {}}
         result = run_validation_pipeline(instruction)
         assert result.valid, result.message
 
     def test_full_pipeline_goto_valid(self, empty_grid):
-        client = FakeModelClient()
         semantic = SemanticValidator(empty_grid)
-        instruction = client.parse("去 (100, 100)")
+        instruction = {"intent": "goto", "parameters": {"x_m": 100, "y_m": 100}}
         result = run_validation_pipeline(instruction, semantic_validator=semantic)
         assert result.valid, result.message
 
     def test_full_pipeline_goto_wall(self, grid_with_obstacles):
-        client = FakeModelClient()
         semantic = SemanticValidator(grid_with_obstacles)
-        instruction = client.parse("去 (50, 50)")
+        instruction = {"intent": "goto", "parameters": {"x_m": 50, "y_m": 50}}
         result = run_validation_pipeline(instruction, semantic_validator=semantic)
         assert not result.valid
         assert result.layer == "semantic"
 
+    def test_full_pipeline_patrol(self):
+        instruction = {"intent": "patrol", "parameters": {}}
+        result = run_validation_pipeline(instruction)
+        assert result.valid, result.message
+
     def test_full_pipeline_with_safety(self, healthy_safety):
-        client = FakeModelClient()
         safety_v = SafetyValidator(healthy_safety)
-        instruction = client.parse("停")
+        instruction = {"intent": "stop", "parameters": {}}
         result = run_validation_pipeline(instruction, safety_validator=safety_v)
         assert result.valid
 
     def test_full_pipeline_safety_fault(self, faulty_safety):
-        client = FakeModelClient()
         safety_v = SafetyValidator(faulty_safety)
-        instruction = client.parse("停")
+        instruction = {"intent": "stop", "parameters": {}}
         result = run_validation_pipeline(instruction, safety_validator=safety_v)
         assert not result.valid
         assert result.layer == "safety"
+
+
+# ═══════════════════════════════════════════════════════════════
+# InstructionStateMachine queue tests
+# ═══════════════════════════════════════════════════════════════
+
+class TestInstructionStateMachineQueue:
+    def setup_method(self):
+        self.sm = InstructionStateMachine()
+
+    def test_initial_queue_empty(self):
+        assert self.sm.queue_size == 0
+        assert self.sm.current_index == 0
+        assert not self.sm.has_more()
+
+    def test_enqueue_and_dequeue(self):
+        instructions = [
+            {"intent": "goto", "parameters": {"x_m": 100, "y_m": 200}},
+            {"intent": "patrol", "parameters": {}},
+        ]
+        self.sm.enqueue(instructions)
+        assert self.sm.queue_size == 2
+        assert self.sm.current_index == 0
+
+        inst = self.sm.dequeue_next()
+        assert inst is not None
+        assert inst["intent"] == "goto"
+        assert self.sm.current_index == 1
+        assert self.sm.has_more()
+
+        inst = self.sm.dequeue_next()
+        assert inst is not None
+        assert inst["intent"] == "patrol"
+        assert self.sm.current_index == 2
+        assert not self.sm.has_more()
+
+    def test_dequeue_exhausted_returns_none(self):
+        instructions = [{"intent": "stop", "parameters": {}}]
+        self.sm.enqueue(instructions)
+        self.sm.dequeue_next()
+        assert self.sm.dequeue_next() is None
+
+    def test_clear_queue(self):
+        instructions = [
+            {"intent": "goto", "parameters": {"x_m": 100, "y_m": 200}},
+            {"intent": "stop", "parameters": {}},
+        ]
+        self.sm.enqueue(instructions)
+        assert self.sm.queue_size == 2
+        self.sm.clear_queue()
+        assert self.sm.queue_size == 0
+        assert self.sm.current_index == 0
+        assert not self.sm.has_more()
+
+    def test_queue_max_length_truncation(self):
+        """Enqueue 12 instructions → queue_size must be 10."""
+        instructions = [{"intent": "stop", "parameters": {}}] * 12
+        self.sm.enqueue(instructions)
+        assert self.sm.queue_size == 10
+        assert self.sm.current_index == 0
+
+    def test_has_more(self):
+        instructions = [
+            {"intent": "goto", "parameters": {"x_m": 1, "y_m": 2}},
+            {"intent": "goto", "parameters": {"x_m": 3, "y_m": 4}},
+        ]
+        self.sm.enqueue(instructions)
+        assert self.sm.has_more()
+        self.sm.dequeue_next()
+        assert self.sm.has_more()
+        self.sm.dequeue_next()
+        assert not self.sm.has_more()
+
+    def test_thread_safety_enqueue_dequeue(self):
+        """Concurrent enqueue + dequeue should not deadlock or corrupt state."""
+        errors = []
+
+        def enqueuer():
+            for _ in range(50):
+                try:
+                    self.sm.enqueue([{"intent": "stop", "parameters": {}}])
+                except Exception as e:
+                    errors.append(e)
+
+        def dequeuer():
+            for _ in range(50):
+                try:
+                    self.sm.dequeue_next()
+                except Exception as e:
+                    errors.append(e)
+
+        threads = [threading.Thread(target=enqueuer) for _ in range(2)] + \
+                  [threading.Thread(target=dequeuer) for _ in range(2)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+        # No deadlocks, no exceptions
+        assert len(errors) == 0
+
+    def test_enqueue_resets_index(self):
+        """Enqueue should reset current_index to 0."""
+        instructions = [
+            {"intent": "goto", "parameters": {"x_m": 10, "y_m": 20}},
+            {"intent": "goto", "parameters": {"x_m": 30, "y_m": 40}},
+        ]
+        self.sm.enqueue(instructions)
+        self.sm.dequeue_next()
+        assert self.sm.current_index == 1
+
+        # New enqueue extends queue and resets index
+        self.sm.enqueue([{"intent": "stop", "parameters": {}}])
+        assert self.sm.current_index == 0
+        assert self.sm.queue_size == 3  # 2 original + 1 new
+
+
+# ═══════════════════════════════════════════════════════════════
+# SchemaValidator validate_list tests
+# ═══════════════════════════════════════════════════════════════
+
+class TestSchemaValidatorList:
+    def setup_method(self):
+        self.v = SchemaValidator()
+
+    def test_validate_list_all_valid(self):
+        instructions = [
+            {"intent": "stop", "parameters": {}},
+            {"intent": "goto", "parameters": {"x_m": 100, "y_m": 200}},
+            {"intent": "patrol", "parameters": {}},
+        ]
+        ok, msg = self.v.validate_list(instructions)
+        assert ok, msg
+
+    def test_validate_list_one_invalid(self):
+        instructions = [
+            {"intent": "stop", "parameters": {}},
+            {"intent": "goto", "parameters": {}},  # missing x_m, y_m
+        ]
+        ok, msg = self.v.validate_list(instructions)
+        assert not ok
+        assert "element [1]" in msg
+
+    def test_validate_list_empty(self):
+        ok, msg = self.v.validate_list([])
+        assert ok, msg
+
+    def test_validate_list_first_invalid(self):
+        instructions = [
+            {"intent": "invalid_intent", "parameters": {}},
+            {"intent": "stop", "parameters": {}},
+        ]
+        ok, msg = self.v.validate_list(instructions)
+        assert not ok
+        assert "element [0]" in msg
+
+
+# ═══════════════════════════════════════════════════════════════
+# LLMClient parse returns list tests
+# ═══════════════════════════════════════════════════════════════
+
+class TestLLMClientParseReturnType:
+    """Tests that parse() returns list[dict] — single instruction wrapped in list."""
+
+    def test_parse_single_returns_len_one_list(self):
+        """For a single instruction input, parse should return a len-1 list."""
+        from tests.test_nl_integration import _TestParser
+        parser = _TestParser()
+        result = parser.parse("停")
+        assert isinstance(result, list)
+        assert len(result) == 1
+        assert result[0]["intent"] == "stop"
+
+    def test_parse_clarify_returns_list(self):
+        from tests.test_nl_integration import _TestParser
+        parser = _TestParser()
+        result = parser.parse("开到那边去")
+        assert isinstance(result, list)
+        assert len(result) == 1
+        assert result[0]["intent"] == "clarify"
+
+    def test_parse_goto_returns_list(self):
+        from tests.test_nl_integration import _TestParser
+        parser = _TestParser()
+        result = parser.parse("去坐标 (50, 30)")
+        assert isinstance(result, list)
+        assert len(result) == 1
+        assert result[0]["intent"] == "goto"
+        assert result[0]["parameters"]["x_m"] == 50

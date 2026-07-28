@@ -1,7 +1,7 @@
 """Integration tests for NL command pipeline in server.py.
 
 Tests the NL → parse → validate → execute pipeline without WebSocket.
-Uses FakeModelClient for deterministic results.
+Uses a deterministic test parser for reproducible results.
 """
 
 from __future__ import annotations
@@ -13,16 +13,17 @@ import time
 
 import pytest
 
-from mockvehicle2d.instruction.llm_client import FakeModelClient
+from mockvehicle2d.instruction.compiler import TaskCompiler
 from mockvehicle2d.instruction.state_machine import InstructionState, InstructionStateMachine
 from mockvehicle2d.instruction.validator import SchemaValidator, SemanticValidator
 from mockvehicle2d.map_grid import MapGrid
 from mockvehicle2d.local_state import AnchorSpec, AnchoredLocalState, OdometryConfig
 from mockvehicle2d.navigation import GotoController
-from mockvehicle2d.safety import LocalSafetyRuntime, SafetyAdvanceResult
+from mockvehicle2d.safety import LocalSafetyRuntime
 from mockvehicle2d.server import (
     _handle_nl_command,
     _nl_completion_reason,
+    _process_next_in_queue,
     _summarize_scan_for_nl,
     _cancel_nl_task,
     handle_command_message,
@@ -30,6 +31,54 @@ from mockvehicle2d.server import (
     VehicleRuntime,
 )
 from mockvehicle2d.vehicle import Vehicle
+
+
+# ═══════════════════════════════════════════════════════════════
+# Test helper — minimal deterministic parser for pipeline tests
+# ═══════════════════════════════════════════════════════════════
+
+import re as _re
+
+
+class _TestParser:
+    """Minimal deterministic NL parser for integration testing.
+
+    Replaces LLMClient with a simple regex-based parser
+    that covers the inputs used in these tests.
+    """
+
+    _STOP_WORDS = {"停", "停下", "停止", "紧急停止", "别动了"}
+    _GOTO_PAT = _re.compile(r"去.*?(\d+(?:\.\d+)?).*?(\d+(?:\.\d+)?)")
+    _PATROL_WORDS = {"开始巡逻", "巡逻", "启动巡逻"}
+    _CLARIFY_WORDS = {"开到那边去"}
+
+    def parse(self, text: str) -> list[dict]:
+        text = text.strip()
+        if not text:
+            return [{"intent": "clarify", "parameters": {"question": "请输入指令"}}]
+
+        if text in self._STOP_WORDS:
+            return [{"intent": "stop", "parameters": {}}]
+
+        if text in self._PATROL_WORDS:
+            return [{"intent": "patrol", "parameters": {}}]
+
+        if text in self._CLARIFY_WORDS:
+            return [{"intent": "clarify", "parameters": {"question": "请指定坐标"}}]
+
+        # goto patterns
+        m = self._GOTO_PAT.search(text)
+        if m:
+            x = float(m.group(1))
+            y = float(m.group(2))
+            return [{"intent": "goto", "parameters": {"x_m": x, "y_m": y}}]
+
+        return [{"intent": "clarify", "parameters": {"question": "请指定坐标"}}]
+
+
+class _AsyncTestParser(_TestParser):
+    async def parse(self, text: str) -> list[dict]:
+        return super().parse(text)
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -81,7 +130,7 @@ def safety():
 
 @pytest.fixture
 def nl_client():
-    return FakeModelClient()
+    return _TestParser()
 
 
 @pytest.fixture
@@ -127,7 +176,7 @@ class _InvalidSeqSocket:
         if not self.received:
             self.received = True
             return json.dumps(
-                {"type": "nl_command", "seq": self.seq, "text": "前进 0.1 米"}
+                {"type": "nl_command", "seq": self.seq, "text": "去坐标 (10.1, 10)"}
             )
         self.clock.now = 0.2
         raise asyncio.TimeoutError
@@ -159,7 +208,7 @@ class _ActiveOwnerSocket:
         self.receive_count += 1
         if self.receive_count == 1:
             return json.dumps(
-                {"type": "nl_command", "seq": 1, "text": "前进 0.1 米"}
+                {"type": "nl_command", "seq": 1, "text": "去坐标 (10.1, 10)"}
             )
         if self.receive_count == 2:
             return json.dumps(
@@ -297,92 +346,6 @@ class TestNlCommandGoto:
         assert navigation.status == "active"
 
 
-class TestNlCommandMoveDistance:
-    """NL '前进 5 米' → GotoController with relative goal."""
-
-    def test_move_forward_computes_goal(self, vehicle, empty_grid, navigation, nl_client,
-                                         schema_v, semantic_v, state_machine):
-        # Vehicle at (10, 10), yaw=0 (faces +x)
-        vehicle.yaw = 0.0
-        msg = {"type": "nl_command", "seq": 4, "text": "前进 5 米"}
-        _handle_nl_command(
-            msg, vehicle, empty_grid, navigation,
-            time.time(), time.monotonic(),
-            nl_client, schema_v, semantic_v,
-            state_machine,
-        )
-
-        assert navigation.status == "active"
-        goal_x, goal_y = navigation.reported_goal
-        assert abs(goal_x - 15.0) < 0.1, f"expected goal_x ~15.0, got {goal_x}"
-        assert abs(goal_y - 10.0) < 0.1, f"expected goal_y ~10.0, got {goal_y}"
-
-    def test_move_backward_computes_goal(self, vehicle, empty_grid, navigation, nl_client,
-                                          schema_v, semantic_v, state_machine):
-        vehicle.yaw = 0.0
-        msg = {"type": "nl_command", "seq": 5, "text": "后退 3 米"}
-        _handle_nl_command(
-            msg, vehicle, empty_grid, navigation,
-            time.time(), time.monotonic(),
-            nl_client, schema_v, semantic_v,
-            state_machine,
-        )
-
-        assert navigation.status == "active"
-        goal_x, goal_y = navigation.reported_goal
-        assert abs(goal_x - 7.0) < 0.1, f"expected goal_x ~7.0, got {goal_x}"
-        assert abs(goal_y - 10.0) < 0.1, f"expected goal_y ~10.0, got {goal_y}"
-
-    def test_move_with_yaw_45deg(self, vehicle, empty_grid, navigation, nl_client,
-                                  schema_v, semantic_v, state_machine):
-        vehicle.yaw = math.pi / 4  # 45 degrees
-        msg = {"type": "nl_command", "seq": 6, "text": "前进 5 米"}
-        _handle_nl_command(
-            msg, vehicle, empty_grid, navigation,
-            time.time(), time.monotonic(),
-            nl_client, schema_v, semantic_v,
-            state_machine,
-        )
-
-        assert navigation.status == "active"
-        goal_x, goal_y = navigation.reported_goal
-        expected_x = 10.0 + 5.0 * math.cos(math.pi / 4)
-        expected_y = 10.0 + 5.0 * math.sin(math.pi / 4)
-        assert abs(goal_x - expected_x) < 0.1
-        assert abs(goal_y - expected_y) < 0.1
-
-    def test_move_uses_estimated_pose_not_simulator_truth(
-        self,
-        vehicle,
-        empty_grid,
-        navigation,
-        nl_client,
-        schema_v,
-        semantic_v,
-        state_machine,
-        estimated_nl_runtime,
-    ):
-        estimated_nl_runtime.odometry.apply_correction(
-            5.0, 0.0, 0.0, timestamp=time.time()
-        )
-
-        _handle_nl_command(
-            {"type": "nl_command", "seq": 60, "text": "前进 1 米"},
-            vehicle,
-            empty_grid,
-            navigation,
-            time.time(),
-            time.monotonic(),
-            nl_client,
-            schema_v,
-            semantic_v,
-            state_machine,
-        )
-
-        assert vehicle.x == 10.0
-        assert navigation.reported_goal == pytest.approx((16.0, 10.0))
-
-
 class TestNlCommandClarify:
     """NL '开到那边去' → clarify response."""
 
@@ -403,184 +366,11 @@ class TestNlCommandClarify:
         assert isinstance(replies[0]["missing"], list)
 
 
-class TestNlCommandRotate:
-    """NL '左转 90 度' → rotates vehicle."""
-
-    @staticmethod
-    def _run_until_done(
-        vehicle, grid, navigation, local_state, *, ticks=300
-    ):
-        now = vehicle.last_update
-        for _ in range(ticks):
-            now += 0.05
-            collided = vehicle.advance(grid, now)
-            local_state.update_from_truth(
-                vehicle.x,
-                vehicle.y,
-                vehicle.yaw,
-                timestamp=local_state.pose.timestamp + 0.05,
-            )
-            navigation.update(
-                vehicle,
-                grid,
-                now,
-                pose=local_state.pose,
-                advance_result=SafetyAdvanceResult(collided=collided),
-                local_map=local_state.local_map,
-            )
-            assert vehicle.body_velocities()[0] == 0.0
-            if navigation.status != "active":
-                break
-
-    @pytest.mark.parametrize(
-        ("text", "expected_sign"),
-        [("左转 90 度", -1), ("右转 90 度", 1)],
-    )
-    def test_rotate_changes_yaw_and_reaches(
-        self,
-        text,
-        expected_sign,
-        vehicle,
-        empty_grid,
-        navigation,
-        nl_client,
-        schema_v,
-        semantic_v,
-        state_machine,
-        estimated_nl_runtime,
-    ):
-        _handle_nl_command(
-            {"type": "nl_command", "seq": 8, "text": text},
-            vehicle,
-            empty_grid,
-            navigation,
-            time.time(),
-            time.monotonic(),
-            nl_client,
-            schema_v,
-            semantic_v,
-            state_machine,
-        )
-
-        assert navigation.status == "active"
-        assert navigation.snapshot()["goal"].keys() == {"yaw_rad"}
-        navigation.update(
-            vehicle,
-            empty_grid,
-            vehicle.last_update,
-            pose=estimated_nl_runtime.pose,
-            advance_result=SafetyAdvanceResult(),
-            local_map=estimated_nl_runtime.local_map,
-        )
-        assert navigation.status == "active"
-        assert math.copysign(1.0, vehicle.body_velocities()[1]) == expected_sign
-
-        self._run_until_done(
-            vehicle, empty_grid, navigation, estimated_nl_runtime
-        )
-        assert navigation.status == "reached"
-        assert expected_sign * vehicle.yaw > math.radians(85)
-
-    @pytest.mark.parametrize(
-        ("estimated_yaw_rad", "text", "delta_yaw_rad"),
-        [
-            (3.0, "右转 30 度", math.pi / 6),
-            (-3.0, "左转 30 度", -math.pi / 6),
-        ],
-    )
-    def test_rotate_wraps_pi_and_uses_estimate_not_truth(
-        self,
-        estimated_yaw_rad,
-        text,
-        delta_yaw_rad,
-        vehicle,
-        empty_grid,
-        navigation,
-        nl_client,
-        schema_v,
-        semantic_v,
-        state_machine,
-        estimated_nl_runtime,
-    ):
-        estimated_nl_runtime.odometry.apply_correction(
-            0.0, 0.0, estimated_yaw_rad, timestamp=time.time()
-        )
-        _handle_nl_command(
-            {"type": "nl_command", "seq": 81, "text": text},
-            vehicle,
-            empty_grid,
-            navigation,
-            time.time(),
-            time.monotonic(),
-            nl_client,
-            schema_v,
-            semantic_v,
-            state_machine,
-        )
-
-        assert vehicle.yaw == 0.0
-        assert navigation.yaw_goal_rad == pytest.approx(
-            math.atan2(
-                math.sin(estimated_yaw_rad + delta_yaw_rad),
-                math.cos(estimated_yaw_rad + delta_yaw_rad),
-            )
-        )
-
-    def test_rotate_lost_and_manual_override_use_existing_gates(
-        self,
-        vehicle,
-        empty_grid,
-        navigation,
-        nl_client,
-        schema_v,
-        semantic_v,
-        state_machine,
-        estimated_nl_runtime,
-    ):
-        estimated_nl_runtime.set_localization_quality(
-            "lost", timestamp=time.time()
-        )
-        replies = _handle_nl_command(
-            {"type": "nl_command", "seq": 82, "text": "左转 90 度"},
-            vehicle,
-            empty_grid,
-            navigation,
-            time.time(),
-            time.monotonic(),
-            nl_client,
-            schema_v,
-            semantic_v,
-            state_machine,
-        )
-        assert navigation.status == "blocked"
-        assert any(
-            reply.get("reason") == "localization_lost" for reply in replies
-        )
-
-        estimated_nl_runtime.set_localization_quality(
-            "nominal", timestamp=time.time()
-        )
-        navigation.start_rotation(1.0)
-        reply = handle_command_message(
-            '{"type":"cmd","seq":83,"cmd":"stop"}',
-            vehicle,
-            empty_grid,
-            vehicle.last_update,
-            time.time(),
-            navigation,
-            local_state=estimated_nl_runtime,
-        )
-        assert reply["accepted"]
-        assert navigation.status == "cancelled"
-
-
 @pytest.mark.parametrize(
     ("text", "use_safety", "reason"),
     (
         ("去坐标 (10, 5.5)", False, "collision"),
         ("去坐标 (10, 5.5)", True, "safety_obstacle"),
-        ("前进 1 米", True, "safety_obstacle"),
-        ("右转 90 度", True, "safety_obstacle"),
     ),
 )
 def test_nl_automatic_command_rejects_terminal_handoff(
@@ -654,14 +444,6 @@ def test_nl_automatic_command_rejects_terminal_handoff(
         "navigation_reason",
     ),
     (
-        ("状态", False, "nl_task_update", "blocked", "collision"),
-        (
-            "看一下",
-            True,
-            "nl_scan_report",
-            "blocked",
-            "safety_obstacle",
-        ),
         ("开到那边去", False, "nl_confirm_request", "blocked", "collision"),
         ("停", False, "nl_task_update", "cancelled", "nl_stop"),
     ),
@@ -745,45 +527,12 @@ def test_nl_early_response_settles_terminal_goto_handoff(
     assert navigation.snapshot()["planning"] is False
 
 
-class TestNlCommandScan:
-    """NL '看一下' → scan report."""
+class TestNlCommandPatrol:
+    """NL '开始巡逻' → patrol started."""
 
-    def test_scan_sends_report(self, vehicle, empty_grid, navigation, nl_client,
-                                schema_v, semantic_v, state_machine):
-        # Build a simple scan frame with a few points
-        scan_data = {
-            "type": "scan",
-            "points": [
-                {"angle": 0.0, "range": 1.5, "intensity": 1.0},
-                {"angle": 0.5, "range": 2.0, "intensity": 1.0},
-                {"angle": math.pi / 2, "range": 3.0, "intensity": 1.0},
-            ],
-        }
-
-        msg = {"type": "nl_command", "seq": 9, "text": "看一下"}
-        replies = _handle_nl_command(
-            msg, vehicle, empty_grid, navigation,
-            time.time(), time.monotonic(),
-            nl_client, schema_v, semantic_v,
-            state_machine,
-            scan_data=scan_data,
-        )
-
-        scan_reports = [r for r in replies if r["type"] == "nl_scan_report"]
-        assert len(scan_reports) == 1
-        report = scan_reports[0]
-        assert "summary" in report
-        assert "points_summary" in report
-        # front should have min 1.5
-        assert report["points_summary"].get("front") == 1.5
-
-
-class TestNlCommandStatus:
-    """NL '状态' → status report."""
-
-    def test_status_reports_position(self, vehicle, empty_grid, navigation, nl_client,
-                                      schema_v, semantic_v, state_machine):
-        msg = {"type": "nl_command", "seq": 10, "text": "状态"}
+    def test_patrol_starts(self, vehicle, empty_grid, navigation, nl_client,
+                            schema_v, semantic_v, state_machine):
+        msg = {"type": "nl_command", "seq": 20, "text": "开始巡逻"}
         replies = _handle_nl_command(
             msg, vehicle, empty_grid, navigation,
             time.time(), time.monotonic(),
@@ -791,10 +540,113 @@ class TestNlCommandStatus:
             state_machine,
         )
 
+        assert state_machine.current_state == InstructionState.ACTIVE
         task_updates = [r for r in replies if r["type"] == "nl_task_update"]
-        assert len(task_updates) >= 1
-        assert task_updates[0]["status"] == "completed"
-        assert "position" in str(task_updates[0].get("reason", ""))
+        assert len(task_updates) == 1
+        assert task_updates[0]["status"] == "active"
+        assert "patrol" in str(task_updates[0].get("reason", ""))
+
+    def test_sequence_goto_then_stop_clears_remaining_patrol(
+        self,
+        vehicle,
+        empty_grid,
+        navigation,
+        schema_v,
+        semantic_v,
+        state_machine,
+        estimated_nl_runtime,
+    ):
+        class SequenceClient:
+            def parse(self, _text):
+                return [
+                    {"intent": "goto", "parameters": {"x_m": 20.0, "y_m": 20.0}},
+                    {"intent": "stop", "parameters": {}},
+                    {"intent": "patrol", "parameters": {}},
+                ]
+
+        class CaptureSocket:
+            def __init__(self):
+                self.messages = []
+
+            async def send(self, payload):
+                self.messages.append(json.loads(payload))
+
+        replies = _handle_nl_command(
+            {"type": "nl_command", "seq": 21, "text": "执行序列"},
+            vehicle,
+            empty_grid,
+            navigation,
+            time.time(),
+            time.monotonic(),
+            SequenceClient(),
+            schema_v,
+            semantic_v,
+            state_machine,
+            local_state=estimated_nl_runtime,
+        )
+        assert any(reply.get("status") == "active" for reply in replies)
+        assert state_machine.has_more()
+
+        state_machine.transition(InstructionState.COMPLETED)
+        state_machine.transition(InstructionState.IDLE)
+        socket = CaptureSocket()
+        asyncio.run(
+            _process_next_in_queue(
+                socket,
+                vehicle,
+                empty_grid,
+                navigation,
+                time.time(),
+                time.monotonic(),
+                schema_v,
+                semantic_v,
+                state_machine,
+                TaskCompiler(),
+                local_state=estimated_nl_runtime,
+            )
+        )
+
+        assert any(
+            message.get("status") == "completed"
+            and message.get("reason") == "vehicle stopped"
+            for message in socket.messages
+        )
+        assert state_machine.current_state == InstructionState.IDLE
+        assert not state_machine.has_more()
+
+    def test_sequence_validation_failure_clears_remaining_instructions(
+        self,
+        vehicle,
+        empty_grid,
+        navigation,
+        schema_v,
+        semantic_v,
+        state_machine,
+    ):
+        class InvalidSequenceClient:
+            def parse(self, _text):
+                return [
+                    {"intent": "goto_point", "parameters": {"x_m": 20.0, "y_m": 20.0}},
+                    {"intent": "patrol", "parameters": {}},
+                ]
+
+        replies = _handle_nl_command(
+            {"type": "nl_command", "seq": 22, "text": "无效序列"},
+            vehicle,
+            empty_grid,
+            navigation,
+            time.time(),
+            time.monotonic(),
+            InvalidSequenceClient(),
+            schema_v,
+            semantic_v,
+            state_machine,
+        )
+
+        assert replies[0]["accepted"] is False
+        assert "schema validation failed" in replies[0]["reason"]
+        assert state_machine.current_state == InstructionState.IDLE
+        assert not state_machine.has_more()
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -1011,6 +863,7 @@ class TestValidationFailures:
                 _runtime=runtime,
                 _monotonic=clock.monotonic,
                 _wall_time=lambda: 10.0 + clock.now,
+                _nl_client=_AsyncTestParser(),
             )
         )
 
@@ -1044,6 +897,7 @@ class TestValidationFailures:
                 _runtime=runtime,
                 _monotonic=clock.monotonic,
                 _wall_time=lambda: 10.0 + clock.now,
+                _nl_client=_TestParser(),
             )
         )
 
@@ -1179,32 +1033,14 @@ class TestFullPipeline:
         assert navigation.status == "active"
         assert state_machine.current_state == InstructionState.ACTIVE
 
-    def test_pipeline_move_distance_then_wait_completion(self, vehicle, empty_grid,
-                                                          navigation, nl_client, schema_v,
-                                                          semantic_v, state_machine):
-        """Test that move_distance with GotoController reaches goal."""
-        vehicle.yaw = 0.0
-        msg = {"type": "nl_command", "seq": 24, "text": "前进 1 米"}
-        _handle_nl_command(
+    def test_pipeline_patrol(self, vehicle, empty_grid, navigation,
+                              nl_client, schema_v, semantic_v, state_machine):
+        msg = {"type": "nl_command", "seq": 24, "text": "开始巡逻"}
+        replies = _handle_nl_command(
             msg, vehicle, empty_grid, navigation,
             time.time(), time.monotonic(),
             nl_client, schema_v, semantic_v,
             state_machine,
         )
-        assert navigation.status == "active"
-        goal_x, goal_y = navigation.reported_goal
-        assert abs(goal_x - 11.0) < 0.1
-        assert abs(goal_y - 10.0) < 0.1
-
-    def test_pipeline_rotate_reports_si_yaw_goal(self, vehicle, empty_grid,
-                                                  navigation, nl_client, schema_v,
-                                                  semantic_v, state_machine):
-        _handle_nl_command(
-            {"type": "nl_command", "seq": 25, "text": "右转 90 度"},
-            vehicle, empty_grid, navigation,
-            time.time(), time.monotonic(),
-            nl_client, schema_v, semantic_v, state_machine,
-        )
-        assert navigation.snapshot()["goal"] == {
-            "yaw_rad": pytest.approx(math.pi / 2)
-        }
+        assert state_machine.current_state == InstructionState.ACTIVE
+        assert any(r["type"] == "nl_task_update" and r["status"] == "active" for r in replies)
