@@ -12,7 +12,10 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO_ROOT / "src"))
 
 from mockvehicle2d.map_grid import MapGrid
+from mockvehicle2d.local_state import AnchorSpec, AnchoredLocalState, ObservedGrid, PoseEstimate
 from mockvehicle2d.navigation import GotoController
+from mockvehicle2d.safety import LocalSafetyRuntime, SafetyAdvanceResult
+from mockvehicle2d.scan import LaserPoint, TMINI_SCAN_CONFIG, scan_grid
 from mockvehicle2d.server import (
     CommandMessageError,
     handler,
@@ -61,6 +64,65 @@ class GotoTest(unittest.TestCase):
     def vehicle(self, **kwargs) -> Vehicle:
         return Vehicle(5.0, 5.0, command_timeout=0.25, now=0.0, **kwargs)
 
+    @staticmethod
+    def observed() -> ObservedGrid:
+        return ObservedGrid(AnchorSpec("goto-test", 0.0, 0.0, 0.0))
+
+    @staticmethod
+    def pose(vehicle: Vehicle, timestamp: float = 0.0) -> PoseEstimate:
+        return PoseEstimate(
+            "goto-test",
+            vehicle.x,
+            vehicle.y,
+            vehicle.yaw,
+            (0.0, 0.0, 0.0),
+            "nominal",
+            timestamp,
+            0,
+        )
+
+    def start(
+        self,
+        navigation: GotoController,
+        vehicle: Vehicle,
+        local_map: ObservedGrid,
+        x_m: float,
+        y_m: float,
+    ) -> None:
+        navigation.start(
+            x_m,
+            y_m,
+            local_map=local_map,
+            pose=self.pose(vehicle),
+            vehicle_radius_m=vehicle.radius,
+        )
+
+    def update(
+        self,
+        navigation: GotoController,
+        vehicle: Vehicle,
+        grid: MapGrid,
+        local_map: ObservedGrid,
+        now: float,
+    ) -> None:
+        navigation.update(
+            vehicle,
+            grid,
+            now,
+            pose=self.pose(vehicle, now),
+            local_map=local_map,
+        )
+
+    @staticmethod
+    def local_state(vehicle: Vehicle) -> AnchoredLocalState:
+        return AnchoredLocalState(
+            AnchorSpec("goto-runtime", vehicle.x, vehicle.y, vehicle.yaw),
+            truth_x_m=vehicle.x,
+            truth_y_m=vehicle.y,
+            truth_yaw_rad=vehicle.yaw,
+            timestamp=0.0,
+        )
+
     def test_goto_parser_accepts_only_exact_finite_coordinates(self) -> None:
         self.assertEqual(
             parse_goto_message('{"type":"goto","seq":12,"x_m":8,"y_m":3.5}'),
@@ -84,15 +146,16 @@ class GotoTest(unittest.TestCase):
     def test_controller_turns_then_reaches_and_stays_stopped(self) -> None:
         vehicle = self.vehicle(yaw=math.pi)
         navigation = GotoController()
-        navigation.start(7.0, 5.0)
+        local_map = self.observed()
+        self.start(navigation, vehicle, local_map, 7.0, 5.0)
 
-        navigation.update(vehicle, self.grid, 0.0)
+        self.update(navigation, vehicle, self.grid, local_map, 0.0)
         self.assertEqual(navigation.status, "active")
         self.assertEqual(vehicle.velocities()[:2], (0.0, 0.0))
         self.assertLess(vehicle.velocities()[2], 0.0)
 
         for step in range(1, 301):
-            navigation.update(vehicle, self.grid, step * 0.05)
+            self.update(navigation, vehicle, self.grid, local_map, step * 0.05)
             if navigation.status == "reached":
                 break
 
@@ -102,20 +165,21 @@ class GotoTest(unittest.TestCase):
         self.assertLessEqual(math.hypot(vehicle.x - 7.0, vehicle.y - 5.0), navigation.goal_tolerance_m)
         self.assertEqual(vehicle.velocities(), (0.0, 0.0, 0.0))
         stopped_pose = (vehicle.x, vehicle.y, vehicle.yaw)
-        navigation.update(vehicle, self.grid, 20.0)
+        self.update(navigation, vehicle, self.grid, local_map, 20.0)
         self.assertEqual((vehicle.x, vehicle.y, vehicle.yaw), stopped_pose)
 
     def test_controller_slows_near_goal_and_refreshes_watchdog(self) -> None:
         vehicle = self.vehicle()
         navigation = GotoController()
-        navigation.start(5.2, 5.0)
-        navigation.update(vehicle, self.grid, 0.0)
+        local_map = self.observed()
+        self.start(navigation, vehicle, local_map, 5.2, 5.0)
+        self.update(navigation, vehicle, self.grid, local_map, 0.0)
         self.assertGreater(vehicle.velocities()[0], 0.0)
         self.assertLess(vehicle.velocities()[0], vehicle.linear_speed)
 
-        navigation.start(20.0, 5.0)
-        for step in range(1, 11):
-            navigation.update(vehicle, self.grid, step * 0.1)
+        self.start(navigation, vehicle, local_map, 20.0, 5.0)
+        for step in range(1, 31):
+            self.update(navigation, vehicle, self.grid, local_map, step * 0.1)
         self.assertEqual(navigation.status, "active")
         self.assertEqual(vehicle.command, "drive")
         self.assertGreater(vehicle.x, 5.4)
@@ -124,24 +188,26 @@ class GotoTest(unittest.TestCase):
         grid = MapGrid.from_wall_set(30, 30, {(7, y) for y in range(30)})
         vehicle = self.vehicle()
         navigation = GotoController()
-        navigation.start(10.0, 5.0)
+        local_map = self.observed()
+        self.start(navigation, vehicle, local_map, 10.0, 5.0)
 
-        for step in range(40):
-            navigation.update(vehicle, grid, step * 0.1)
+        for step in range(200):
+            self.update(navigation, vehicle, grid, local_map, step * 0.1)
             if navigation.status == "blocked":
                 break
 
         self.assertEqual((navigation.status, navigation.reason), ("blocked", "collision"))
         self.assertEqual(vehicle.velocities(), (0.0, 0.0, 0.0))
         stopped_pose = (vehicle.x, vehicle.y, vehicle.yaw)
-        navigation.update(vehicle, grid, 5.0)
+        self.update(navigation, vehicle, grid, local_map, (step + 1) * 0.1)
         self.assertEqual((vehicle.x, vehicle.y, vehicle.yaw), stopped_pose)
 
     def test_manual_or_invalid_input_cancels_active_goal_without_resume(self) -> None:
         vehicle = self.vehicle()
         navigation = GotoController()
-        navigation.start(10.0, 5.0)
-        navigation.update(vehicle, self.grid, 0.0)
+        local_map = self.observed()
+        self.start(navigation, vehicle, local_map, 10.0, 5.0)
+        self.update(navigation, vehicle, self.grid, local_map, 0.0)
 
         ack = handle_command_message(
             '{"type":"drive","seq":2,"linear_mps":0,"angular_rps":0}',
@@ -153,20 +219,21 @@ class GotoTest(unittest.TestCase):
         )
         self.assertEqual(ack["type"], "cmd_ack")
         self.assertEqual((navigation.status, navigation.reason), ("cancelled", "manual_override"))
-        navigation.update(vehicle, self.grid, 0.2)
+        self.update(navigation, vehicle, self.grid, local_map, 0.2)
         self.assertEqual(vehicle.velocities(), (0.0, 0.0, 0.0))
 
-        navigation.start(10.0, 5.0)
-        navigation.update(vehicle, self.grid, 0.3)
+        self.start(navigation, vehicle, local_map, 10.0, 5.0)
+        self.update(navigation, vehicle, self.grid, local_map, 0.3)
         error = handle_command_message("not-json", vehicle, self.grid, 0.4, 10.1, navigation)
         self.assertEqual(error["type"], "error")
         self.assertEqual((navigation.status, navigation.reason), ("cancelled", "invalid_command"))
-        navigation.update(vehicle, self.grid, 0.5)
+        self.update(navigation, vehicle, self.grid, local_map, 0.5)
         self.assertEqual(vehicle.velocities(), (0.0, 0.0, 0.0))
 
     def test_goto_ack_replacement_and_pose_status_are_observable(self) -> None:
         vehicle = self.vehicle()
         navigation = GotoController()
+        local_state = self.local_state(vehicle)
         first = handle_command_message(
             json.dumps({"type": "goto", "seq": 3, "x_m": 8, "y_m": 6}),
             vehicle,
@@ -174,6 +241,7 @@ class GotoTest(unittest.TestCase):
             0.0,
             11.0,
             navigation,
+            local_state=local_state,
         )
         self.assertEqual(
             first,
@@ -192,30 +260,203 @@ class GotoTest(unittest.TestCase):
             0.1,
             11.1,
             navigation,
+            local_state=local_state,
         )
-        self.assertEqual(navigation.goal, (9.0, 5.0))
+        self.assertEqual(navigation.reported_goal, (9.0, 5.0))
 
-        navigation.update(vehicle, self.grid, 0.1)
-        pose, _scan = telemetry_messages(vehicle, self.grid, 1, 11.2, navigation)
+        navigation.update(
+            vehicle,
+            self.grid,
+            0.1,
+            pose=local_state.pose,
+            local_map=local_state.local_map,
+        )
+        local_state.update_from_truth(
+            vehicle.x, vehicle.y, vehicle.yaw, timestamp=11.2
+        )
+        pose, _scan = telemetry_messages(
+            vehicle,
+            self.grid,
+            1,
+            11.2,
+            navigation,
+            local_state=local_state,
+        )
         self.assertEqual(pose["control_mode"], "autonomous")
-        self.assertEqual(
-            pose["navigation"],
-            {"status": "active", "goal": {"x_m": 9.0, "y_m": 5.0}, "reason": None},
-        )
+        self.assertEqual(pose["navigation"]["status"], "active")
+        self.assertEqual(pose["navigation"]["goal"], {"x_m": 9.0, "y_m": 5.0})
+        self.assertEqual(pose["navigation"]["algorithm"], "d_star_lite")
 
-        legacy = handle_command_message('{"cmd":"stop"}', vehicle, self.grid, 0.2, 11.3, navigation)
+        legacy = handle_command_message(
+            '{"cmd":"stop"}',
+            vehicle,
+            self.grid,
+            0.2,
+            11.3,
+            navigation,
+            local_state=local_state,
+        )
         self.assertEqual(
             legacy,
             {"type": "cmd_ack", "ts": 11.3, "seq": None, "cmd": "stop", "accepted": True},
         )
-        pose, _scan = telemetry_messages(vehicle, self.grid, 2, 11.4, navigation)
+        pose, _scan = telemetry_messages(
+            vehicle,
+            self.grid,
+            2,
+            11.4,
+            navigation,
+            local_state=local_state,
+        )
         self.assertEqual(pose["control_mode"], "manual")
         self.assertEqual(pose["navigation"]["status"], "cancelled")
 
+    def test_known_occupied_goal_uses_provisional_stop_without_false_completion(self) -> None:
+        vehicle = self.vehicle()
+        navigation = GotoController()
+        local_state = self.local_state(vehicle)
+        local_state.integrate_scan(
+            (LaserPoint(0.0, 1.0, 1.0),),
+            0.0,
+            TMINI_SCAN_CONFIG,
+        )
+        self.assertIn((1, 0), local_state.local_map.occupied_cells())
+
+        ack = handle_command_message(
+            '{"type":"goto","seq":5,"x_m":6,"y_m":5}',
+            vehicle,
+            self.grid,
+            0.0,
+            12.0,
+            navigation,
+            local_state=local_state,
+        )
+
+        self.assertEqual(
+            ack,
+            {
+                "type": "goto_ack",
+                "ts": 12.0,
+                "seq": 5,
+                "goal": {"x_m": 6.0, "y_m": 5.0},
+                "accepted": True,
+            },
+        )
+        snapshot = navigation.snapshot()
+        self.assertEqual(snapshot["status"], "active")
+        self.assertEqual(snapshot["goal_mode"], "approaching_safe_stop")
+        effective = snapshot["effective_goal"]
+        self.assertIsNotNone(effective)
+        navigation.update(
+            vehicle,
+            self.grid,
+            0.1,
+            pose=PoseEstimate(
+                local_state.anchor.anchor_id,
+                effective["x_m"],
+                effective["y_m"],
+                0.0,
+                (0.0, 0.0, 0.0),
+                "nominal",
+                0.1,
+                1,
+            ),
+            advance_result=SafetyAdvanceResult(),
+            local_map=local_state.local_map,
+        )
+        self.assertEqual(navigation.status, "active")
+        self.assertEqual(navigation.snapshot()["goal_mode"], "approaching_safe_stop")
+        self.assertIsNone(navigation.reason)
+        self.assertEqual(vehicle.command, "stop")
+        self.assertEqual(vehicle.body_velocities(), (0.0, 0.0))
+
+    def test_known_occupied_goal_accepts_body_edge_safe_candidate(self) -> None:
+        grid = MapGrid.from_wall_set(16, 12, {(8, 5)})
+        vehicle = Vehicle(
+            2.5,
+            5.5,
+            radius=0.5,
+            command_timeout=1.0,
+            now=0.0,
+        )
+        navigation = GotoController()
+        local_state = self.local_state(vehicle)
+        local_state.integrate_scan(
+            tuple(
+                scan_grid(
+                    grid,
+                    vehicle.x,
+                    vehicle.y,
+                    vehicle.yaw,
+                    TMINI_SCAN_CONFIG,
+                )
+            ),
+            0.0,
+            TMINI_SCAN_CONFIG,
+        )
+
+        ack = handle_command_message(
+            '{"type":"goto","seq":5,"x_m":8.5,"y_m":5.5}',
+            vehicle,
+            grid,
+            0.0,
+            12.0,
+            navigation,
+            local_state=local_state,
+        )
+
+        self.assertEqual(
+            ack,
+            {
+                "type": "goto_ack",
+                "ts": 12.0,
+                "seq": 5,
+                "goal": {"x_m": 8.5, "y_m": 5.5},
+                "accepted": True,
+            },
+        )
+        self.assertEqual(navigation.status, "active")
+        self.assertEqual(navigation.requested_goal, (6.0, 0.0))
+        self.assertEqual(navigation.reported_goal, (8.5, 5.5))
+        self.assertNotEqual(navigation.goal, navigation.requested_goal)
+        snapshot = navigation.snapshot()
+        self.assertEqual(snapshot["goal"], {"x_m": 8.5, "y_m": 5.5})
+        self.assertIn(
+            snapshot["goal_mode"],
+            {"approaching_safe_stop", "nearby_safe"},
+        )
+        self.assertLessEqual(snapshot["approach_distance_m"], 1.0)
+
+    def test_known_free_goal_remains_accepted(self) -> None:
+        vehicle = self.vehicle()
+        navigation = GotoController()
+        local_state = self.local_state(vehicle)
+        local_state.integrate_scan(
+            (LaserPoint(0.0, 0.0, 0.0),),
+            0.0,
+            TMINI_SCAN_CONFIG,
+        )
+        self.assertFalse(local_state.local_map.is_unknown(1, 0))
+
+        ack = handle_command_message(
+            '{"type":"goto","seq":5,"x_m":6,"y_m":5}',
+            vehicle,
+            self.grid,
+            0.0,
+            12.0,
+            navigation,
+            local_state=local_state,
+        )
+
+        self.assertTrue(ack["accepted"])
+        self.assertEqual(navigation.status, "active")
+        self.assertEqual(navigation.snapshot()["goal_mode"], "exact")
+
     def test_goto_handoff_collision_blocks_replacement_goal(self) -> None:
         grid = MapGrid.from_wall_set(30, 30, {(7, y) for y in range(30)})
-        vehicle = Vehicle(6.4, 5.0, command_timeout=0.25, now=0.0)
+        vehicle = Vehicle(6.49, 5.0, command_timeout=0.25, now=0.0)
         navigation = GotoController()
+        local_state = self.local_state(vehicle)
         handle_command_message(
             '{"type":"goto","seq":5,"x_m":10,"y_m":5}',
             vehicle,
@@ -223,16 +464,24 @@ class GotoTest(unittest.TestCase):
             0.0,
             12.0,
             navigation,
+            local_state=local_state,
         )
-        navigation.update(vehicle, grid, 0.0)
+        navigation.update(
+            vehicle,
+            grid,
+            0.0,
+            pose=local_state.pose,
+            local_map=local_state.local_map,
+        )
 
         ack = handle_command_message(
-            '{"type":"goto","seq":6,"x_m":4,"y_m":5}',
+            '{"type":"goto","seq":6,"x_m":250,"y_m":5}',
             vehicle,
             grid,
             0.25,
             12.25,
             navigation,
+            local_state=local_state,
         )
 
         self.assertEqual(
@@ -241,18 +490,65 @@ class GotoTest(unittest.TestCase):
                 "type": "goto_ack",
                 "ts": 12.25,
                 "seq": 6,
-                "goal": {"x_m": 4.0, "y_m": 5.0},
+                "goal": {"x_m": 250.0, "y_m": 5.0},
                 "accepted": False,
                 "reason": "collision",
             },
         )
-        self.assertEqual(navigation.goal, (4.0, 5.0))
+        self.assertEqual(navigation.reported_goal, (250.0, 5.0))
         self.assertEqual((navigation.status, navigation.reason), ("blocked", "collision"))
+        self.assertFalse(navigation.snapshot()["planning"])
         self.assertEqual(vehicle.velocities(), (0.0, 0.0, 0.0))
         stopped_pose = (vehicle.x, vehicle.y, vehicle.yaw)
-        navigation.update(vehicle, grid, 0.3)
+        navigation.update(
+            vehicle,
+            grid,
+            0.3,
+            pose=local_state.pose,
+            local_map=local_state.local_map,
+        )
         self.assertEqual((vehicle.x, vehicle.y, vehicle.yaw), stopped_pose)
         self.assertEqual(vehicle.velocities(), (0.0, 0.0, 0.0))
+
+    def test_goto_handoff_safety_stop_clears_replacement_planning(self) -> None:
+        vehicle = self.vehicle()
+        navigation = GotoController()
+        local_state = self.local_state(vehicle)
+        handle_command_message(
+            '{"type":"goto","seq":5,"x_m":10,"y_m":5}',
+            vehicle,
+            self.grid,
+            0.0,
+            12.0,
+            navigation,
+            local_state=local_state,
+        )
+        navigation.update(
+            vehicle,
+            self.grid,
+            0.0,
+            pose=local_state.pose,
+            local_map=local_state.local_map,
+        )
+
+        ack = handle_command_message(
+            '{"type":"goto","seq":6,"x_m":250,"y_m":5}',
+            vehicle,
+            self.grid,
+            0.25,
+            12.25,
+            navigation,
+            LocalSafetyRuntime(healthy=False),
+            local_state=local_state,
+        )
+
+        self.assertFalse(ack["accepted"])
+        self.assertEqual(ack["reason"], "safety_sensor_fault")
+        self.assertEqual(
+            (navigation.status, navigation.reason),
+            ("blocked", "safety_sensor_fault"),
+        )
+        self.assertFalse(navigation.snapshot()["planning"])
 
     def test_websocket_goto_ack_precedes_autonomous_pose(self) -> None:
         clock = _Clock()

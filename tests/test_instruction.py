@@ -12,10 +12,8 @@ Covers:
 
 from __future__ import annotations
 
-import json
 import math
 import threading
-import time
 
 import pytest
 
@@ -33,6 +31,7 @@ from mockvehicle2d.instruction.validator import (
     run_validation_pipeline,
 )
 from mockvehicle2d.map_grid import MapGrid, WALL, VOID
+from mockvehicle2d.scan import scan_sector
 from mockvehicle2d.safety import LocalSafetyRuntime
 
 
@@ -175,6 +174,29 @@ class TestSemanticValidator:
     def test_goto_too_large(self):
         ok, msg = self.v.validate(_valid_instruction("goto", {"x_m": 300, "y_m": 100}))
         assert not ok
+
+    def test_goto_uses_actual_grid_dimensions(self):
+        validator = SemanticValidator(MapGrid(12, 7))
+        assert validator.validate(
+            _valid_instruction("goto", {"x_m": 11.5, "y_m": 6.5})
+        )[0]
+        assert not validator.validate(
+            _valid_instruction("goto", {"x_m": 12.0, "y_m": 6.5})
+        )[0]
+
+    @pytest.mark.parametrize("coordinate", [math.nan, math.inf, -math.inf])
+    def test_goto_rejects_non_finite_coordinates(self, coordinate):
+        ok, msg = SemanticValidator(None).validate(
+            _valid_instruction("goto", {"x_m": coordinate, "y_m": 1.0})
+        )
+        assert not ok
+        assert "finite" in msg
+
+    def test_goto_without_truth_grid_does_not_apply_absolute_bounds(self):
+        ok, msg = SemanticValidator(None).validate(
+            _valid_instruction("goto", {"x_m": 1001.0, "y_m": 1000.0})
+        )
+        assert ok, msg
 
     def test_goto_is_wall(self, grid_with_obstacles):
         v = SemanticValidator(grid_with_obstacles)
@@ -402,6 +424,49 @@ class TestTaskCompiler:
         task = self.compiler.compile(inst)
         assert task["type"] == "unknown"
 
+    def test_real_tmini_clockwise_scan_sectors(self):
+        assert {
+            angle: scan_sector(angle)
+            for angle in (
+                0.0,
+                math.pi / 2,
+                3 * math.pi / 2,
+                7 * math.pi / 4,
+                math.pi / 4,
+                math.pi,
+                -math.pi / 2,
+                5 * math.pi / 2,
+                3 * math.pi / 4,
+                5 * math.pi / 4,
+            )
+        } == {
+            0.0: "front",
+            math.pi / 2: "right",
+            3 * math.pi / 2: "left",
+            7 * math.pi / 4: "front",
+            math.pi / 4: "front",
+            math.pi: "back",
+            -math.pi / 2: "left",
+            5 * math.pi / 2: "right",
+            3 * math.pi / 4: "back",
+            5 * math.pi / 4: "back",
+        }
+
+    @pytest.mark.parametrize(
+        ("angle", "expected"),
+        (
+            (2 * math.pi, "front"),
+            (-2 * math.pi, "front"),
+            (math.nan, None),
+            (math.inf, None),
+            (-math.inf, None),
+            (True, None),
+            ("0", None),
+            (None, None),
+        ),
+    )
+    def test_scan_sector_rejects_non_finite_or_non_real_angles(self, angle, expected):
+        assert scan_sector(angle) == expected
 
 # ═══════════════════════════════════════════════════════════════
 # AuthorityManager tests

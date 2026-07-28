@@ -68,10 +68,11 @@ class GridScanTest(unittest.TestCase):
         self.assertAlmostEqual(default_metadata["max_angle"], TMINI_SCAN_CONFIG.max_angle)
         self.assertAlmostEqual(default_metadata["max_angle"] + default_metadata["angle_increment"], 2 * math.pi)
 
-    def test_tmini_returns_are_quantized_to_centimetres(self) -> None:
+    def test_tmini_telemetry_quantizes_full_precision_internal_range(self) -> None:
         grid = MapGrid.from_wall_set(8, 4, {(4, 1)})
         point = scan_grid(grid, 1.493, 1.5, 0.0, TMINI_SCAN_CONFIG)[0]
-        self.assertEqual(point.range, 2.51)
+        self.assertAlmostEqual(point.range, 2.507)
+        self.assertEqual(point.as_dict()["range"], 2.51)
         self.assertEqual(point.intensity, 1.0)
 
 

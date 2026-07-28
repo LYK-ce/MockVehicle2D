@@ -15,9 +15,7 @@ def _strip_thinking(content: str) -> str:
     Handles both closed and unclosed (truncated) think blocks.
     After stripping, extracts remaining text for JSON parsing.
     """
-    # Remove closed think blocks
     content = re.sub(r"<think>.*?</think>\s*", "", content, flags=re.DOTALL)
-    # If an unclosed <think> remains (truncated output), remove it and everything after
     content = re.sub(r"<think>.*$", "", content, flags=re.DOTALL)
     return content.strip()
 

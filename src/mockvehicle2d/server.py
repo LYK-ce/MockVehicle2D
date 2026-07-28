@@ -2,6 +2,7 @@
 """Controllable 2D vehicle and Tmini-style WebSocket simulator."""
 
 import asyncio
+from dataclasses import dataclass, field
 import json
 import math
 import random
@@ -10,15 +11,25 @@ import signal
 import struct
 import time
 
-from mockvehicle2d.instruction.compiler import TaskCompiler
 from mockvehicle2d.instruction.llm_client import LLMClient
 from mockvehicle2d.instruction.state_machine import InstructionState, InstructionStateMachine
 from mockvehicle2d.instruction.validator import SchemaValidator, SemanticValidator
+from mockvehicle2d.local_state import (
+    AnchorSpec,
+    AnchoredLocalState,
+    LocalMapDelta,
+    OdometryConfig,
+)
 from mockvehicle2d.map_grid import MapGrid, VOID
 from mockvehicle2d.navigation import GotoController
 from mockvehicle2d.pathfinding import PathFollowingController
 from mockvehicle2d.safety import LocalSafetyRuntime
-from mockvehicle2d.scan import TMINI_SCAN_CONFIG, scan_message
+from mockvehicle2d.scan import (
+    LaserPoint,
+    TMINI_SCAN_CONFIG,
+    scan_grid,
+    scan_message,
+)
 from mockvehicle2d.vehicle import COMMANDS, Vehicle
 
 
@@ -27,8 +38,133 @@ PORT = 19090
 DEFAULT_VEHICLE_ID = "mock_vehicle_01"
 SPAWN_X = 10.0
 SPAWN_Y = 10.0
+MAP_RESOLUTION_M = 1.0
 MAX_JSON_INTEGER_DIGITS = 4300
+MAX_SEQUENCE = 2**64 - 1
 VEHICLE_ID_PATTERN = re.compile(r"[A-Za-z0-9._-]{1,64}")
+
+
+@dataclass
+class RuntimeFrame:
+    scan_points: tuple[LaserPoint, ...]
+    map_delta: LocalMapDelta | None
+    pose_timestamp: float
+    scan_timestamp: float
+    safety_stop: str | None = None
+
+
+@dataclass
+class VehicleRuntime:
+    """State owned by one simulated vehicle and retained across controller sessions."""
+
+    voxels: list[dict[str, object]]
+    grid: MapGrid
+    vehicle: Vehicle
+    navigation: GotoController
+    safety: LocalSafetyRuntime
+    local_state: AnchoredLocalState
+    frame_sequence: int = 0
+    controller_lease: asyncio.Lock = field(
+        default_factory=asyncio.Lock, repr=False, compare=False
+    )
+
+    def update(self, monotonic_now: float, wall_timestamp: float) -> RuntimeFrame:
+        automatic = self.navigation.status == "active"
+        lost_automatic = self.navigation.block_for_localization_loss(
+            self.vehicle, self.local_state.pose, monotonic_now
+        )
+        advance_result = None
+        if not lost_automatic:
+            advance_result = self.safety.advance(
+                self.vehicle,
+                self.grid,
+                monotonic_now,
+                automatic=automatic,
+            )
+        scan_points = tuple(
+            scan_grid(
+                self.grid,
+                self.vehicle.x,
+                self.vehicle.y,
+                self.vehicle.yaw,
+                TMINI_SCAN_CONFIG,
+            )
+        )
+        self.local_state.update_from_truth(
+            self.vehicle.x,
+            self.vehicle.y,
+            self.vehicle.yaw,
+            timestamp=wall_timestamp,
+        )
+        map_delta = self.local_state.match_and_integrate_scan(
+            scan_points,
+            wall_timestamp,
+            TMINI_SCAN_CONFIG,
+            forbidden_points_vehicle_m=(
+                ()
+                if self.safety.observation.edge_point_vehicle_m is None
+                else (self.safety.observation.edge_point_vehicle_m,)
+            ),
+        )
+        pose = self.local_state.pose
+        if not lost_automatic:
+            self.navigation.update(
+                self.vehicle,
+                self.grid,
+                monotonic_now,
+                self.safety,
+                pose=pose,
+                advance_result=advance_result,
+                local_map=self.local_state.local_map,
+                map_delta=map_delta,
+            )
+        return RuntimeFrame(
+            scan_points,
+            map_delta,
+            wall_timestamp,
+            wall_timestamp,
+            None if advance_result is None else advance_result.reason,
+        )
+
+    @classmethod
+    def create(
+        cls,
+        *,
+        started_at: float,
+        timestamp: float | None = None,
+        anchor: AnchorSpec,
+        odometry_config: OdometryConfig,
+        linear_speed: float = 0.5,
+        angular_speed: float = math.pi / 2,
+        radius: float = 0.5,
+        command_timeout: float = 1.0,
+        safety_healthy: bool = True,
+    ) -> "VehicleRuntime":
+        voxels, grid = generate_map(radius=radius)
+        vehicle = Vehicle(
+            SPAWN_X,
+            SPAWN_Y,
+            linear_speed=linear_speed,
+            angular_speed=angular_speed,
+            radius=radius,
+            command_timeout=command_timeout,
+            now=started_at,
+        )
+        return cls(
+            voxels,
+            grid,
+            vehicle,
+            GotoController(),
+            LocalSafetyRuntime(healthy=safety_healthy),
+            AnchoredLocalState(
+                anchor,
+                truth_x_m=vehicle.x,
+                truth_y_m=vehicle.y,
+                truth_yaw_rad=vehicle.yaw,
+                odometry_config=odometry_config,
+                timestamp=started_at if timestamp is None else timestamp,
+            ),
+        )
 
 
 class CommandMessageError(ValueError):
@@ -50,11 +186,49 @@ def _next_deadline(deadline: float, now: float, period: float) -> float:
     return deadline + (math.floor((now - deadline) / period) + 1) * period
 
 
-def _safe_seq(message: object) -> int | None:
+def _is_sequence(value: object) -> bool:
+    return (
+        isinstance(value, int)
+        and not isinstance(value, bool)
+        and 0 <= value <= MAX_SEQUENCE
+    )
+
+
+def _safe_seq(message: object) -> int:
     if not isinstance(message, dict):
-        return None
+        return 0
     seq = message.get("seq")
-    return seq if isinstance(seq, int) and not isinstance(seq, bool) and seq >= 0 else None
+    return seq if _is_sequence(seq) else 0
+
+
+def _require_seq(message: dict[str, object], subject: str) -> int:
+    if "seq" not in message:
+        raise CommandMessageError("missing_seq", f"{subject} requires seq")
+    seq = message["seq"]
+    if not _is_sequence(seq):
+        raise CommandMessageError(
+            "invalid_seq", "seq must be an unsigned 64-bit integer", 0
+        )
+    return seq
+
+
+def _started_nl_task_seq(replies: list[dict[str, object]]) -> int | None:
+    for reply in replies:
+        if (
+            reply.get("type") == "nl_task_update"
+            and reply.get("status") == "active"
+        ):
+            return _safe_seq(reply)
+    return None
+
+
+def _nl_completion_reason(navigation: GotoController) -> str:
+    if (
+        navigation.goal_mode == "nearby_safe"
+        and navigation.reason == "nearby_safe_stop"
+    ):
+        return "nearby_safe_stop"
+    return "goal_reached"
 
 
 def _bounded_json_int(value: str) -> int:
@@ -87,10 +261,7 @@ def _parse_command_object(message: dict[str, object]) -> tuple[str, int | None]:
         raise CommandMessageError("missing_type", "canonical command requires type", seq)
     if message["type"] != "cmd":
         raise CommandMessageError("invalid_type", "type must be cmd", seq)
-    if "seq" not in message:
-        raise CommandMessageError("missing_seq", "canonical command requires seq", None)
-    if seq is None:
-        raise CommandMessageError("invalid_seq", "seq must be a non-negative integer", None)
+    seq = _require_seq(message, "canonical command")
     if "cmd" not in message or not isinstance(message["cmd"], str) or message["cmd"] not in COMMANDS:
         raise CommandMessageError("invalid_cmd", "unsupported cmd", seq)
     if set(message) != {"type", "seq", "cmd"}:
@@ -109,10 +280,7 @@ def _parse_drive_object(
     seq = _safe_seq(message)
     if message.get("type") != "drive":
         raise CommandMessageError("invalid_type", "type must be drive", seq)
-    if "seq" not in message:
-        raise CommandMessageError("missing_seq", "drive command requires seq", None)
-    if seq is None:
-        raise CommandMessageError("invalid_seq", "seq must be a non-negative integer", None)
+    seq = _require_seq(message, "drive command")
     if set(message) != {"type", "seq", "linear_mps", "angular_rps"}:
         raise CommandMessageError("invalid_fields", "drive command has missing or unexpected fields", seq)
 
@@ -139,10 +307,7 @@ def _parse_goto_object(message: dict[str, object]) -> tuple[float, float, int]:
     seq = _safe_seq(message)
     if message.get("type") != "goto":
         raise CommandMessageError("invalid_type", "type must be goto", seq)
-    if "seq" not in message:
-        raise CommandMessageError("missing_seq", "goto command requires seq", None)
-    if seq is None:
-        raise CommandMessageError("invalid_seq", "seq must be a non-negative integer", None)
+    seq = _require_seq(message, "goto command")
     if set(message) != {"type", "seq", "x_m", "y_m"}:
         raise CommandMessageError("invalid_fields", "goto command has missing or unexpected fields", seq)
 
@@ -159,8 +324,59 @@ def _parse_goto_object(message: dict[str, object]) -> tuple[float, float, int]:
 
 
 def parse_goto_message(raw: object) -> tuple[float, float, int]:
-    """Validate one local-odometry go-to-goal command."""
+    """Validate one global-map go-to-goal command."""
     return _parse_goto_object(_decode_message(raw))
+
+
+def _advance_command_handoff(
+    vehicle: Vehicle,
+    grid: MapGrid,
+    monotonic_now: float,
+    wall_timestamp: float,
+    navigation: GotoController | None,
+    safety: LocalSafetyRuntime | None,
+    path_following: PathFollowingController | None,
+    local_state: AnchoredLocalState | None,
+) -> tuple[bool, str | None]:
+    lost_automatic = (
+        navigation is not None
+        and local_state is not None
+        and navigation.block_for_localization_loss(
+            vehicle, local_state.pose, monotonic_now
+        )
+    )
+    if lost_automatic:
+        collided, safety_stop = False, None
+    elif safety is None:
+        collided, safety_stop = vehicle.advance(grid, monotonic_now), None
+    else:
+        handoff = safety.advance(
+            vehicle,
+            grid,
+            monotonic_now,
+            automatic=(
+                (navigation is not None and navigation.status == "active")
+                or (path_following is not None and path_following.status == "active")
+            ),
+        )
+        collided = handoff.collided
+        safety_stop = handoff.reason if handoff.stopped else None
+    if local_state is not None:
+        local_state.update_from_truth(
+            vehicle.x, vehicle.y, vehicle.yaw, timestamp=wall_timestamp
+        )
+    return collided, safety_stop
+
+
+def _block_navigation_for_handoff(
+    navigation: GotoController,
+    collided: bool,
+    safety_stop: str | None,
+) -> str | None:
+    reason = "collision" if collided else safety_stop
+    if reason is not None:
+        navigation.block(reason)
+    return reason
 
 
 def handle_command_message(
@@ -172,23 +388,19 @@ def handle_command_message(
     navigation: GotoController | None = None,
     safety: LocalSafetyRuntime | None = None,
     path_following: PathFollowingController | None = None,
+    local_state: AnchoredLocalState | None = None,
 ) -> dict[str, object]:
     """Advance the prior command, then acknowledge or fail-safe stop."""
-    if safety is None:
-        handoff_collided = vehicle.advance(grid, monotonic_now)
-        handoff_safety_stop = None
-    else:
-        handoff = safety.advance(
-            vehicle,
-            grid,
-            monotonic_now,
-            automatic=(
-                (navigation is not None and navigation.status == "active")
-                or (path_following is not None and path_following.status == "active")
-            ),
-        )
-        handoff_collided = handoff.collided
-        handoff_safety_stop = handoff.reason if handoff.stopped else None
+    handoff_collided, handoff_safety_stop = _advance_command_handoff(
+        vehicle,
+        grid,
+        monotonic_now,
+        wall_timestamp,
+        navigation,
+        safety,
+        path_following,
+        local_state,
+    )
     rejection_reason: str | None = None
     try:
         message = _decode_message(raw)
@@ -199,13 +411,33 @@ def handle_command_message(
             vehicle.stop()
             if path_following is not None:
                 path_following.cancel("manual_override")
-            navigation.start(x_m, y_m)
-            if handoff_collided:
-                navigation.status = "blocked"
-                navigation.reason = "collision"
-            elif handoff_safety_stop is not None:
-                navigation.status = "blocked"
-                navigation.reason = handoff_safety_stop
+            if local_state is not None and local_state.pose.quality == "lost":
+                navigation.block("localization_lost")
+            elif local_state is None:
+                raise CommandMessageError(
+                    "goto_unavailable",
+                    "estimated pose and observed map are required",
+                    seq,
+                )
+            else:
+                local_x, local_y, _ = local_state.anchor.global_to_anchor(x_m, y_m)
+                try:
+                    navigation.start(
+                        local_x,
+                        local_y,
+                        reported_goal=(x_m, y_m),
+                        local_map=local_state.local_map,
+                        pose=local_state.pose,
+                        vehicle_radius_m=vehicle.radius,
+                    )
+                except ValueError as error:
+                    raise CommandMessageError(
+                        "invalid_goto", str(error), seq
+                    ) from error
+            if navigation.status == "active":
+                _block_navigation_for_handoff(
+                    navigation, handoff_collided, handoff_safety_stop
+                )
             accepted = navigation.status == "active"
             reply = {
                 "type": "goto_ack",
@@ -216,6 +448,8 @@ def handle_command_message(
             }
             if not accepted:
                 reply["reason"] = navigation.reason
+                if navigation.detail is not None:
+                    reply["detail"] = navigation.detail
             return reply
         if message.get("type") == "drive":
             linear_mps, angular_rps, seq = _parse_drive_object(
@@ -268,6 +502,96 @@ def handle_command_message(
     return reply
 
 
+def _estimated_global_pose(
+    local_state: AnchoredLocalState,
+) -> tuple[float, float, float]:
+    estimate = local_state.pose
+    return local_state.anchor.anchor_to_global(
+        estimate.x_m, estimate.y_m, estimate.yaw_rad
+    )
+
+
+def _log_navigation_transition(
+    runtime: VehicleRuntime,
+    previous: tuple[object, ...] | None,
+) -> tuple[object, ...]:
+    navigation = runtime.navigation
+    snapshot = navigation.snapshot()
+    key = (
+        snapshot["status"],
+        snapshot["reason"],
+        snapshot["detail"],
+        json.dumps(snapshot["goal"], sort_keys=True),
+        snapshot.get("goal_mode"),
+        json.dumps(snapshot.get("effective_goal"), sort_keys=True),
+    )
+    if key == previous or (previous is None and snapshot["status"] == "idle"):
+        return key
+
+    pose = runtime.local_state.pose
+    resolution_m = runtime.local_state.local_map.resolution_m
+    global_x_m, global_y_m, global_yaw_rad = _estimated_global_pose(
+        runtime.local_state
+    )
+    local_goal_cell = (
+        None
+        if navigation.goal is None
+        else {
+            "gx": math.floor(navigation.goal[0] / resolution_m),
+            "gy": math.floor(navigation.goal[1] / resolution_m),
+        }
+    )
+    event = {
+        "status": snapshot["status"],
+        "reason": snapshot["reason"],
+        "detail": snapshot["detail"],
+        "global_pose": {
+            "x_m": global_x_m,
+            "y_m": global_y_m,
+            "yaw_rad": global_yaw_rad,
+        },
+        "global_goal": snapshot["goal"],
+        "goal_mode": snapshot.get("goal_mode"),
+        "effective_goal": snapshot.get("effective_goal"),
+        "local_start_cell": {
+            "gx": math.floor(pose.x_m / resolution_m),
+            "gy": math.floor(pose.y_m / resolution_m),
+        },
+        "local_goal_cell": local_goal_cell,
+        "map_revision": runtime.local_state.local_map.revision,
+        "replan_count": snapshot.get("replan_count", 0),
+    }
+    print(
+        "[navigation] "
+        + json.dumps(event, ensure_ascii=False, separators=(",", ":"), sort_keys=True)
+    )
+    return key
+
+
+def _start_estimated_goto(
+    navigation: GotoController,
+    vehicle: Vehicle,
+    local_state: AnchoredLocalState,
+    x_m: float,
+    y_m: float,
+) -> None:
+    if local_state.pose.quality == "lost":
+        navigation.block("localization_lost")
+        return
+    local_x_m, local_y_m, _ = local_state.anchor.global_to_anchor(x_m, y_m)
+    try:
+        navigation.start(
+            local_x_m,
+            local_y_m,
+            reported_goal=(x_m, y_m),
+            local_map=local_state.local_map,
+            pose=local_state.pose,
+            vehicle_radius_m=vehicle.radius,
+        )
+    except ValueError as error:
+        navigation.block(f"invalid_goal: {error}")
+
+
 def _handle_nl_command(
     message: dict[str, object],
     vehicle: Vehicle,
@@ -279,14 +603,26 @@ def _handle_nl_command(
     schema_v: SchemaValidator,
     semantic_v: SemanticValidator,
     state_machine: InstructionStateMachine,
-    task_compiler: TaskCompiler,
-    scan_data: dict[str, object] | None = None,
     path_following: PathFollowingController | None = None,
+    local_state: AnchoredLocalState | None = None,
+    safety: LocalSafetyRuntime | None = None,
+    parsed_instructions: list[dict[str, object]] | dict[str, object] | None = None,
 ) -> list[dict[str, object]]:
     """Process one nl_command message. Returns a list of reply dicts to send."""
-    seq = message.get("seq")
-    if not isinstance(seq, int) or isinstance(seq, bool) or seq < 0:
-        seq = 0
+    handoff_collided, handoff_safety_stop = _advance_command_handoff(
+        vehicle,
+        grid,
+        monotonic_now,
+        wall_timestamp,
+        navigation,
+        safety,
+        path_following,
+        local_state,
+    )
+    handoff_reason = _block_navigation_for_handoff(
+        navigation, handoff_collided, handoff_safety_stop
+    )
+    seq = _safe_seq(message)
     text = message.get("text", "")
     if not isinstance(text, str) or not text.strip():
         return [{
@@ -320,12 +656,18 @@ def _handle_nl_command(
 
     # 1. Parse — now returns list[dict]
     state_machine.transition(InstructionState.PARSING)
-    result = nl_client.parse(text)
-    if asyncio.iscoroutine(result):
-        instructions = asyncio.run(result)
-    else:
-        instructions = result
+    instructions = parsed_instructions
+    if instructions is None:
+        instructions = nl_client.parse(text)
+        if asyncio.iscoroutine(instructions):
+            instructions.close()
+            raise RuntimeError(
+                "async NL clients must be awaited by the WebSocket handler"
+            )
+    if isinstance(instructions, dict):
+        instructions = [instructions]
     if not instructions:
+        state_machine.clear_queue()
         state_machine.transition(InstructionState.FAILED)
         replies.append({
             "type": "nl_parse_result",
@@ -348,8 +690,10 @@ def _handle_nl_command(
         sequence_total = state_machine.queue_size
         replies.extend(_execute_parsed_instruction(
             instruction, vehicle, grid, navigation, wall_timestamp, monotonic_now,
-            schema_v, semantic_v, state_machine, task_compiler, seq,
+            schema_v, semantic_v, state_machine, seq,
             path_following=path_following,
+            local_state=local_state,
+            handoff_reason=handoff_reason,
         ))
         # Patch sequence info into nl_parse_result
         for r in replies:
@@ -369,6 +713,7 @@ def _handle_nl_command(
     sequence_total = state_machine.queue_size
 
     if instruction is None:
+        state_machine.clear_queue()
         state_machine.transition(InstructionState.FAILED)
         replies.append({
             "type": "nl_parse_result",
@@ -383,8 +728,10 @@ def _handle_nl_command(
 
     replies.extend(_execute_parsed_instruction(
         instruction, vehicle, grid, navigation, wall_timestamp, monotonic_now,
-        schema_v, semantic_v, state_machine, task_compiler, seq,
+        schema_v, semantic_v, state_machine, seq,
         path_following=path_following,
+        local_state=local_state,
+        handoff_reason=handoff_reason,
     ))
     # Add sequence info to nl_parse_result
     for r in replies:
@@ -405,9 +752,10 @@ def _execute_parsed_instruction(
     schema_v: SchemaValidator,
     semantic_v: SemanticValidator,
     state_machine: InstructionStateMachine,
-    task_compiler: TaskCompiler,
     seq: int,
     path_following: PathFollowingController | None = None,
+    local_state: AnchoredLocalState | None = None,
+    handoff_reason: str | None = None,
 ) -> list[dict[str, object]]:
     """Execute an already-parsed instruction through validate → accept → execute pipeline.
 
@@ -419,6 +767,7 @@ def _execute_parsed_instruction(
     state_machine.transition(InstructionState.VALIDATING)
     schema_ok, schema_err = schema_v.validate(instruction)
     if not schema_ok:
+        state_machine.clear_queue()
         state_machine.transition(InstructionState.REJECTED)
         replies.append({
             "type": "nl_parse_result",
@@ -448,6 +797,7 @@ def _execute_parsed_instruction(
 
     semantic_ok, semantic_err = semantic_v.validate(instruction)
     if not semantic_ok:
+        state_machine.clear_queue()
         state_machine.transition(InstructionState.REJECTED)
         replies.append({
             "type": "nl_parse_result",
@@ -478,6 +828,7 @@ def _execute_parsed_instruction(
         navigation.cancel("nl_stop")
         if path_following is not None:
             path_following.cancel("nl_stop")
+        state_machine.clear_queue()
         state_machine.transition(InstructionState.ACTIVE)
         state_machine.transition(InstructionState.COMPLETED)
         replies.append({
@@ -501,74 +852,34 @@ def _execute_parsed_instruction(
         })
         return replies
 
+    if handoff_reason is not None:
+        replies[-1]["accepted"] = False
+        replies[-1]["reason"] = handoff_reason
+        if path_following is not None:
+            path_following.cancel(handoff_reason)
+        state_machine.transition(InstructionState.ACTIVE)
+        state_machine.transition(InstructionState.BLOCKED)
+        replies.append({
+            "type": "nl_task_update",
+            "ts": wall_timestamp,
+            "seq": seq,
+            "status": "blocked",
+            "reason": handoff_reason,
+        })
+        state_machine.clear_queue()
+        state_machine.transition(InstructionState.IDLE)
+        return replies
+
     if intent == "goto":
         x_m = params["x_m"]
         y_m = params["y_m"]
-        # Phase 3: use task compiler to decide controller
-        pose_snap = {"pose": {"x": vehicle.x, "y": vehicle.y, "yaw": vehicle.yaw}}
-        task = task_compiler.compile(instruction, pose_snap)
-        controller_choice = task.get("controller", "GotoController")
-
-        if controller_choice == "blocked":
-            # Go through ACTIVE first (state machine: ACCEPTED→ACTIVE→BLOCKED)
-            state_machine.transition(InstructionState.ACTIVE)
-            state_machine.transition(InstructionState.BLOCKED)
-            state_machine.clear_queue()
-            replies.append({
-                "type": "nl_task_update",
-                "ts": wall_timestamp,
-                "seq": seq,
-                "status": "blocked",
-                "reason": task.get("reason", "no path found"),
-            })
-            state_machine.transition(InstructionState.IDLE)
-            return replies
-
         vehicle.stop()
-        if controller_choice == "PathFollowingController" and path_following is not None:
-            path = task.get("path")
-            if not path or len(path) < 2:
-                state_machine.transition(InstructionState.ACTIVE)
-                state_machine.transition(InstructionState.BLOCKED)
-                state_machine.clear_queue()
-                replies.append({
-                    "type": "nl_task_update",
-                    "ts": wall_timestamp,
-                    "seq": seq,
-                    "status": "blocked",
-                    "reason": "invalid path",
-                })
-                state_machine.transition(InstructionState.IDLE)
-                return replies
-            navigation.cancel("path_following_active")
-            path_following.start(path)
-            if path_following.status != "active":
-                state_machine.transition(InstructionState.ACTIVE)
-                state_machine.transition(InstructionState.BLOCKED)
-                state_machine.clear_queue()
-                replies.append({
-                    "type": "nl_task_update",
-                    "ts": wall_timestamp,
-                    "seq": seq,
-                    "status": "blocked",
-                    "reason": path_following.reason or "path rejected",
-                })
-                state_machine.transition(InstructionState.IDLE)
-                return replies
-            state_machine.transition(InstructionState.ACTIVE)
-            replies.append({
-                "type": "nl_task_update",
-                "ts": wall_timestamp,
-                "seq": seq,
-                "status": "active",
-                "reason": f"path-following to ({x_m}, {y_m}) via {len(path)} waypoints",
-            })
-            return replies
-
-        # Default: GotoController
         if path_following is not None:
             path_following.cancel("goto_active")
-        navigation.start(x_m, y_m)
+        if local_state is None:
+            navigation.block("local_state_unavailable")
+        else:
+            _start_estimated_goto(navigation, vehicle, local_state, x_m, y_m)
         if navigation.status != "active":
             state_machine.transition(InstructionState.ACTIVE)
             state_machine.transition(InstructionState.BLOCKED)
@@ -616,8 +927,8 @@ async def _process_next_in_queue(
     schema_v: SchemaValidator,
     semantic_v: SemanticValidator,
     state_machine: InstructionStateMachine,
-    task_compiler: TaskCompiler,
     path_following: PathFollowingController | None = None,
+    local_state: AnchoredLocalState | None = None,
 ) -> None:
     """Dequeue the next instruction from the queue and execute it.
 
@@ -630,10 +941,12 @@ async def _process_next_in_queue(
     sequence_index = state_machine.current_index
     sequence_total = state_machine.queue_size
 
+    state_machine.transition(InstructionState.PARSING)
     replies = _execute_parsed_instruction(
         instruction, vehicle, grid, navigation, wall_timestamp, monotonic_now,
-        schema_v, semantic_v, state_machine, task_compiler, 0,
+        schema_v, semantic_v, state_machine, 0,
         path_following=path_following,
+        local_state=local_state,
     )
     for r in replies:
         if r.get("type") == "nl_parse_result":
@@ -642,76 +955,6 @@ async def _process_next_in_queue(
         await websocket.send(json.dumps(r))
 
     print(f"[NL] auto-dequeued instruction {sequence_index}/{sequence_total}: {instruction.get('intent')}")
-
-
-def _summarize_scan_for_nl(scan_data: dict[str, object] | None) -> dict[str, object]:
-    """Build a human-readable NL scan summary from raw scan frame."""
-    if scan_data is None:
-        return {"text": "无扫描数据", "sectors": {}}
-    points = scan_data.get("points", [])
-    if not isinstance(points, list) or not points:
-        return {"text": "无扫描点", "sectors": {}}
-
-    sectors: dict[str, list[float]] = {"front": [], "left": [], "right": [], "back": []}
-    for pt in points:
-        if not isinstance(pt, dict):
-            continue
-        angle = pt.get("angle", 0.0)
-        rng = pt.get("range", 0.0)
-        if not isinstance(rng, (int, float)) or rng <= 0:
-            continue
-        if -math.pi / 4 <= angle < math.pi / 4:
-            sectors["front"].append(rng)
-        elif math.pi / 4 <= angle < 3 * math.pi / 4:
-            sectors["left"].append(rng)
-        elif -3 * math.pi / 4 <= angle < -math.pi / 4:
-            sectors["right"].append(rng)
-        else:
-            sectors["back"].append(rng)
-
-    summary: dict[str, float] = {}
-    for sector, ranges in sectors.items():
-        if ranges:
-            summary[sector] = round(min(ranges), 2)
-
-    # Build human-readable text
-    parts = []
-    for sector in ("front", "left", "right", "back"):
-        label = {"front": "前方", "left": "左侧", "right": "右侧", "back": "后方"}[sector]
-        if sector in summary:
-            parts.append(f"{label} {summary[sector]:.1f}m")
-        else:
-            parts.append(f"{label} 无数据")
-    text = "障碍物距离 — " + "，".join(parts)
-
-    return {"text": text, "sectors": summary}
-
-
-def _cancel_nl_task(
-    navigation: GotoController,
-    state_machine: InstructionStateMachine,
-    reason: str,
-    path_following: PathFollowingController | None = None,
-) -> dict[str, object] | None:
-    """Cancel any active NL task and clear the queue. Returns nl_task_update to send, or None."""
-    current = state_machine.current_state
-    if current in (InstructionState.ACCEPTED, InstructionState.ACTIVE, InstructionState.CONFIRMING):
-        navigation.cancel(reason)
-        if path_following is not None:
-            path_following.cancel(reason)
-        state_machine.clear_queue()
-        state_machine.transition(InstructionState.CANCELLED)
-        update: dict[str, object] = {
-            "type": "nl_task_update",
-            "seq": 0,
-            "status": "cancelled",
-            "reason": reason,
-        }
-        # Allow going back to IDLE after cancelling
-        if state_machine.current_state == InstructionState.CANCELLED:
-            pass  # Will be reset by next nl_command
-        return update
-    return None
 
 
 def _encode_map_chunks(voxels: list[dict[str, object]], map_size: int) -> list[bytes]:
@@ -742,7 +985,32 @@ def _encode_map_chunks(voxels: list[dict[str, object]], map_size: int) -> list[b
     return chunks
 
 
-async def _send_map_chunks(websocket, chunks: list[bytes], wall_time: float) -> None:
+def _map_metadata(grid: MapGrid, anchor: AnchorSpec) -> dict[str, object]:
+    origin_x_m, origin_y_m, origin_yaw_rad = anchor.anchor_to_global(
+        -SPAWN_X, -SPAWN_Y, 0.0
+    )
+    return {
+        "source": "simulator_ground_truth",
+        "frame_id": "simulator_map",
+        "resolution_m": MAP_RESOLUTION_M,
+        "width_cells": grid.width,
+        "height_cells": grid.height,
+        "transform_to_global_map": {
+            "x_m": origin_x_m,
+            "y_m": origin_y_m,
+            "yaw_rad": origin_yaw_rad,
+        },
+        "binary_chunks": {
+            "type": 0,
+            "chunk_size_cells": 256,
+            "header": ">Bii",
+            "byte_order": "big",
+            "payload_order": "row_major_y_x",
+        },
+    }
+
+
+async def _send_map_chunks(websocket, chunks: list[bytes]) -> None:
     """Send map_full as binary chunk frames to Pictor."""
     total_bytes = sum(len(c) for c in chunks)
     print(f"[→] sending map_full ({total_bytes} bytes, {len(chunks)} chunk(s))")
@@ -784,10 +1052,37 @@ def telemetry_messages(
     navigation: GotoController | None = None,
     path_following: PathFollowingController | None = None,
     safety: LocalSafetyRuntime | None = None,
+    local_state: AnchoredLocalState | None = None,
+    scan_points: tuple[LaserPoint, ...] | None = None,
+    scan_already_integrated: bool = False,
 ) -> tuple[dict[str, object], dict[str, object]]:
     """Build a pose/scan pair from one state snapshot and wall-clock timestamp."""
-    vx, vy, omega = vehicle.velocities()
-    # Determine control_mode: PathFollowingController wins if both are active
+    scan_points = (
+        tuple(
+            scan_grid(
+                grid, vehicle.x, vehicle.y, vehicle.yaw, TMINI_SCAN_CONFIG
+            )
+        )
+        if scan_points is None
+        else scan_points
+    )
+    if local_state is not None and not scan_already_integrated:
+        local_state.match_and_integrate_scan(
+            scan_points, timestamp, TMINI_SCAN_CONFIG
+        )
+    if local_state is None:
+        x_m, y_m, yaw_rad = vehicle.x, vehicle.y, vehicle.yaw
+        source = "simulator_ground_truth"
+        localization = None
+    else:
+        estimate = local_state.pose
+        x_m, y_m, yaw_rad = local_state.anchor.anchor_to_global(
+            estimate.x_m, estimate.y_m, estimate.yaw_rad
+        )
+        source = "anchored_odometry"
+        localization = estimate.as_dict()
+    linear_mps, omega = vehicle.body_velocities()
+    vx, vy = linear_mps * math.cos(yaw_rad), linear_mps * math.sin(yaw_rad)
     if path_following is not None and path_following.status == "active":
         control_mode = path_following.control_mode
         nav_snapshot = path_following.snapshot()
@@ -796,16 +1091,30 @@ def telemetry_messages(
         nav_snapshot = navigation.snapshot()
     else:
         control_mode = "manual"
-        nav_snapshot = {"status": "idle", "goal": None, "reason": None}
+        nav_snapshot = {
+            "status": "idle",
+            "goal": None,
+            "reason": None,
+            "detail": None,
+        }
     pose = {
         "type": "pose",
+        "timestamp_s": timestamp,
         "ts": timestamp,
         "seq": sequence,
-        "source": "simulator_ground_truth",
-        "x": vehicle.x,
-        "y": vehicle.y,
+        "source": source,
+        "x_m": x_m,
+        "y_m": y_m,
+        "z_m": 0.0,
+        "yaw_rad": yaw_rad,
+        "vx_mps": vx,
+        "vy_mps": vy,
+        "omega_rps": omega,
+        # Deprecated Pictor compatibility aliases; values remain SI.
+        "x": x_m,
+        "y": y_m,
         "z": 0.0,
-        "yaw": vehicle.yaw,
+        "yaw": yaw_rad,
         "vx": vx,
         "vy": vy,
         "omega": omega,
@@ -821,10 +1130,24 @@ def telemetry_messages(
                 "reason": None,
                 "obstacle_clearance_m": None,
                 "edge_clearance_m": None,
+                "edge_point_vehicle_m": None,
             }
         ),
     }
-    scan = scan_message(grid, vehicle.x, vehicle.y, vehicle.yaw, timestamp, TMINI_SCAN_CONFIG)
+    if localization is not None:
+        if local_state is not None and local_state.last_scan_match is not None:
+            localization["scan_match"] = local_state.last_scan_match.as_dict()
+            localization["local_map_revision"] = local_state.local_map.revision
+        pose["localization"] = localization
+    scan = scan_message(
+        grid,
+        vehicle.x,
+        vehicle.y,
+        vehicle.yaw,
+        timestamp,
+        TMINI_SCAN_CONFIG,
+        scan_points,
+    )
     scan["seq"] = sequence
     return pose, scan
 
@@ -840,94 +1163,130 @@ async def handler(
     _monotonic=time.monotonic,
     _wall_time=time.time,
     _safety_healthy: bool = True,
+    _localization_quality: str | None = None,
+    _runtime: VehicleRuntime | None = None,
+    _nl_client: LLMClient | None = None,
 ) -> None:
     """Serve one client; all receives and sends stay serialized in this coroutine."""
     vehicle_id = validate_vehicle_id(vehicle_id)
     addr = websocket.remote_address
     print(f"[+] client connected: {addr}")
     started_at = _monotonic()
-    voxels, grid = generate_map(radius=radius)
-    vehicle = Vehicle(
-        SPAWN_X,
-        SPAWN_Y,
+    runtime = _runtime or VehicleRuntime.create(
+        started_at=started_at,
+        timestamp=_wall_time(),
+        anchor=AnchorSpec(f"{vehicle_id}_anchor", SPAWN_X, SPAWN_Y, 0.0),
+        odometry_config=OdometryConfig(),
         linear_speed=linear_speed,
         angular_speed=angular_speed,
         radius=radius,
         command_timeout=command_timeout,
-        now=started_at,
+        safety_healthy=_safety_healthy,
     )
-    navigation = GotoController()
-    path_following = PathFollowingController()
-    safety = LocalSafetyRuntime(healthy=_safety_healthy)
-
-    # NL instruction pipeline
-    schema_v = SchemaValidator()
-    nl_client = LLMClient(schema_validator=schema_v)  # LLM client for NL parsing
-    semantic_v = SemanticValidator(grid)
-    state_machine = InstructionStateMachine()
-    task_compiler = TaskCompiler(grid)
-
-    frame_sequence = 0
-    next_deadline = started_at
-    active_nl_seq: int | None = None
-    last_scan_data: dict[str, object] | None = None
-
+    if runtime.controller_lease.locked():
+        try:
+            await websocket.send(
+                json.dumps(
+                    {
+                        "type": "error",
+                        "ts": _wall_time(),
+                        "seq": None,
+                        "code": "vehicle_busy",
+                        "message": "another controller is active",
+                    }
+                )
+            )
+        except Exception as error:
+            print(f"[!] busy connection ended: {error}")
+        print(f"[-] busy client rejected: {addr}")
+        return
+    await runtime.controller_lease.acquire()
     try:
-        await websocket.send(json.dumps({"type": "hello", "vehicle_id": vehicle_id}))
+        voxels, grid = runtime.voxels, runtime.grid
+        vehicle, navigation, safety = (
+            runtime.vehicle,
+            runtime.navigation,
+            runtime.safety,
+        )
+        schema_v = SchemaValidator()
+        nl_client = _nl_client or LLMClient(schema_validator=schema_v)
+        semantic_v = SemanticValidator(None)
+        state_machine = InstructionStateMachine()
+        path_following = None
+        next_deadline = started_at
+        active_nl_seq: int | None = None
+        last_navigation_log_key: tuple[object, ...] | None = None
+
+        if (
+            _localization_quality is not None
+            and _localization_quality != runtime.local_state.pose.quality
+        ):
+            runtime.local_state.set_localization_quality(
+                _localization_quality, timestamp=_wall_time()
+            )
+        await websocket.send(
+            json.dumps(
+                {
+                    "type": "hello",
+                    "vehicle_id": vehicle_id,
+                    "map": _map_metadata(grid, runtime.local_state.anchor),
+                }
+            )
+        )
         map_chunks = _encode_map_chunks(voxels, 256)
-        await _send_map_chunks(websocket, map_chunks, _wall_time())
+        await _send_map_chunks(websocket, map_chunks)
 
         while True:
             now = _monotonic()
             if now >= next_deadline:
-                # Phase 3: update path_following if active, else navigation
-                if path_following.status == "active":
-                    path_following.update(vehicle, grid, now, safety)
-                elif navigation.status == "active":
-                    navigation.update(vehicle, grid, now, safety)
-                else:
-                    navigation.update(vehicle, grid, now, safety)
                 timestamp = _wall_time()
+                frame = runtime.update(now, timestamp)
+                last_navigation_log_key = _log_navigation_transition(
+                    runtime, last_navigation_log_key
+                )
                 pose, scan = telemetry_messages(
-                    vehicle, grid, frame_sequence, timestamp, navigation, path_following, safety
+                    vehicle,
+                    grid,
+                    runtime.frame_sequence,
+                    timestamp,
+                    navigation,
+                    None,
+                    safety,
+                    runtime.local_state,
+                    frame.scan_points,
+                    True,
                 )
                 await websocket.send(json.dumps(pose))
                 await websocket.send(json.dumps(scan))
-                last_scan_data = scan
-                print(f"[→] pose #{frame_sequence}: x={vehicle.x:.2f} y={vehicle.y:.2f} cmd={vehicle.command}")
-
-                # Check NL task status — determine active controller
-                active_controller = (
-                    path_following if path_following.status == "active"
-                    else navigation if navigation.status == "active"
-                    else None
+                print(
+                    f"[→] pose #{runtime.frame_sequence}: "
+                    f"x={pose['x']:.2f} y={pose['y']:.2f} cmd={vehicle.command}"
                 )
-                # Also handle completed/blocked from non-active controllers
+
                 if state_machine.current_state == InstructionState.ACTIVE:
-                    # Check path_following first
-                    pf_status = path_following.status
                     nav_status = navigation.status
-                    if pf_status == "reached" or nav_status == "reached":
+                    if nav_status == "reached":
                         state_machine.transition(InstructionState.COMPLETED)
                         await websocket.send(json.dumps({
                             "type": "nl_task_update",
                             "ts": timestamp,
                             "seq": active_nl_seq if active_nl_seq is not None else 0,
                             "status": "completed",
-                            "reason": "goal_reached",
+                            "reason": _nl_completion_reason(navigation),
                         }))
                         state_machine.transition(InstructionState.IDLE)
                         active_nl_seq = None
-                        print(f"[NL] task completed: goal reached")
+                        print("[NL] task completed: goal reached")
                         # Auto-dequeue next in sequence
                         if state_machine.has_more():
                             await _process_next_in_queue(
                                 websocket, vehicle, grid, navigation, timestamp, now,
-                                schema_v, semantic_v, state_machine, task_compiler,
+                                schema_v, semantic_v, state_machine,
                                 path_following=path_following,
+                                local_state=runtime.local_state,
                             )
-                    elif pf_status == "blocked" or nav_status == "blocked":
-                        reason = path_following.reason if pf_status == "blocked" else navigation.reason
+                    elif nav_status == "blocked":
+                        reason = navigation.reason
                         state_machine.transition(InstructionState.BLOCKED)
                         await websocket.send(json.dumps({
                             "type": "nl_task_update",
@@ -940,8 +1299,8 @@ async def handler(
                         state_machine.transition(InstructionState.IDLE)
                         active_nl_seq = None
                         print(f"[NL] task blocked: {reason} (queue cleared)")
-                    elif pf_status == "cancelled" or nav_status == "cancelled":
-                        reason = path_following.reason if pf_status == "cancelled" else navigation.reason
+                    elif nav_status == "cancelled":
+                        reason = navigation.reason
                         state_machine.transition(InstructionState.CANCELLED)
                         await websocket.send(json.dumps({
                             "type": "nl_task_update",
@@ -955,7 +1314,7 @@ async def handler(
                         active_nl_seq = None
                         print(f"[NL] task cancelled: {reason} (queue cleared)")
 
-                frame_sequence += 1
+                runtime.frame_sequence += 1
                 next_deadline = _next_deadline(next_deadline, _monotonic(), TMINI_SCAN_CONFIG.scan_time)
                 continue
 
@@ -968,25 +1327,32 @@ async def handler(
             try:
                 message = _decode_message(raw)
                 if message.get("type") == "nl_command":
+                    text = message.get("text", "")
+                    parsed_instructions = None
+                    if isinstance(text, str) and text.strip():
+                        parsed_instructions = nl_client.parse(text)
+                        if asyncio.iscoroutine(parsed_instructions):
+                            parsed_instructions = await parsed_instructions
                     replies = _handle_nl_command(
                         message, vehicle, grid, navigation,
                         _wall_time(), _monotonic(),
                         nl_client, schema_v, semantic_v,
-                        state_machine, task_compiler,
-                        scan_data=last_scan_data,
-                        path_following=path_following,
+                        state_machine,
+                        local_state=runtime.local_state,
+                        safety=safety,
+                        parsed_instructions=parsed_instructions,
                     )
                     for r in replies:
                         await websocket.send(json.dumps(r))
-                    # Track active seq
-                    if state_machine.current_state == InstructionState.ACTIVE:
-                        active_nl_seq = message.get("seq")
-                    # Auto-dequeue next if instruction completed synchronously (e.g. stop)
+                    started_seq = _started_nl_task_seq(replies)
+                    if started_seq is not None:
+                        active_nl_seq = started_seq
                     elif state_machine.current_state == InstructionState.IDLE and state_machine.has_more():
                         await _process_next_in_queue(
                             websocket, vehicle, grid, navigation, _wall_time(), _monotonic(),
-                            schema_v, semantic_v, state_machine, task_compiler,
+                            schema_v, semantic_v, state_machine,
                             path_following=path_following,
+                            local_state=runtime.local_state,
                         )
                     continue
                 if message.get("type") == "nl_clarify_response":
@@ -994,31 +1360,37 @@ async def handler(
                     text = message.get("text", "")
                     if isinstance(text, str) and text.strip():
                         synthetic = {"type": "nl_command", "seq": message.get("seq", 0), "text": text}
+                        parsed_instructions = nl_client.parse(text)
+                        if asyncio.iscoroutine(parsed_instructions):
+                            parsed_instructions = await parsed_instructions
                         replies = _handle_nl_command(
                             synthetic, vehicle, grid, navigation,
                             _wall_time(), _monotonic(),
                             nl_client, schema_v, semantic_v,
-                            state_machine, task_compiler,
-                            scan_data=last_scan_data,
-                            path_following=path_following,
+                            state_machine,
+                            local_state=runtime.local_state,
+                            safety=safety,
+                            parsed_instructions=parsed_instructions,
                         )
                         for r in replies:
                             await websocket.send(json.dumps(r))
-                        if state_machine.current_state == InstructionState.ACTIVE:
-                            active_nl_seq = message.get("seq")
-                        # After clarify response, continue remaining queue if not active
+                        started_seq = _started_nl_task_seq(replies)
+                        if started_seq is not None:
+                            active_nl_seq = started_seq
                         elif state_machine.is_terminal() and state_machine.has_more():
                             state_machine.transition(InstructionState.IDLE)
                             await _process_next_in_queue(
                                 websocket, vehicle, grid, navigation, _wall_time(), _monotonic(),
-                                schema_v, semantic_v, state_machine, task_compiler,
+                                schema_v, semantic_v, state_machine,
                                 path_following=path_following,
+                                local_state=runtime.local_state,
                             )
                     else:
+                        clarify_seq = _safe_seq(message)
                         await websocket.send(json.dumps({
                             "type": "nl_parse_result",
                             "ts": _wall_time(),
-                            "seq": message.get("seq", 0),
+                            "seq": clarify_seq,
                             "instruction": None,
                             "accepted": False,
                             "reason": "empty clarify response",
@@ -1031,7 +1403,6 @@ async def handler(
             # Cancel active NL task if manual command arrives
             if state_machine.current_state in (InstructionState.ACCEPTED, InstructionState.ACTIVE, InstructionState.CONFIRMING):
                 navigation.cancel("manual_override")
-                path_following.cancel("manual_override")
                 state_machine.transition(InstructionState.CANCELLED)
                 state_machine.clear_queue()
                 await websocket.send(json.dumps({
@@ -1042,18 +1413,26 @@ async def handler(
                     "reason": "manual_override",
                 }))
                 active_nl_seq = None
-                print(f"[NL] task cancelled by manual override (queue cleared)")
+                print("[NL] task cancelled by manual override (queue cleared)")
 
             reply = handle_command_message(
-                raw, vehicle, grid, _monotonic(), _wall_time(), navigation, safety, path_following=path_following
+                raw,
+                vehicle,
+                grid,
+                _monotonic(),
+                _wall_time(),
+                navigation,
+                safety,
+                None,
+                runtime.local_state,
             )
             await websocket.send(json.dumps(reply))
     except Exception as error:
         print(f"[!] connection ended: {error}")
     finally:
-        navigation.cancel("disconnected")
-        path_following.cancel("disconnected")
-        vehicle.stop()
+        runtime.navigation.cancel("disconnected")
+        runtime.vehicle.stop()
+        runtime.controller_lease.release()
         print(f"[-] client disconnected: {addr}")
 
 
@@ -1065,10 +1444,36 @@ async def main(
     angular_speed: float = math.pi / 2,
     radius: float = 0.5,
     command_timeout: float = 1.0,
+    anchor_id: str | None = None,
+    anchor_x_m: float = SPAWN_X,
+    anchor_y_m: float = SPAWN_Y,
+    anchor_yaw_rad: float = 0.0,
+    odometry_translation_noise_stddev_m: float = 0.0,
+    odometry_yaw_noise_stddev_rad: float = 0.0,
+    odometry_seed: int = 0,
 ) -> None:
     from websockets.asyncio.server import serve
 
     vehicle_id = validate_vehicle_id(vehicle_id)
+    runtime = VehicleRuntime.create(
+        started_at=time.monotonic(),
+        timestamp=time.time(),
+        anchor=AnchorSpec(
+            anchor_id or f"{vehicle_id}_anchor",
+            anchor_x_m,
+            anchor_y_m,
+            anchor_yaw_rad,
+        ),
+        odometry_config=OdometryConfig(
+            odometry_translation_noise_stddev_m,
+            odometry_yaw_noise_stddev_rad,
+            odometry_seed,
+        ),
+        linear_speed=linear_speed,
+        angular_speed=angular_speed,
+        radius=radius,
+        command_timeout=command_timeout,
+    )
     stop = asyncio.Event()
     _shutting_down = False
 
@@ -1097,6 +1502,7 @@ async def main(
             angular_speed=angular_speed,
             radius=radius,
             command_timeout=command_timeout,
+            _runtime=runtime,
         )
 
     try:

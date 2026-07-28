@@ -11,6 +11,7 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO_ROOT / "src"))
 
 from mockvehicle2d.map_grid import FREE, MapGrid, VOID, WALL
+from mockvehicle2d.local_state import AnchorSpec, AnchoredLocalState, ObservedGrid, PoseEstimate
 from mockvehicle2d.navigation import GotoController
 from mockvehicle2d.safety import LocalSafetyRuntime
 from mockvehicle2d.server import generate_map, handle_command_message, telemetry_messages
@@ -21,6 +22,55 @@ def wall_grid(wall_x: int) -> MapGrid:
     return MapGrid.from_wall_set(20, 20, {(wall_x, y) for y in range(20)})
 
 
+def observed_map() -> ObservedGrid:
+    return ObservedGrid(AnchorSpec("safety-test", 0.0, 0.0, 0.0))
+
+
+def estimated_pose(vehicle: Vehicle, timestamp: float = 0.0) -> PoseEstimate:
+    return PoseEstimate(
+        "safety-test",
+        vehicle.x,
+        vehicle.y,
+        vehicle.yaw,
+        (0.0, 0.0, 0.0),
+        "nominal",
+        timestamp,
+        0,
+    )
+
+
+def start_navigation(
+    navigation: GotoController,
+    vehicle: Vehicle,
+    local_map: ObservedGrid,
+) -> None:
+    navigation.start(
+        10.0,
+        5.5,
+        local_map=local_map,
+        pose=estimated_pose(vehicle),
+        vehicle_radius_m=vehicle.radius,
+    )
+
+
+def update_navigation(
+    navigation: GotoController,
+    vehicle: Vehicle,
+    grid: MapGrid,
+    local_map: ObservedGrid,
+    now: float,
+    safety: LocalSafetyRuntime,
+) -> None:
+    navigation.update(
+        vehicle,
+        grid,
+        now,
+        safety,
+        pose=estimated_pose(vehicle, now),
+        local_map=local_map,
+    )
+
+
 class SafetyRuntimeTest(unittest.TestCase):
     def vehicle(self, x: float = 2.0) -> Vehicle:
         return Vehicle(x, 5.5, radius=0.5, command_timeout=10.0, now=0.0)
@@ -29,9 +79,10 @@ class SafetyRuntimeTest(unittest.TestCase):
         vehicle = self.vehicle(1.8)
         navigation = GotoController()
         safety = LocalSafetyRuntime()
-        navigation.start(10.0, 5.5)
+        local_map = observed_map()
+        start_navigation(navigation, vehicle, local_map)
 
-        navigation.update(vehicle, wall_grid(3), 0.0, safety)
+        update_navigation(navigation, vehicle, wall_grid(3), local_map, 0.0, safety)
 
         self.assertEqual(navigation.status, "active")
         self.assertEqual(safety.snapshot()["state"], "limited")
@@ -42,10 +93,11 @@ class SafetyRuntimeTest(unittest.TestCase):
         vehicle = self.vehicle()
         navigation = GotoController()
         safety = LocalSafetyRuntime()
-        navigation.start(10.0, 5.5)
-        navigation.update(vehicle, wall_grid(4), 0.0, safety)
+        local_map = observed_map()
+        start_navigation(navigation, vehicle, local_map)
+        update_navigation(navigation, vehicle, wall_grid(4), local_map, 0.0, safety)
 
-        navigation.update(vehicle, wall_grid(4), 2.0, safety)
+        update_navigation(navigation, vehicle, wall_grid(4), local_map, 4.0, safety)
 
         self.assertEqual(navigation.status, "active")
         self.assertEqual(safety.snapshot()["state"], "limited")
@@ -63,8 +115,9 @@ class SafetyRuntimeTest(unittest.TestCase):
         for grid, vehicle, safety, reason in cases:
             with self.subTest(reason=reason):
                 navigation = GotoController()
-                navigation.start(10.0, 5.5)
-                navigation.update(vehicle, grid, 0.0, safety)
+                local_map = observed_map()
+                start_navigation(navigation, vehicle, local_map)
+                update_navigation(navigation, vehicle, grid, local_map, 0.0, safety)
                 self.assertEqual((navigation.status, navigation.reason), ("blocked", reason))
                 self.assertEqual(vehicle.body_velocities(), (0.0, 0.0))
                 stopped_pose = (vehicle.x, vehicle.y, vehicle.yaw)
@@ -72,7 +125,7 @@ class SafetyRuntimeTest(unittest.TestCase):
                 if grid.in_bounds(3, 5):
                     grid.set_cell(3, 5, FREE)
                 safety.healthy = True
-                navigation.update(vehicle, grid, 1.0, safety)
+                update_navigation(navigation, vehicle, grid, local_map, 1.0, safety)
                 self.assertEqual((vehicle.x, vehicle.y, vehicle.yaw), stopped_pose)
                 self.assertEqual(navigation.status, "blocked")
 
@@ -297,10 +350,11 @@ class SafetyRuntimeTest(unittest.TestCase):
         vehicle = self.vehicle()
         navigation = GotoController()
         safety = LocalSafetyRuntime()
-        navigation.start(10.0, 5.5)
-        navigation.update(vehicle, grid, 0.0, safety)
+        local_map = observed_map()
+        start_navigation(navigation, vehicle, local_map)
+        update_navigation(navigation, vehicle, grid, local_map, 0.0, safety)
 
-        navigation.update(vehicle, grid, 4.0, safety)
+        update_navigation(navigation, vehicle, grid, local_map, 4.0, safety)
 
         self.assertEqual(navigation.status, "active")
         self.assertEqual(
@@ -309,14 +363,14 @@ class SafetyRuntimeTest(unittest.TestCase):
         )
         self.assertLessEqual(vehicle.x, 4.0 - vehicle.radius - 0.25 + 1e-9)
 
-        navigation.update(vehicle, grid, 6.0, safety)
+        update_navigation(navigation, vehicle, grid, local_map, 14.0, safety)
 
         self.assertEqual((navigation.status, navigation.reason), ("blocked", "safety_edge"))
         self.assertFalse(vehicle.collision)
         self.assertLessEqual(vehicle.x, 4.0 - vehicle.radius - 0.25 + 1e-9)
         stopped_pose = (vehicle.x, vehicle.y, vehicle.yaw)
         grid.set_cell(4, 5, FREE)
-        navigation.update(vehicle, grid, 7.0, safety)
+        update_navigation(navigation, vehicle, grid, local_map, 15.0, safety)
         self.assertEqual((vehicle.x, vehicle.y, vehicle.yaw), stopped_pose)
         self.assertEqual(navigation.status, "blocked")
 
@@ -332,6 +386,13 @@ class SafetyRuntimeTest(unittest.TestCase):
         )
         navigation = GotoController()
         safety = LocalSafetyRuntime()
+        local_state = AnchoredLocalState(
+            AnchorSpec("safety-runtime", vehicle.x, vehicle.y, vehicle.yaw),
+            truth_x_m=vehicle.x,
+            truth_y_m=vehicle.y,
+            truth_yaw_rad=vehicle.yaw,
+            timestamp=0.0,
+        )
         handle_command_message(
             '{"type":"drive","seq":8,"linear_mps":5,"angular_rps":0}',
             vehicle,
@@ -340,6 +401,7 @@ class SafetyRuntimeTest(unittest.TestCase):
             12.0,
             navigation,
             safety,
+            local_state=local_state,
         )
 
         ack = handle_command_message(
@@ -350,6 +412,7 @@ class SafetyRuntimeTest(unittest.TestCase):
             13.0,
             navigation,
             safety,
+            local_state=local_state,
         )
 
         self.assertEqual(
@@ -411,6 +474,7 @@ class SafetyRuntimeTest(unittest.TestCase):
                 "reason": None,
                 "obstacle_clearance_m": None,
                 "edge_clearance_m": None,
+                "edge_point_vehicle_m": None,
             },
         )
 

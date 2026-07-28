@@ -4,7 +4,7 @@ YDLIDAR Tmini 测试 — 严格按 C++ YDlidarDriver 逐函数翻译
 用法: python3 test_lidar.py [/dev/rplidar]
 """
 
-import sys, struct, time, threading
+import sys, time, threading
 import serial
 import numpy as np
 import matplotlib.pyplot as plt
@@ -330,7 +330,7 @@ def main():
             sc.set_data(xs, ys)
         return sc,
 
-    ani = FuncAnimation(fig, update, interval=100, blit=False, cache_frame_data=False)
+    _ani = FuncAnimation(fig, update, interval=100, blit=False, cache_frame_data=False)
     plt.show()
 
     ser.write(bytes([LIDAR_CMD_SYNC, LIDAR_CMD_STOP]))

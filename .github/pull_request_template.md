@@ -18,7 +18,7 @@ Fixes #
 
 ## Checklist
 
-- [ ] Tests pass locally (`mockvehicle2d test`)
+- [ ] Tests pass locally (`python -m pytest`)
 - [ ] New tests added for new functionality
 - [ ] Documentation updated (README, docs/, or inline docstrings)
 - [ ] No dead code, TODOs, or commented-out code left behind

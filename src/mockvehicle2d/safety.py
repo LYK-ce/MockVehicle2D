@@ -22,6 +22,7 @@ EDGE_SAMPLE_STEP_M = 0.05
 class SafetyObservation:
     obstacle_clearance_m: float | None = None
     edge_clearance_m: float | None = None
+    edge_point_vehicle_m: tuple[float, float] | None = None
     healthy: bool = True
 
     def __post_init__(self) -> None:
@@ -34,6 +35,17 @@ class SafetyObservation:
                 raise ValueError("safety clearances must be finite and non-negative")
         if type(self.healthy) is not bool:
             raise ValueError("healthy must be a bool")
+        if self.edge_point_vehicle_m is not None and (
+            not isinstance(self.edge_point_vehicle_m, tuple)
+            or len(self.edge_point_vehicle_m) != 2
+            or not all(
+                isinstance(value, (int, float))
+                and not isinstance(value, bool)
+                and math.isfinite(value)
+                for value in self.edge_point_vehicle_m
+            )
+        ):
+            raise ValueError("edge point must be a finite vehicle-frame pair")
 
 
 @dataclass(frozen=True)
@@ -88,13 +100,37 @@ def nearest_edge_clearance(
     sample_step_m: float = EDGE_SAMPLE_STEP_M,
 ) -> float | None:
     """Conservatively sample the swept circular footprint for void or map bounds."""
+    clearance, _point = _nearest_edge_evidence(
+        grid,
+        x,
+        y,
+        yaw,
+        desired_linear_mps,
+        vehicle_radius=vehicle_radius,
+        lookahead_m=lookahead_m,
+        sample_step_m=sample_step_m,
+    )
+    return clearance
+
+
+def _nearest_edge_evidence(
+    grid: MapGrid,
+    x: float,
+    y: float,
+    yaw: float,
+    desired_linear_mps: float,
+    *,
+    vehicle_radius: float,
+    lookahead_m: float = EDGE_LOOKAHEAD_M,
+    sample_step_m: float = EDGE_SAMPLE_STEP_M,
+) -> tuple[float | None, tuple[float, float] | None]:
     values = (x, y, yaw, desired_linear_mps, vehicle_radius, lookahead_m, sample_step_m)
     if not all(math.isfinite(value) for value in values):
         raise ValueError("edge sensing inputs must be finite")
     if vehicle_radius <= 0 or lookahead_m < 0 or sample_step_m <= 0:
         raise ValueError("radius and sample step must be positive; lookahead cannot be negative")
     if desired_linear_mps == 0:
-        return None
+        return None, None
 
     direction = yaw if desired_linear_mps > 0 else yaw + math.pi
     sample_count = math.ceil(lookahead_m / sample_step_m)
@@ -102,12 +138,24 @@ def nearest_edge_clearance(
         distance = min(index * sample_step_m, lookahead_m)
         center_x = x + distance * math.cos(direction)
         center_y = y + distance * math.sin(direction)
-        if not _footprint_has_ground(grid, center_x, center_y, vehicle_radius):
-            return max(0.0, distance - sample_step_m) if index else 0.0
-    return None
+        missing = _first_missing_ground_cell(grid, center_x, center_y, vehicle_radius)
+        if missing is not None:
+            dx, dy = missing[0] + 0.5 - x, missing[1] + 0.5 - y
+            cosine, sine = math.cos(yaw), math.sin(yaw)
+            return (
+                max(0.0, distance - sample_step_m) if index else 0.0,
+                (cosine * dx + sine * dy, -sine * dx + cosine * dy),
+            )
+    return None, None
 
 
 def _footprint_has_ground(grid: MapGrid, cx: float, cy: float, radius: float) -> bool:
+    return _first_missing_ground_cell(grid, cx, cy, radius) is None
+
+
+def _first_missing_ground_cell(
+    grid: MapGrid, cx: float, cy: float, radius: float
+) -> tuple[int, int] | None:
     radius_squared = radius * radius
     for gy in range(math.floor(cy - radius), math.floor(cy + radius) + 1):
         for gx in range(math.floor(cx - radius), math.floor(cx + radius) + 1):
@@ -115,8 +163,8 @@ def _footprint_has_ground(grid: MapGrid, cx: float, cy: float, radius: float) ->
             closest_y = max(gy, min(cy, gy + 1))
             if (closest_x - cx) ** 2 + (closest_y - cy) ** 2 < radius_squared:
                 if not grid.has_ground(gx, gy):
-                    return False
-    return True
+                    return gx, gy
+    return None
 
 
 class SafetyGovernor:
@@ -193,18 +241,20 @@ class LocalSafetyRuntime:
             if desired_linear_mps
             else ()
         )
+        edge_clearance, edge_point = _nearest_edge_evidence(
+            grid,
+            vehicle.x,
+            vehicle.y,
+            vehicle.yaw,
+            desired_linear_mps,
+            vehicle_radius=vehicle.radius,
+        )
         self.observation = SafetyObservation(
             obstacle_clearance_m=nearest_obstacle_clearance(
                 points, desired_linear_mps, vehicle.radius
             ),
-            edge_clearance_m=nearest_edge_clearance(
-                grid,
-                vehicle.x,
-                vehicle.y,
-                vehicle.yaw,
-                desired_linear_mps,
-                vehicle_radius=vehicle.radius,
-            ),
+            edge_clearance_m=edge_clearance,
+            edge_point_vehicle_m=edge_point,
             healthy=self.healthy,
         )
         self.decision = self._governor.limit(
@@ -338,4 +388,12 @@ class LocalSafetyRuntime:
             "reason": self.decision.reason,
             "obstacle_clearance_m": self.observation.obstacle_clearance_m,
             "edge_clearance_m": self.observation.edge_clearance_m,
+            "edge_point_vehicle_m": (
+                None
+                if self.observation.edge_point_vehicle_m is None
+                else {
+                    "x_m": self.observation.edge_point_vehicle_m[0],
+                    "y_m": self.observation.edge_point_vehicle_m[1],
+                }
+            ),
         }

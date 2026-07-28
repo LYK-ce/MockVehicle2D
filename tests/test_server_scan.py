@@ -3,6 +3,7 @@
 import argparse
 import asyncio
 import json
+import math
 from pathlib import Path
 import sys
 import unittest
@@ -16,7 +17,18 @@ from mockvehicle2d.cli.main import _port
 from mockvehicle2d.collision import is_circle_passable
 from mockvehicle2d.map_grid import MapGrid
 from mockvehicle2d.scan import scan_message
-from mockvehicle2d.server import _next_deadline, generate_map, handler, main as server_main, telemetry_messages, validate_vehicle_id
+from mockvehicle2d.local_state import AnchorSpec, OdometryConfig
+from mockvehicle2d.server import (
+    VehicleRuntime,
+    _log_navigation_transition,
+    _map_metadata,
+    _next_deadline,
+    generate_map,
+    handler,
+    main as server_main,
+    telemetry_messages,
+    validate_vehicle_id,
+)
 from mockvehicle2d.vehicle import Vehicle
 
 
@@ -131,9 +143,18 @@ class ScanMessageTest(unittest.TestCase):
         self.assertEqual(
             [message["type"] for message in websocket.messages], ["hello", "pose", "scan"]
         )
-        self.assertEqual(websocket.messages[0], {"type": "hello", "vehicle_id": "pictor_test-1"})
+        self.assertEqual(websocket.messages[0]["type"], "hello")
+        self.assertEqual(websocket.messages[0]["vehicle_id"], "pictor_test-1")
+        self.assertEqual(websocket.messages[0]["map"]["frame_id"], "simulator_map")
+        self.assertEqual(websocket.messages[0]["map"]["resolution_m"], 1.0)
         self.assertEqual(websocket.messages[1]["x"], 10.0)
-        self.assertEqual(websocket.messages[1]["source"], "simulator_ground_truth")
+        self.assertEqual(websocket.messages[1]["source"], "anchored_odometry")
+        self.assertEqual(websocket.messages[1]["localization"]["frame_id"], "anchor_map")
+        self.assertEqual(
+            websocket.messages[1]["localization"]["anchor_id"],
+            "pictor_test-1_anchor",
+        )
+        self.assertNotIn("truth", json.dumps(websocket.messages[1]).lower())
         self.assertEqual(websocket.messages[1]["command"], "stop")
         self.assertEqual(
             websocket.messages[1]["safety"],
@@ -142,11 +163,26 @@ class ScanMessageTest(unittest.TestCase):
                 "reason": None,
                 "obstacle_clearance_m": None,
                 "edge_clearance_m": None,
+                "edge_point_vehicle_m": None,
             },
         )
         self.assertEqual(websocket.messages[1]["seq"], websocket.messages[2]["seq"])
         self.assertEqual(websocket.messages[1]["ts"], websocket.messages[2]["ts"])
         self.assertEqual(websocket.messages[-1]["config"]["model"], "ydlidar_tmini")
+
+    def test_map_metadata_places_raw_grid_in_global_frame_for_custom_anchor(self) -> None:
+        metadata = _map_metadata(
+            MapGrid(32, 16),
+            AnchorSpec("custom", 100.0, 50.0, math.pi / 2),
+        )
+
+        self.assertEqual(metadata["frame_id"], "simulator_map")
+        self.assertEqual((metadata["width_cells"], metadata["height_cells"]), (32, 16))
+        self.assertEqual(metadata["binary_chunks"]["header"], ">Bii")
+        transform = metadata["transform_to_global_map"]
+        self.assertAlmostEqual(transform["x_m"], 110.0)
+        self.assertAlmostEqual(transform["y_m"], 40.0)
+        self.assertAlmostEqual(transform["yaw_rad"], math.pi / 2)
 
     def test_vehicle_id_is_safe_for_pictor_names_and_logs(self) -> None:
         self.assertEqual(validate_vehicle_id("mock.Vehicle_01-test"), "mock.Vehicle_01-test")
@@ -207,6 +243,50 @@ class ScanMessageTest(unittest.TestCase):
             [message["type"] for message in websocket.messages],
             ["hello", "pose", "scan", "pose", "scan"],
         )
+
+    def test_navigation_log_emits_each_active_terminal_transition_once(self) -> None:
+        def log_flow(status: str, reason: str, detail: str | None) -> None:
+            runtime = VehicleRuntime.create(
+                started_at=0.0,
+                timestamp=0.0,
+                anchor=AnchorSpec("log-anchor", 10.0, 10.0, 0.0),
+                odometry_config=OdometryConfig(),
+            )
+            previous = _log_navigation_transition(runtime, None)
+            runtime.navigation.start(
+                3.0,
+                2.0,
+                reported_goal=(13.0, 12.0),
+                local_map=runtime.local_state.local_map,
+                pose=runtime.local_state.pose,
+                vehicle_radius_m=runtime.vehicle.radius,
+            )
+            previous = _log_navigation_transition(runtime, previous)
+            previous = _log_navigation_transition(runtime, previous)
+            runtime.navigation.status = status
+            runtime.navigation.reason = reason
+            runtime.navigation.detail = detail
+            previous = _log_navigation_transition(runtime, previous)
+            _log_navigation_transition(runtime, previous)
+
+        with patch("builtins.print") as output:
+            log_flow("reached", "goal_tolerance", None)
+            log_flow("blocked", "no_path", "search_exhausted")
+
+        events = [
+            json.loads(call.args[0].removeprefix("[navigation] "))
+            for call in output.call_args_list
+        ]
+        self.assertEqual(
+            [event["status"] for event in events],
+            ["active", "reached", "active", "blocked"],
+        )
+        self.assertEqual(events[-1]["detail"], "search_exhausted")
+        self.assertEqual(events[-1]["global_goal"], {"x_m": 13.0, "y_m": 12.0})
+        self.assertEqual(events[-1]["local_start_cell"], {"gx": 0, "gy": 0})
+        self.assertEqual(events[-1]["local_goal_cell"], {"gx": 3, "gy": 2})
+        self.assertEqual(events[-1]["map_revision"], 0)
+        self.assertEqual(events[-1]["replan_count"], 0)
 
 
 def main() -> int:

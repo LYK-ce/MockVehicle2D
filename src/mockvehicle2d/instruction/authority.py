@@ -6,7 +6,7 @@ Five priority levels ensure safety > manual > agent > idle.
 from __future__ import annotations
 
 import threading
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from enum import IntEnum
 
 

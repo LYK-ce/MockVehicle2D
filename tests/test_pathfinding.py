@@ -5,7 +5,7 @@ test_pathfinding.py — Tests for A* search and WaypointFollower.
 import math
 import unittest
 
-from mockvehicle2d.map_grid import MapGrid
+from mockvehicle2d.map_grid import MapGrid, VOID
 from mockvehicle2d.pathfinding import a_star_search, WaypointFollower
 from mockvehicle2d.pathfinding.a_star import _inflate_blocked
 
@@ -118,6 +118,29 @@ class TestAStar(unittest.TestCase):
         path = a_star_search(grid, (1, 0), (9, 9), vehicle_radius=0.5)
         self.assertIsNone(path)
 
+    def test_void_cells_are_blocked_when_inflation_is_enabled(self):
+        grid = _empty_grid(5, 5)
+        for y in range(grid.height):
+            grid.set_cell(2, y, VOID)
+
+        path = a_star_search(grid, (0, 2), (4, 2), vehicle_radius=0.5)
+
+        self.assertIsNone(path)
+
+    def test_radius_is_converted_to_resolution_aware_inflation_cells(self):
+        grid = _grid_from_walls(8, 8, {(2, 3)})
+
+        path = a_star_search(
+            grid,
+            (0, 3),
+            (0, 7),
+            vehicle_radius=1.1,
+            resolution_m=1.0,
+        )
+
+        self.assertIsNone(path)
+        self.assertIn((0, 3), _inflate_blocked(grid, inflation_cells=2))
+
     def test_out_of_bounds_raises(self):
         grid = _empty_grid(10, 10)
         with self.assertRaises(ValueError):
@@ -138,19 +161,19 @@ class TestWaypointFollower(unittest.TestCase):
         self.assertEqual(cmd, "forward")
         self.assertFalse(done)
 
-    def test_spin_left_when_target_is_left(self):
+    def test_spin_right_when_target_has_positive_screen_y(self):
         path = [(0, 0), (0, 5)]  # target is +y (down in screen coords)
         follower = WaypointFollower(path)
         # At (0,0), facing +x (0°), target is at +y (90° clockwise)
-        # delta = 90° positive → spin_left
+        # Vehicle's positive yaw is clockwise, which is its spin_right command.
         cmd, done = follower.next_cmd(0, 0, 0.0)
-        self.assertEqual(cmd, "spin_left")
+        self.assertEqual(cmd, "spin_right")
 
-    def test_spin_right_when_target_is_right(self):
+    def test_spin_left_when_target_has_negative_screen_y(self):
         path = [(0, 0), (0, -5)]  # target is -y
         follower = WaypointFollower(path)
         cmd, done = follower.next_cmd(0, 0, 0.0)
-        self.assertEqual(cmd, "spin_right")
+        self.assertEqual(cmd, "spin_left")
 
     def test_arrival_at_goal(self):
         """AC6: Within arrival_distance → stop + reached_goal=True."""

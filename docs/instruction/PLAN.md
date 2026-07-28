@@ -5,6 +5,11 @@
 > **日期**: 2026-07-24
 > **状态**: Draft for Review
 
+> **当前实现说明（2026-07-28）**：生产契约已统一为
+> `src/mockvehicle2d/instruction/schemas/v3.json`，仅支持 `stop`、`goto`、
+> `clarify`、`patrol`。本文中的 v1/v2 方案及 `goto_point`、`move_distance`
+> 等意图只记录历史设计，均已废弃，不是当前接口。
+
 ## 概述
 
 本文档是 GUIDE_v3.md Phase 0 的交付物，覆盖 GUIDE_v3.md 第 3 节全部 14 项设计要求。
@@ -54,13 +59,13 @@
 ### 2.1 设计原则
 
 - 模型输出为 JSON，结构由确定性程序定义（版本化 Schema）
-- v2 Schema 中 LLM 仅输出 `intent` + `parameters`，版本管理由确定性程序负责
+- v3 Schema 中 LLM 仅输出 `intent` + `parameters`，版本管理由确定性程序负责
 - 指令是"规范"而非"命令"——确定性程序始终拥有最终执行权
 - Schema 只定义模型能输出的内容；车辆 ID、消息序号、速度上限等由确定性程序注入
 
 ### 2.2 第一版 Schema (v1) — 历史参考
 
-> **v1 已被 v2 取代。** 当前生产 Schema 为 v2（参见 §3.7.2），LLM 仅需输出 `intent` + `parameters`。以下 v1 设计保留作为设计演进记录。
+> **v1 和 v2 均已被 v3 取代。** 当前生产 Schema 为 v3；以下 v1 设计仅作设计演进记录。
 
 ```json
 {
@@ -163,15 +168,16 @@
 
 - v1 Schema: `required: ["schema_version", "intent", "timestamp"]` — LLM 负责输出版本号
 - v2 Schema: `required: ["intent", "parameters"]` — LLM 只输出核心字段，版本由确定性程序管理
+- v3 Schema: `required: ["intent", "parameters"]` — 当前生产契约，仅支持 `stop`、`goto`、`clarify`、`patrol`
 - `additionalProperties: true`（v2）— LLM 多输出的字段被忽略，不因此拒绝指令
-- Schema 文件存放于 `src/mockvehicle2d/instruction/schemas/v2.json`
+- 当前 Schema 文件为 `src/mockvehicle2d/instruction/schemas/v3.json`
 
 ### 2.4 能力标注
 
-- ✅ **现有**: v2 Schema 已实现（LLM 仅输出 intent + parameters）
+- ✅ **现有**: v3 Schema 已实现（LLM 仅输出 intent + parameters）
 - 🆕 **本阶段新增**: JSON Schema v1.0 定义 + 校验器实现（已在 Phase 1 完成）
 - ✅ **已实现**: v2 Schema 简化 + Retry 机制 + 14B 模型支持（Phase 1b 增量）
-- ⏸️ **暂不实现**: true Schema v3.x（多车扩展时需要增加 `target_vehicle` 字段）
+- ⏸️ **暂不实现**: 后续多车 Schema 修订（需要增加 `target_vehicle` 字段）
 
 ---
 
@@ -544,7 +550,7 @@ mockvehicle2d nl --fake                          # 使用 FakeModelClient（Phas
 | **安全运行时独立** | SafetyRuntime 在主控制循环中每步执行，不依赖模型输出 | 模型不能覆盖安全决策 |
 | **急停硬件通道** | 急停信号直接作用于 Vehicle.stop()，跳过软件栈 | 软件故障不影响急停 |
 | **结果缓冲** | 模型输出写入线程安全队列，控制循环按固定周期消费 | 解耦生产和消费速率 |
-| **fallback 策略** | 模型超时/错误时，指令队列保留上一条有效指令或回退到 stop | 模型故障不产生意外行为 |
+| **fallback 策略** | 模型超时/解析错误时清空多指令序列，不执行后续指令 | 模型故障不产生意外行为 |
 
 ### 7.4 模型延迟/崩溃处理流程
 
@@ -562,10 +568,10 @@ mockvehicle2d nl --fake                          # 使用 FakeModelClient（Phas
                              │
                              ▼
                   ┌─────────────────────┐
-                  │ 发送 nl_task_update │
-                  │ status: "failed"    │
-                  │ 车辆保持当前状态    │
-                  │ （如已 stop 则停车）│
+                  │ 返回 nl_parse_result│
+                  │ accepted: false     │
+                  │ 清空多指令序列队列   │
+                  │ 不执行后续指令       │
                   │ vLLM 需手动重启     │
                   └─────────────────────┘
 ```
@@ -665,26 +671,27 @@ class FakeModelClient:
 | **PARSING** | 模型正在推理 | nl_command 接收 | 不变 |
 | **VALIDATING** | 确定性校验中 | 模型返回 JSON | 不变 |
 | **CONFIRMING** | 等待用户确认 | intent=clarify | 不变 |
-| **REJECTED** | 指令被拒绝 | 校验失败 | 保持之前状态 |
+| **REJECTED** | 指令被拒绝 | 校验失败 | 清空序列队列，随后回到 IDLE |
 | **ACCEPTED** | 指令已接受，即将执行 | 校验全部通过 | 准备启动任务 |
 | **ACTIVE** | 任务执行中 | 编译为确定性任务并启动 | 由 GotoController/PathFollower 控制 |
-| **COMPLETED** | 任务成功完成 | 到达目标 / 条件满足 | stop，等待新指令 |
-| **BLOCKED** | 任务被安全阻断 | collision / safety block | 停车，保持阻断状态 |
-| **CANCELLED** | 任务被取消 | 手动 override / 超时 | stop |
-| **FAILED** | 模型调用失败 | 超时 / 服务断开 | 保持之前状态 |
+| **COMPLETED** | 任务成功完成 | 到达目标 / 条件满足 | 普通任务可继续下一条；stop 清空序列 |
+| **BLOCKED** | 任务被安全阻断 | collision / safety / localization block | 停车、清空序列队列，随后回到 IDLE |
+| **CANCELLED** | 任务被取消 | 手动 override / 超时 | stop、清空序列队列，随后回到 IDLE |
+| **FAILED** | 模型调用或执行失败 | 超时 / 服务断开 / 未支持意图 | 清空序列队列，随后回到 IDLE |
 
 ### 8.3 关键不变式
 
 1. 只有 `ACTIVE` 状态下车辆才能由 agent 控制运动
 2. 任何状态下急停/手动控制可以抢占，状态立即变为 `CANCELLED`
-3. `BLOCKED` 状态不会自动恢复——必须等待新指令或人工接管
+3. `BLOCKED` 不会自动恢复原任务——清空序列并回到 IDLE 后，必须接收新指令
 4. 状态转移是原子的，由 `InstructionStateMachine` 类集中管理
+5. 仅当前任务成功完成才会出队下一条，并先转入 `PARSING`；其余终止路径清空整个序列
 
 ### 8.4 能力标注
 
 - ✅ **现有**: GotoController 内部状态 (idle/active/reached/blocked/cancelled)
-- 🆕 **本阶段新增**: InstructionStateMachine 完整实现、11 状态转移图
-- ⏸️ **暂不实现**: 多指令队列、并发任务（Phase 6）
+- ✅ **已实现**: InstructionStateMachine、11 状态转移图和最多 10 条的多指令队列
+- ⏸️ **暂不实现**: 并发任务（Phase 6）
 
 ---
 
@@ -1046,15 +1053,15 @@ class YDLidarProvider:
 | **集群急停** | N/A | 一键停止所有车辆（广播 stop 或专用消息类型） |
 | **操作者权限** | N/A | 多操作者访问控制、任务队列管理和优先级 |
 
-### 14.2 Schema v3 预留（`target_vehicle` 字段） — 未来多车扩展
+### 14.2 后续 Schema 修订预留（`target_vehicle` 字段）
 
-> 注：当前 v2 Schema 仅含 `intent` + `parameters`。以下为未来多车场景的 v3 扩展预留。
+> 注：当前生产 v3 不定义车辆寻址字段。以下仅是未来多车场景提案，不是当前接口。
 
 ```json
 {
-  "intent": "goto_point",
-  "target_vehicle": "car_2",        // 🆕 多车寻址（v3）
-  "target_vehicle_selector": {       // 🆕 或条件选择（v3）
+  "intent": "goto",
+  "target_vehicle": "car_2",
+  "target_vehicle_selector": {
     "nearest_to": {"x_m": 50, "y_m": 50},
     "status": "idle"
   },
@@ -1206,31 +1213,36 @@ def has_more(self) -> bool:
 #### 主循环自动出队
 
 在 `handler()` 主循环中：
-- **COMPLETED → IDLE**: 检查 `state_machine.has_more()`，自动出队并执行下一条
-- **同步完成**（如 stop）: 在 `nl_command` 处理完成后检查 `has_more()`
+- **普通任务成功**：`COMPLETED → IDLE` 后检查 `has_more()`；若有剩余，
+  调用 `dequeue_next()`，转入 `PARSING`，再执行校验和任务启动
+- **stop**：作为显式序列终止指令，即使自身成功也会清空队列，不继续出队
 
 ### D.4 失败传播
 
-**任何步骤失败 → 清空整个队列**：
+当前实现采用 fail-closed：除普通任务成功完成外，任何失败、阻断、取消或显式
+`stop` 都会调用 `clear_queue()`，不会继续执行后续指令。
 
-| 失败类型 | 触发位置 | 操作 |
-|----------|---------|------|
-| 解析失败 | `_handle_nl_command` — parse 返回空列表 | 不清空队列（尚未入队） |
-| Schema 校验失败 | `_execute_parsed_instruction` | 状态机 → REJECTED → IDLE（不清空队列，仅拒绝当前指令；后续指令可由用户手动恢复） |
-| 语义校验失败 | `_execute_parsed_instruction` | 同上 |
-| 任务 BLOCKED | handler 主循环 — navigation 状态检测 | `clear_queue()` |
-| 任务 CANCELLED | handler 主循环 / 手动覆盖 | `clear_queue()` |
-| 任务 FAILED（未知 intent） | `_execute_parsed_instruction` | `clear_queue()` |
-| 手动覆盖（manual cmd） | handler — 收到非 NL 消息 | `clear_queue()` |
-| `_cancel_nl_task()` | 程序化取消 | `clear_queue()` |
+| 终止类型 | 触发位置 | 当前操作 |
+|----------|---------|----------|
+| `stop` | `_execute_parsed_instruction` | 停车并取消导航，`clear_queue()`，COMPLETED → IDLE |
+| 解析失败 | `_handle_nl_command` — parse 返回空列表 | `clear_queue()`，FAILED → IDLE |
+| Schema 校验失败 | `_execute_parsed_instruction` | `clear_queue()`，REJECTED → IDLE |
+| 语义校验失败 | `_execute_parsed_instruction` | `clear_queue()`，REJECTED → IDLE |
+| BLOCKED（含 collision / safety / localization） | 指令交接或 `handler()` 导航状态检测 | 停车或阻断导航，`clear_queue()`，BLOCKED → IDLE |
+| CANCELLED / 手动覆盖 | `handler()` 收到手动消息或导航取消 | 取消导航，`clear_queue()`，CANCELLED → IDLE |
+| FAILED（未支持 intent） | `_execute_parsed_instruction` | `clear_queue()`，FAILED → IDLE |
 
 ### D.5 Clarify 序列处理
 
 当序列中包含 `clarify` 意图且队列中还有剩余指令时：
 1. 当前 clarify 指令入队，出队并执行 → 进入 CONFIRMING 状态
 2. 用户通过 `nl_clarify_response` 回复
-3. 回复处理完成后，如果队列中还有剩余指令（`has_more()`），自动继续执行
-4. Clarify 响应不会清除或覆盖现有队列
+3. 非空回复只取模型解析结果的第一条作为当前 clarify 的替代指令；原序列尾部不被
+   清除、覆盖或追加
+4. 替代指令再次返回 clarify 时继续停留在 CONFIRMING；成功完成后才按 D.3
+   `dequeue_next()` → `PARSING`；失败、阻断、取消或 stop 按 D.4 清空队列
+5. 空回复返回 `accepted=false`，保持 CONFIRMING 和原序列尾部
+6. 若 clarify 后本就没有剩余指令，回复按新的普通序列处理
 
 ### D.6 向后兼容性
 

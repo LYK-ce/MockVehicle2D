@@ -19,7 +19,7 @@ import math
 import sys
 
 from mockvehicle2d.map_grid import MapGrid
-from mockvehicle2d.collision import raycast, is_circle_passable, CollisionResult
+from mockvehicle2d.collision import raycast, is_circle_passable
 
 
 PASS = 0

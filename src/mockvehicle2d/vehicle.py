@@ -107,7 +107,12 @@ class Vehicle:
             raise ValueError("drive velocities exceed configured limits")
         return float(linear_mps), float(angular_rps)
 
-    def stop(self) -> None:
+    def stop(self, now: float | None = None) -> None:
+        """Stop immediately; ``now`` discards any unintegrated prior motion."""
+        if now is not None:
+            if now < self._last_update:
+                raise ValueError("monotonic time moved backwards")
+            self._last_update = now
         self.command = "stop"
         self._linear_mps = 0.0
         self._angular_rps = 0.0

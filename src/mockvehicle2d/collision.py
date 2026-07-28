@@ -56,7 +56,17 @@ def raycast(grid: MapGrid, x1: int, y1: int, x2: int, y2: int) -> CollisionResul
 
 # ── 圆形碰撞检测 (AABB vs Circle) ──────────────────────
 
-def _cell_overlaps_circle(gx: int, gy: int, cx: float, cy: float, r2: float) -> bool:
+def is_strict_overlap(distance_squared: float, radius_squared: float) -> bool:
+    """Treat floating-point representations of exact tangency as non-overlap."""
+    return distance_squared < radius_squared and not math.isclose(
+        distance_squared,
+        radius_squared,
+        rel_tol=1e-12,
+        abs_tol=1e-12,
+    )
+
+
+def cell_overlaps_circle(gx: int, gy: int, cx: float, cy: float, r2: float) -> bool:
     """圆是否与 cell [gx, gx+1] × [gy, gy+1] 重叠。
 
     取 cell AABB 上离圆心最近的点，判断距离是否 < r。
@@ -65,7 +75,7 @@ def _cell_overlaps_circle(gx: int, gy: int, cx: float, cy: float, r2: float) -> 
     closest_y = max(gy, min(cy, gy + 1))
     dx = closest_x - cx
     dy = closest_y - cy
-    return dx * dx + dy * dy < r2
+    return is_strict_overlap(dx * dx + dy * dy, r2)
 
 
 def is_circle_passable(grid: MapGrid, cx: float, cy: float, radius: float) -> bool:
@@ -89,7 +99,7 @@ def is_circle_passable(grid: MapGrid, cx: float, cy: float, radius: float) -> bo
 
     for gy in range(y_min, y_max + 1):
         for gx in range(x_min, x_max + 1):
-            if not _cell_overlaps_circle(gx, gy, cx, cy, r2):
+            if not cell_overlaps_circle(gx, gy, cx, cy, r2):
                 continue
             if not grid.is_passable(gx, gy):
                 return False
@@ -138,7 +148,7 @@ def _segment_intersects_aabb(
     return True
 
 
-def _segment_aabb_distance_squared(
+def segment_aabb_distance_squared(
     x1: float, y1: float, x2: float, y2: float, min_x: float, min_y: float, max_x: float, max_y: float
 ) -> float:
     if _segment_intersects_aabb(x1, y1, x2, y2, min_x, min_y, max_x, max_y):
@@ -162,7 +172,10 @@ def is_swept_circle_passable(
         for gx in range(math.floor(min(x1, x2) - radius), math.floor(max(x1, x2) + radius) + 1):
             if grid.is_passable(gx, gy):
                 continue
-            if _segment_aabb_distance_squared(x1, y1, x2, y2, gx, gy, gx + 1, gy + 1) < radius_squared:
+            distance_squared = segment_aabb_distance_squared(
+                x1, y1, x2, y2, gx, gy, gx + 1, gy + 1
+            )
+            if is_strict_overlap(distance_squared, radius_squared):
                 return False
     return True
 
@@ -180,7 +193,7 @@ def get_blocking_cells(grid: MapGrid, cx: float, cy: float, radius: float) -> li
     walls = []
     for gy in range(y_min, y_max + 1):
         for gx in range(x_min, x_max + 1):
-            if not _cell_overlaps_circle(gx, gy, cx, cy, r2):
+            if not cell_overlaps_circle(gx, gy, cx, cy, r2):
                 continue
             if not grid.is_passable(gx, gy):
                 walls.append((gx, gy))

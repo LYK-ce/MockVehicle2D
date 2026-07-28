@@ -7,7 +7,7 @@ git clone git@github.com:LYK-ce/MockVehicle2D.git
 cd MockVehicle2D
 bash bootstrap.sh
 source .venv/bin/activate
-mockvehicle2d test          # verify everything works
+python -m pytest            # verify everything works
 ```
 
 ## Development Workflow
@@ -25,7 +25,7 @@ mockvehicle2d test          # verify everything works
 
 3. **Run tests** before committing:
    ```bash
-   mockvehicle2d test
+   python -m pytest
    ```
 
 4. **Commit** with a descriptive message:
@@ -45,7 +45,7 @@ mockvehicle2d test          # verify everything works
 ## PR Checklist
 
 Every pull request must:
-- [ ] Pass all tests (`mockvehicle2d test`)
+- [ ] Pass all tests (`python -m pytest`)
 - [ ] Include tests for new functionality
 - [ ] Update relevant documentation
 - [ ] Be free of dead code and TODOs
