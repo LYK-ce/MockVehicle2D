@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import json
 import re
+import sys
 
 
 def _strip_thinking(content: str) -> str:
@@ -79,19 +80,30 @@ class LLMClient:
         model: str = "Qwen3-8B-Q4_K_M",
         max_retries: int = 3,
         schema_validator=None,
+        enable_thinking: bool = False,
     ) -> None:
         self._base_url = base_url
         self._model = model
         self._max_retries = max_retries
         self._schema_validator = schema_validator
+        self._enable_thinking = enable_thinking
         self._client = None  # Lazy init
 
     @property
     def _async_client(self):
         if self._client is None:
             from openai import AsyncOpenAI
+            import httpx
 
-            self._client = AsyncOpenAI(base_url=self._base_url, api_key="not-needed")
+            http_client = httpx.AsyncClient(
+                trust_env=False,  # ignore HTTP_PROXY/ALL_PROXY etc.
+                timeout=httpx.Timeout(30.0),
+            )
+            self._client = AsyncOpenAI(
+                base_url=self._base_url,
+                api_key="not-needed",
+                http_client=http_client,
+            )
         return self._client
 
     async def parse(self, text: str) -> list[dict]:
@@ -117,7 +129,7 @@ class LLMClient:
                     messages=messages,
                     temperature=0.1,
                     max_tokens=1024,
-                    extra_body={"enable_thinking": True},
+                    extra_body={"enable_thinking": self._enable_thinking},
                     timeout=30.0,
                 )
                 content = response.choices[0].message.content
@@ -178,8 +190,8 @@ class LLMClient:
 
                 return instructions
 
-            except Exception:
-                # Non-JSONDecodeError (e.g. timeout, connection error) — do NOT retry
+            except Exception as exc:
+                print(f"[LLM] parse error: {exc}", file=sys.stderr)
                 return []
 
         return []

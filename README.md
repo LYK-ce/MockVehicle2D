@@ -39,19 +39,17 @@ mockvehicle2d pathfind --start-m 10,10 --goal-m 200,200
 mockvehicle2d serve-llm                         # 默认 GPU 0, Qwen3-8B
 mockvehicle2d serve-llm --gpu 0 --model Qwen3-14B-Q4_K_M  # 14B 模型
 
-# 方式二：手动启动 server（脚本）
-bash scripts/start_llm_server.sh                # 默认
-bash scripts/start_llm_server.sh 0 Qwen3-14B-Q4_K_M  # 14B
-
 # 然后执行 NL 指令
 mockvehicle2d nl "去坐标 (100, 200)"
 mockvehicle2d nl "停"
 mockvehicle2d nl "开始巡逻"
 mockvehicle2d nl --interactive
+mockvehicle2d nl --think "去坐标 (50, 30)"       # 开启 thinking 模式
 mockvehicle2d nl --model Qwen3-14B-Q4_K_M "去坐标 (50, 30)"
 
 # 离线评测
 mockvehicle2d nl --eval
+mockvehicle2d nl --eval --think                 # thinking 模式评测
 
 # 启动 Pygame 可视化
 mockvehicle2d visual
@@ -69,6 +67,7 @@ MockVehicle2D/
 │   │   └── main.py
 │   ├── instruction/        ← NL→JSON 自然语言指令系统
 │   │   ├── llm_client.py   ← LLMClient (Qwen via llama.cpp)
+│   │   ├── dispatcher.py   ← v3 intent → function_call + Robot Controller 命令翻译
 │   │   ├── validator.py    ← Schema 与可选地图语义校验
 │   │   ├── state_machine.py← 指令生命周期与多指令队列
 │   │   ├── compiler.py     ← 离线 JSON 指令编译/调试
@@ -219,7 +218,15 @@ AABB vs Circle 圆形碰撞
 
 ### 运行模式
 
-`mockvehicle2d nl` 通过 `LLMClient` 连接本地 llama.cpp server（`localhost:8000`）进行 NL→JSON 推理。默认单 GPU（`CUDA_VISIBLE_DEVICES=0`），Qwen3-8B-Q4_K_M，Thinking 模式开启。
+`mockvehicle2d nl` 通过 `LLMClient` 连接本地 llama.cpp server（`localhost:8000`）进行 NL→JSON 推理。默认单 GPU（`CUDA_VISIBLE_DEVICES=0`），Qwen3-8B-Q4_K_M，Thinking 模式默认关闭。
+
+### 翻译层
+
+服务端在 LLM 输出 v3 意图 JSON 后，通过 `dispatcher.py` 确定性翻译为：
+- **function_call** — 内部 dispatch 格式（如 `{"name":"goto","arguments":{"x_m":100,"y_m":200}}`）
+- **command** — Robot Controller 协议命令（如 `{"cmd":"auto","action":"push","missions":[{"type":"goto","x_m":100,"y_m":200}]}`）
+
+翻译产物在所有 NL 相关 WebSocket 回复（`nl_parse_result`、`nl_task_update`、`nl_confirm_request`）中以 `function_call` 和 `command` 字段携带。Pictor 可直接消费 `command` 字段对接已有的 mode/manual/auto 命令处理。
 
 ### LLM 配置
 
@@ -229,6 +236,10 @@ mockvehicle2d nl "去坐标 (100, 200)"
 
 # 切换到 Qwen3-14B
 mockvehicle2d nl --model Qwen3-14B-Q4_K_M "去坐标 (100, 200)"
+
+# 开启 / 关闭 thinking 模式（默认 off）
+mockvehicle2d nl --think "去坐标 (100, 200)"
+mockvehicle2d nl --no-think "去坐标 (100, 200)"
 ```
 
 ### JSON Schema v3（最小化设计）
@@ -253,8 +264,8 @@ LLM 输出 JSON 解析失败或 Schema 校验失败时，自动将错误反馈�
 mockvehicle2d nl --eval
 ```
 
-46 条测试覆盖全部 4 种意图 + 边界情况（越界坐标、注入攻击、乱码输入）。
-Qwen3-8B: 98% | Qwen3-14B: 100%（单 GPU A100, Q4_K_M, Thinking 开启）。
+30 条测试覆盖全部 4 种意图 + 多指令序列 + 边界情况。
+Qwen3-8B: 100% 意图准确率，100% Schema 通过率（单 GPU A100, Q4_K_M）。
 
 ## 通信协议
 

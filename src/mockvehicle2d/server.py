@@ -11,6 +11,11 @@ import signal
 import struct
 import time
 
+from mockvehicle2d.instruction.dispatcher import (
+    TranslatedInstruction,
+    translate,
+    translate_all,
+)
 from mockvehicle2d.instruction.llm_client import LLMClient
 from mockvehicle2d.instruction.state_machine import InstructionState, InstructionStateMachine
 from mockvehicle2d.instruction.validator import SchemaValidator, SemanticValidator
@@ -235,6 +240,12 @@ def _bounded_json_int(value: str) -> int:
     if len(value.lstrip("-")) > MAX_JSON_INTEGER_DIGITS:
         raise ValueError("JSON integer is too long")
     return int(value)
+
+
+def _inject_translated(reply: dict[str, object], translated: TranslatedInstruction) -> None:
+    """Inject function_call and command fields into a reply dict."""
+    reply["function_call"] = translated.function_call
+    reply["command"] = translated.command
 
 
 def _decode_message(raw: object) -> dict[str, object]:
@@ -666,6 +677,15 @@ def _handle_nl_command(
             )
     if isinstance(instructions, dict):
         instructions = [instructions]
+
+    # Translate v3 intents → function_call + command
+    translated: list[TranslatedInstruction] = []
+    if instructions:
+        try:
+            translated = translate_all(instructions)
+        except ValueError:
+            pass  # unknown intent handled downstream
+
     if not instructions:
         state_machine.clear_queue()
         state_machine.transition(InstructionState.FAILED)
@@ -695,11 +715,14 @@ def _handle_nl_command(
             local_state=local_state,
             handoff_reason=handoff_reason,
         ))
-        # Patch sequence info into nl_parse_result
+        # Patch sequence info + translated fields into nl_parse_result
+        ti = translated[0] if translated else None
         for r in replies:
             if r.get("type") == "nl_parse_result":
                 r["sequence_index"] = sequence_index
                 r["sequence_total"] = sequence_total
+            if ti is not None:
+                _inject_translated(r, ti)
         return replies
 
     # Clear old queue if this is a standalone clarify response (no remaining items)
@@ -733,11 +756,17 @@ def _handle_nl_command(
         local_state=local_state,
         handoff_reason=handoff_reason,
     ))
-    # Add sequence info to nl_parse_result
+    # Add sequence info + translated fields to all replies
+    ti = translated[state_machine.current_index - 1] if (
+        translated and state_machine.current_index > 0
+        and state_machine.current_index <= len(translated)
+    ) else None
     for r in replies:
         if r.get("type") == "nl_parse_result":
             r["sequence_index"] = sequence_index
             r["sequence_total"] = sequence_total
+        if ti is not None:
+            _inject_translated(r, ti)
 
     return replies
 
@@ -952,6 +981,11 @@ async def _process_next_in_queue(
         if r.get("type") == "nl_parse_result":
             r["sequence_index"] = sequence_index
             r["sequence_total"] = sequence_total
+        try:
+            ti = translate(instruction)
+            _inject_translated(r, ti)
+        except ValueError:
+            pass
         await websocket.send(json.dumps(r))
 
     print(f"[NL] auto-dequeued instruction {sequence_index}/{sequence_total}: {instruction.get('intent')}")
@@ -1215,6 +1249,7 @@ async def handler(
         path_following = None
         next_deadline = started_at
         active_nl_seq: int | None = None
+        active_translated: TranslatedInstruction | None = None
         last_navigation_log_key: tuple[object, ...] | None = None
 
         if (
@@ -1273,9 +1308,12 @@ async def handler(
                             "seq": active_nl_seq if active_nl_seq is not None else 0,
                             "status": "completed",
                             "reason": _nl_completion_reason(navigation),
+                            "function_call": active_translated.function_call if active_translated is not None else None,
+                            "command": active_translated.command if active_translated is not None else None,
                         }))
                         state_machine.transition(InstructionState.IDLE)
                         active_nl_seq = None
+                        active_translated = None
                         print("[NL] task completed: goal reached")
                         # Auto-dequeue next in sequence
                         if state_machine.has_more():
@@ -1294,10 +1332,13 @@ async def handler(
                             "seq": active_nl_seq if active_nl_seq is not None else 0,
                             "status": "blocked",
                             "reason": reason or "unknown",
+                            "function_call": active_translated.function_call if active_translated is not None else None,
+                            "command": active_translated.command if active_translated is not None else None,
                         }))
                         state_machine.clear_queue()
                         state_machine.transition(InstructionState.IDLE)
                         active_nl_seq = None
+                        active_translated = None
                         print(f"[NL] task blocked: {reason} (queue cleared)")
                     elif nav_status == "cancelled":
                         reason = navigation.reason
@@ -1308,10 +1349,13 @@ async def handler(
                             "seq": active_nl_seq if active_nl_seq is not None else 0,
                             "status": "cancelled",
                             "reason": reason or "unknown",
+                            "function_call": active_translated.function_call if active_translated is not None else None,
+                            "command": active_translated.command if active_translated is not None else None,
                         }))
                         state_machine.clear_queue()
                         state_machine.transition(InstructionState.IDLE)
                         active_nl_seq = None
+                        active_translated = None
                         print(f"[NL] task cancelled: {reason} (queue cleared)")
 
                 runtime.frame_sequence += 1
@@ -1347,6 +1391,15 @@ async def handler(
                     started_seq = _started_nl_task_seq(replies)
                     if started_seq is not None:
                         active_nl_seq = started_seq
+                        # Extract active_translated from reply
+                        for r in replies:
+                            if r.get("function_call") and r.get("type") in ("nl_task_update", "nl_parse_result"):
+                                active_translated = TranslatedInstruction(
+                                    function_call=r.get("function_call", {}),
+                                    command=r.get("command"),
+                                    instruction=r.get("instruction", {}),
+                                )
+                                break
                     elif state_machine.current_state == InstructionState.IDLE and state_machine.has_more():
                         await _process_next_in_queue(
                             websocket, vehicle, grid, navigation, _wall_time(), _monotonic(),
@@ -1411,8 +1464,11 @@ async def handler(
                     "seq": active_nl_seq if active_nl_seq is not None else 0,
                     "status": "cancelled",
                     "reason": "manual_override",
+                    "function_call": active_translated.function_call if active_translated is not None else None,
+                    "command": active_translated.command if active_translated is not None else None,
                 }))
                 active_nl_seq = None
+                active_translated = None
                 print("[NL] task cancelled by manual override (queue cleared)")
 
             reply = handle_command_message(
