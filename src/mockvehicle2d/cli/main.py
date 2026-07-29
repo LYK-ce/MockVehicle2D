@@ -158,27 +158,27 @@ def _cmd_serve_llm(args):
     import subprocess
 
     model_name = args.model
-    # Derive GGUF repo name: Qwen3-8B-Q4_K_M → Qwen3-8B-GGUF
-    repo_name = model_name.rsplit("-", 1)[0] + "-GGUF"
 
-    # Find model in HF cache
-    hf_cache = os.environ.get("HF_HOME", os.path.expanduser("~/.cache/huggingface"))
-    model_dir = os.path.join(hf_cache, "hub", f"models--Qwen--{repo_name}")
-    snapshots = os.path.join(model_dir, "snapshots")
-    if not os.path.isdir(snapshots):
-        print("ERROR: Model not found. Download first:")
-        print(f"  hf download Qwen/{repo_name} {model_name}.gguf")
-        sys.exit(1)
+    # Find model: check local models dir first, then HF cache
+    models_dir = "/vepfs-mlp2/c20250205/241905024/jmx/MockVehicle2D/models"
+    model_path = os.path.join(models_dir, f"{model_name}.gguf")
 
-    # Find the .gguf file in any snapshot
-    model_path = None
-    for snap in os.listdir(snapshots):
-        candidate = os.path.join(snapshots, snap, f"{model_name}.gguf")
-        if os.path.isfile(candidate):
-            model_path = candidate
-            break
-    if model_path is None:
-        print(f"ERROR: {model_name}.gguf not found in {snapshots}")
+    if not os.path.isfile(model_path):
+        # Fall back to HuggingFace cache
+        repo_name = model_name.rsplit("-", 1)[0] + "-GGUF"
+        hf_cache = os.environ.get("HF_HOME", os.path.expanduser("~/.cache/huggingface"))
+        model_dir = os.path.join(hf_cache, "hub", f"models--Qwen--{repo_name}")
+        snapshots = os.path.join(model_dir, "snapshots")
+        if os.path.isdir(snapshots):
+            for snap in os.listdir(snapshots):
+                candidate = os.path.join(snapshots, snap, f"{model_name}.gguf")
+                if os.path.isfile(candidate):
+                    model_path = candidate
+                    break
+
+    if not os.path.isfile(model_path):
+        print(f"ERROR: Model {model_name}.gguf not found")
+        print(f"Checked: {models_dir}/ and HF cache")
         sys.exit(1)
 
     env = os.environ.copy()
@@ -235,7 +235,7 @@ def _cmd_nl(args):
     if args.interactive:
         import asyncio
         from mockvehicle2d.instruction.llm_client import LLMClient
-        client = LLMClient(model=args.model, schema_validator=schema_v)
+        client = LLMClient(model=args.model, schema_validator=schema_v, enable_thinking=args.think)
         print("NL Instruction REPL — type 'quit' to exit")
         while True:
             try:
@@ -282,7 +282,7 @@ def _cmd_nl(args):
 
     import asyncio
     from mockvehicle2d.instruction.llm_client import LLMClient
-    client = LLMClient(model=args.model, schema_validator=schema_v)
+    client = LLMClient(model=args.model, schema_validator=schema_v, enable_thinking=args.think)
     instructions = asyncio.run(client.parse(text))
 
     if not instructions:
@@ -316,7 +316,7 @@ def _run_eval(dataset, schema_v, semantic_v):
     from mockvehicle2d.instruction.llm_client import LLMClient
     from mockvehicle2d.instruction.validator import run_validation_pipeline
 
-    client = LLMClient(schema_validator=schema_v)
+    client = LLMClient(schema_validator=schema_v, enable_thinking=args.think)
     total = len(dataset)
     intent_correct = 0
     schema_pass = 0
@@ -475,6 +475,10 @@ def main():
                         help="Path to evaluation dataset JSON")
     nl_cmd.add_argument("--model", type=str, default="Qwen3-8B-Q4_K_M", metavar="MODEL",
                          help="Model name for LLMClient (default: Qwen3-8B-Q4_K_M)")
+    nl_cmd.add_argument("--think", action="store_true", default=True,
+                        help="Enable thinking mode (default: on)")
+    nl_cmd.add_argument("--no-think", action="store_false", dest="think",
+                        help="Disable thinking mode")
 
     args = parser.parse_args()
 

@@ -79,11 +79,13 @@ class LLMClient:
         model: str = "Qwen3-8B-Q4_K_M",
         max_retries: int = 3,
         schema_validator=None,
+        enable_thinking: bool = True,
     ) -> None:
         self._base_url = base_url
         self._model = model
         self._max_retries = max_retries
         self._schema_validator = schema_validator
+        self._enable_thinking = enable_thinking
         self._client = None  # Lazy init
 
     @property
@@ -117,7 +119,7 @@ class LLMClient:
                     messages=messages,
                     temperature=0.1,
                     max_tokens=1024,
-                    extra_body={"enable_thinking": True},
+                    extra_body={"enable_thinking": self._enable_thinking},
                     timeout=30.0,
                 )
                 content = response.choices[0].message.content
