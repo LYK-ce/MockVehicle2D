@@ -136,14 +136,16 @@ class ObservedGridTest(unittest.TestCase):
             1.0,
             self.config,
         )
+        first_revision = self.grid.revision
         second = self.grid.integrate_scan(
             scan,
             self.pose,
             2.0,
             self.config,
         )
-        self.assertGreater(first.revision, 0)
-        self.assertEqual(second.revision, first.revision)
+        self.assertTrue(first.changed_cells)
+        self.assertGreater(first_revision, 0)
+        self.assertEqual(self.grid.revision, first_revision)
         self.assertEqual(second.changed_cells, ())
 
     def test_lost_localization_does_not_write_the_map(self) -> None:

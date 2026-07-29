@@ -378,17 +378,16 @@ class TestControllerProtocol(unittest.TestCase):
             )
             await runtime.controller_lease.acquire()
             before = runtime.controller.snapshot()
-            values = iter((20.0, 21.0))
             socket = Socket([], "error")
             await handler(
                 socket,
                 _runtime=runtime,
                 _monotonic=lambda: 0.0,
-                _wall_time=lambda: next(values),
+                _wall_time=lambda: 20.0,
             )
             error = socket.messages[-1]
             self.assertEqual(error["code"], "vehicle_busy")
-            self.assertEqual(error["timestamp_s"], 0.0)
+            self.assertEqual(error["timestamp_s"], 20.0)
             self.assertEqual(runtime.controller.snapshot(), before)
             self.assertTrue(runtime.controller_lease.locked())
             runtime.controller_lease.release()

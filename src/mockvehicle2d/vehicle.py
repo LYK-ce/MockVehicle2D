@@ -45,7 +45,7 @@ class Vehicle:
     def install_drive(self, linear_mps: float, angular_rps: float, now: float) -> None:
         """Install bounded velocities after the vehicle has already advanced to ``now``."""
         linear, angular = self._validated_drive_velocities(linear_mps, angular_rps)
-        self._install_velocities(linear, angular, now, "drive")
+        self._install_velocities(linear, angular, now)
 
     def _validated_drive_velocities(
         self, linear_mps: float, angular_rps: float
@@ -119,15 +119,13 @@ class Vehicle:
     def command_deadline(self) -> float | None:
         return self._command_deadline
 
-    def _install_velocities(
-        self, linear_mps: float, angular_rps: float, now: float, command: str
-    ) -> None:
+    def _install_velocities(self, linear_mps: float, angular_rps: float, now: float) -> None:
         if now != self._last_update:
             raise ValueError("vehicle must be advanced to now before installing velocities")
         if linear_mps == 0 and angular_rps == 0:
             self.stop()
             return
-        self.command = command
+        self.command = "drive"
         self._linear_mps = linear_mps
         self._angular_rps = angular_rps
         self._command_deadline = now + self.command_timeout

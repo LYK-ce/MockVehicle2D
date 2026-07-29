@@ -547,10 +547,6 @@ class MapCellUpdate:
 
 @dataclass(frozen=True)
 class LocalMapDelta:
-    anchor_id: str
-    revision: int
-    pose_revision: int
-    observed_at: float
     changed_cells: tuple[MapCellUpdate, ...]
 
 
@@ -654,13 +650,7 @@ class ObservedGrid:
         )
         if changed:
             self.revision += 1
-        return LocalMapDelta(
-            self.anchor.anchor_id,
-            self.revision,
-            pose.revision,
-            observed_at,
-            changed,
-        )
+        return LocalMapDelta(changed)
 
     def snapshot(self) -> dict[str, object]:
         return {
