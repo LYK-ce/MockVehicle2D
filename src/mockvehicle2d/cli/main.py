@@ -272,7 +272,7 @@ def _cmd_nl(args):
             sys.exit(1)
         with open(dataset_path, encoding="utf-8") as f:
             dataset = json.load(f)
-        return _run_eval(dataset, schema_v, semantic_v)
+        return _run_eval(dataset, schema_v, semantic_v, enable_thinking=args.think)
 
     # --- single command mode ---
     text = args.text
@@ -306,7 +306,7 @@ def _cmd_nl(args):
     sys.exit(0 if all_valid else 1)
 
 
-def _run_eval(dataset, schema_v, semantic_v):
+def _run_eval(dataset, schema_v, semantic_v, enable_thinking=True):
     """Run offline evaluation: compare LLMClient parse vs expected.
 
     expected can be a single dict or a list of dicts for multi-instruction cases.
@@ -316,7 +316,7 @@ def _run_eval(dataset, schema_v, semantic_v):
     from mockvehicle2d.instruction.llm_client import LLMClient
     from mockvehicle2d.instruction.validator import run_validation_pipeline
 
-    client = LLMClient(schema_validator=schema_v, enable_thinking=args.think)
+    client = LLMClient(schema_validator=schema_v, enable_thinking=enable_thinking)
     total = len(dataset)
     intent_correct = 0
     schema_pass = 0
