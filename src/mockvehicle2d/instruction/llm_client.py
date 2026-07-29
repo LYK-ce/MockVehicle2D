@@ -93,8 +93,17 @@ class LLMClient:
     def _async_client(self):
         if self._client is None:
             from openai import AsyncOpenAI
+            import httpx
 
-            self._client = AsyncOpenAI(base_url=self._base_url, api_key="not-needed")
+            http_client = httpx.AsyncClient(
+                trust_env=False,  # ignore HTTP_PROXY/ALL_PROXY etc.
+                timeout=httpx.Timeout(30.0),
+            )
+            self._client = AsyncOpenAI(
+                base_url=self._base_url,
+                api_key="not-needed",
+                http_client=http_client,
+            )
         return self._client
 
     async def parse(self, text: str) -> list[dict]:
