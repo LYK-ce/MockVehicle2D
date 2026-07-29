@@ -63,7 +63,7 @@ MockVehicle2D/
 │   ├── navigation.py        ← finite-view autonomous velocity decisions
 │   ├── safety.py            ← local safety sensing and limits
 │   ├── server.py            ← WebSocket server
-│   └── visual.py            ← Pygame visualization
+│   └── vehicle.py           ← deterministic vehicle dynamics
 ├── tests/                   ← test suite
 ├── docs/                    ← design documents
 └── bootstrap.sh             ← one-shot setup script

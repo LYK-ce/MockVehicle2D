@@ -140,7 +140,6 @@ class ControllerEvent:
             "event_seq": self.event_seq,
             "event_epoch": self.event_epoch,
             "timestamp_s": timestamp,
-            "ts": timestamp,
             "mission_id": self.mission.mission_id,
             "submitted_seq": self.mission.submitted_seq,
             "status": self.status,

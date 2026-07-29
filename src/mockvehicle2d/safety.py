@@ -88,31 +88,6 @@ def nearest_obstacle_clearance(
     return min(clearances, default=None)
 
 
-def nearest_edge_clearance(
-    grid: MapGrid,
-    x: float,
-    y: float,
-    yaw: float,
-    desired_linear_mps: float,
-    *,
-    vehicle_radius: float,
-    lookahead_m: float = EDGE_LOOKAHEAD_M,
-    sample_step_m: float = EDGE_SAMPLE_STEP_M,
-) -> float | None:
-    """Conservatively sample the swept circular footprint for void or map bounds."""
-    clearance, _point = _nearest_edge_evidence(
-        grid,
-        x,
-        y,
-        yaw,
-        desired_linear_mps,
-        vehicle_radius=vehicle_radius,
-        lookahead_m=lookahead_m,
-        sample_step_m=sample_step_m,
-    )
-    return clearance
-
-
 def _nearest_edge_evidence(
     grid: MapGrid,
     x: float,
@@ -147,10 +122,6 @@ def _nearest_edge_evidence(
                 (cosine * dx + sine * dy, -sine * dx + cosine * dy),
             )
     return None, None
-
-
-def _footprint_has_ground(grid: MapGrid, cx: float, cy: float, radius: float) -> bool:
-    return _first_missing_ground_cell(grid, cx, cy, radius) is None
 
 
 def _first_missing_ground_cell(

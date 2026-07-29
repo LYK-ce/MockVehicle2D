@@ -56,9 +56,6 @@ mockvehicle2d serve \
   --anchor-y-m 10 \
   --anchor-yaw-rad 0
 
-# 独立 Pygame 运动/碰撞调试窗口
-mockvehicle2d visual
-
 # 完整真值地图上的 A* 离线调试工具，不属于自主运行链路
 mockvehicle2d pathfind --start-m 10,10 --goal-m 200,200
 ```
@@ -68,7 +65,7 @@ mockvehicle2d pathfind --start-m 10,10 --goal-m 200,200
 
 ## 控制方式
 
-协议版本为 `4`，不接受旧的 `cmd`、`drive`、直接 `goto` 或自然语言命令。
+协议版本为 `4`，只接受 `mode`、`manual` 和 `auto` 三类命令。
 每个连接内的 `seq` 必须严格递增。
 
 ```json
@@ -154,7 +151,3 @@ src/mockvehicle2d/
 读数。自主控制器不会读取它。当前定位仅包含增量 odometry 和有限窗 scan matching，
 没有回环、位姿图、全局优化、地图持久化或中央地图同步；因此它是控制架构与算法测试台，
 不是现实传感器和车辆动力学的完整数字孪生。
-
-可选的自然语言意图翻译器只生成合法 v4 命令，不接入 WebSocket 执行环，也不持有
-控制权。接口和限制见
-[自然语言边界文档](docs/nl_function_calling_design.md)。

@@ -137,11 +137,11 @@ def active_runtime(anchor_id: str) -> VehicleRuntime:
         anchor=AnchorSpec(anchor_id, 10.0, 10.0, 0.0),
         odometry_config=OdometryConfig(),
     )
-    mode, _ = runtime.handle_command(
+    mode = runtime.handle_command(
         ModeCommand(1, ModeAction.SWITCH_TO_AUTO),
         monotonic_now=0.0,
     )
-    pushed, _ = runtime.handle_command(
+    pushed = runtime.handle_command(
         AutoCommand(
             2,
             AutoAction.PUSH,
@@ -212,7 +212,6 @@ class TestControllerProtocol(unittest.TestCase):
         cases = [
             ('{"type":"goto","seq":1,"x_m":1,"y_m":2}', "invalid_type"),
             ('{"type":"cmd","seq":1,"cmd":"forward"}', "invalid_type"),
-            ('{"type":"nl_command","seq":1,"text":"go"}', "invalid_type"),
             ('{"type":"mode","action":"switch_to_auto"}', "missing_seq"),
             ('{"type":"mode","seq":true,"action":"switch_to_auto"}', "invalid_seq"),
             ('{"type":"mode","seq":-1,"action":"switch_to_auto"}', "invalid_seq"),
@@ -389,7 +388,7 @@ class TestControllerProtocol(unittest.TestCase):
             )
             error = socket.messages[-1]
             self.assertEqual(error["code"], "vehicle_busy")
-            self.assertEqual(error["timestamp_s"], error["ts"])
+            self.assertEqual(error["timestamp_s"], 0.0)
             self.assertEqual(runtime.controller.snapshot(), before)
             self.assertTrue(runtime.controller_lease.locked())
             runtime.controller_lease.release()

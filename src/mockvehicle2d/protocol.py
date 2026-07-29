@@ -69,7 +69,6 @@ def command_ack(
     message: dict[str, object] = {
         "type": "command_ack",
         "timestamp_s": timestamp,
-        "ts": timestamp,
         "seq": command.seq,
         "command": {
             "type": _command_type(command),
@@ -87,7 +86,6 @@ def error_message(error: ProtocolError, *, timestamp: float) -> dict[str, object
     return {
         "type": "error",
         "timestamp_s": timestamp,
-        "ts": timestamp,
         "seq": error.seq,
         "code": error.code,
         "message": str(error),

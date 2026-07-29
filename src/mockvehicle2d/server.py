@@ -13,7 +13,7 @@ import signal
 import struct
 import time
 
-from mockvehicle2d.controller import Command, ControllerEvent, RobotController
+from mockvehicle2d.controller import Command, CommandResult, RobotController
 from mockvehicle2d.local_state import (
     AnchorSpec,
     AnchoredLocalState,
@@ -50,7 +50,6 @@ VEHICLE_ID_PATTERN = re.compile(r"[A-Za-z0-9._-]{1,64}")
 class RuntimeFrame:
     scan_points: tuple[LaserPoint, ...]
     timestamp: float
-    events: tuple[ControllerEvent, ...]
 
 
 @dataclass
@@ -89,27 +88,22 @@ class VehicleRuntime:
         command: Command,
         *,
         monotonic_now: float,
-    ):
+    ) -> CommandResult:
         self.advance_to(monotonic_now)
-        event_seq = self.controller.latest_event_seq
-        result = self.controller.handle(
+        return self.controller.handle(
             command,
             vehicle=self.vehicle,
             grid=self.grid,
             safety=self.safety,
             now=monotonic_now,
         )
-        return result, self.controller.events_after(event_seq)
 
-    def fail_safe_stop(self, monotonic_now: float) -> tuple[ControllerEvent, ...]:
+    def fail_safe_stop(self, monotonic_now: float) -> None:
         self.advance_to(monotonic_now)
-        event_seq = self.controller.latest_event_seq
         self.controller.fail_safe_stop(self.vehicle, "invalid_command")
-        return self.controller.events_after(event_seq)
 
     def update(self, monotonic_now: float, wall_timestamp: float) -> RuntimeFrame:
         self.advance_to(monotonic_now)
-        event_seq = self.controller.latest_event_seq
         advance_result = self._pending_advance
         self._pending_advance = SafetyAdvanceResult()
         scan_points = tuple(
@@ -148,11 +142,7 @@ class VehicleRuntime:
             advance_result=advance_result,
             now=monotonic_now,
         )
-        return RuntimeFrame(
-            scan_points,
-            wall_timestamp,
-            self.controller.events_after(event_seq),
-        )
+        return RuntimeFrame(scan_points, wall_timestamp)
 
     @classmethod
     def create(
@@ -319,7 +309,6 @@ def telemetry_messages(
     pose = {
         "type": "pose",
         "timestamp_s": frame.timestamp,
-        "ts": frame.timestamp,
         "seq": runtime.frame_sequence,
         "source": "anchored_odometry",
         "frame_id": "global_map",
@@ -422,7 +411,6 @@ async def handler(
                 {
                     "type": "error",
                     "timestamp_s": timestamp,
-                    "ts": timestamp,
                     "seq": None,
                     "code": "vehicle_busy",
                     "message": "another controller owns the vehicle lease",
@@ -511,7 +499,7 @@ async def handler(
                         command.seq,
                     )
                 last_seq = command.seq
-                result, _ = runtime.handle_command(
+                result = runtime.handle_command(
                     command,
                     monotonic_now=_monotonic(),
                 )

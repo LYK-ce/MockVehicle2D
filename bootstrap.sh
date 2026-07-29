@@ -15,7 +15,7 @@ echo "==> Activating and installing..."
 # shellcheck disable=SC1091
 source .venv/bin/activate
 pip install --upgrade pip -q
-pip install -e ".[visual,dev]"
+pip install -e ".[dev]"
 
 echo ""
 echo "✅ Bootstrap complete!"
@@ -23,5 +23,4 @@ echo ""
 echo "   Activate:  source .venv/bin/activate"
 echo "   Test:      python -m pytest"
 echo "   Server:    mockvehicle2d serve"
-echo "   Visual:    mockvehicle2d visual"
 echo ""

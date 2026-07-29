@@ -9,14 +9,14 @@ import unittest
 REPO_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO_ROOT / "src"))
 
-from mockvehicle2d.collision import is_circle_passable, is_swept_circle_passable, raycast
+from mockvehicle2d.collision import is_swept_circle_passable
 from mockvehicle2d.map_grid import MapGrid
 from mockvehicle2d.safety import (
     HARD_STOP_CLEARANCE_M,
     SLOW_ZONE_CLEARANCE_M,
     SafetyGovernor,
     SafetyObservation,
-    nearest_edge_clearance,
+    _nearest_edge_evidence,
     nearest_obstacle_clearance,
 )
 from mockvehicle2d.scan import LaserPoint, ScanConfig, scan_grid
@@ -41,10 +41,10 @@ class MapStateSafetyTest(unittest.TestCase):
         grid = MapGrid(6, 4)
         grid.set_cell(3, 1, 2)
 
-        self.assertFalse(is_circle_passable(grid, 3.5, 1.5, 0.4))
+        self.assertFalse(
+            is_swept_circle_passable(grid, 3.5, 1.5, 3.5, 1.5, 0.4)
+        )
         self.assertFalse(is_swept_circle_passable(grid, 1.5, 1.5, 4.5, 1.5, 0.4))
-        self.assertTrue(raycast(grid, 1, 1, 4, 1).hit)
-        self.assertTrue(raycast(grid, 1, 2, 8, 2).hit)
 
     def test_horizontal_tmini_only_returns_walls(self) -> None:
         config = ScanConfig(0.0, 0.0, 1.0, 0.1, 0.05, 8.0)
@@ -88,22 +88,22 @@ class SafetySensingTest(unittest.TestCase):
         grid = MapGrid(8, 6)
         grid.set_cell(5, 3, 2)
 
-        clearance = nearest_edge_clearance(
+        clearance, _ = _nearest_edge_evidence(
             grid, 3.5, 2.5, 0.0, 0.5, vehicle_radius=0.6, lookahead_m=3.0
         )
         self.assertIsNotNone(clearance)
         self.assertAlmostEqual(clearance, 1.15, delta=0.05)
 
-        reverse_clearance = nearest_edge_clearance(
+        reverse_clearance, _ = _nearest_edge_evidence(
             MapGrid(8, 6), 1.5, 2.5, 0.0, -0.5, vehicle_radius=0.5, lookahead_m=2.0
         )
         self.assertIsNotNone(reverse_clearance)
         self.assertAlmostEqual(reverse_clearance, 1.0, delta=0.05)
 
         self.assertIsNone(
-            nearest_edge_clearance(
+            _nearest_edge_evidence(
                 MapGrid(8, 6), 3.5, 2.5, 0.0, 0.5, vehicle_radius=0.4, lookahead_m=2.0
-            )
+            )[0]
         )
 
 

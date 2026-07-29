@@ -66,11 +66,11 @@ def make_runtime(
 
 
 def start_missions(runtime: VehicleRuntime, *missions: GotoMission) -> None:
-    mode, _ = runtime.handle_command(
+    mode = runtime.handle_command(
         ModeCommand(1, ModeAction.SWITCH_TO_AUTO),
         monotonic_now=runtime.vehicle.last_update,
     )
-    pushed, _ = runtime.handle_command(
+    pushed = runtime.handle_command(
         AutoCommand(2, AutoAction.PUSH, tuple(missions)),
         monotonic_now=runtime.vehicle.last_update,
     )
@@ -138,11 +138,15 @@ class TestControllerNavigation(unittest.TestCase):
             GotoMission("detour", "global_map", 26.5, 5.5, 2),
         )
 
+        event_cursor = runtime.controller.latest_event_seq
         terminal_events = []
         first_replan_x = None
         for tick in range(1, 900):
-            frame = runtime.update(tick / 6, tick / 6)
-            terminal_events.extend(frame.events)
+            runtime.update(tick / 6, tick / 6)
+            new_events = runtime.controller.events_after(event_cursor)
+            if new_events:
+                event_cursor = new_events[-1].event_seq
+                terminal_events.extend(new_events)
             if (
                 runtime.controller.navigation.snapshot()["replan_count"]
                 and first_replan_x is None
@@ -163,7 +167,10 @@ class TestControllerNavigation(unittest.TestCase):
             runtime.controller.navigation.snapshot()["replan_count"],
             1,
         )
-        self.assertIn("reached", [event.status for event in terminal_events])
+        self.assertIn(
+            "reached",
+            [event.status for event in terminal_events],
+        )
 
     def test_obstacle_goal_finishes_at_confirmed_safe_stop_within_one_metre(self) -> None:
         grid = MapGrid.from_wall_set(16, 12, {(8, 5)})
@@ -174,12 +181,19 @@ class TestControllerNavigation(unittest.TestCase):
             GotoMission("blocked-goal", "global_map", *requested, 2),
         )
 
-        reached = None
+        event_cursor = runtime.controller.latest_event_seq
         for tick in range(1, 900):
-            frame = runtime.update(tick / 6, tick / 6)
+            runtime.update(tick / 6, tick / 6)
+            new_events = runtime.controller.events_after(event_cursor)
+            if new_events:
+                event_cursor = new_events[-1].event_seq
             reached = next(
-                (event for event in frame.events if event.status == "reached"),
-                reached,
+                (
+                    event
+                    for event in new_events
+                    if event.status == "reached"
+                ),
+                None,
             )
             if reached is not None:
                 break

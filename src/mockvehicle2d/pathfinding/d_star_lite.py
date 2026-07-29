@@ -106,10 +106,6 @@ class DStarLitePlanner:
             "key_modifier_cost": self._key_modifier_cost,
         }
 
-    @property
-    def bounds(self) -> tuple[int, int, int, int] | None:
-        return self._bounds
-
     def planning_budget_allows(self, start: Cell, goal: Cell) -> bool:
         self._validate_cell(start, "start")
         self._validate_cell(goal, "goal")

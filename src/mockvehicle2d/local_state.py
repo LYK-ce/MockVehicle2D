@@ -107,8 +107,6 @@ class PoseEstimate:
             "covariance_diagonal": list(self.covariance),
             "quality": self.quality,
             "timestamp_s": self.timestamp,
-            # Deprecated compatibility alias; value remains Unix seconds.
-            "timestamp": self.timestamp,
             "revision": self.revision,
         }
 
@@ -555,15 +553,6 @@ class LocalMapDelta:
     observed_at: float
     changed_cells: tuple[MapCellUpdate, ...]
 
-    def as_dict(self) -> dict[str, object]:
-        return {
-            "anchor_id": self.anchor_id,
-            "revision": self.revision,
-            "pose_revision": self.pose_revision,
-            "observed_at_s": self.observed_at,
-            "changed_cells": [cell.as_dict() for cell in self.changed_cells],
-        }
-
 
 class ObservedGrid:
     """Sparse, stable ``anchor_map`` occupancy built only from local scans."""
@@ -771,7 +760,6 @@ class AnchoredLocalState:
         self.local_map = ObservedGrid(anchor, resolution_m=map_resolution_m)
         self.scan_matcher = CorrelativeScanMatcher(scan_match_config)
         self.last_scan_match: ScanMatchResult | None = None
-        self.last_map_delta: LocalMapDelta | None = None
 
     @property
     def pose(self) -> PoseEstimate:
@@ -795,14 +783,13 @@ class AnchoredLocalState:
     ) -> LocalMapDelta | None:
         if self.pose.quality == "lost":
             return None
-        self.last_map_delta = self.local_map.integrate_scan(
+        return self.local_map.integrate_scan(
             points,
             self.pose,
             observed_at,
             config,
             forbidden_points_vehicle_m=forbidden_points_vehicle_m,
         )
-        return self.last_map_delta
 
     def match_and_integrate_scan(
         self,

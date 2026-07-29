@@ -30,16 +30,11 @@ Thumbs.db
 
 # Project
 *.log
-docs/instruction/
-scripts/start_llm_server.sh
 
 # Agents
 AGENTS.md
 .zgent/
 .agent-doc/
-
-# Models
-models/
 
 # Local caches & temp
 .mypy_cache/

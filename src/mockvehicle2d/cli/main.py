@@ -96,12 +96,6 @@ def _cmd_serve(args) -> None:
     )
 
 
-def _cmd_visual(_args) -> None:
-    from mockvehicle2d.visual import main as visual_main
-
-    visual_main()
-
-
 def _cmd_pathfind(args) -> None:
     from mockvehicle2d.map_grid import MapGrid
     from mockvehicle2d.pathfinding import a_star_search
@@ -214,7 +208,6 @@ def main() -> None:
     )
     serve.add_argument("--odom-seed", type=_integer, default=0, metavar="INTEGER")
 
-    subcommands.add_parser("visual", help="Launch the local Pygame simulator")
     pathfind = subcommands.add_parser(
         "pathfind",
         help="Run the full-truth A* debug tool",
@@ -242,7 +235,6 @@ def main() -> None:
     args = parser.parse_args()
     commands = {
         "serve": _cmd_serve,
-        "visual": _cmd_visual,
         "pathfind": _cmd_pathfind,
     }
     commands[args.command](args)

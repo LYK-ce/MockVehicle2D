@@ -153,5 +153,4 @@ mockvehicle2d serve \
 ```
 
 Pictor 或其他客户端必须实现
-[WebSocket v4 协议](websocket_protocol.md)。旧的 `cmd`、`drive`、直接 `goto` 和
-自然语言消息不会被接受。
+[WebSocket v4 协议](websocket_protocol.md)。

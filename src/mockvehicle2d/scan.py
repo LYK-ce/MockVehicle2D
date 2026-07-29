@@ -72,7 +72,6 @@ class ScanConfig:
 
 
 TMINI_SCAN_CONFIG = ScanConfig()
-DEFAULT_SCAN_CONFIG = TMINI_SCAN_CONFIG
 
 
 def _first_wall_range(
@@ -126,7 +125,7 @@ def _first_wall_range(
 
 
 def scan_grid(
-    grid: MapGrid, x: float, y: float, yaw: float, config: ScanConfig = DEFAULT_SCAN_CONFIG
+    grid: MapGrid, x: float, y: float, yaw: float, config: ScanConfig = TMINI_SCAN_CONFIG
 ) -> list[LaserPoint]:
     """Cast a full local scan from pose ``(x, y, yaw)`` through ``grid``.
 
@@ -154,7 +153,7 @@ def scan_message(
     y: float,
     yaw: float,
     timestamp: float,
-    config: ScanConfig = DEFAULT_SCAN_CONFIG,
+    config: ScanConfig = TMINI_SCAN_CONFIG,
     points: Iterable[LaserPoint] | None = None,
 ) -> dict[str, object]:
     """Build the JSON-compatible local scan frame used by the WebSocket server."""
@@ -163,7 +162,6 @@ def scan_message(
     return {
         "type": "scan",
         "timestamp_s": timestamp,
-        "ts": timestamp,
         "frame_id": "laser",
         "config": config.as_dict(),
         "points": [point.as_dict() for point in scan_points],

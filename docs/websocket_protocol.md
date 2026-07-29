@@ -16,7 +16,7 @@
 `NaN`、`Infinity`、二进制命令、超过 64 KiB 的消息均无效。每个连接内的 `seq` 是
 无符号 64 位整数且必须严格递增。
 
-旧的 `cmd`、`drive`、直接 `goto`、`nl_command` 和无 `type/seq` 格式不属于 v4。
+除 `mode`、`manual`、`auto` 外的消息类型，以及无 `type/seq` 的格式都不属于 v4。
 
 ## 连接流程
 
@@ -37,7 +37,6 @@ Client ◄──── mission_update ───── Vehicle  （有状态变�
 {
   "type": "error",
   "timestamp_s": 1717800000.1,
-  "ts": 1717800000.1,
   "seq": null,
   "code": "vehicle_busy",
   "message": "another controller owns the vehicle lease"
@@ -158,7 +157,6 @@ Auto → Manual 暂停并保留任务。Manual → Auto 若有保留任务仍停
 {
   "type": "command_ack",
   "timestamp_s": 1717800000.2,
-  "ts": 1717800000.2,
   "seq": 5,
   "command": {"type": "auto", "action": "push"},
   "accepted": true,
@@ -198,7 +196,6 @@ Auto → Manual 暂停并保留任务。Manual → Auto 若有保留任务仍停
   "event_epoch": "c1df10b7f5cd48a5a4850665b16bb1f8",
   "event_seq": 42,
   "timestamp_s": 1717800000.3,
-  "ts": 1717800000.3,
   "mission_id": "goto-001",
   "submitted_seq": 5,
   "status": "blocked",
@@ -225,7 +222,7 @@ Auto → Manual 暂停并保留任务。Manual → Auto 若有保留任务仍停
 `(event_epoch, event_seq)` 去重；epoch 变化时清除旧的 sequence 游标。
 
 当前 simulator 为便于验证可靠性，保留本进程的全部任务事件；进程重启后 ledger 和
-序号都会清空。`timestamp_s`/`ts` 是本次发送时间，重放时可能变化，事件身份只能使用
+序号都会清空。`timestamp_s` 是本次发送时间，重放时可能变化，事件身份只能使用
 `(event_epoch, event_seq)`。
 
 状态及触发：
@@ -320,7 +317,6 @@ cell 状态：`0` 可通行、`1` 墙、`2` 无地面/落差。客户端用
 {
   "type": "pose",
   "timestamp_s": 1717800000.4,
-  "ts": 1717800000.4,
   "seq": 12,
   "source": "anchored_odometry",
   "frame_id": "global_map",
@@ -390,7 +386,6 @@ cell 状态：`0` 可通行、`1` 墙、`2` 无地面/落差。客户端用
 {
   "type": "scan",
   "timestamp_s": 1717800000.4,
-  "ts": 1717800000.4,
   "seq": 12,
   "frame_id": "laser",
   "config": {
@@ -424,7 +419,6 @@ Forbidden 证据。
 {
   "type": "error",
   "timestamp_s": 1717800000.5,
-  "ts": 1717800000.5,
   "seq": 9,
   "code": "invalid_fields",
   "message": "command has missing or unexpected fields"
@@ -441,7 +435,3 @@ invalid_type, invalid_action, invalid_fields, invalid_number
 drive_out_of_range, invalid_missions, mission_batch_too_large
 duplicate_mission_id, invalid_mission, invalid_mission_type, goal_out_of_range
 ```
-
-可选的 `mockvehicle2d.instruction.dispatcher` 可以把已校验意图转换为单条合法 v4
-命令，但它不是 WebSocket 消息类型。Server 不接受旧 `nl_command`，翻译器也不会
-隐式切换模式或绕过 `RobotController`。

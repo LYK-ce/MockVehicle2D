@@ -12,7 +12,6 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-visual = ["pygame"]
 hardware = ["pyserial", "numpy", "matplotlib"]
 dev = ["pytest"]
 
