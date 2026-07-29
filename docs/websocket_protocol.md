@@ -381,6 +381,95 @@ WebSocket 连接崩溃。
 和 `patrol`。v1/v2 中的 `goto_point`、`move_distance`、`status`、`rotate` 和
 `scan_report` 已废弃，不是当前支持接口；旧 schema 文件仅保留作历史参考。
 
+服务端收到 `nl_command` 后，将 v3 意图 JSON **自动翻译为函数调用和 Robot Controller
+协议命令**，并在所有 NL 相关回复中携带翻译产物。翻译层是确定性查表，不依赖 LLM。
+
+#### nl_parse_result（新增字段）
+
+```json
+{
+    "type": "nl_parse_result",
+    "ts": 1717800000.500,
+    "seq": 42,
+    "accepted": true,
+    "instruction": {"intent": "goto", "parameters": {"x_m": 100, "y_m": 200}},
+    "function_call": {
+        "name": "goto",
+        "arguments": {"x_m": 100, "y_m": 200}
+    },
+    "command": {
+        "cmd": "auto",
+        "action": "push",
+        "missions": [{"type": "goto", "x_m": 100, "y_m": 200}]
+    },
+    "sequence_index": 1,
+    "sequence_total": 2
+}
+```
+
+| 字段 | 类型 | 说明 |
+|------|------|------|
+| `instruction` | object | 原始 v3 意图 JSON，向后兼容 |
+| `function_call` | object | **新增**。翻译后的函数调用 `{"name": "...", "arguments": {...}}` |
+| `command` | object | **新增**。Robot Controller 协议命令 |
+| `sequence_index` | int | 多指令序列中的序号（1-based） |
+| `sequence_total` | int | 多指令序列中的总数 |
+
+#### nl_task_update（新增字段）
+
+```json
+{
+    "type": "nl_task_update",
+    "ts": 1717800000.600,
+    "seq": 42,
+    "status": "active",
+    "reason": "navigating to (100, 200)",
+    "function_call": {
+        "name": "goto",
+        "arguments": {"x_m": 100, "y_m": 200}
+    },
+    "command": {
+        "cmd": "auto",
+        "action": "push",
+        "missions": [{"type": "goto", "x_m": 100, "y_m": 200}]
+    },
+    "sequence_index": 1,
+    "sequence_total": 2
+}
+```
+
+`function_call` 和 `command` 字段在 task 生命周期内保留，包括 `completed`、
+`blocked`、`cancelled` 状态。
+
+#### nl_confirm_request（新增字段）
+
+```json
+{
+    "type": "nl_confirm_request",
+    "ts": 1717800000.400,
+    "seq": 42,
+    "question": "请指定目标坐标",
+    "missing": ["x_m", "y_m"],
+    "instruction": {"intent": "clarify", "parameters": {"question": "请指定目标坐标", "missing_parameters": ["x_m", "y_m"]}},
+    "function_call": {
+        "name": "clarify",
+        "arguments": {"question": "请指定目标坐标", "missing_parameters": ["x_m", "y_m"]}
+    },
+    "command": null
+}
+```
+
+`clarify` 对应的 `command` 始终为 `null`（不需要 Robot Controller 命令）。
+
+#### v3 intent → command 翻译规则
+
+| v3 intent | → function_call | → command |
+|-----------|----------------|-----------|
+| `stop` | `{"name": "stop", "arguments": {}}` | `{"cmd": "manual", "action": "stop"}` |
+| `goto` | `{"name": "goto", "arguments": {"x_m":..., "y_m":...}}` | `{"cmd": "auto", "action": "push", "missions": [{"type": "goto", "x_m":..., "y_m":...}]}` |
+| `patrol` | `{"name": "patrol", "arguments": {}}` | `{"cmd": "auto", "action": "push", "missions": [{"type": "patrol"}]}` |
+| `clarify` | `{"name": "clarify", "arguments": {"question":..., ...}}` | `null` |
+
 ### cmd_ack — 命令确认
 
 ```json
