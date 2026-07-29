@@ -79,7 +79,7 @@ class LLMClient:
         model: str = "Qwen3-8B-Q4_K_M",
         max_retries: int = 3,
         schema_validator=None,
-        enable_thinking: bool = True,
+        enable_thinking: bool = False,
     ) -> None:
         self._base_url = base_url
         self._model = model

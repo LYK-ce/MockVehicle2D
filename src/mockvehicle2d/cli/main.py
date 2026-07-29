@@ -306,7 +306,7 @@ def _cmd_nl(args):
     sys.exit(0 if all_valid else 1)
 
 
-def _run_eval(dataset, schema_v, semantic_v, enable_thinking=True):
+def _run_eval(dataset, schema_v, semantic_v, enable_thinking=False):
     """Run offline evaluation: compare LLMClient parse vs expected.
 
     expected can be a single dict or a list of dicts for multi-instruction cases.
@@ -475,8 +475,8 @@ def main():
                         help="Path to evaluation dataset JSON")
     nl_cmd.add_argument("--model", type=str, default="Qwen3-8B-Q4_K_M", metavar="MODEL",
                          help="Model name for LLMClient (default: Qwen3-8B-Q4_K_M)")
-    nl_cmd.add_argument("--think", action="store_true", default=True,
-                        help="Enable thinking mode (default: on)")
+    nl_cmd.add_argument("--think", action="store_true", default=False,
+                        help="Enable thinking mode (default: off)")
     nl_cmd.add_argument("--no-think", action="store_false", dest="think",
                         help="Disable thinking mode")
 
