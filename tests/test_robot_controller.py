@@ -54,6 +54,7 @@ class Harness:
         )
         self.safety = LocalSafetyRuntime()
         self.controller = RobotController(mission_capacity=capacity)
+        self.event_cursor = 0
 
     def mode(self, seq: int, action: ModeAction):
         return self.controller.handle(
@@ -122,6 +123,12 @@ class Harness:
             now=now,
         )
 
+    def events(self):
+        events = self.controller.events_after(self.event_cursor)
+        if events:
+            self.event_cursor = events[-1].event_seq
+        return events
+
 
 def mission(
     mission_id: str,
@@ -173,7 +180,7 @@ def case_manual_takeover_preserves_missions_and_requires_explicit_resume() -> No
     harness.tick(0.0)
     assert harness.controller.active_mission.mission_id == "first"
     assert harness.controller.auto_state is AutoState.ACTIVE
-    harness.controller.drain_events()
+    harness.events()
 
     harness.mode(3, ModeAction.SWITCH_TO_MANUAL)
     assert harness.controller.mode is OpMode.MANUAL
@@ -181,13 +188,13 @@ def case_manual_takeover_preserves_missions_and_requires_explicit_resume() -> No
     assert harness.controller.active_mission.mission_id == "first"
     assert harness.controller.snapshot()["mission_queue"]["mission_ids"] == ["second"]
     assert harness.vehicle.body_velocities() == (0.0, 0.0)
-    paused = harness.controller.drain_events()
+    paused = harness.events()
     assert [(event.mission.mission_id, event.status) for event in paused] == [
         ("first", "paused")
     ]
 
     harness.mode(4, ModeAction.SWITCH_TO_AUTO)
-    assert harness.controller.drain_events() == ()
+    assert harness.events() == ()
     harness.tick(0.1)
     assert harness.controller.auto_state is AutoState.PAUSED
     assert harness.vehicle.body_velocities() == (0.0, 0.0)
@@ -211,7 +218,7 @@ def case_push_is_atomic_bounded_and_mission_ids_are_idempotent() -> None:
         (mission("one", 11.0), mission("two", 12.0)),
     )
     assert accepted.accepted
-    harness.controller.drain_events()
+    harness.events()
 
     duplicate = harness.auto(
         3,
@@ -220,7 +227,7 @@ def case_push_is_atomic_bounded_and_mission_ids_are_idempotent() -> None:
     )
     assert duplicate.accepted
     assert duplicate.reason is None
-    assert harness.controller.drain_events() == ()
+    assert harness.events() == ()
 
     conflict = harness.auto(
         4,
@@ -243,6 +250,47 @@ def case_push_is_atomic_bounded_and_mission_ids_are_idempotent() -> None:
     ]
 
 
+def case_mission_ids_remain_idempotent_for_the_process_lifetime() -> None:
+    harness = Harness(capacity=1)
+    harness.mode(1, ModeAction.SWITCH_TO_AUTO)
+    for index in range(1100):
+        pushed = harness.auto(
+            index * 2 + 2,
+            AutoAction.PUSH,
+            (mission(f"history-{index}", 11.0, seq=index * 2 + 2),),
+        )
+        assert pushed.accepted
+        harness.auto(index * 2 + 3, AutoAction.CANCEL_ALL)
+        harness.events()
+
+    retry = harness.auto(
+        3000,
+        AutoAction.PUSH,
+        (mission("history-0", 11.0, seq=3000),),
+    )
+    assert retry.accepted
+    assert harness.events() == ()
+
+    conflict = harness.auto(
+        3001,
+        AutoAction.PUSH,
+        (mission("history-0", 12.0, seq=3001),),
+    )
+    assert not conflict.accepted
+    assert conflict.reason == "mission_id_conflict"
+
+
+def case_pause_without_outstanding_missions_stays_idle() -> None:
+    harness = Harness()
+    harness.mode(1, ModeAction.SWITCH_TO_AUTO)
+
+    result = harness.auto(2, AutoAction.PAUSE)
+
+    assert result.accepted
+    assert harness.controller.auto_state is AutoState.IDLE
+    assert harness.events() == ()
+
+
 def case_cancel_all_cancels_active_and_pending_missions() -> None:
     harness = Harness(capacity=3)
     harness.mode(1, ModeAction.SWITCH_TO_AUTO)
@@ -251,12 +299,12 @@ def case_cancel_all_cancels_active_and_pending_missions() -> None:
         AutoAction.PUSH,
         (mission("one", 14.0), mission("two", 18.0)),
     )
-    harness.controller.drain_events()
+    harness.events()
     harness.tick(0.0)
-    harness.controller.drain_events()
+    harness.events()
 
     result = harness.auto(3, AutoAction.CANCEL_ALL)
-    events = harness.controller.drain_events()
+    events = harness.events()
     assert result.accepted
     assert [event.mission.mission_id for event in events] == ["one", "two"]
     assert {event.status for event in events} == {"cancelled"}
@@ -306,12 +354,12 @@ def case_zero_distance_missions_complete_in_queue_order() -> None:
         AutoAction.PUSH,
         (mission("one", 10.0), mission("two", 10.0)),
     )
-    harness.controller.drain_events()
+    harness.events()
 
     harness.tick(0.0)
-    first = harness.controller.drain_events()
+    first = harness.events()
     harness.tick(0.1)
-    second = harness.controller.drain_events()
+    second = harness.events()
 
     assert [(event.mission.mission_id, event.status) for event in first] == [
         ("one", "active"),
@@ -381,7 +429,7 @@ def case_stop_motion_is_global_task_preserving_and_idempotent() -> None:
     assert harness.vehicle.body_velocities() == (0.0, 0.0)
     assert not harness.controller.snapshot()["manual_setpoint_active"]
     assert harness.mode(3, ModeAction.STOP_MOTION).accepted
-    assert harness.controller.drain_events() == ()
+    assert harness.events() == ()
 
     harness.mode(4, ModeAction.SWITCH_TO_AUTO)
     harness.auto(
@@ -390,7 +438,7 @@ def case_stop_motion_is_global_task_preserving_and_idempotent() -> None:
         (mission("active", 14.0), mission("queued", 18.0)),
     )
     harness.tick(0.0)
-    harness.controller.drain_events()
+    harness.events()
 
     assert harness.mode(6, ModeAction.STOP_MOTION).accepted
     assert harness.controller.mode is OpMode.AUTO
@@ -400,13 +448,13 @@ def case_stop_motion_is_global_task_preserving_and_idempotent() -> None:
         "queued"
     ]
     assert harness.vehicle.body_velocities() == (0.0, 0.0)
-    paused = harness.controller.drain_events()
+    paused = harness.events()
     assert [(event.status, event.reason) for event in paused] == [
         ("paused", "stop_motion")
     ]
 
     assert harness.mode(7, ModeAction.STOP_MOTION).accepted
-    assert harness.controller.drain_events() == ()
+    assert harness.events() == ()
 
 
 def case_resume_is_idempotent_while_auto_is_active() -> None:
@@ -414,7 +462,7 @@ def case_resume_is_idempotent_while_auto_is_active() -> None:
     harness.mode(1, ModeAction.SWITCH_TO_AUTO)
     harness.auto(2, AutoAction.PUSH, (mission("active", 14.0),))
     harness.tick(0.0)
-    harness.controller.drain_events()
+    harness.events()
     before = (
         harness.controller.active_mission,
         harness.controller.navigation.snapshot(),
@@ -428,7 +476,7 @@ def case_resume_is_idempotent_while_auto_is_active() -> None:
         harness.vehicle.body_velocities(),
     )
     assert after == before
-    assert harness.controller.drain_events() == ()
+    assert harness.events() == ()
 
 
 class TestRobotController(unittest.TestCase):
@@ -441,6 +489,12 @@ class TestRobotController(unittest.TestCase):
     )
     test_atomic_queue = staticmethod(
         case_push_is_atomic_bounded_and_mission_ids_are_idempotent
+    )
+    test_process_lifetime_idempotency = staticmethod(
+        case_mission_ids_remain_idempotent_for_the_process_lifetime
+    )
+    test_pause_while_idle = staticmethod(
+        case_pause_without_outstanding_missions_stays_idle
     )
     test_cancel_all = staticmethod(case_cancel_all_cancels_active_and_pending_missions)
     test_blocked_queue = staticmethod(

@@ -85,11 +85,6 @@ class Vehicle:
         if not self.advance(grid, now):
             self._install_velocities(linear, angular, now, "drive")
 
-    def install_command(self, command: str, now: float) -> None:
-        """Install a discrete command after the vehicle has already advanced to ``now``."""
-        linear, angular = self.velocities_for_command(command)
-        self._install_velocities(linear, angular, now, command)
-
     def install_drive(self, linear_mps: float, angular_rps: float, now: float) -> None:
         """Install bounded velocities after the vehicle has already advanced to ``now``."""
         linear, angular = self._validated_drive_velocities(linear_mps, angular_rps)

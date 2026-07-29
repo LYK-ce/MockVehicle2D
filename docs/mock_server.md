@@ -70,6 +70,8 @@ AutoState
 | 控制连接断开 | 停车；自动任务暂停；释放独占连接 |
 | 非法协议输入 | 停车；自动任务暂停，原因 `invalid_command` |
 
+在 `Auto/Idle` 且没有活动或排队任务时，`pause` 保持 Idle，不产生虚假的预暂停状态。
+
 ## 一帧的执行顺序
 
 Server 以 Tmini 名义扫描周期（约 6 Hz）执行：
@@ -102,13 +104,20 @@ Auto `push` 只写入任务队列。控制帧启动当前 `goto`，将 `global_m
 不直接控制车辆。到达、阻断、暂停和取消都通过 `mission_update` 明确发布。
 
 同一 `mission_id` 和同一目标可用新的 `seq` 安全重试；不会生成第二个任务。相同 ID
-对应不同目标会返回 `mission_id_conflict`。
+对应不同目标会返回 `mission_id_conflict`。该记录在 Server 进程生命周期内永久保留，
+不会因任务数量增加而静默淘汰；进程重启会清空，因为模拟器当前不提供持久化。
 Auto 已为 Active 时重复 `resume` 也是幂等操作，不会重启 D* 搜索。
 
 ## 连接与故障语义
 
 - 一个 Runtime 同时只允许一个控制 WebSocket；其他连接收到 `vehicle_busy`。
 - `hello` 是业务首帧，声明协议版本、控制租约、任务坐标系、地图元数据和控制器快照。
+- `RobotController` 先把任务状态变化写入进程内 event ledger，再由 Server 发送。
+  每个事件有 `event_epoch` 和严格递增的 `event_seq`；只有 WebSocket `send` 成功后，
+  本连接游标才前移。
+- 新连接在 `hello` 后自动按序重放本进程的全部任务事件。重连可能产生重复传输，客户端
+  按稳定的 `(event_epoch, event_seq)` 幂等去重；事件不会因 pose、scan、ack 或事件
+  发送失败而丢失。Server 进程重启后 epoch 会变化。
 - JSON 发送和二进制地图 chunk 均有超时，慢客户端不会无限占用控制循环。
 - 连接断开不删除 odometry、本地地图、活动任务或队列；车辆停车并把自动状态设为
   `Paused`。

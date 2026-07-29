@@ -262,21 +262,6 @@ class LocalSafetyRuntime:
         )
         return self.decision
 
-    def enforce_manual(
-        self,
-        vehicle: Vehicle,
-        grid: MapGrid,
-        desired: tuple[float, float] | None = None,
-    ) -> SafetyDecision:
-        """Apply hard manual safety; a stopped latch is changed only by a new command."""
-        velocities = vehicle.body_velocities() if desired is None else desired
-        if desired is None and velocities == (0.0, 0.0):
-            return self.decision
-        decision = self.evaluate(vehicle, grid, *velocities, automatic=False)
-        if decision.state in {"stopped", "fault"}:
-            vehicle.stop()
-        return decision
-
     def advance(
         self,
         vehicle: Vehicle,

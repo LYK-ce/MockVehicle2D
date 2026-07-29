@@ -96,15 +96,20 @@ mockvehicle2d pathfind --start-m 10,10 --goal-m 200,200
   `command-timeout-s` 内持续刷新，松手发送 `stop`。
 - Auto → Manual 会暂停当前任务并保留队列；切回 Auto 后仍为 `paused`，需要显式
   `resume`。
-- `pause` 保留活动任务和队列；`cancel_all` 才会清空它们。
+- `pause` 保留活动任务和队列；没有活动或排队任务时保持 `Idle`；`cancel_all`
+  才会清空任务。
 - Auto 已在执行时重复 `resume` 是无副作用操作，不会停车或重启规划。
-- `mission_id` 是幂等键。相同 ID 和相同目标的重试不会重复入队；相同 ID 携带不同目标
-  会被拒绝。
+- `mission_id` 在 Server 进程生命周期内是永久幂等键。相同 ID 和相同目标的重试不会
+  重复入队；相同 ID 携带不同目标会被拒绝。进程重启后该内存状态会清空。
 - 控制连接断开时车辆立即停车，自动任务暂停而不是丢弃；重连后可显式恢复。
 - 非法输入触发故障停车；活动自动任务进入暂停状态。
 
 每条合法命令先收到 `command_ack`。自动任务另外通过 `mission_update` 报告
 `queued`、`active`、`paused`、`reached`、`blocked` 和 `cancelled`。
+每个任务事件携带 `event_epoch` 和进程内严格递增的 `event_seq`。Server 保留本进程
+产生的全部任务事件，连接建立后按顺序自动重放；断线重连可能再次收到已经处理过的
+事件，客户端应按 `(event_epoch, event_seq)` 幂等去重。命令 ack 只确认命令是否受理，
+任务结果以事件为准。
 完整字段见 [WebSocket 协议](docs/websocket_protocol.md)。
 
 ## 自主导航

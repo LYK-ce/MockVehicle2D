@@ -305,7 +305,7 @@ class TestControllerNavigation(unittest.TestCase):
         self.assertEqual(vehicle.body_velocities(), (0.0, 0.0))
         too_far_events = [
             event
-            for event in controller.drain_events()
+            for event in controller.events_after(0)
             if event.mission.mission_id == "too-far"
         ]
         self.assertEqual(

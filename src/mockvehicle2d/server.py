@@ -17,7 +17,6 @@ from mockvehicle2d.controller import Command, ControllerEvent, RobotController
 from mockvehicle2d.local_state import (
     AnchorSpec,
     AnchoredLocalState,
-    LocalMapDelta,
     OdometryConfig,
 )
 from mockvehicle2d.map_grid import MapGrid, VOID
@@ -50,7 +49,6 @@ VEHICLE_ID_PATTERN = re.compile(r"[A-Za-z0-9._-]{1,64}")
 @dataclass(frozen=True)
 class RuntimeFrame:
     scan_points: tuple[LaserPoint, ...]
-    map_delta: LocalMapDelta | None
     timestamp: float
     events: tuple[ControllerEvent, ...]
 
@@ -93,6 +91,7 @@ class VehicleRuntime:
         monotonic_now: float,
     ):
         self.advance_to(monotonic_now)
+        event_seq = self.controller.latest_event_seq
         result = self.controller.handle(
             command,
             vehicle=self.vehicle,
@@ -100,15 +99,17 @@ class VehicleRuntime:
             safety=self.safety,
             now=monotonic_now,
         )
-        return result, self.controller.drain_events()
+        return result, self.controller.events_after(event_seq)
 
     def fail_safe_stop(self, monotonic_now: float) -> tuple[ControllerEvent, ...]:
         self.advance_to(monotonic_now)
+        event_seq = self.controller.latest_event_seq
         self.controller.fail_safe_stop(self.vehicle, "invalid_command")
-        return self.controller.drain_events()
+        return self.controller.events_after(event_seq)
 
     def update(self, monotonic_now: float, wall_timestamp: float) -> RuntimeFrame:
         self.advance_to(monotonic_now)
+        event_seq = self.controller.latest_event_seq
         advance_result = self._pending_advance
         self._pending_advance = SafetyAdvanceResult()
         scan_points = tuple(
@@ -149,9 +150,8 @@ class VehicleRuntime:
         )
         return RuntimeFrame(
             scan_points,
-            map_delta,
             wall_timestamp,
-            self.controller.drain_events(),
+            self.controller.events_after(event_seq),
         )
 
     @classmethod
@@ -371,13 +371,16 @@ async def _send_map_chunks(websocket, chunks: list[bytes]) -> None:
         await asyncio.wait_for(websocket.send(chunk), timeout=SEND_TIMEOUT_S)
 
 
-async def _send_events(
+async def _send_pending_events(
     websocket,
-    events: tuple[ControllerEvent, ...],
+    controller: RobotController,
+    after_event_seq: int,
     timestamp: float,
-) -> None:
-    for event in events:
+) -> int:
+    for event in controller.events_after(after_event_seq):
         await _send_json(websocket, event.as_dict(timestamp))
+        after_event_seq = event.event_seq
+    return after_event_seq
 
 
 async def handler(
@@ -440,6 +443,7 @@ async def handler(
                 _localization_quality,
                 timestamp=_wall_time(),
             )
+        timestamp = _wall_time()
         await _send_json(
             websocket,
             {
@@ -451,6 +455,12 @@ async def handler(
                 "map": _map_metadata(runtime.grid, runtime.local_state.anchor),
                 "controller": runtime.controller.snapshot(),
             },
+        )
+        event_cursor = await _send_pending_events(
+            websocket,
+            runtime.controller,
+            0,
+            timestamp,
         )
         await _send_map_chunks(websocket, _encode_map_chunks(runtime.voxels, 256))
 
@@ -464,7 +474,12 @@ async def handler(
                 pose, scan = telemetry_messages(runtime, frame)
                 await _send_json(websocket, pose)
                 await _send_json(websocket, scan)
-                await _send_events(websocket, frame.events, timestamp)
+                event_cursor = await _send_pending_events(
+                    websocket,
+                    runtime.controller,
+                    event_cursor,
+                    timestamp,
+                )
                 runtime.frame_sequence += 1
                 next_deadline = _next_deadline(
                     next_deadline,
@@ -496,7 +511,7 @@ async def handler(
                         command.seq,
                     )
                 last_seq = command.seq
-                result, events = runtime.handle_command(
+                result, _ = runtime.handle_command(
                     command,
                     monotonic_now=_monotonic(),
                 )
@@ -509,11 +524,21 @@ async def handler(
                         controller=runtime.controller.snapshot(),
                     ),
                 )
-                await _send_events(websocket, events, timestamp)
+                event_cursor = await _send_pending_events(
+                    websocket,
+                    runtime.controller,
+                    event_cursor,
+                    timestamp,
+                )
             except ProtocolError as error:
-                events = runtime.fail_safe_stop(_monotonic())
+                runtime.fail_safe_stop(_monotonic())
                 await _send_json(websocket, error_message(error, timestamp=timestamp))
-                await _send_events(websocket, events, timestamp)
+                event_cursor = await _send_pending_events(
+                    websocket,
+                    runtime.controller,
+                    event_cursor,
+                    timestamp,
+                )
     except Exception as error:
         print(f"[!] controller connection ended: {error}")
     finally:

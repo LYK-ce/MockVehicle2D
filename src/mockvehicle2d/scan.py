@@ -2,7 +2,6 @@
 
 from dataclasses import dataclass
 import math
-from numbers import Real
 from typing import Iterable
 
 from mockvehicle2d.map_grid import MapGrid
@@ -74,43 +73,6 @@ class ScanConfig:
 
 TMINI_SCAN_CONFIG = ScanConfig()
 DEFAULT_SCAN_CONFIG = TMINI_SCAN_CONFIG
-
-
-def _finite_real(value: object) -> float | None:
-    if isinstance(value, bool) or not isinstance(value, Real):
-        return None
-    try:
-        value = float(value)
-    except (OverflowError, ValueError):
-        return None
-    return value if math.isfinite(value) else None
-
-
-def scan_sector(angle_rad: object) -> str | None:
-    """Return the clockwise 90° sector, or ``None`` for an invalid angle."""
-
-    angle = _finite_real(angle_rad)
-    if angle is None:
-        return None
-    angle = math.remainder(angle, math.tau)
-    magnitude = abs(angle)
-    if magnitude <= math.pi / 4:
-        return "front"
-    if magnitude >= 3 * math.pi / 4:
-        return "back"
-    return "right" if angle > 0 else "left"
-
-
-def scan_summary_sample(point: object) -> tuple[str, float] | None:
-    """Return a valid positive range and its sector for scan summaries."""
-
-    if not isinstance(point, dict):
-        return None
-    sector = scan_sector(point.get("angle"))
-    range_m = _finite_real(point.get("range"))
-    if sector is None or range_m is None or range_m <= 0:
-        return None
-    return sector, range_m
 
 
 def _first_wall_range(

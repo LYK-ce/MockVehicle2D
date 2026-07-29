@@ -23,6 +23,7 @@
 ```text
 Client ── WebSocket handshake ──► Vehicle
 Client ◄──────── hello ────────── Vehicle
+Client ◄── retained mission_update ─ Vehicle  （按 event_seq 重放）
 Client ◄──── binary map chunks ── Vehicle
 Client ◄──── pose + scan ──────── Vehicle  （约 6 Hz）
 Client ─────── command ─────────► Vehicle
@@ -43,8 +44,9 @@ Client ◄──── mission_update ───── Vehicle  （有状态变�
 }
 ```
 
-断开会立即停车并释放租约。odometry、本地地图、活动任务和待执行队列保留；自动状态
-变为 `paused`。重连后由 `hello.controller` 恢复 UI，再显式 `resume`。
+断开会立即停车并释放租约。odometry、本地地图、活动任务和待执行队列保留；有未完成
+任务时自动状态变为 `paused`。重连后由 `hello.controller` 恢复当前状态，随后 Server
+按 `event_seq` 重放本进程保留的全部任务事件，再显式 `resume`。
 
 ## 下行命令
 
@@ -126,6 +128,8 @@ Auto → Manual 暂停并保留任务。Manual → Auto 若有保留任务仍停
 - 已知 `mission_id` 携带不同目标时返回 `mission_id_conflict`。
 
 客户端重试时必须使用新的、更大的命令 `seq`，但沿用原 `mission_id`。
+幂等记录在 Server 进程生命周期内不会静默淘汰；进程重启后内存记录清空，不提供
+跨重启幂等或持久化恢复。
 
 ### 自动任务控制
 
@@ -143,6 +147,8 @@ Auto → Manual 暂停并保留任务。Manual → Auto 若有保留任务仍停
 
 任务 `blocked` 后不会自动跳到下一项。控制端可以修复条件后 `resume` 重试，或
 `cancel_all` 放弃整批任务。
+
+没有活动任务和待执行任务时，`pause` 是无副作用操作，状态保持 `Auto/Idle`。
 
 ## 命令确认
 
@@ -189,6 +195,8 @@ Auto → Manual 暂停并保留任务。Manual → Auto 若有保留任务仍停
 ```json
 {
   "type": "mission_update",
+  "event_epoch": "c1df10b7f5cd48a5a4850665b16bb1f8",
+  "event_seq": 42,
   "timestamp_s": 1717800000.3,
   "ts": 1717800000.3,
   "mission_id": "goto-001",
@@ -208,6 +216,17 @@ Auto → Manual 暂停并保留任务。Manual → Auto 若有保留任务仍停
   }
 }
 ```
+
+`event_epoch` 标识当前内存 ledger，Server 进程重启后变化；`event_seq` 从 1 开始，
+在该 epoch 内严格递增且不复用。事件先写入
+`RobotController` 的进程内 ledger，再尝试发送；发送失败不会删除事件。一个连接内只按
+递增顺序发送尚未发送的事件。重连会从 ledger 起点自动重放，因此传输语义是
+**at-least-once**：跨连接可能重复，但不会改变事件身份或乱序。客户端必须按
+`(event_epoch, event_seq)` 去重；epoch 变化时清除旧的 sequence 游标。
+
+当前 simulator 为便于验证可靠性，保留本进程的全部任务事件；进程重启后 ledger 和
+序号都会清空。`timestamp_s`/`ts` 是本次发送时间，重放时可能变化，事件身份只能使用
+`(event_epoch, event_seq)`。
 
 状态及触发：
 
@@ -268,7 +287,12 @@ Auto → Manual 暂停并保留任务。Manual → Auto 若有保留任务仍停
   },
   "controller": {
     "mode": "manual",
-    "auto_state": "idle"
+    "auto_state": "idle",
+    "mission_events": {
+      "event_epoch": "c1df10b7f5cd48a5a4850665b16bb1f8",
+      "latest_event_seq": 0,
+      "retention": "process_lifetime"
+    }
   }
 }
 ```

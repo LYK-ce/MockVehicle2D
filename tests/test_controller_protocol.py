@@ -14,6 +14,7 @@ sys.path.insert(0, str(REPO_ROOT / "src"))
 from mockvehicle2d.controller import (
     AutoAction,
     AutoCommand,
+    GotoMission,
     ManualAction,
     ManualCommand,
     ModeAction,
@@ -83,6 +84,97 @@ class Clock:
 
     def monotonic(self) -> float:
         return self.now
+
+
+class EventSocket:
+    remote_address = ("test", 0)
+
+    def __init__(
+        self,
+        commands: list[str] | None = None,
+        *,
+        fail_type: str | None = None,
+        fail_status: str | None = None,
+        record_failure: bool = False,
+        clock: Clock | None = None,
+        advance_after_commands: float | None = None,
+    ) -> None:
+        self.commands = iter(commands or ())
+        self.fail_type = fail_type
+        self.fail_status = fail_status
+        self.record_failure = record_failure
+        self.clock = clock
+        self.advance_after_commands = advance_after_commands
+        self.messages: list[dict[str, object]] = []
+
+    async def send(self, payload: str | bytes) -> None:
+        if isinstance(payload, bytes):
+            return
+        message = json.loads(payload)
+        failed = message["type"] == self.fail_type or (
+            message["type"] == "mission_update"
+            and message.get("status") == self.fail_status
+        )
+        if not failed or self.record_failure:
+            self.messages.append(message)
+        if failed:
+            raise ConnectionError("injected send failure")
+
+    async def recv(self) -> str:
+        try:
+            return next(self.commands)
+        except StopIteration:
+            if self.clock is not None and self.advance_after_commands is not None:
+                self.clock.now = self.advance_after_commands
+                raise asyncio.TimeoutError
+            raise
+
+
+def active_runtime(anchor_id: str) -> VehicleRuntime:
+    runtime = VehicleRuntime.create(
+        started_at=0.0,
+        timestamp=0.0,
+        anchor=AnchorSpec(anchor_id, 10.0, 10.0, 0.0),
+        odometry_config=OdometryConfig(),
+    )
+    mode, _ = runtime.handle_command(
+        ModeCommand(1, ModeAction.SWITCH_TO_AUTO),
+        monotonic_now=0.0,
+    )
+    pushed, _ = runtime.handle_command(
+        AutoCommand(
+            2,
+            AutoAction.PUSH,
+            (GotoMission("active", "global_map", 12.0, 10.0, 2),),
+        ),
+        monotonic_now=0.0,
+    )
+    runtime.update(0.0, 0.0)
+    assert mode.accepted and pushed.accepted
+    return runtime
+
+
+def serve_socket(
+    socket: EventSocket,
+    runtime: VehicleRuntime,
+    clock: Clock,
+) -> None:
+    asyncio.run(
+        handler(
+            socket,
+            _runtime=runtime,
+            _monotonic=clock.monotonic,
+            _wall_time=clock.monotonic,
+        )
+    )
+
+
+def mission_updates(socket: EventSocket) -> list[dict[str, object]]:
+    return [
+        message
+        for message in socket.messages
+        if message["type"] == "mission_update"
+    ]
 
 
 class TestControllerProtocol(unittest.TestCase):
@@ -225,6 +317,10 @@ class TestControllerProtocol(unittest.TestCase):
         )
         self.assertEqual(hello["protocol_version"], 4)
         self.assertEqual(hello["controller"]["mode"], "manual")
+        event_info = hello["controller"]["mission_events"]
+        self.assertEqual(event_info["latest_event_seq"], 0)
+        self.assertEqual(event_info["retention"], "process_lifetime")
+        self.assertRegex(event_info["event_epoch"], r"^[0-9a-f]{32}$")
         self.assertEqual(
             (pose["seq"], pose["timestamp_s"]),
             (scan["seq"], scan["timestamp_s"]),
@@ -336,6 +432,124 @@ class TestControllerProtocol(unittest.TestCase):
             stopped["controller"]["mission_queue"]["mission_ids"],
             ["hold"],
         )
+
+    def test_reconnect_replays_command_path_result_after_send_failure(self) -> None:
+        runtime = VehicleRuntime.create(
+            started_at=0.0,
+            timestamp=0.0,
+            anchor=AnchorSpec("event-command", 10.0, 10.0, 0.0),
+            odometry_config=OdometryConfig(),
+        )
+        clock = Clock()
+        first = EventSocket(
+            [
+                '{"type":"mode","seq":1,"action":"switch_to_auto"}',
+                '{"type":"auto","seq":2,"action":"push","missions":['
+                '{"mission_id":"cancel-me","type":"goto",'
+                '"frame_id":"global_map","x_m":12,"y_m":10}]}',
+                '{"type":"auto","seq":3,"action":"cancel_all"}',
+            ],
+            fail_status="cancelled",
+        )
+        serve_socket(first, runtime, clock)
+        self.assertFalse(
+            any(
+                message.get("status") == "cancelled"
+                for message in first.messages
+            )
+        )
+
+        reconnect = EventSocket(fail_status="cancelled", record_failure=True)
+        serve_socket(reconnect, runtime, clock)
+        updates = mission_updates(reconnect)
+        self.assertEqual(
+            [(message["mission_id"], message["status"]) for message in updates],
+            [("cancel-me", "queued"), ("cancel-me", "cancelled")],
+        )
+        self.assertEqual(
+            [message["event_seq"] for message in updates],
+            [1, 2],
+        )
+        self.assertEqual(
+            {message["event_epoch"] for message in updates},
+            {runtime.controller.event_epoch},
+        )
+
+    def test_reconnect_replays_frame_path_result_when_pose_send_precedes_it(
+        self,
+    ) -> None:
+        runtime = VehicleRuntime.create(
+            started_at=0.0,
+            timestamp=0.0,
+            anchor=AnchorSpec("event-frame", 10.0, 10.0, 0.0),
+            odometry_config=OdometryConfig(),
+        )
+        clock = Clock()
+        first = EventSocket(
+            [
+                '{"type":"mode","seq":1,"action":"switch_to_auto"}',
+                '{"type":"auto","seq":2,"action":"push","missions":['
+                '{"mission_id":"already-there","type":"goto",'
+                '"frame_id":"global_map","x_m":10,"y_m":10}]}',
+            ],
+            fail_status="reached",
+            clock=clock,
+            advance_after_commands=1.0,
+        )
+        serve_socket(first, runtime, clock)
+        self.assertFalse(
+            any(message.get("status") == "reached" for message in first.messages)
+        )
+
+        reconnect = EventSocket(fail_status="reached", record_failure=True)
+        serve_socket(reconnect, runtime, clock)
+        updates = mission_updates(reconnect)
+        self.assertEqual(
+            [(message["mission_id"], message["status"]) for message in updates],
+            [
+                ("already-there", "queued"),
+                ("already-there", "active"),
+                ("already-there", "reached"),
+            ],
+        )
+        self.assertEqual(
+            [message["event_seq"] for message in updates],
+            [1, 2, 3],
+        )
+        self.assertEqual(
+            {message["event_epoch"] for message in updates},
+            {runtime.controller.event_epoch},
+        )
+
+    def test_disconnect_pause_survives_telemetry_send_failure(self) -> None:
+        runtime = active_runtime("event-disconnect")
+        clock = Clock()
+        serve_socket(EventSocket(fail_type="pose"), runtime, clock)
+
+        reconnect = EventSocket(fail_status="paused", record_failure=True)
+        serve_socket(reconnect, runtime, clock)
+        updates = mission_updates(reconnect)
+        self.assertEqual(
+            [(message["event_seq"], message["status"]) for message in updates],
+            [(1, "queued"), (2, "active"), (3, "paused")],
+        )
+        self.assertEqual(updates[-1]["reason"], "controller_disconnected")
+
+    def test_invalid_command_pause_is_sent_once_in_order(self) -> None:
+        runtime = active_runtime("event-invalid")
+        clock = Clock()
+        socket = EventSocket(
+            ['{"type":"goto","seq":3,"x_m":12,"y_m":10}'],
+            fail_status="paused",
+            record_failure=True,
+        )
+        serve_socket(socket, runtime, clock)
+        updates = mission_updates(socket)
+        self.assertEqual(
+            [(message["event_seq"], message["status"]) for message in updates],
+            [(1, "queued"), (2, "active"), (3, "paused")],
+        )
+        self.assertEqual(updates[-1]["reason"], "invalid_command")
 
 
 if __name__ == "__main__":

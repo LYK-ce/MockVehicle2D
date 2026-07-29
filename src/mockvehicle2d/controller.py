@@ -2,12 +2,13 @@
 
 from __future__ import annotations
 
-from collections import OrderedDict, deque
+from collections import deque
 from dataclasses import dataclass
 from enum import Enum
 import math
 import re
 from typing import TYPE_CHECKING
+import uuid
 
 from mockvehicle2d.navigation import GotoController
 
@@ -25,7 +26,6 @@ if TYPE_CHECKING:
 
 MISSION_ID_PATTERN = re.compile(r"[A-Za-z0-9._:-]{1,64}")
 MISSION_FRAME = "global_map"
-MAX_MISSION_HISTORY = 1024
 
 
 class OpMode(str, Enum):
@@ -126,6 +126,8 @@ Command = ModeCommand | ManualCommand | AutoCommand
 
 @dataclass(frozen=True)
 class ControllerEvent:
+    event_seq: int
+    event_epoch: str
     mission: GotoMission
     status: str
     reason: str | None = None
@@ -135,6 +137,8 @@ class ControllerEvent:
     def as_dict(self, timestamp: float) -> dict[str, object]:
         message: dict[str, object] = {
             "type": "mission_update",
+            "event_seq": self.event_seq,
+            "event_epoch": self.event_epoch,
             "timestamp_s": timestamp,
             "ts": timestamp,
             "mission_id": self.mission.mission_id,
@@ -180,10 +184,11 @@ class RobotController:
         self.mission_capacity = mission_capacity
         self.active_mission: GotoMission | None = None
         self._pending: deque[GotoMission] = deque()
-        self._mission_history: OrderedDict[
-            str, tuple[tuple[str, float, float], str]
-        ] = OrderedDict()
-        self._events: deque[ControllerEvent] = deque()
+        # ponytail: process-lifetime ledgers fit the simulator; add persistence and
+        # explicit retention only when long-running deployment volume requires it.
+        self._mission_history: dict[str, tuple[str, float, float]] = {}
+        self._events: list[ControllerEvent] = []
+        self.event_epoch = uuid.uuid4().hex
         self._manual_setpoint: tuple[float, float] | None = None
         self._manual_deadline: float | None = None
         self._needs_start = False
@@ -286,10 +291,18 @@ class RobotController:
         ):
             self._pause_active(reason)
 
-    def drain_events(self) -> tuple[ControllerEvent, ...]:
-        events = tuple(self._events)
-        self._events.clear()
-        return events
+    @property
+    def latest_event_seq(self) -> int:
+        return len(self._events)
+
+    def events_after(self, event_seq: int) -> tuple[ControllerEvent, ...]:
+        if (
+            isinstance(event_seq, bool)
+            or not isinstance(event_seq, int)
+            or event_seq < 0
+        ):
+            raise ValueError("event_seq must be a non-negative integer")
+        return tuple(self._events[event_seq:])
 
     def snapshot(self) -> dict[str, object]:
         return {
@@ -305,6 +318,11 @@ class RobotController:
             },
             "manual_setpoint_active": self._manual_setpoint is not None,
             "navigation": self.navigation.snapshot(),
+            "mission_events": {
+                "event_epoch": self.event_epoch,
+                "latest_event_seq": self.latest_event_seq,
+                "retention": "process_lifetime",
+            },
         }
 
     def _handle_mode(
@@ -390,8 +408,11 @@ class RobotController:
             return self._push(command.missions)
         if command.action is AutoAction.PAUSE:
             vehicle.stop(now)
-            self._pause_active("paused")
-            self.auto_state = AutoState.PAUSED
+            if self.active_mission is not None or self._pending:
+                self._pause_active("paused")
+            else:
+                self.auto_state = AutoState.IDLE
+                self._needs_start = False
             return CommandResult(True)
         if command.action is AutoAction.RESUME:
             if self.auto_state is AutoState.ACTIVE:
@@ -421,18 +442,15 @@ class RobotController:
             if known is None:
                 new_missions.append(mission)
                 continue
-            if known[0] != mission.fingerprint:
+            if known != mission.fingerprint:
                 return CommandResult(False, "mission_id_conflict")
         if len(self._pending) + len(new_missions) > self.mission_capacity:
             return CommandResult(False, "mission_queue_full")
 
-        events = tuple(
-            ControllerEvent(mission, "queued") for mission in new_missions
-        )
         for mission in new_missions:
             self._pending.append(mission)
-            self._record(mission, "queued")
-        self._events.extend(events)
+            self._mission_history[mission.mission_id] = mission.fingerprint
+            self._emit(mission, "queued")
         if new_missions and self.auto_state is AutoState.IDLE:
             self.auto_state = AutoState.ACTIVE
             self._needs_start = True
@@ -501,24 +519,22 @@ class RobotController:
             self.navigation.block("localization_lost")
             self._finish_blocked_without_vehicle()
             return
-        self._record(mission, "active")
-        self._events.append(
-            ControllerEvent(mission, "active", navigation=self.navigation.snapshot())
+        self._emit(
+            mission,
+            "active",
+            navigation=self.navigation.snapshot(),
         )
 
     def _finish_reached(self, vehicle: Vehicle) -> None:
         assert self.active_mission is not None
         mission = self.active_mission
         vehicle.stop()
-        self._record(mission, "reached")
-        self._events.append(
-            ControllerEvent(
-                mission,
-                "reached",
-                self.navigation.reason,
-                self.navigation.detail,
-                self.navigation.snapshot(),
-            )
+        self._emit(
+            mission,
+            "reached",
+            self.navigation.reason,
+            self.navigation.detail,
+            self.navigation.snapshot(),
         )
         self.active_mission = None
         self._needs_start = bool(self._pending)
@@ -534,15 +550,12 @@ class RobotController:
         assert self.active_mission is not None
         self.auto_state = AutoState.BLOCKED
         self._needs_start = False
-        self._record(self.active_mission, "blocked")
-        self._events.append(
-            ControllerEvent(
-                self.active_mission,
-                "blocked",
-                self.navigation.reason or "blocked",
-                self.navigation.detail,
-                self.navigation.snapshot(),
-            )
+        self._emit(
+            self.active_mission,
+            "blocked",
+            self.navigation.reason or "blocked",
+            self.navigation.detail,
+            self.navigation.snapshot(),
         )
 
     def _pause_active(self, reason: str) -> None:
@@ -552,14 +565,11 @@ class RobotController:
         if self.active_mission is not None:
             if self.navigation.status == "active":
                 self.navigation.cancel(reason)
-            self._record(self.active_mission, "paused")
-            self._events.append(
-                ControllerEvent(
-                    self.active_mission,
-                    "paused",
-                    reason,
-                    navigation=self.navigation.snapshot(),
-                )
+            self._emit(
+                self.active_mission,
+                "paused",
+                reason,
+                navigation=self.navigation.snapshot(),
             )
         self.auto_state = AutoState.PAUSED
         self._needs_start = False
@@ -571,19 +581,29 @@ class RobotController:
         )
         if self.navigation.status in {"active", "blocked"}:
             self.navigation.cancel(reason)
-        events = tuple(
-            ControllerEvent(mission, "cancelled", reason) for mission in missions
-        )
         for mission in missions:
-            self._record(mission, "cancelled")
-        self._events.extend(events)
+            self._emit(mission, "cancelled", reason)
         self.active_mission = None
         self._pending.clear()
         self.auto_state = AutoState.IDLE
         self._needs_start = False
 
-    def _record(self, mission: GotoMission, status: str) -> None:
-        self._mission_history[mission.mission_id] = mission.fingerprint, status
-        self._mission_history.move_to_end(mission.mission_id)
-        while len(self._mission_history) > MAX_MISSION_HISTORY:
-            self._mission_history.popitem(last=False)
+    def _emit(
+        self,
+        mission: GotoMission,
+        status: str,
+        reason: str | None = None,
+        detail: str | None = None,
+        navigation: dict[str, object] | None = None,
+    ) -> None:
+        self._events.append(
+            ControllerEvent(
+                self.latest_event_seq + 1,
+                self.event_epoch,
+                mission,
+                status,
+                reason,
+                detail,
+                navigation,
+            )
+        )
