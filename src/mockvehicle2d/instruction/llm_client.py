@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import json
 import re
+import sys
 
 
 def _strip_thinking(content: str) -> str:
@@ -180,8 +181,8 @@ class LLMClient:
 
                 return instructions
 
-            except Exception:
-                # Non-JSONDecodeError (e.g. timeout, connection error) — do NOT retry
+            except Exception as exc:
+                print(f"[LLM] parse error: {exc}", file=sys.stderr)
                 return []
 
         return []
