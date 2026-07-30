@@ -334,6 +334,21 @@ def test_actual_pose_can_egress_from_planning_clearance_envelope() -> None:
     assert path is not None
     assert path[:2] == [(0, 0), (-1, 0)]
     assert search.best_start_connection((0.0, 0.25), (0, 0)) == (-1, 0)
+    assert not search.is_segment_passable(
+        (0.0, 0.25),
+        (0.0, 0.75),
+        extra_clearance_m=0.25,
+    )
+    assert not search._segment_blocked(
+        (0.2, 0.5),
+        (-0.5, 0.5),
+        allow_clearance_egress=True,
+    )
+    assert search._segment_blocked(
+        (0.2, 0.5),
+        (1.5, 0.5),
+        allow_clearance_egress=True,
+    )
 
 
 def test_blocked_start_without_confirmed_actual_pose_cannot_egress() -> None:

@@ -305,7 +305,15 @@ class GotoController:
             target_x = (target_cell[0] + 0.5) * local_map.resolution_m
             target_y = (target_cell[1] + 0.5) * local_map.resolution_m
             if not self._planner.is_segment_passable(
-                (x_m, y_m), (target_x, target_y)
+                (x_m, y_m),
+                (target_x, target_y),
+                extra_clearance_m=HARD_STOP_CLEARANCE_M,
+            ) and (
+                safety_stop is not None
+                or not self._planner.is_segment_passable(
+                    (x_m, y_m),
+                    (target_x, target_y),
+                )
             ):
                 target_cell = self._planner.best_start_connection(
                     (x_m, y_m),
