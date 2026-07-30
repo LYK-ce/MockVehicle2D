@@ -88,31 +88,6 @@ def nearest_obstacle_clearance(
     return min(clearances, default=None)
 
 
-def nearest_edge_clearance(
-    grid: MapGrid,
-    x: float,
-    y: float,
-    yaw: float,
-    desired_linear_mps: float,
-    *,
-    vehicle_radius: float,
-    lookahead_m: float = EDGE_LOOKAHEAD_M,
-    sample_step_m: float = EDGE_SAMPLE_STEP_M,
-) -> float | None:
-    """Conservatively sample the swept circular footprint for void or map bounds."""
-    clearance, _point = _nearest_edge_evidence(
-        grid,
-        x,
-        y,
-        yaw,
-        desired_linear_mps,
-        vehicle_radius=vehicle_radius,
-        lookahead_m=lookahead_m,
-        sample_step_m=sample_step_m,
-    )
-    return clearance
-
-
 def _nearest_edge_evidence(
     grid: MapGrid,
     x: float,
@@ -147,10 +122,6 @@ def _nearest_edge_evidence(
                 (cosine * dx + sine * dy, -sine * dx + cosine * dy),
             )
     return None, None
-
-
-def _footprint_has_ground(grid: MapGrid, cx: float, cy: float, radius: float) -> bool:
-    return _first_missing_ground_cell(grid, cx, cy, radius) is None
 
 
 def _first_missing_ground_cell(
@@ -203,7 +174,7 @@ class SafetyGovernor:
             return SafetyDecision(linear_mps, angular_rps, "clear", None)
 
         clearance, reason = nearest
-        if clearance <= HARD_STOP_CLEARANCE_M:
+        if clearance < HARD_STOP_CLEARANCE_M:
             return SafetyDecision(0.0, angular_rps, "stopped", reason)
         if automatic and linear_mps and clearance < SLOW_ZONE_CLEARANCE_M:
             scale = (clearance - HARD_STOP_CLEARANCE_M) / (
@@ -262,21 +233,6 @@ class LocalSafetyRuntime:
         )
         return self.decision
 
-    def enforce_manual(
-        self,
-        vehicle: Vehicle,
-        grid: MapGrid,
-        desired: tuple[float, float] | None = None,
-    ) -> SafetyDecision:
-        """Apply hard manual safety; a stopped latch is changed only by a new command."""
-        velocities = vehicle.body_velocities() if desired is None else desired
-        if desired is None and velocities == (0.0, 0.0):
-            return self.decision
-        decision = self.evaluate(vehicle, grid, *velocities, automatic=False)
-        if decision.state in {"stopped", "fault"}:
-            vehicle.stop()
-        return decision
-
     def advance(
         self,
         vehicle: Vehicle,
@@ -312,9 +268,17 @@ class LocalSafetyRuntime:
             decision = self.evaluate(
                 vehicle, grid, policy_linear_mps, angular_rps, automatic=automatic
             )
-            if decision.state in {"stopped", "fault"}:
+            if decision.state == "fault":
                 vehicle.stop()
                 vehicle.advance(grid, now)
+                return SafetyAdvanceResult(stopped=True, reason=decision.reason)
+            if decision.state == "stopped":
+                vehicle.advance(
+                    grid,
+                    now,
+                    limited_velocities=(0.0, decision.angular_rps),
+                )
+                vehicle.stop()
                 return SafetyAdvanceResult(stopped=True, reason=decision.reason)
             effective_linear = math.copysign(
                 min(abs(linear_mps), abs(decision.linear_mps)),
@@ -339,8 +303,12 @@ class LocalSafetyRuntime:
                 step_distance = min(step_distance, max(0.0, clearance - HARD_STOP_CLEARANCE_M))
                 if step_distance <= 1e-12:
                     self.decision = SafetyDecision(0.0, angular_rps, "stopped", reason)
+                    vehicle.advance(
+                        grid,
+                        now,
+                        limited_velocities=(0.0, angular_rps),
+                    )
                     vehicle.stop()
-                    vehicle.advance(grid, now)
                     return SafetyAdvanceResult(stopped=True, reason=reason)
 
             step_time = min(

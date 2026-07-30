@@ -1,538 +1,437 @@
-# WebSocket 通信协议
+# WebSocket v4 协议
 
-## 基本信息
+## 基本约定
 
 | 项目 | 值 |
-|------|------|
-| 传输协议 | WebSocket |
-| 数据格式 | JSON 文本消息 |
-| 编码 | UTF-8 |
-| 角色 | 小车 = Server，PC = Client |
-| 默认端口 | 19090 |
+|------|----|
+| 角色 | 小车是 WebSocket Server，控制端是 Client |
+| 默认地址 | `ws://127.0.0.1:19090` |
+| 命令格式 | UTF-8 JSON 文本对象 |
+| 协议版本 | `4` |
+| 控制权 | 每辆车同时只有一个独占连接 |
+| 单位 | m、s、rad、m/s、rad/s |
+| 任务坐标系 | `global_map` |
 
-除兼容旧客户端的精确 `{"cmd":"..."}` 格式外，每条消息均为 JSON 文本对象，
-顶层必有 `type` 字段。
+下行命令的顶层字段必须与定义完全一致，不允许缺失或额外字段。JSON 重复 key、
+`NaN`、`Infinity`、二进制命令、超过 64 KiB 的消息均无效。每个连接内的 `seq` 是
+无符号 64 位整数且必须严格递增。
 
-公开协议统一使用 SI 单位：距离为米、时间为秒、角度为弧度、线速度为米/秒、角速度为
-弧度/秒。规范字段以 `_m`、`_s`、`_rad`、`_mps`、`_rps` 明确单位。
-
----
+除 `mode`、`manual`、`auto` 外的消息类型，以及无 `type/seq` 的格式都不属于 v4。
 
 ## 连接流程
 
-连接分两层：
-
-| 阶段 | 触发条件 | 含义 |
-|------|---------|------|
-| WebSocket 握手完成 | TCP 升级为 WS | 物理通道建立 |
-| `hello` 包收到 | 小车发送身份 | **正式建立连接** |
-
-Pictor 仅在收到 `hello` 后才认为连接可用，之后才开始处理 `pose`、`map_*` 等业务消息。
-`hello` 之前收到的任何消息将被丢弃。
-同一车辆同时只接受一个控制连接；已有控制器时，新连接只收到
-`{"type":"error","code":"vehicle_busy",...}` 并结束，不会收到 `hello`，也不会改变车辆状态。
-当前控制器断开会安全停车并释放控制权，随后连接继续沿用已有 odometry 和本地地图 revision。
-
-```
-小车 ── TCP 握手 ──→ PC       (物理层)
-小车 ── hello ──→ PC          ← 必须第一帧，业务层连接建立
-小车 ── map_full ──→ PC
-小车 ── pose ──→ PC
+```text
+Client ── WebSocket handshake ──► Vehicle
+Client ◄──────── hello ────────── Vehicle
+Client ◄── retained mission_update ─ Vehicle  （按 event_seq 重放）
+Client ◄──── binary map chunks ── Vehicle
+Client ◄──── pose + scan ──────── Vehicle  （约 6 Hz）
+Client ─────── command ─────────► Vehicle
+Client ◄──── command_ack ──────── Vehicle
+Client ◄──── mission_update ───── Vehicle  （有状态变化时）
 ```
 
----
-
-## 上行：小车 → PC
-
-### hello — 注册身份
-
-连接建立后立即发送，声明车辆 ID。
+已有控制连接时，新连接只收到：
 
 ```json
 {
-    "type": "hello",
-    "vehicle_id": "car_0",
-    "map": {
-        "source": "simulator_ground_truth",
-        "frame_id": "simulator_map",
-        "resolution_m": 1.0,
-        "width_cells": 256,
-        "height_cells": 256,
-        "transform_to_global_map": {
-            "x_m": 0.0,
-            "y_m": 0.0,
-            "yaw_rad": 0.0
-        },
-        "binary_chunks": {
-            "type": 0,
-            "chunk_size_cells": 256,
-            "header": ">Bii",
-            "byte_order": "big",
-            "payload_order": "row_major_y_x"
-        }
+  "type": "error",
+  "timestamp_s": 1717800000.1,
+  "seq": null,
+  "code": "vehicle_busy",
+  "message": "another controller owns the vehicle lease"
+}
+```
+
+断开会立即停车并释放租约。odometry、本地地图、活动任务和待执行队列保留；有未完成
+任务时自动状态变为 `paused`。重连后由 `hello.controller` 恢复当前状态，随后 Server
+按 `event_seq` 重放本进程保留的全部任务事件，再显式 `resume`。
+
+## 下行命令
+
+### 模式
+
+```json
+{"type":"mode","seq":1,"action":"switch_to_auto"}
+{"type":"mode","seq":2,"action":"switch_to_manual"}
+{"type":"mode","seq":3,"action":"stop_motion"}
+```
+
+模式命令不受当前模式限制。实际切换先停车；重复切到当前模式是幂等操作。
+Auto → Manual 暂停并保留任务。Manual → Auto 若有保留任务仍停在 `paused`，需要
+`auto/resume`。
+
+`stop_motion` 是模式无关的安全停车入口：
+
+- 在 Manual 中立即停车并清除手动速度租约，模式仍为 Manual；
+- 在 Auto 中立即停车，活动任务和队列保留，状态变为 `paused`；
+- 在 Auto Idle 中保持 Idle；
+- 重复调用不重复发布 paused 事件。
+
+### 手动速度
+
+```json
+{
+  "type": "manual",
+  "seq": 4,
+  "action": "drive",
+  "linear_mps": 0.25,
+  "angular_rps": -0.4
+}
+```
+
+```json
+{"type":"manual","seq":5,"action":"stop"}
+```
+
+仅在 `manual` 模式有效。线速度与角速度必须是有限 JSON 数字，绝对值不得超过 Server
+的 `--linear-speed-mps` 和 `--angular-speed-rps`。
+
+`drive` 是有时限的设定值：客户端在按住操作键时持续刷新，刷新间隔必须小于
+`--command-timeout-s`；松手发送 `stop`。设定值经过本地安全门控后才安装到车辆。
+
+### 自动任务入队
+
+```json
+{
+  "type": "auto",
+  "seq": 5,
+  "action": "push",
+  "missions": [
+    {
+      "mission_id": "goto-001",
+      "type": "goto",
+      "frame_id": "global_map",
+      "x_m": 20.0,
+      "y_m": 30.0
+    },
+    {
+      "mission_id": "goto-002",
+      "type": "goto",
+      "frame_id": "global_map",
+      "x_m": 24.0,
+      "y_m": 35.0
     }
+  ]
 }
 ```
 
-| 字段 | 类型 | 说明 |
-|------|------|------|
-| `vehicle_id` | string | 车辆唯一标识 |
-| `map` | object | 随后的二进制地图帧元数据与 `simulator_map → global_map` 刚体变换 |
+仅在 `auto` 模式有效。当前只支持 `goto`。`mission_id` 为 1–64 个 ASCII 字母、
+数字、点、下划线、冒号或连字符。坐标必须有限且绝对值不超过 `1,000,000 m`。
 
-### pose — 车辆位姿
+一次 push 是原子的：
 
-实时发送车辆位置、朝向和速度。
+- batch 不能为空、不能超过任务队列配置，且 batch 内 ID 必须唯一；
+- 待执行队列空间不足时整个 batch 拒绝；
+- 已知 `mission_id` 携带相同 `frame_id/x_m/y_m` 时视为幂等重试，不重复入队；
+- 已知 `mission_id` 携带不同目标时返回 `mission_id_conflict`。
+
+客户端重试时必须使用新的、更大的命令 `seq`，但沿用原 `mission_id`。
+幂等记录在 Server 进程生命周期内不会静默淘汰；进程重启后内存记录清空，不提供
+跨重启幂等或持久化恢复。
+
+### 自动任务控制
+
+```json
+{"type":"auto","seq":6,"action":"pause"}
+{"type":"auto","seq":7,"action":"resume"}
+{"type":"auto","seq":8,"action":"cancel_all"}
+```
+
+| action | 语义 |
+|--------|------|
+| `pause` | 停车，保留活动任务和队列 |
+| `resume` | 从 Paused/Blocked 重新启动；已为 Active 时幂等，无任务时进入 idle |
+| `cancel_all` | 停车，取消活动任务并清空队列 |
+
+任务 `blocked` 后不会自动跳到下一项。控制端可以修复条件后 `resume` 重试，或
+`cancel_all` 放弃整批任务。
+
+没有活动任务和待执行任务时，`pause` 是无副作用操作，状态保持 `Auto/Idle`。
+
+## 命令确认
+
+每个通过语法边界的命令返回一个 `command_ack`：
 
 ```json
 {
-    "type": "pose",
-    "timestamp_s": 1717800000.123,
-    "ts": 1717800000.123,
-    "seq": 12,
-    "source": "anchored_odometry",
-    "x_m": 1.5,
-    "y_m": 3.2,
-    "z_m": 0.0,
-    "yaw_rad": 0.785,
-    "vx_mps": 0.5,
-    "vy_mps": 0.0,
-    "omega_rps": 0.0,
-    "x": 1.5,
-    "y": 3.2,
-    "z": 0.0,
-    "yaw": 0.785,
-    "vx": 0.5,
-    "vy": 0.0,
-    "omega": 0.0,
-    "collision": false,
-    "command": "forward",
-    "localization": {
-        "frame_id": "anchor_map",
-        "anchor_id": "mock_vehicle_01_anchor",
-        "x_m": 1.5,
-        "y_m": 3.2,
-        "yaw_rad": 0.785,
-        "covariance_diagonal": [0.0, 0.0, 0.0],
-        "quality": "nominal",
-        "timestamp_s": 123.0,
-        "timestamp": 123.0,
-        "revision": 12
+  "type": "command_ack",
+  "timestamp_s": 1717800000.2,
+  "seq": 5,
+  "command": {"type": "auto", "action": "push"},
+  "accepted": true,
+  "controller": {
+    "mode": "auto",
+    "auto_state": "active",
+    "active_mission": null,
+    "mission_queue": {
+      "size": 2,
+      "capacity": 16,
+      "mission_ids": ["goto-001", "goto-002"]
     },
-    "control_mode": "autonomous",
-    "navigation": {
-        "status": "active",
-        "goal": {"x_m": 8.0, "y_m": 3.5},
-        "goal_mode": "exact",
-        "requested_goal": {
-            "frame_id": "anchor_map",
-            "x_m": 8.0,
-            "y_m": 3.5
-        },
-        "effective_goal": {
-            "frame_id": "anchor_map",
-            "x_m": 8.0,
-            "y_m": 3.5
-        },
-        "approach_distance_m": 0.0,
-        "planning": false,
-        "reason": null,
-        "algorithm": "d_star_lite",
-        "path_revision": 3,
-        "replan_count": 1,
-        "current_waypoint": {"x_m": 2.5, "y_m": 3.5},
-        "path": [{"x_m": 1.5, "y_m": 3.5}]
+    "manual_setpoint_active": false,
+    "navigation": {"status": "idle"}
+  }
+}
+```
+
+`accepted=true` 表示命令已被控制器接受，不表示任务到达，也不保证首个规划切片已完成。
+拒绝时增加 `reason`，例如：
+
+| reason | 含义 |
+|--------|------|
+| `wrong_mode` | 命令族与当前模式不符 |
+| `mission_queue_full` | 待执行队列空间不足 |
+| `mission_id_conflict` | 相同任务 ID 对应不同内容 |
+| `safety_obstacle` / `safety_edge` | 手动速度被安全门控拒绝 |
+| `safety_sensor_fault` | 安全输入故障 |
+
+## 任务事件
+
+任务状态变化通过独立的 `mission_update` 上报：
+
+```json
+{
+  "type": "mission_update",
+  "event_epoch": "c1df10b7f5cd48a5a4850665b16bb1f8",
+  "event_seq": 42,
+  "timestamp_s": 1717800000.3,
+  "mission_id": "goto-001",
+  "submitted_seq": 5,
+  "status": "blocked",
+  "goal": {
+    "frame_id": "global_map",
+    "x_m": 20.0,
+    "y_m": 30.0
+  },
+  "reason": "no_path",
+  "detail": "nearby_safe_goal_unavailable",
+  "navigation": {
+    "status": "blocked",
+    "goal_mode": "approaching_safe_stop",
+    "planning": false
+  }
+}
+```
+
+`event_epoch` 标识当前内存 ledger，Server 进程重启后变化；`event_seq` 从 1 开始，
+在该 epoch 内严格递增且不复用。事件先写入
+`RobotController` 的进程内 ledger，再尝试发送；发送失败不会删除事件。一个连接内只按
+递增顺序发送尚未发送的事件。重连会从 ledger 起点自动重放，因此传输语义是
+**at-least-once**：跨连接可能重复，但不会改变事件身份或乱序。客户端必须按
+`(event_epoch, event_seq)` 去重；epoch 变化时清除旧的 sequence 游标。
+
+当前 simulator 为便于验证可靠性，保留本进程的全部任务事件；进程重启后 ledger 和
+序号都会清空。`timestamp_s` 是本次发送时间，重放时可能变化，事件身份只能使用
+`(event_epoch, event_seq)`。
+
+状态及触发：
+
+| status | 含义 |
+|--------|------|
+| `queued` | 新任务已进入队列 |
+| `active` | 任务已成为活动项并开始规划 |
+| `paused` | `stop_motion`、模式接管、显式暂停、非法输入或连接断开 |
+| `reached` | 精确目标或附近安全目标已到达 |
+| `blocked` | 无路、定位丢失、安全故障或目标超出规划硬限制 |
+| `cancelled` | `cancel_all` 取消 |
+
+规划距离超过硬限制时，任务先正常收到 push 的 ack/queued，随后收到：
+
+```json
+{
+  "type": "mission_update",
+  "mission_id": "too-far",
+  "status": "blocked",
+  "reason": "invalid_goal",
+  "detail": "goal exceeds maximum distance"
+}
+```
+
+该任务错误不会中断 WebSocket。
+
+## 上行遥测
+
+### hello
+
+`hello` 是业务首帧：
+
+```json
+{
+  "type": "hello",
+  "protocol_version": 4,
+  "vehicle_id": "mock_vehicle_01",
+  "control_lease": "exclusive",
+  "mission_frame_id": "global_map",
+  "map": {
+    "source": "simulator_ground_truth",
+    "frame_id": "simulator_map",
+    "resolution_m": 1.0,
+    "width_cells": 256,
+    "height_cells": 256,
+    "transform_to_global_map": {
+      "x_m": 0.0,
+      "y_m": 0.0,
+      "yaw_rad": 0.0
     },
-    "safety": {
-        "state": "limited",
-        "reason": "safety_obstacle",
-        "obstacle_clearance_m": 0.7,
-        "edge_clearance_m": null
+    "binary_chunks": {
+      "type": 0,
+      "chunk_size_cells": 256,
+      "header": ">Bii",
+      "byte_order": "big",
+      "payload_order": "row_major_y_x"
     }
+  },
+  "controller": {
+    "mode": "manual",
+    "auto_state": "idle",
+    "mission_events": {
+      "event_epoch": "c1df10b7f5cd48a5a4850665b16bb1f8",
+      "latest_event_seq": 0,
+      "retention": "process_lifetime"
+    }
+  }
 }
 ```
 
-| 字段 | 类型 | 单位 | 说明 |
-|------|------|------|------|
-| `timestamp_s` | f64 | 秒 | 规范 Unix 时间戳 |
-| `ts` | f64 | 秒 | 已弃用的 Pictor 兼容别名；值等于 `timestamp_s` |
-| `seq` | u64 | — | 遥测帧序号；紧随其后的 `scan` 使用相同值 |
-| `source` | string | — | 固定为 `anchored_odometry` |
-| `x_m`, `y_m`, `z_m` | f32 | 米 | 锚定里程计投影到 `global_map` 的坐标 |
-| `yaw_rad` | f32 | 弧度 | 偏航角 |
-| `vx_mps`, `vy_mps` | f32 | 米/秒 | 2D 速度分量 |
-| `omega_rps` | f32 | 弧度/秒 | 实际角速度；左旋为负，右旋为正 |
-| `x/y/z/yaw/vx/vy/omega` | f32 | SI | 已弃用的 Pictor 兼容别名；值与对应规范字段相同 |
-| `collision` | bool | — | 最近一次平移是否被碰撞截停 |
-| `command` | string | — | 当前有效命令；看门狗超时后为 `stop` |
-| `localization` | object | — | `anchor_map` 中的局部位姿、协方差对角线、质量和 revision |
-| `control_mode` | string | — | `navigation.status=active` 时为 `autonomous`，否则为 `manual` |
-| `navigation` | object | — | `status`、`planning`、兼容请求 `goal`、`anchor_map` 中的 `requested_goal` / `effective_goal`、`goal_mode`、车体外缘 `approach_distance_m` 和终止原因 |
-| `safety` | object | — | 最新安全状态、原因、前进方向障碍净空和边缘净空；未发现时净空为 `null` |
+`map.source=simulator_ground_truth` 表示调试真值，不能作为自动规划输入。
 
-`pose` 不再发送绝对仿真真值。小车只保存已知出生锚点
-`global_map → anchor_map`，之后通过运动增量预测锚定 odometry，并用当前 scan 与旧的
-Occupied 证据做有限窗相关匹配。低支持、低得分、离群或歧义匹配不会修正位姿；该局部
-SLAM 前端不含回环、地点识别、位姿图或全局优化，仍可能长期漂移。
-`localization.quality` 为 `nominal`、`degraded` 或 `lost`；`lost` 会阻止自动任务和本地地图写入。
-`localization.timestamp_s` 是规范秒时间戳；`localization.timestamp` 是值相同的弃用别名。
-`navigation.status` 为 `idle`、`active`、`reached`、`blocked` 或 `cancelled`；结束后仍保留目标与原因，便于客户端确认结果。
-`navigation.planning=true` 表示目标已受理但当前规划切片尚未完成；车辆此时保持
-`stop`。遥测中的旧 `path` 仅供显示，不会在 pending 期间执行。
+### 二进制地图 chunk
 
----
-
-### scan — 本地二维激光扫描
-
-每次 `pose` 后发送一帧 **YDLidar Tmini** 风格的局部扫描；Server 按单调时钟以名义 6 Hz 发送这对消息。它只表示小车相对坐标系中的障碍物距离，不是点云或全局地图；定位前端会在小车内部将多帧 scan 与 odometry 组合。
-
-```json
-{
-    "type": "scan",
-    "timestamp_s": 1717800000.123,
-    "ts": 1717800000.123,
-    "seq": 12,
-    "frame_id": "laser",
-    "config": {
-        "min_angle": 0.0,
-        "max_angle": 6.273765,
-        "angle_increment": 0.00942,
-        "time_increment": 0.000249875,
-        "scan_time": 0.166667,
-        "min_range": 0.02,
-        "max_range": 12.0,
-        "point_count": 667,
-        "model": "ydlidar_tmini",
-        "range_sample_rate_hz": 4000,
-        "scan_rate_hz": 6,
-        "angle_unit": "rad",
-        "range_unit": "m",
-        "angle_direction": "clockwise_from_forward",
-        "no_return": {"range": 0.0, "intensity": 0.0}
-    },
-    "points": [
-        {"angle": 0.0, "range": 2.5, "intensity": 1.0},
-        {"angle": 0.00942, "range": 0.0, "intensity": 0.0}
-    ]
-}
-```
-
-`angle` 的单位是弧度，`range` 的单位是米，字段形式与 YDLidar SDK 的 `LaserPoint` 对齐。`yaw=0`、`angle=0` 指向世界 `+x`；在本模拟器的 `+y` 向下栅格中，正角度朝 `+y` 增长（从上方看顺时针）。四向摘要以 `0`、`π/2`、`π`、`3π/2` 分别表示前、右、后、左；对角边界对称归入前/后扇区（`π/4` 与 `7π/4` 为前，`3π/4` 与 `5π/4` 为后）。
-
-默认配置模拟 Tmini 的 `ydlidar_tmini` 元数据：360°、0.02–12 m、名义 4000 Hz 测距、名义 6 Hz 扫描、667 个均匀射线。`667 = round(4000 / 6)`，为保持每帧固定点数，`time_increment = scan_time / 667`（约 4002 Hz）；不会实现复杂的每帧交替点数。有效墙体回波按 0.01 m 确定性量化，强度固定为 `1.0`。无回波统一编码为 `range: 0.0, intensity: 0.0`，包括最大量程外、离开已知栅格或未知空间；它**不是**障碍物。扫描没有噪声或反射率模型。
-
-| 字段 | 类型 | 说明 |
-|------|------|------|
-| `timestamp_s` | f64 | 规范 Unix 时间戳；与同帧 `pose.timestamp_s` 相同 |
-| `ts` | f64 | 已弃用兼容别名；值等于 `timestamp_s` |
-| `frame_id` | string | 固定为小车本地 `laser` 坐标系 |
-| `seq` | u64 | 与同一状态快照的 `pose.seq` 相同 |
-| `config` | object | 一帧的 LaserScan 配置与无回波约定 |
-| `points` | array | 按角度递增排列的 `{angle, range, intensity}` 读数 |
-
-### map_full — 全量地图
-
-连接建立或重连后，在 `hello` 之后发送一个或多个二进制 chunk；不存在 JSON
-`map_full` 消息。每个 chunk 固定为：
+`hello` 后发送一个或多个二进制帧：
 
 ```text
 offset  bytes  encoding
 0       1      u8 frame_type = 0
 1       4      i32 big-endian chunk_origin_gx
 5       4      i32 big-endian chunk_origin_gy
-9       65536  256×256 u8 cells, row-major: payload[local_y*256 + local_x]
+9       65536  256×256 u8 cells，row-major y/x
 ```
 
-格状态为 `0`=可通行、`1`=墙/障碍物、`2`=无地面/落差。`chunk_origin_gx/gy`
-是 chunk 左上格在 `simulator_map` 中的格坐标，不是 chunk 序号。格分辨率、地图尺寸、
-帧名和 `simulator_map → global_map` 变换由前一条 `hello.map` 给出；因此非默认出生锚点
-下，消费者不得把原始格坐标直接当成全局坐标。
+cell 状态：`0` 可通行、`1` 墙、`2` 无地面/落差。客户端用
+`hello.map.transform_to_global_map` 将 `simulator_map` 坐标叠加到 `global_map`。
 
-> **Legacy Pictor 限制**：忽略 `hello.map` 的客户端只支持默认 anchor 产生的恒等
-> `simulator_map → global_map` 变换。Server 不会为非默认 anchor 重写二进制格坐标；
-> 此时客户端必须应用 `transform_to_global_map`，否则调试地图与车辆位姿不会对齐。
-
-### map_delta — 增量地图（尚未实现）
-
-仅发送变化的格子。
+### pose
 
 ```json
 {
-    "type": "map_delta",
-    "ts": 1717800000.300,
-    "voxels": [
-        {"gx": 2, "gy": 1, "gz": 0, "state": 1, "conf": 0.90}
-    ]
-}
-```
-
-这是预留的 JSON 增量格式；当前 Server 不发送。它与上面的二进制全量 chunk 不是同一种封装。
-
----
-
-## 下行：PC → 小车
-
-### cmd — 控制命令
-
-规范格式：
-
-```json
-{
-    "type": "cmd",
-    "seq": 42,
-    "cmd": "forward"
-}
-```
-
-所有带 `seq` 的下行命令统一使用 u64：`0 <= seq <= 18446744073709551615`，布尔值不算整数。非法值在可解析回复中规范化为 `0`；缺失字段或无法解析消息时可为 `null`。为兼容旧客户端，也接受字段严格为 `{"cmd":"forward"}` 的 legacy 格式，其确认消息中 `seq` 为 `null`。二进制帧、非 JSON、非对象、错误 `type`、额外字段、非法 `seq` 或未知 `cmd` 都会立即停车并返回 `error`。
-
-| 命令 | 说明 |
-|------|------|
-| `forward` | 前进 |
-| `forward_left` | 前进并左转（W+A） |
-| `forward_right` | 前进并右转（W+D） |
-| `backward` | 后退 |
-| `backward_left` | 后退并左转（S+A） |
-| `backward_right` | 后退并右转（S+D） |
-| `spin_left` | 左旋 |
-| `spin_right` | 右旋 |
-| `stop` | 停止（松手时发送） |
-
-默认运动参数：前进/后退 `±0.5 m/s`；在 `+y` 向下、正 yaw 顺时针的坐标约定中，左旋/右旋为 `∓1.5708 rad/s`。组合命令同时应用对应线速度与角速度，形成弧线。连续 `1.0 s` 未收到有效非停止命令时，看门狗令车辆停止。这些值可通过 `mockvehicle2d serve` 参数校准。
-
-### drive — 连续速度控制
-
-```json
-{
-    "type": "drive",
-    "seq": 43,
-    "linear_mps": 0.25,
-    "angular_rps": -0.4
-}
-```
-
-`linear_mps` 和 `angular_rps` 必须是有限 JSON 数字，布尔值不算数字；绝对值分别不得超过 Server 的 `--linear-speed-mps` 和 `--angular-speed-rps` 配置。字段必须严格为示例中的四项。`0, 0` 等价于停车；非零速度沿用与 `cmd` 相同的看门狗、运动积分和碰撞停车。确认仍使用 `cmd_ack`，其中 `cmd` 为 `"drive"`。
-
-### goto — 全局锚定目标
-
-```json
-{
-    "type": "goto",
-    "seq": 44,
-    "x_m": 12.0,
-    "y_m": 8.5
-}
-```
-
-`x_m`、`y_m` 是 `global_map` 中的有限 JSON 数字，字段必须严格为以上四项。Server 用已知
-出生锚点把目标转换到 `anchor_map`。控制器只读取 `PoseEstimate` 和 `ObservedGrid`，用
-D* Lite 在有限规划窗中经过高代价 Unknown、避开按车体半径膨胀的 Occupied。扫描 delta
-改变路线时增量修复路径；驶向 Unknown 时主动降速。完整 `map_full` 和 `vehicle.x/y/yaw`
-不参与路径决策。定位 `degraded` 时自动线速限制为一半；
-`lost` 时 `goto_ack.accepted=false` 或活动任务变为 `blocked`，原因为
-`localization_lost`；未结算的旧自动运动不会再积分，但新的人工 `cmd` / `drive` 仍可接管。
-安全硬停止或安全输入故障也会立即停车。
-规划和地图变化后的重规划都按控制帧推进，默认每帧最多 256 次 D* 扩展和 256 个安全停车
-候选检查；因此长距离 `goto` 可在若干帧内保持 `accepted=true`、`status=active`、
-`planning=true`。跨帧累计扩展达到当前有限规划窗格数的 20 倍时，以
-`detail=expansion_limit` 终止，而不会无限规划。
-目标最初为 Unknown 时仍可接受并探索。一旦本地观测确认精确目标无法容纳车体及
-`0.25 m` 硬安全净空，或 D* Lite 确认精确目标不可达，控制器会在车体外缘距原目标
-`1 m` 的限制内搜索连续候选；候选中心搜索半径因此为
-`1 m + vehicle_radius_m`，并不要求车体中心也在 `1 m` 内。候选必须对已知
-Occupied/Forbidden 满足车体和硬净空、D* 规划格与预算合法、格中心到连续候选的末段
-安全且从当前估计位姿可达。
-
-完整安全包络已确认 Free 时使用 `goal_mode=nearby_safe`。只有未确认但对已知障碍安全的
-候选时使用 `goal_mode=approaching_safe_stop`：车辆可在 Unknown 中受安全门控继续抵近，
-每帧扫描后重新验证；抵达未确认候选只停车等待，不会报告 `reached`。包络确认后才以
-`status=reached`、`reason=nearby_safe_stop` 完成，`detail` 说明原目标是
-`goal_blocked` 或 `goal_unreachable`。不存在任何安全且可达候选时才转为 `blocked`
-（`reason=no_path`、`detail=nearby_safe_goal_unavailable`）。
-
-`goal` 保留原 `global_map` 请求以兼容既有客户端；`requested_goal` 和
-`effective_goal` 明确给出 `anchor_map` 中的原目标与执行目标。
-`approach_distance_m=max(0, distance(requested_goal,effective_goal)-vehicle_radius_m)`
-是车体外缘到原目标的距离，单位为米。
-
-新的 `goto` 会替换旧目标。任何 `cmd` 或 `drive`（包括 `stop`），以及任何非法输入，都会永久取消当前目标；碰撞、安全阻断、定位丢失和连接断开也会停止任务并清除 pending 规划。终止后内部重规划不会重新激活旧目标；除非客户端重新发送 `goto`，否则不会恢复自动行驶。
-
-确认消息独立为：
-
-```json
-{
-    "type": "goto_ack",
-    "ts": 1717800000.400,
-    "seq": 44,
-    "goal": {"x_m": 12.0, "y_m": 8.5},
-    "accepted": true
-}
-```
-
-`accepted` 只有在目标已进入 `active` 状态时才为 `true`，不表示首个规划切片已经完成；
-客户端应结合后续 `navigation.planning` 判断。若旧运动在命令交接时
-已因碰撞或安全门控停止，则返回 `accepted: false`，并以 `reason` 报告
-`collision`、`safety_obstacle`、`safety_edge`、`safety_sensor_fault` 或
-`localization_lost`。超过规划距离/格数预算或缺少本地定位/地图时也会拒绝，而不会让
-WebSocket 连接崩溃。
-
-### nl_command — 自然语言指令
-
-自然语言解析器的当前生产契约为 JSON Schema v3，只接受 `stop`、`goto`、`clarify`
-和 `patrol`。v1/v2 中的 `goto_point`、`move_distance`、`status`、`rotate` 和
-`scan_report` 已废弃，不是当前支持接口；旧 schema 文件仅保留作历史参考。
-
-服务端收到 `nl_command` 后，将 v3 意图 JSON **自动翻译为函数调用和 Robot Controller
-协议命令**，并在所有 NL 相关回复中携带翻译产物。翻译层是确定性查表，不依赖 LLM。
-
-#### nl_parse_result（新增字段）
-
-```json
-{
-    "type": "nl_parse_result",
-    "ts": 1717800000.500,
-    "seq": 42,
-    "accepted": true,
-    "instruction": {"intent": "goto", "parameters": {"x_m": 100, "y_m": 200}},
-    "function_call": {
-        "name": "goto",
-        "arguments": {"x_m": 100, "y_m": 200}
+  "type": "pose",
+  "timestamp_s": 1717800000.4,
+  "seq": 12,
+  "source": "anchored_odometry",
+  "frame_id": "global_map",
+  "x_m": 12.1,
+  "y_m": 8.5,
+  "z_m": 0.0,
+  "yaw_rad": 0.4,
+  "vx_mps": 0.2,
+  "vy_mps": 0.08,
+  "omega_rps": 0.1,
+  "collision": false,
+  "actuator_command": "drive",
+  "controller": {
+    "mode": "auto",
+    "auto_state": "active",
+    "active_mission": {
+      "mission_id": "goto-001",
+      "type": "goto",
+      "frame_id": "global_map",
+      "x_m": 20.0,
+      "y_m": 30.0,
+      "submitted_seq": 5
     },
-    "command": {
-        "cmd": "auto",
-        "action": "push",
-        "missions": [{"type": "goto", "x_m": 100, "y_m": 200}]
+    "mission_queue": {
+      "size": 1,
+      "capacity": 16,
+      "mission_ids": ["goto-002"]
     },
-    "sequence_index": 1,
-    "sequence_total": 2
+    "manual_setpoint_active": false,
+    "navigation": {
+      "status": "active",
+      "goal_mode": "exact",
+      "planning": false,
+      "algorithm": "d_star_lite",
+      "replan_count": 1
+    }
+  },
+  "safety": {
+    "state": "clear",
+    "reason": null,
+    "obstacle_clearance_m": null,
+    "edge_clearance_m": null
+  },
+  "localization": {
+    "frame_id": "anchor_map",
+    "anchor_id": "mock_vehicle_01_anchor",
+    "x_m": 2.1,
+    "y_m": -1.5,
+    "yaw_rad": 0.4,
+    "covariance_diagonal": [0.0, 0.0, 0.0],
+    "quality": "nominal",
+    "timestamp_s": 1717800000.4,
+    "revision": 12,
+    "local_map_revision": 8
+  }
 }
 ```
 
-| 字段 | 类型 | 说明 |
-|------|------|------|
-| `instruction` | object | 原始 v3 意图 JSON，向后兼容 |
-| `function_call` | object | **新增**。翻译后的函数调用 `{"name": "...", "arguments": {...}}` |
-| `command` | object | **新增**。Robot Controller 协议命令 |
-| `sequence_index` | int | 多指令序列中的序号（1-based） |
-| `sequence_total` | int | 多指令序列中的总数 |
+`pose` 不泄露绝对仿真真值。`controller` 是模式、队列和导航的权威快照。
+`localization.quality` 为 `nominal`、`degraded` 或 `lost`。
 
-#### nl_task_update（新增字段）
+### scan
+
+紧随 `pose` 的 scan 使用相同 `seq` 和 `timestamp_s`：
 
 ```json
 {
-    "type": "nl_task_update",
-    "ts": 1717800000.600,
-    "seq": 42,
-    "status": "active",
-    "reason": "navigating to (100, 200)",
-    "function_call": {
-        "name": "goto",
-        "arguments": {"x_m": 100, "y_m": 200}
-    },
-    "command": {
-        "cmd": "auto",
-        "action": "push",
-        "missions": [{"type": "goto", "x_m": 100, "y_m": 200}]
-    },
-    "sequence_index": 1,
-    "sequence_total": 2
+  "type": "scan",
+  "timestamp_s": 1717800000.4,
+  "seq": 12,
+  "frame_id": "laser",
+  "config": {
+    "model": "ydlidar_tmini",
+    "min_angle": 0.0,
+    "max_angle": 6.273765,
+    "angle_increment": 0.00942,
+    "scan_time": 0.166667,
+    "min_range": 0.02,
+    "max_range": 12.0,
+    "point_count": 667,
+    "angle_unit": "rad",
+    "range_unit": "m",
+    "angle_direction": "clockwise_from_forward",
+    "no_return": {"range": 0.0, "intensity": 0.0}
+  },
+  "points": [
+    {"angle": 0.0, "range": 2.5, "intensity": 1.0},
+    {"angle": 0.00942, "range": 0.0, "intensity": 0.0}
+  ]
 }
 ```
 
-`function_call` 和 `command` 字段在 task 生命周期内保留，包括 `completed`、
-`blocked`、`cancelled` 状态。
+有效墙体回波按 `0.01 m` 量化；无回波为 `range=0`、`intensity=0`，不能解释为
+障碍物。水平 Tmini 不检测落差；模拟器用独立下视输入生成 edge safety 和
+Forbidden 证据。
 
-#### nl_confirm_request（新增字段）
+## 协议错误
 
 ```json
 {
-    "type": "nl_confirm_request",
-    "ts": 1717800000.400,
-    "seq": 42,
-    "question": "请指定目标坐标",
-    "missing": ["x_m", "y_m"],
-    "instruction": {"intent": "clarify", "parameters": {"question": "请指定目标坐标", "missing_parameters": ["x_m", "y_m"]}},
-    "function_call": {
-        "name": "clarify",
-        "arguments": {"question": "请指定目标坐标", "missing_parameters": ["x_m", "y_m"]}
-    },
-    "command": null
+  "type": "error",
+  "timestamp_s": 1717800000.5,
+  "seq": 9,
+  "code": "invalid_fields",
+  "message": "command has missing or unexpected fields"
 }
 ```
 
-`clarify` 对应的 `command` 始终为 `null`（不需要 Robot Controller 命令）。
+协议错误会先触发故障停车；若自动任务存在，会额外收到 `paused` 事件，原因为
+`invalid_command`。常见 code：
 
-#### v3 intent → command 翻译规则
-
-| v3 intent | → function_call | → command |
-|-----------|----------------|-----------|
-| `stop` | `{"name": "stop", "arguments": {}}` | `{"cmd": "manual", "action": "stop"}` |
-| `goto` | `{"name": "goto", "arguments": {"x_m":..., "y_m":...}}` | `{"cmd": "auto", "action": "push", "missions": [{"type": "goto", "x_m":..., "y_m":...}]}` |
-| `patrol` | `{"name": "patrol", "arguments": {}}` | `{"cmd": "auto", "action": "push", "missions": [{"type": "patrol"}]}` |
-| `clarify` | `{"name": "clarify", "arguments": {"question":..., ...}}` | `null` |
-
-### cmd_ack — 命令确认
-
-```json
-{
-    "type": "cmd_ack",
-    "ts": 1717800000.400,
-    "seq": 42,
-    "cmd": "forward",
-    "accepted": true
-}
+```text
+invalid_json_text, message_too_large, invalid_json, invalid_message
+missing_seq, invalid_seq, stale_seq
+invalid_type, invalid_action, invalid_fields, invalid_number
+drive_out_of_range, invalid_missions, mission_batch_too_large
+duplicate_mission_id, invalid_mission, invalid_mission_type, goal_out_of_range
 ```
-
-`accepted` 只有在命令通过碰撞与安全门控并实际安装后才为 `true`。若命令被拒绝，
-Server 返回 `accepted: false`，并用 `reason` 报告 `collision`、
-`safety_obstacle`、`safety_edge` 或 `safety_sensor_fault`。
-
-### error — 命令错误
-
-```json
-{
-    "type": "error",
-    "ts": 1717800000.500,
-    "seq": 42,
-    "code": "invalid_cmd",
-    "message": "unsupported cmd"
-}
-```
-
-无法安全提取序号时 `seq` 为 `null`。错误输入总是先触发安全停车。
-`vehicle_busy` 是连接级拒绝，不会停车、取消或推进当前控制器的车辆。
-
----
-
-## 消息一览
-
-```
-上行 (小车 → PC)          下行 (PC → 小车)
-─────────────────         ─────────────────
-hello                      cmd / drive / goto
-map_full
-pose
-scan
-cmd_ack / goto_ack / error
-map_delta
-```
-
-`map_full` 是 `simulator_ground_truth`，仅供物理、传感器生成和调试显示；`pose` 是
-`anchored_odometry`，`scan` 是模拟的 Tmini 本地观测。扫描会累计到车辆内存中的
-`ObservedGrid`，D* Lite 在小车内部消费其 Unknown/Free/Occupied/Forbidden、revision 和 delta；
-局部地图 delta 尚未通过 WebSocket 上传。车辆 runtime 跨控制器断开重连保留，但活动
-`goto` 会取消。当前有轻量 scan matching 和局部增量规划，没有回环、位姿图、全局优化、
-地图持久化或中央地图同步。自然语言 v3 的 `goto` 进入同一个 GotoController，不走旧的
-全真值 A* / PathFollowingController。
-
-## 安全运行时
-
-水平安装的 Tmini 只对 `state=1` 的墙产生正距离回波；`range=0` 仍表示无回波，不能解释为障碍物。Tmini 不能检测地面落差，因此 `state=2` 和地图越界由模拟器独立的向下地面探测辅助量判断，不能宣称来自雷达。
-
-运行时以车辆圆形 footprint 为边界输出障碍/边缘净空：Tmini 正回波投影到行驶方向的完整圆形扫掠走廊，不使用固定角度扇区。净空 `<=0.25 m` 时硬停止，自动模式在 `0.25–1.0 m` 内线性降低平移速度，手动模式不执行慢速区降速但仍执行硬停止。即使事件循环延迟，旧速度也只按不超过 `0.05 m` 且不越过硬停止净空的小步推进，并在每步前重新观测。带平移的手动命令触发硬停止后会全部停车；客户端可发送新的反向或纯旋转命令重新评估并脱困。停车状态不会自行恢复。
-
-`safety.state` 为 `clear`、`limited`、`stopped` 或 `fault`；对应原因目前为 `safety_obstacle`、`safety_edge` 或 `safety_sensor_fault`。安全输入故障采用 fail-safe：自动任务变为 `blocked`，手动命令也全部停车。未发现正雷达回波或有限前视范围内未发现边缘仅表示当前观测为 clear，不表示更远区域已知。生产模拟默认输入健康；`healthy=false` 只用于确定性故障测试。
-
-车辆自有地图按每条射线把命中前区域标为 Free、命中格标为 Occupied、遮挡后保持 Unknown；
-独立下视输入发现无地面时把对应格标为不可被水平雷达覆盖的 Forbidden，供 D* Lite 绕行。
-当前模拟协议把 `range=0` 的无回波射线更新到最大量程 Free；真实 Tmini 的无回波原因更复杂，
-接入硬件前必须校准，不能直接沿用。水平 Tmini 仍不能检测跌落。

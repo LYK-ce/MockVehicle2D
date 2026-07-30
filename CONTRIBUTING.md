@@ -58,10 +58,12 @@ MockVehicle2D/
 │   ├── cli/                 ← CLI entry points
 │   ├── map_grid.py          ← 2D grid map
 │   ├── collision.py         ← collision detection
-│   ├── navigation.py        ← direct go-to-goal control
+│   ├── controller.py        ← modes, mission queue, and control authority
+│   ├── protocol.py          ← canonical WebSocket command boundary
+│   ├── navigation.py        ← finite-view autonomous velocity decisions
 │   ├── safety.py            ← local safety sensing and limits
 │   ├── server.py            ← WebSocket server
-│   └── visual.py            ← Pygame visualization
+│   └── vehicle.py           ← deterministic vehicle dynamics
 ├── tests/                   ← test suite
 ├── docs/                    ← design documents
 └── bootstrap.sh             ← one-shot setup script

@@ -291,6 +291,82 @@ def test_floating_tangency_matches_runtime_but_real_penetration_blocks() -> None
     assert not is_swept_circle_passable(truth, *penetration, 0.5)
 
 
+def test_hard_clearance_keeps_two_metre_corridor_traversable() -> None:
+    observed = ObservedGrid(ANCHOR, resolution_m=0.5)
+    search = DStarLitePlanner(
+        observed,
+        vehicle_radius_m=0.5,
+        hard_clearance_m=0.25,
+        bounds_margin_m=2.0,
+    )
+    corridor_walls = tuple(
+        MapCellUpdate(x, y, OCCUPIED)
+        for x in range(-2, 15)
+        for y in (7, 12)
+    )
+
+    path = search.plan(
+        (0, 9),
+        (12, 9),
+        changed_cells=corridor_walls,
+    )
+
+    assert path is not None
+    assert path[0] == (0, 9)
+    assert path[-1] == (12, 9)
+
+
+def test_actual_pose_can_egress_from_planning_clearance_envelope() -> None:
+    search = DStarLitePlanner(
+        ObservedGrid(ANCHOR, resolution_m=0.5),
+        vehicle_radius_m=0.5,
+        hard_clearance_m=0.25,
+        bounds_margin_m=2.0,
+    )
+
+    path = search.plan(
+        (0, 0),
+        (-3, 0),
+        changed_cells=(MapCellUpdate(1, 0, OCCUPIED),),
+        start_position_m=(0.0, 0.25),
+    )
+
+    assert path is not None
+    assert path[:2] == [(0, 0), (-1, 0)]
+    assert search.best_start_connection((0.0, 0.25), (0, 0)) == (-1, 0)
+    assert not search.is_segment_passable(
+        (0.0, 0.25),
+        (0.0, 0.75),
+        extra_clearance_m=0.25,
+    )
+    assert not search._segment_blocked(
+        (0.2, 0.5),
+        (-0.5, 0.5),
+        allow_clearance_egress=True,
+    )
+    assert search._segment_blocked(
+        (0.2, 0.5),
+        (1.5, 0.5),
+        allow_clearance_egress=True,
+    )
+
+
+def test_blocked_start_without_confirmed_actual_pose_cannot_egress() -> None:
+    search = DStarLitePlanner(
+        ObservedGrid(ANCHOR, resolution_m=0.5),
+        vehicle_radius_m=0.5,
+        hard_clearance_m=0.25,
+        bounds_margin_m=2.0,
+    )
+
+    assert search.plan(
+        (0, 0),
+        (-3, 0),
+        changed_cells=(MapCellUpdate(1, 0, OCCUPIED),),
+    ) is None
+    assert search.last_failure == "start_blocked"
+
+
 def test_confirmed_free_clearance_rejects_unknown_and_occupied_envelopes() -> None:
     observed = ObservedGrid(AnchorSpec("dstar-anchor", 0.0, 0.0, 0.0))
     search = DStarLitePlanner(observed, vehicle_radius_m=0.5)

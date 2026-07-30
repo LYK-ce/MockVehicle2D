@@ -15,6 +15,7 @@ FREE = 0
 OCCUPIED = 1
 FORBIDDEN = 2
 LOCALIZATION_QUALITIES = frozenset(("nominal", "degraded", "lost"))
+OCCUPIED_CLEAR_OBSERVATIONS = 3
 
 
 def _wrapped(angle: float) -> float:
@@ -107,8 +108,6 @@ class PoseEstimate:
             "covariance_diagonal": list(self.covariance),
             "quality": self.quality,
             "timestamp_s": self.timestamp,
-            # Deprecated compatibility alias; value remains Unix seconds.
-            "timestamp": self.timestamp,
             "revision": self.revision,
         }
 
@@ -549,20 +548,7 @@ class MapCellUpdate:
 
 @dataclass(frozen=True)
 class LocalMapDelta:
-    anchor_id: str
-    revision: int
-    pose_revision: int
-    observed_at: float
     changed_cells: tuple[MapCellUpdate, ...]
-
-    def as_dict(self) -> dict[str, object]:
-        return {
-            "anchor_id": self.anchor_id,
-            "revision": self.revision,
-            "pose_revision": self.pose_revision,
-            "observed_at_s": self.observed_at,
-            "changed_cells": [cell.as_dict() for cell in self.changed_cells],
-        }
 
 
 class ObservedGrid:
@@ -575,6 +561,7 @@ class ObservedGrid:
         self.resolution_m = resolution_m
         self.revision = 0
         self._cells: dict[tuple[int, int], int] = {}
+        self._occupied_free_observations: dict[tuple[int, int], int] = {}
 
     def get_cell(self, gx: int, gy: int) -> int:
         if type(gx) is not int or type(gy) is not int:
@@ -649,11 +636,21 @@ class ObservedGrid:
                 for gy in _axis_cells_at_point(evidence_y, self.resolution_m):
                     updates[gx, gy] = FORBIDDEN
 
-        updates = {
-            cell: state
-            for cell, state in updates.items()
-            if self._cells.get(cell) != FORBIDDEN or state == FORBIDDEN
-        }
+        filtered_updates = {}
+        for cell, state in updates.items():
+            existing = self._cells.get(cell)
+            if existing == FORBIDDEN and state != FORBIDDEN:
+                continue
+            if existing == OCCUPIED and state == FREE:
+                observations = (
+                    self._occupied_free_observations.get(cell, 0) + 1
+                )
+                if observations < OCCUPIED_CLEAR_OBSERVATIONS:
+                    self._occupied_free_observations[cell] = observations
+                    continue
+            self._occupied_free_observations.pop(cell, None)
+            filtered_updates[cell] = state
+        updates = filtered_updates
         original = {cell: self._cells.get(cell, UNKNOWN) for cell in updates}
         self._cells.update(updates)
         changed = tuple(
@@ -665,13 +662,7 @@ class ObservedGrid:
         )
         if changed:
             self.revision += 1
-        return LocalMapDelta(
-            self.anchor.anchor_id,
-            self.revision,
-            pose.revision,
-            observed_at,
-            changed,
-        )
+        return LocalMapDelta(changed)
 
     def snapshot(self) -> dict[str, object]:
         return {
@@ -771,7 +762,6 @@ class AnchoredLocalState:
         self.local_map = ObservedGrid(anchor, resolution_m=map_resolution_m)
         self.scan_matcher = CorrelativeScanMatcher(scan_match_config)
         self.last_scan_match: ScanMatchResult | None = None
-        self.last_map_delta: LocalMapDelta | None = None
 
     @property
     def pose(self) -> PoseEstimate:
@@ -795,14 +785,13 @@ class AnchoredLocalState:
     ) -> LocalMapDelta | None:
         if self.pose.quality == "lost":
             return None
-        self.last_map_delta = self.local_map.integrate_scan(
+        return self.local_map.integrate_scan(
             points,
             self.pose,
             observed_at,
             config,
             forbidden_points_vehicle_m=forbidden_points_vehicle_m,
         )
-        return self.last_map_delta
 
     def match_and_integrate_scan(
         self,

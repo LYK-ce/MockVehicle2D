@@ -1,7 +1,7 @@
 # 有限视野寻路
 
-自动 `goto` 使用车辆自己的有限视野占据栅格和 D* Lite。模拟器完整真值地图不参与路径
-规划，只用于物理碰撞、传感器生成和调试显示。
+Auto 队列中的 `goto` 任务使用车辆自己的有限视野占据栅格和 D* Lite。模拟器完整真值
+地图不参与路径规划，只用于物理碰撞、传感器生成和调试显示。
 
 ## 运行链路
 
@@ -15,7 +15,11 @@ bounded scan matching（只匹配旧 Occupied 证据）
 ObservedGrid: Unknown / Free / Occupied + delta
               │
               ▼
-D* Lite（增量修复路径）──► 局部 waypoint ──► 速度控制 ──► safety
+D* Lite（增量修复路径）──► 局部 waypoint ──► 期望速度
+                                                    │
+RobotController ────────────────────────────────────┤
+                                                    ▼
+                                                  safety
 ```
 
 一帧按固定顺序执行：
@@ -67,9 +71,11 @@ Free；选中后保持稳定，并在每帧证据更新后重新验证。
 
 规划按控制帧增量推进。`goto` 已受理但当前切片尚未完成时，任务保持 `active`，
 `planning=true` 且车辆保持 `stop`；旧 `path` 可继续出现在遥测中供 UI 对比，但不会被
-执行。地图变化触发的 `replan()` 使用相同的每帧额度，可能需要多个 `update` 才完成。
-手动接管、碰撞、安全阻断、定位丢失及其他终止态会清除 pending；终止后的 `replan()`
-不会恢复任务，必须重新下发 `goto`。
+执行。地图变化通过 `update(map_delta=...)` 触发相同额度的增量重规划，可能需要多个
+控制帧才完成。
+手动接管、显式 pause、连接断开和非法命令会停车、清除本次 pending 规划并保留任务；
+显式 `resume` 会从当前位姿和地图重新启动。碰撞、无路、安全故障或定位丢失会将当前任务
+置为 `blocked` 且不跳过队列；条件恢复后可 `resume` 重试，或用 `cancel_all` 清空。
 
 遥测 `navigation` 中可观察：
 
@@ -105,7 +111,7 @@ Free；选中后保持稳定，并在每帧证据更新后重新验证。
 }
 ```
 
-公开路径和目标使用米；整数 cell 只存在于规划器内部。`goal` 保留兼容的原始
+公开路径和目标使用米；整数 cell 只存在于规划器内部。`goal` 保留原始
 `global_map` 请求，`requested_goal` 与 `effective_goal` 分别明确原请求和实际执行的
 `anchor_map` 坐标。`goal_mode` 为 `exact`、`approaching_safe_stop` 或 `nearby_safe`。
 `approach_distance_m` 是实际目标到原请求目标的中心距离减去车体半径（下限为零），即
@@ -154,7 +160,7 @@ cell_path = a_star_search(
 ## 已知限制
 
 - 局部地图和 D* Lite 状态只在进程内存中；重连保留，进程重启丢失。
-- 控制连接断开会取消活动 `goto`，重连后需重新下发目标。
+- 控制连接断开会停车并暂停活动 `goto`；重连后需显式 `resume`。
 - 暂无路径平滑、运动学轨迹优化和动态目标速度预测。
 - Unknown 的无回波 Free 更新沿用当前模拟约定，接入真实 Tmini 前必须校准。
 - 水平 Tmini 无法发现落差；模拟器使用独立下视安全输入。

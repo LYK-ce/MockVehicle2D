@@ -9,17 +9,19 @@ import unittest
 REPO_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO_ROOT / "src"))
 
-from mockvehicle2d.collision import is_circle_passable, is_swept_circle_passable, raycast
+from mockvehicle2d.collision import is_swept_circle_passable
 from mockvehicle2d.map_grid import MapGrid
 from mockvehicle2d.safety import (
     HARD_STOP_CLEARANCE_M,
     SLOW_ZONE_CLEARANCE_M,
+    LocalSafetyRuntime,
     SafetyGovernor,
     SafetyObservation,
-    nearest_edge_clearance,
+    _nearest_edge_evidence,
     nearest_obstacle_clearance,
 )
 from mockvehicle2d.scan import LaserPoint, ScanConfig, scan_grid
+from mockvehicle2d.vehicle import Vehicle
 
 
 class MapStateSafetyTest(unittest.TestCase):
@@ -41,10 +43,10 @@ class MapStateSafetyTest(unittest.TestCase):
         grid = MapGrid(6, 4)
         grid.set_cell(3, 1, 2)
 
-        self.assertFalse(is_circle_passable(grid, 3.5, 1.5, 0.4))
+        self.assertFalse(
+            is_swept_circle_passable(grid, 3.5, 1.5, 3.5, 1.5, 0.4)
+        )
         self.assertFalse(is_swept_circle_passable(grid, 1.5, 1.5, 4.5, 1.5, 0.4))
-        self.assertTrue(raycast(grid, 1, 1, 4, 1).hit)
-        self.assertTrue(raycast(grid, 1, 2, 8, 2).hit)
 
     def test_horizontal_tmini_only_returns_walls(self) -> None:
         config = ScanConfig(0.0, 0.0, 1.0, 0.1, 0.05, 8.0)
@@ -88,22 +90,22 @@ class SafetySensingTest(unittest.TestCase):
         grid = MapGrid(8, 6)
         grid.set_cell(5, 3, 2)
 
-        clearance = nearest_edge_clearance(
+        clearance, _ = _nearest_edge_evidence(
             grid, 3.5, 2.5, 0.0, 0.5, vehicle_radius=0.6, lookahead_m=3.0
         )
         self.assertIsNotNone(clearance)
         self.assertAlmostEqual(clearance, 1.15, delta=0.05)
 
-        reverse_clearance = nearest_edge_clearance(
+        reverse_clearance, _ = _nearest_edge_evidence(
             MapGrid(8, 6), 1.5, 2.5, 0.0, -0.5, vehicle_radius=0.5, lookahead_m=2.0
         )
         self.assertIsNotNone(reverse_clearance)
         self.assertAlmostEqual(reverse_clearance, 1.0, delta=0.05)
 
         self.assertIsNone(
-            nearest_edge_clearance(
+            _nearest_edge_evidence(
                 MapGrid(8, 6), 3.5, 2.5, 0.0, 0.5, vehicle_radius=0.4, lookahead_m=2.0
-            )
+            )[0]
         )
 
 
@@ -159,6 +161,42 @@ class SafetyGovernorTest(unittest.TestCase):
 
         clear = self.governor.limit(0.4, 0.0, SafetyObservation(), True)
         self.assertEqual((clear.state, clear.reason), ("clear", None))
+
+    def test_held_translation_stop_preserves_allowed_rotation(self) -> None:
+        grid = MapGrid.from_wall_set(8, 8, {(3, y) for y in range(8)})
+        vehicle = Vehicle(2.3, 4.0, now=0.0)
+        vehicle.install_drive(0.5, 0.3, 0.0)
+
+        result = LocalSafetyRuntime().advance(
+            vehicle,
+            grid,
+            0.1,
+            automatic=True,
+        )
+
+        self.assertTrue(result.stopped)
+        self.assertEqual(result.reason, "safety_obstacle")
+        self.assertEqual(vehicle.x, 2.3)
+        self.assertGreater(vehicle.yaw, 0.0)
+        self.assertEqual(vehicle.body_velocities(), (0.0, 0.0))
+
+    def test_exact_hard_clearance_preserves_allowed_rotation(self) -> None:
+        grid = MapGrid.from_wall_set(8, 8, {(3, y) for y in range(8)})
+        vehicle = Vehicle(2.25, 4.0, now=0.0)
+        vehicle.install_drive(0.5, 0.3, 0.0)
+
+        result = LocalSafetyRuntime().advance(
+            vehicle,
+            grid,
+            0.1,
+            automatic=True,
+        )
+
+        self.assertTrue(result.stopped)
+        self.assertEqual(result.reason, "safety_obstacle")
+        self.assertEqual(vehicle.x, 2.25)
+        self.assertGreater(vehicle.yaw, 0.0)
+        self.assertEqual(vehicle.body_velocities(), (0.0, 0.0))
 
 
 def main() -> int:

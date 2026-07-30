@@ -9,12 +9,9 @@ description = "2D vehicle simulator for Pictor WebSocket protocol testing and co
 requires-python = ">=3.10"
 dependencies = [
     "websockets",
-    "jsonschema>=4.0",
 ]
 
 [project.optional-dependencies]
-visual = ["pygame"]
-nl = ["openai"]
 hardware = ["pyserial", "numpy", "matplotlib"]
 dev = ["pytest"]
 
@@ -24,9 +21,6 @@ mockvehicle2d = "mockvehicle2d.cli.main:main"
 [tool.setuptools.packages.find]
 where = ["src"]
 include = ["mockvehicle2d*"]
-
-[tool.setuptools.package-data]
-"mockvehicle2d.instruction" = ["schemas/*.json"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
