@@ -48,6 +48,7 @@ class DStarLitePlanner:
         grid: ObservedGrid,
         *,
         vehicle_radius_m: float = 0.5,
+        hard_clearance_m: float = 0.0,
         unknown_cost: float = 3.0,
         bounds_margin_m: float = 16.0,
         max_goal_distance_m: float = 256.0,
@@ -56,6 +57,8 @@ class DStarLitePlanner:
         if (
             not math.isfinite(vehicle_radius_m)
             or vehicle_radius_m < 0
+            or not math.isfinite(hard_clearance_m)
+            or hard_clearance_m < 0
             or not math.isfinite(unknown_cost)
             or unknown_cost < 1
             or not math.isfinite(bounds_margin_m)
@@ -68,13 +71,16 @@ class DStarLitePlanner:
             raise ValueError("invalid D* Lite configuration")
         self.resolution_m = grid.resolution_m
         self.vehicle_radius_m = vehicle_radius_m
+        self.hard_clearance_m = hard_clearance_m
         self.unknown_cost = unknown_cost
         self.bounds_margin_m = bounds_margin_m
         self._bounds_margin_cells = math.ceil(bounds_margin_m / grid.resolution_m)
         self.max_goal_distance_m = max_goal_distance_m
         self.max_cells = max_cells
-        self._vehicle_radius_cells = vehicle_radius_m / grid.resolution_m
-        self._inflation_cells = math.ceil(self._vehicle_radius_cells)
+        self._planning_radius_cells = (
+            vehicle_radius_m + hard_clearance_m
+        ) / grid.resolution_m
+        self._inflation_cells = math.ceil(self._planning_radius_cells)
         self._states = {
             (cell["gx"], cell["gy"]): cell["state"]
             for cell in grid.snapshot()["cells"]
@@ -82,6 +88,7 @@ class DStarLitePlanner:
         self._bounds: tuple[int, int, int, int] | None = None
         self._start: Cell | None = None
         self._last_start: Cell | None = None
+        self._start_position_cells: tuple[float, float] | None = None
         self._goal: Cell | None = None
         self._key_modifier_cost = 0.0
         self._g: dict[Cell, float] = {}
@@ -192,6 +199,7 @@ class DStarLitePlanner:
                 source,
                 destination,
                 allow_forbidden_egress=True,
+                allow_clearance_egress=self._start_position_cells is not None,
             ):
                 continue
             connector = (
@@ -221,11 +229,13 @@ class DStarLitePlanner:
         goal: Cell,
         *,
         changed_cells: Iterable[MapCellUpdate] = (),
+        start_position_m: tuple[float, float] | None = None,
     ) -> list[Cell] | None:
         progress = self.advance_plan(
             start,
             goal,
             changed_cells=changed_cells,
+            start_position_m=start_position_m,
             expansion_budget=1,
         )
         total_expansions = 1 if progress.status == "pending" else 0
@@ -235,6 +245,7 @@ class DStarLitePlanner:
             progress = self.advance_plan(
                 start,
                 goal,
+                start_position_m=start_position_m,
                 expansion_budget=max(1, limit - total_expansions + 1),
             )
             consumed = self._expansions - before
@@ -251,12 +262,38 @@ class DStarLitePlanner:
         goal: Cell,
         *,
         changed_cells: Iterable[MapCellUpdate] = (),
+        start_position_m: tuple[float, float] | None = None,
         expansion_budget: int,
     ) -> PlanProgress:
         self.validate_plan_request(start, goal)
         if type(expansion_budget) is not int or expansion_budget <= 0:
             raise ValueError("expansion budget must be a positive integer")
+        if start_position_m is not None:
+            if (
+                not isinstance(start_position_m, tuple)
+                or len(start_position_m) != 2
+                or any(
+                    isinstance(value, bool)
+                    or not isinstance(value, (int, float))
+                    or not math.isfinite(value)
+                    for value in start_position_m
+                )
+            ):
+                raise ValueError("start position must be a finite metric pair")
+            if (
+                math.floor(start_position_m[0] / self.resolution_m),
+                math.floor(start_position_m[1] / self.resolution_m),
+            ) != start:
+                raise ValueError("start position must lie inside the start cell")
+            start_position_cells = (
+                start_position_m[0] / self.resolution_m,
+                start_position_m[1] / self.resolution_m,
+            )
+        else:
+            start_position_cells = None
         self.last_failure = None
+        previous_start_position = self._start_position_cells
+        self._start_position_cells = start_position_cells
 
         changes = tuple(changed_cells)
         for change in changes:
@@ -293,7 +330,12 @@ class DStarLitePlanner:
             self._last_start = start
             if changes:
                 self._apply_changes(changes)
-        if self._blocked(start):
+            elif (
+                self._blocked(start)
+                and previous_start_position != start_position_cells
+            ):
+                self._update_vertex(start)
+        if self._blocked(start) and not self._has_start_egress():
             self.last_failure = "start_blocked"
             self._planning_pending = False
             return PlanProgress("unreachable")
@@ -433,7 +475,9 @@ class DStarLitePlanner:
             self._push(cell)
 
     def _cost(self, source: Cell, destination: Cell) -> float:
-        if self._blocked(source) or self._blocked(destination):
+        if self._blocked(source):
+            return self._start_connection_cost(source, destination)
+        if self._blocked(destination):
             return math.inf
         dx, dy = destination[0] - source[0], destination[1] - source[1]
         if dx and dy and (
@@ -456,6 +500,7 @@ class DStarLitePlanner:
         destination: tuple[float, float],
         *,
         allow_forbidden_egress: bool = False,
+        allow_clearance_egress: bool = False,
         radius_cells: float | None = None,
         block_tangent: bool = False,
         require_observed: bool = False,
@@ -463,7 +508,7 @@ class DStarLitePlanner:
         source_x, source_y = source
         destination_x, destination_y = destination
         radius = (
-            self._vehicle_radius_cells
+            self._planning_radius_cells
             if radius_cells is None
             else radius_cells
         )
@@ -502,7 +547,13 @@ class DStarLitePlanner:
                         abs_tol=1e-12,
                     )
                 ):
-                    if allow_forbidden_egress and state == FORBIDDEN:
+                    if (
+                        (allow_forbidden_egress and state == FORBIDDEN)
+                        or (
+                            allow_clearance_egress
+                            and state in {OCCUPIED, FORBIDDEN}
+                        )
+                    ):
                         source_distance_squared = segment_aabb_distance_squared(
                             source_x,
                             source_y,
@@ -569,12 +620,43 @@ class DStarLitePlanner:
                     return True
         return False
 
+    def _has_start_egress(self) -> bool:
+        assert self._start is not None
+        return any(
+            math.isfinite(self._start_connection_cost(self._start, neighbour))
+            for neighbour in self._neighbours(self._start)
+        )
+
+    def _start_connection_cost(
+        self,
+        source: Cell,
+        destination: Cell,
+    ) -> float:
+        if (
+            source != self._start
+            or self._start_position_cells is None
+            or self._blocked(destination)
+        ):
+            return math.inf
+        target = destination[0] + 0.5, destination[1] + 0.5
+        if self._segment_blocked(
+            self._start_position_cells,
+            target,
+            allow_clearance_egress=True,
+        ):
+            return math.inf
+        distance_m = (
+            math.dist(self._start_position_cells, target) * self.resolution_m
+        )
+        state = self._states.get(destination, UNKNOWN)
+        return distance_m * (1.0 if state == FREE else self.unknown_cost)
+
     def _blocked(self, cell: Cell) -> bool:
         if not self._inside(cell):
             return True
         radius = self._inflation_cells
         centre_x, centre_y = cell[0] + 0.5, cell[1] + 0.5
-        radius_squared = self._vehicle_radius_cells**2
+        radius_squared = self._planning_radius_cells**2
         return any(
             self._states.get((gx, gy), UNKNOWN) in {OCCUPIED, FORBIDDEN}
             and (

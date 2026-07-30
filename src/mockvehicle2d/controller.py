@@ -264,11 +264,13 @@ class RobotController:
             desired[1],
             automatic=True,
         )
-        if decision.state in {"stopped", "fault"}:
+        if decision.state == "fault":
             vehicle.stop()
-            if decision.state == "fault":
-                self.navigation.block(decision.reason or "safety_sensor_fault")
-                self._finish_blocked(vehicle)
+            self.navigation.block(decision.reason or "safety_sensor_fault")
+            self._finish_blocked(vehicle)
+            return
+        if decision.state == "stopped":
+            vehicle.install_drive(0.0, decision.angular_rps, now)
             return
         vehicle.install_drive(decision.linear_mps, decision.angular_rps, now)
 
@@ -385,7 +387,9 @@ class RobotController:
 
         desired = command.linear_mps, command.angular_rps
         decision = safety.evaluate(vehicle, grid, *desired, automatic=False)
-        if decision.state in {"stopped", "fault"}:
+        if decision.state == "fault" or (
+            decision.state == "stopped" and decision.angular_rps == 0.0
+        ):
             self._manual_setpoint = None
             self._manual_deadline = None
             vehicle.stop(now)
@@ -477,7 +481,9 @@ class RobotController:
             *self._manual_setpoint,
             automatic=False,
         )
-        if decision.state in {"stopped", "fault"}:
+        if decision.state == "fault" or (
+            decision.state == "stopped" and decision.angular_rps == 0.0
+        ):
             self._manual_setpoint = None
             self._manual_deadline = None
             vehicle.stop()

@@ -61,6 +61,7 @@ class GotoController:
         self._safe_candidate_index = 0
         self._pending_candidate: SafeCandidate | None = None
         self._candidate_inspections = 0
+        self._skip_goal_connected_candidates = False
 
     def start(
         self,
@@ -94,8 +95,11 @@ class GotoController:
         self._safe_candidate_index = 0
         self._pending_candidate = None
         self._candidate_inspections = 0
+        self._skip_goal_connected_candidates = False
         self._planner = DStarLitePlanner(
-            local_map, vehicle_radius_m=vehicle_radius_m
+            local_map,
+            vehicle_radius_m=vehicle_radius_m,
+            hard_clearance_m=HARD_STOP_CLEARANCE_M,
         )
         self._planner.validate_plan_request(
             self._pose_cell(pose, local_map),
@@ -360,6 +364,7 @@ class GotoController:
                 self._pose_cell(pose, local_map),
                 self._goal_cell(local_map),
                 changed_cells=changes,
+                start_position_m=(pose.x_m, pose.y_m),
                 expansion_budget=remaining,
             )
             remaining -= self._planner.stats["expansions"] - before
@@ -400,7 +405,10 @@ class GotoController:
                     return
             if self._nearby_detail is None:
                 self._nearby_detail = failure
-            self._begin_safe_goal_search(local_map)
+            self._begin_safe_goal_search(
+                local_map,
+                skip_goal_connected=failure == "goal_unreachable",
+            )
         if self._planning_kind == "candidate":
             self._advance_safe_candidate(
                 pose,
@@ -409,10 +417,16 @@ class GotoController:
                 remaining,
             )
 
-    def _begin_safe_goal_search(self, local_map: ObservedGrid) -> None:
+    def _begin_safe_goal_search(
+        self,
+        local_map: ObservedGrid,
+        *,
+        skip_goal_connected: bool,
+    ) -> None:
         self._planning_kind = "candidate"
         self.goal_mode = "approaching_safe_stop"
         self._safe_candidates = self._build_safe_candidates(local_map)
+        self._skip_goal_connected_candidates = skip_goal_connected
         self._safe_candidate_index = 0
         self._pending_candidate = None
         self._current_waypoint = None
@@ -452,6 +466,7 @@ class GotoController:
                 self._pose_cell(pose, local_map),
                 goal_cell,
                 changed_cells=changes,
+                start_position_m=(pose.x_m, pose.y_m),
                 expansion_budget=remaining,
             )
             remaining -= self._planner.stats["expansions"] - before
@@ -515,6 +530,16 @@ class GotoController:
             self._candidate_inspections += 1
             point, goal_cell, confirmed = candidate
             if not self._planner.planning_budget_allows(start, goal_cell):
+                continue
+            if (
+                self._skip_goal_connected_candidates
+                and self.requested_goal is not None
+                and self._planner.is_segment_passable(
+                    point,
+                    self.requested_goal,
+                    extra_clearance_m=HARD_STOP_CLEARANCE_M,
+                )
+            ):
                 continue
             if allow_stale_geometry or self._candidate_is_safe(
                 point,
@@ -658,6 +683,7 @@ class GotoController:
         self._safe_candidates = []
         self._safe_candidate_index = 0
         self._pending_candidate = None
+        self._skip_goal_connected_candidates = False
 
     def _approach_distance_m(self) -> float | None:
         if self.requested_goal is None or self.goal is None:

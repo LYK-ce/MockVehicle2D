@@ -1,6 +1,7 @@
 """End-to-end finite-view navigation through RobotController."""
 
 from pathlib import Path
+import math
 import sys
 import unittest
 from unittest.mock import patch
@@ -78,6 +79,133 @@ def start_missions(runtime: VehicleRuntime, *missions: GotoMission) -> None:
 
 
 class TestControllerNavigation(unittest.TestCase):
+    def test_unknown_dead_end_turns_around_exits_and_replans(self) -> None:
+        walls = {
+            *((x, y) for x in range(3, 16) for y in (3, 7)),
+            *((15, y) for y in range(4, 7)),
+        }
+        runtime = make_runtime(
+            MapGrid.from_wall_set(22, 12, walls),
+            map_resolution_m=0.5,
+        )
+        start_missions(
+            runtime,
+            GotoMission("dead-end", "global_map", 18.5, 5.5, 2),
+        )
+
+        furthest_x = runtime.vehicle.x
+        entry_yaw = runtime.vehicle.yaw
+        reversed_heading = False
+        exited_after_reversal = False
+        for tick in range(1, 500):
+            runtime.update(tick / 4, tick / 4)
+            furthest_x = max(furthest_x, runtime.vehicle.x)
+            yaw_delta = abs(
+                math.atan2(
+                    math.sin(runtime.vehicle.yaw - entry_yaw),
+                    math.cos(runtime.vehicle.yaw - entry_yaw),
+                )
+            )
+            reversed_heading |= yaw_delta > math.radians(150)
+            exited_after_reversal |= (
+                reversed_heading and runtime.vehicle.x < furthest_x - 0.5
+            )
+            if runtime.controller.auto_state is not AutoState.ACTIVE:
+                break
+
+        self.assertFalse(runtime.vehicle.collision)
+        self.assertGreater(furthest_x, 2.75)
+        self.assertTrue(reversed_heading, runtime.controller.snapshot())
+        self.assertTrue(exited_after_reversal, runtime.controller.snapshot())
+        self.assertEqual(
+            runtime.controller.navigation.status,
+            "reached",
+            runtime.controller.snapshot(),
+        )
+
+    def test_sealed_exit_becomes_blocked_within_bounded_ticks(self) -> None:
+        walls = {
+            *((x, y) for x in range(3, 10) for y in (3, 9)),
+            *((x, y) for x in (3, 9) for y in range(4, 9)),
+        }
+        runtime = make_runtime(
+            MapGrid.from_wall_set(16, 14, walls),
+            x_m=6.5,
+            y_m=6.5,
+            map_resolution_m=0.5,
+        )
+        start_missions(
+            runtime,
+            GotoMission("sealed", "global_map", 12.5, 6.5, 2),
+        )
+
+        for tick in range(1, 80):
+            runtime.update(tick / 4, tick / 4)
+            if runtime.controller.auto_state is not AutoState.ACTIVE:
+                break
+
+        self.assertFalse(runtime.vehicle.collision)
+        self.assertLessEqual(tick, 20)
+        self.assertEqual(
+            runtime.controller.auto_state,
+            AutoState.BLOCKED,
+            runtime.controller.snapshot(),
+        )
+        self.assertEqual(runtime.controller.navigation.reason, "no_path")
+
+    def test_multi_obstacle_layout_terminates_without_active_stop_loop(self) -> None:
+        walls = {
+            (5, 2),
+            (5, 4),
+            (5, 5),
+            (6, 3),
+            (6, 4),
+            (6, 10),
+            (7, 6),
+            (7, 10),
+            (8, 2),
+            (9, 5),
+            (9, 8),
+            (9, 9),
+            (10, 6),
+            (11, 6),
+            (11, 7),
+            (12, 3),
+            (12, 5),
+            (13, 1),
+            (13, 10),
+        }
+        runtime = make_runtime(
+            MapGrid.from_wall_set(20, 12, walls),
+            map_resolution_m=0.5,
+        )
+        start_missions(
+            runtime,
+            GotoMission("multi-obstacle", "global_map", 14.5, 5.5, 2),
+        )
+
+        start = runtime.vehicle.x, runtime.vehicle.y
+        max_displacement = 0.0
+        for tick in range(1, 500):
+            runtime.update(tick / 6, tick / 6)
+            max_displacement = max(
+                max_displacement,
+                math.dist(start, (runtime.vehicle.x, runtime.vehicle.y)),
+            )
+            if runtime.controller.auto_state is not AutoState.ACTIVE:
+                break
+
+        self.assertFalse(runtime.vehicle.collision)
+        self.assertGreater(max_displacement, 1.0)
+        self.assertIsNot(
+            runtime.controller.auto_state,
+            AutoState.ACTIVE,
+            runtime.controller.snapshot(),
+        )
+        self.assertIn(runtime.controller.navigation.status, {"blocked", "reached"})
+        if runtime.controller.navigation.status == "blocked":
+            self.assertEqual(runtime.controller.navigation.reason, "no_path")
+
     def test_unknown_next_cell_is_traversable_but_speed_limited(self) -> None:
         anchor = AnchorSpec("unknown-anchor", 10.0, 10.0, 0.0)
         local_map = ObservedGrid(anchor)
@@ -171,6 +299,39 @@ class TestControllerNavigation(unittest.TestCase):
             "reached",
             [event.status for event in terminal_events],
         )
+
+    def test_narrow_unsafe_corridor_replans_through_open_detour(self) -> None:
+        walls = {
+            (x, y)
+            for x in range(6, 11)
+            for y in (4, 6)
+        }
+        runtime = make_runtime(
+            MapGrid.from_wall_set(20, 12, walls),
+            map_resolution_m=0.5,
+        )
+        start_missions(
+            runtime,
+            GotoMission("narrow-detour", "global_map", 14.5, 5.5, 2),
+        )
+
+        max_lateral_deviation = 0.0
+        for tick in range(1, 1200):
+            runtime.update(tick / 6, tick / 6)
+            max_lateral_deviation = max(
+                max_lateral_deviation,
+                abs(runtime.vehicle.y - 5.5),
+            )
+            if runtime.controller.auto_state is not AutoState.ACTIVE:
+                break
+
+        self.assertFalse(runtime.vehicle.collision)
+        self.assertEqual(
+            runtime.controller.navigation.status,
+            "reached",
+            runtime.controller.snapshot(),
+        )
+        self.assertGreater(max_lateral_deviation, 1.0)
 
     def test_obstacle_goal_finishes_at_confirmed_safe_stop_within_one_metre(self) -> None:
         grid = MapGrid.from_wall_set(16, 12, {(8, 5)})

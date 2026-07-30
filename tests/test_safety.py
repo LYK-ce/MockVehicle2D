@@ -14,12 +14,14 @@ from mockvehicle2d.map_grid import MapGrid
 from mockvehicle2d.safety import (
     HARD_STOP_CLEARANCE_M,
     SLOW_ZONE_CLEARANCE_M,
+    LocalSafetyRuntime,
     SafetyGovernor,
     SafetyObservation,
     _nearest_edge_evidence,
     nearest_obstacle_clearance,
 )
 from mockvehicle2d.scan import LaserPoint, ScanConfig, scan_grid
+from mockvehicle2d.vehicle import Vehicle
 
 
 class MapStateSafetyTest(unittest.TestCase):
@@ -159,6 +161,42 @@ class SafetyGovernorTest(unittest.TestCase):
 
         clear = self.governor.limit(0.4, 0.0, SafetyObservation(), True)
         self.assertEqual((clear.state, clear.reason), ("clear", None))
+
+    def test_held_translation_stop_preserves_allowed_rotation(self) -> None:
+        grid = MapGrid.from_wall_set(8, 8, {(3, y) for y in range(8)})
+        vehicle = Vehicle(2.3, 4.0, now=0.0)
+        vehicle.install_drive(0.5, 0.3, 0.0)
+
+        result = LocalSafetyRuntime().advance(
+            vehicle,
+            grid,
+            0.1,
+            automatic=True,
+        )
+
+        self.assertTrue(result.stopped)
+        self.assertEqual(result.reason, "safety_obstacle")
+        self.assertEqual(vehicle.x, 2.3)
+        self.assertGreater(vehicle.yaw, 0.0)
+        self.assertEqual(vehicle.body_velocities(), (0.0, 0.0))
+
+    def test_exact_hard_clearance_preserves_allowed_rotation(self) -> None:
+        grid = MapGrid.from_wall_set(8, 8, {(3, y) for y in range(8)})
+        vehicle = Vehicle(2.25, 4.0, now=0.0)
+        vehicle.install_drive(0.5, 0.3, 0.0)
+
+        result = LocalSafetyRuntime().advance(
+            vehicle,
+            grid,
+            0.1,
+            automatic=True,
+        )
+
+        self.assertTrue(result.stopped)
+        self.assertEqual(result.reason, "safety_obstacle")
+        self.assertEqual(vehicle.x, 2.25)
+        self.assertGreater(vehicle.yaw, 0.0)
+        self.assertEqual(vehicle.body_velocities(), (0.0, 0.0))
 
 
 def main() -> int:

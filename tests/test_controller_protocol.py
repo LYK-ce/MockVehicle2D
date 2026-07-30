@@ -178,6 +178,16 @@ def mission_updates(socket: EventSocket) -> list[dict[str, object]]:
 
 
 class TestControllerProtocol(unittest.TestCase):
+    def test_runtime_uses_half_metre_local_planning_grid(self) -> None:
+        runtime = VehicleRuntime.create(
+            started_at=0.0,
+            timestamp=0.0,
+            anchor=AnchorSpec("resolution-test", 10.0, 10.0, 0.0),
+            odometry_config=OdometryConfig(),
+        )
+
+        self.assertEqual(runtime.local_state.local_map.resolution_m, 0.5)
+
     def test_parses_only_the_three_command_families(self) -> None:
         self.assertEqual(
             parse('{"type":"mode","seq":1,"action":"switch_to_auto"}'),

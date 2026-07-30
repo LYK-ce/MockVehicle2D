@@ -174,7 +174,7 @@ class SafetyGovernor:
             return SafetyDecision(linear_mps, angular_rps, "clear", None)
 
         clearance, reason = nearest
-        if clearance <= HARD_STOP_CLEARANCE_M:
+        if clearance < HARD_STOP_CLEARANCE_M:
             return SafetyDecision(0.0, angular_rps, "stopped", reason)
         if automatic and linear_mps and clearance < SLOW_ZONE_CLEARANCE_M:
             scale = (clearance - HARD_STOP_CLEARANCE_M) / (
@@ -268,9 +268,17 @@ class LocalSafetyRuntime:
             decision = self.evaluate(
                 vehicle, grid, policy_linear_mps, angular_rps, automatic=automatic
             )
-            if decision.state in {"stopped", "fault"}:
+            if decision.state == "fault":
                 vehicle.stop()
                 vehicle.advance(grid, now)
+                return SafetyAdvanceResult(stopped=True, reason=decision.reason)
+            if decision.state == "stopped":
+                vehicle.advance(
+                    grid,
+                    now,
+                    limited_velocities=(0.0, decision.angular_rps),
+                )
+                vehicle.stop()
                 return SafetyAdvanceResult(stopped=True, reason=decision.reason)
             effective_linear = math.copysign(
                 min(abs(linear_mps), abs(decision.linear_mps)),
@@ -295,8 +303,12 @@ class LocalSafetyRuntime:
                 step_distance = min(step_distance, max(0.0, clearance - HARD_STOP_CLEARANCE_M))
                 if step_distance <= 1e-12:
                     self.decision = SafetyDecision(0.0, angular_rps, "stopped", reason)
+                    vehicle.advance(
+                        grid,
+                        now,
+                        limited_velocities=(0.0, angular_rps),
+                    )
                     vehicle.stop()
-                    vehicle.advance(grid, now)
                     return SafetyAdvanceResult(stopped=True, reason=reason)
 
             step_time = min(

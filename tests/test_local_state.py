@@ -148,6 +148,43 @@ class ObservedGridTest(unittest.TestCase):
         self.assertEqual(self.grid.revision, first_revision)
         self.assertEqual(second.changed_cells, ())
 
+    def test_single_free_ray_does_not_clear_static_occupied_evidence(self) -> None:
+        self.grid.integrate_scan(
+            (LaserPoint(0.0, 2.5, 1.0),),
+            self.pose,
+            1.0,
+            self.config,
+        )
+
+        delta = self.grid.integrate_scan(
+            (LaserPoint(0.0, 0.0, 0.0),),
+            self.pose,
+            2.0,
+            self.config,
+        )
+
+        self.assertEqual(self.grid.get_cell(3, 0), OCCUPIED)
+        self.assertNotIn((3, 0), {(cell.gx, cell.gy) for cell in delta.changed_cells})
+
+    def test_repeated_free_rays_clear_stale_occupied_evidence(self) -> None:
+        self.grid.integrate_scan(
+            (LaserPoint(0.0, 2.5, 1.0),),
+            self.pose,
+            1.0,
+            self.config,
+        )
+
+        for observed_at in (2.0, 3.0, 4.0):
+            delta = self.grid.integrate_scan(
+                (LaserPoint(0.0, 0.0, 0.0),),
+                self.pose,
+                observed_at,
+                self.config,
+            )
+
+        self.assertEqual(self.grid.get_cell(3, 0), FREE)
+        self.assertIn((3, 0), {(cell.gx, cell.gy) for cell in delta.changed_cells})
+
     def test_lost_localization_does_not_write_the_map(self) -> None:
         state = AnchoredLocalState(
             self.anchor,

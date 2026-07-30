@@ -15,6 +15,7 @@ FREE = 0
 OCCUPIED = 1
 FORBIDDEN = 2
 LOCALIZATION_QUALITIES = frozenset(("nominal", "degraded", "lost"))
+OCCUPIED_CLEAR_OBSERVATIONS = 3
 
 
 def _wrapped(angle: float) -> float:
@@ -560,6 +561,7 @@ class ObservedGrid:
         self.resolution_m = resolution_m
         self.revision = 0
         self._cells: dict[tuple[int, int], int] = {}
+        self._occupied_free_observations: dict[tuple[int, int], int] = {}
 
     def get_cell(self, gx: int, gy: int) -> int:
         if type(gx) is not int or type(gy) is not int:
@@ -634,11 +636,21 @@ class ObservedGrid:
                 for gy in _axis_cells_at_point(evidence_y, self.resolution_m):
                     updates[gx, gy] = FORBIDDEN
 
-        updates = {
-            cell: state
-            for cell, state in updates.items()
-            if self._cells.get(cell) != FORBIDDEN or state == FORBIDDEN
-        }
+        filtered_updates = {}
+        for cell, state in updates.items():
+            existing = self._cells.get(cell)
+            if existing == FORBIDDEN and state != FORBIDDEN:
+                continue
+            if existing == OCCUPIED and state == FREE:
+                observations = (
+                    self._occupied_free_observations.get(cell, 0) + 1
+                )
+                if observations < OCCUPIED_CLEAR_OBSERVATIONS:
+                    self._occupied_free_observations[cell] = observations
+                    continue
+            self._occupied_free_observations.pop(cell, None)
+            filtered_updates[cell] = state
+        updates = filtered_updates
         original = {cell: self._cells.get(cell, UNKNOWN) for cell in updates}
         self._cells.update(updates)
         changed = tuple(

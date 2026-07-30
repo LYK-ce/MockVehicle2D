@@ -42,6 +42,7 @@ DEFAULT_VEHICLE_ID = "mock_vehicle_01"
 SPAWN_X = 10.0
 SPAWN_Y = 10.0
 MAP_RESOLUTION_M = 1.0
+LOCAL_MAP_RESOLUTION_M = 0.5
 SEND_TIMEOUT_S = 1.0
 VEHICLE_ID_PATTERN = re.compile(r"[A-Za-z0-9._-]{1,64}")
 
@@ -182,6 +183,7 @@ class VehicleRuntime:
                 truth_yaw_rad=vehicle.yaw,
                 odometry_config=odometry_config,
                 timestamp=started_at if timestamp is None else timestamp,
+                map_resolution_m=LOCAL_MAP_RESOLUTION_M,
             ),
         )
 

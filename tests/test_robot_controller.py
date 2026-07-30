@@ -401,8 +401,17 @@ def case_manual_and_auto_are_both_gated_by_safety() -> None:
     harness.mode(2, ModeAction.SWITCH_TO_AUTO)
     harness.auto(3, AutoAction.PUSH, (mission("safe", 14.0),))
     harness.tick(0.0)
-    assert harness.vehicle.body_velocities() == (0.0, 0.0)
+    linear_mps, angular_rps = harness.vehicle.body_velocities()
+    assert linear_mps == 0.0
+    assert angular_rps > 0.0
     assert harness.safety.snapshot()["reason"] == "safety_obstacle"
+
+    manual_turn = Harness()
+    manual_turn.grid = harness.grid
+    manual_turn.vehicle.x = 10.3
+    limited = manual_turn.manual(4, ManualAction.DRIVE, 0.5, -0.3)
+    assert limited.accepted
+    assert manual_turn.vehicle.body_velocities() == (0.0, -0.3)
 
 
 def case_disconnect_pauses_auto_and_stops_manual() -> None:
