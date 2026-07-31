@@ -3,11 +3,15 @@
 from __future__ import annotations
 
 import asyncio
+import errno
+import fcntl
 from dataclasses import dataclass
 import json
 import math
 import os
 from pathlib import Path
+import socket
+import stat
 from typing import Iterable
 
 from mockvehicle2d.local_state import (
@@ -430,7 +434,7 @@ class MapSyncState:
             destination[coordinate] = max(destination.get(coordinate, FREE), state)
 
     def snapshot(self) -> dict[str, object]:
-        collaborative = self.collaborative_cells()
+        collaborative_current = self._collaborative_cache is not None
         return {
             "enabled": True,
             "ready": self.ready,
@@ -451,7 +455,12 @@ class MapSyncState:
                 }
                 for source, cells in sorted(self._peer_evidence.items())
             },
-            "collaborative_known_cells": len(collaborative),
+            "collaborative_evidence_cells": len(self._own_cells)
+            + sum(len(cells) for cells in self._peer_evidence.values()),
+            "collaborative_view_current": collaborative_current,
+            "collaborative_known_cells": (
+                len(self._collaborative_cache) if collaborative_current else None
+            ),
         }
 
 
@@ -467,15 +476,73 @@ class _NodeBridge:
         self._writer: asyncio.StreamWriter | None = None
         self._outbound: asyncio.Queue[dict[str, object]] = asyncio.Queue(maxsize=1)
         self._tasks: set[asyncio.Task[object]] = set()
+        self._owned_socket: tuple[int, int] | None = None
 
     async def start_server(self) -> None:
-        self.socket_path.unlink(missing_ok=True)
+        self._remove_stale_socket()
 
         def accepted(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
             self._track(asyncio.create_task(self._read_connection(reader, writer)))
 
         self.server = await asyncio.start_unix_server(accepted, path=self.socket_path)
+        created = self.socket_path.lstat()
+        if not stat.S_ISSOCK(created.st_mode):
+            self.server.close()
+            await self.server.wait_closed()
+            self.server = None
+            raise RuntimeError(f"map-sync path is not a Unix socket: {self.socket_path}")
+        self._owned_socket = (created.st_dev, created.st_ino)
         self._track(asyncio.create_task(self._send_loop()))
+
+    def _remove_stale_socket(self) -> None:
+        try:
+            found = self.socket_path.lstat()
+        except FileNotFoundError:
+            return
+        if not stat.S_ISSOCK(found.st_mode):
+            raise RuntimeError(f"map-sync path is not a Unix socket: {self.socket_path}")
+
+        probe = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        probe.settimeout(0.1)
+        try:
+            result = probe.connect_ex(str(self.socket_path))
+        except (OSError, TimeoutError) as error:
+            raise RuntimeError(
+                f"cannot confirm stale map-sync socket: {self.socket_path}"
+            ) from error
+        finally:
+            probe.close()
+        if result == 0:
+            raise RuntimeError(f"map-sync socket is already active: {self.socket_path}")
+        if result == errno.ENOENT:
+            return
+        if result != errno.ECONNREFUSED:
+            raise RuntimeError(
+                f"cannot confirm stale map-sync socket {self.socket_path}: {os.strerror(result)}"
+            )
+
+        try:
+            current = self.socket_path.lstat()
+        except FileNotFoundError:
+            return
+        if (
+            not stat.S_ISSOCK(current.st_mode)
+            or (current.st_dev, current.st_ino) != (found.st_dev, found.st_ino)
+        ):
+            raise RuntimeError(f"map-sync socket changed during cleanup: {self.socket_path}")
+        self.socket_path.unlink()
+
+    def _remove_owned_socket(self) -> None:
+        owned = self._owned_socket
+        self._owned_socket = None
+        if owned is None:
+            return
+        try:
+            current = self.socket_path.lstat()
+        except FileNotFoundError:
+            return
+        if stat.S_ISSOCK(current.st_mode) and (current.st_dev, current.st_ino) == owned:
+            self.socket_path.unlink()
 
     def _track(self, task: asyncio.Task[object]) -> None:
         self._tasks.add(task)
@@ -593,14 +660,15 @@ class _NodeBridge:
                 except asyncio.TimeoutError:
                     self.process.kill()
                     await self.process.wait()
+        if self.server is not None:
+            self.server.close()
+            await self.server.wait_closed()
+            self.server = None
         for task in tuple(self._tasks):
             task.cancel()
         if self._tasks:
             await asyncio.gather(*self._tasks, return_exceptions=True)
-        if self.server is not None:
-            self.server.close()
-            await self.server.wait_closed()
-        self.socket_path.unlink(missing_ok=True)
+        self._remove_owned_socket()
         self.state.network_disconnected()
 
 
@@ -623,6 +691,7 @@ class P2PFleetSync:
         self._bridges: dict[str, _NodeBridge] = {}
         self._config_paths: list[Path] = []
         self._flush_task: asyncio.Task[None] | None = None
+        self._runtime_lock_fd: int | None = None
 
     @classmethod
     async def start(
@@ -643,14 +712,11 @@ class P2PFleetSync:
     async def _start(self) -> None:
         if not self.sidecar_path.is_file() or not os.access(self.sidecar_path, os.X_OK):
             raise ValueError(f"map-sync sidecar is not executable: {self.sidecar_path}")
-        self.runtime_dir.mkdir(parents=True, exist_ok=True)
-        identity_tasks = [
-            asyncio.create_task(
-                self._ensure_identity(vehicle.vehicle_id),
-            )
+        self._acquire_runtime_lease()
+        peer_ids = [
+            await self._ensure_identity(vehicle.vehicle_id)
             for vehicle in self.vehicles
         ]
-        peer_ids = await asyncio.gather(*identity_tasks)
         if len(set(peer_ids)) != len(peer_ids):
             raise RuntimeError("map-sync sidecars must have unique peer identities")
         peer_id_by_vehicle = dict(zip((vehicle.vehicle_id for vehicle in self.vehicles), peer_ids))
@@ -670,8 +736,8 @@ class P2PFleetSync:
                 self.runtime_dir / f"p{index}.sock",
                 self.states[vehicle.vehicle_id],
             )
-            await bridge.start_server()
             self._bridges[vehicle.vehicle_id] = bridge
+            await bridge.start_server()
 
         for vehicle in self.vehicles:
             bridge = self._bridges[vehicle.vehicle_id]
@@ -713,6 +779,55 @@ class P2PFleetSync:
         if expected_connections:
             await asyncio.wait_for(self._wait_for_full_mesh(expected_connections), timeout=timeout)
         self._flush_task = asyncio.create_task(self._flush_loop())
+
+    def _acquire_runtime_lease(self) -> None:
+        if self._runtime_lock_fd is not None:
+            raise RuntimeError("map-sync runtime lease is already held")
+        self.runtime_dir.mkdir(parents=True, exist_ok=True)
+        directory = self.runtime_dir.stat()
+        if (
+            not stat.S_ISDIR(directory.st_mode)
+            or directory.st_uid != os.geteuid()
+            or directory.st_mode & (stat.S_IWGRP | stat.S_IWOTH)
+        ):
+            raise RuntimeError(
+                "map-sync runtime directory must be owned by this user and not group/world writable"
+            )
+
+        flags = os.O_RDWR | os.O_CREAT | os.O_CLOEXEC
+        if hasattr(os, "O_NOFOLLOW"):
+            flags |= os.O_NOFOLLOW
+        lock_path = self.runtime_dir / ".fleet.lock"
+        fd = os.open(lock_path, flags, 0o600)
+        try:
+            lock = os.fstat(fd)
+            if (
+                not stat.S_ISREG(lock.st_mode)
+                or lock.st_uid != os.geteuid()
+                or lock.st_nlink != 1
+            ):
+                raise RuntimeError("map-sync runtime lock must be an owned regular file")
+            os.fchmod(fd, 0o600)
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError as error:
+                raise RuntimeError(
+                    f"map-sync runtime directory is already in use: {self.runtime_dir}"
+                ) from error
+        except BaseException:
+            os.close(fd)
+            raise
+        self._runtime_lock_fd = fd
+
+    def _release_runtime_lease(self) -> None:
+        fd = self._runtime_lock_fd
+        self._runtime_lock_fd = None
+        if fd is None:
+            return
+        try:
+            fcntl.flock(fd, fcntl.LOCK_UN)
+        finally:
+            os.close(fd)
 
     async def _ensure_identity(self, vehicle_id: str) -> str:
         process = await asyncio.create_subprocess_exec(
@@ -774,13 +889,16 @@ class P2PFleetSync:
             await asyncio.sleep(max(0.0, interval_s - (asyncio.get_running_loop().time() - started)))
 
     async def close(self) -> None:
-        if self._flush_task is not None:
-            self._flush_task.cancel()
-            await asyncio.gather(self._flush_task, return_exceptions=True)
-            self._flush_task = None
-        if self._bridges:
-            await asyncio.gather(*(bridge.close() for bridge in self._bridges.values()))
-            self._bridges.clear()
-        for path in self._config_paths:
-            path.unlink(missing_ok=True)
-        self._config_paths.clear()
+        try:
+            if self._flush_task is not None:
+                self._flush_task.cancel()
+                await asyncio.gather(self._flush_task, return_exceptions=True)
+                self._flush_task = None
+            if self._bridges:
+                await asyncio.gather(*(bridge.close() for bridge in self._bridges.values()))
+                self._bridges.clear()
+            for path in self._config_paths:
+                path.unlink(missing_ok=True)
+            self._config_paths.clear()
+        finally:
+            self._release_runtime_lease()

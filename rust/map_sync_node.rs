@@ -364,33 +364,31 @@ async fn run(config: NodeConfig) -> Result<(), BoxError> {
                         listen_port: config.listen_port,
                     }).await?;
                 }
-                SwarmEvent::ConnectionEstablished { peer_id, .. } => {
-                    if peer_by_id.contains_key(&peer_id) && connected.insert(peer_id) {
-                        let mut connected_vehicle_ids: Vec<_> = connected
-                            .iter()
-                            .filter_map(|peer| peer_by_id.get(peer).map(String::as_str))
-                            .collect();
-                        connected_vehicle_ids.sort_unstable();
-                        send_event(&mut writer, &PeerHealthEvent {
-                            r#type: "peer_health",
-                            vehicle_id: &config.vehicle_id,
-                            connected_vehicle_ids,
-                        }).await?;
-                    }
+                SwarmEvent::ConnectionEstablished { peer_id, .. }
+                    if peer_by_id.contains_key(&peer_id) && connected.insert(peer_id) => {
+                    let mut connected_vehicle_ids: Vec<_> = connected
+                        .iter()
+                        .filter_map(|peer| peer_by_id.get(peer).map(String::as_str))
+                        .collect();
+                    connected_vehicle_ids.sort_unstable();
+                    send_event(&mut writer, &PeerHealthEvent {
+                        r#type: "peer_health",
+                        vehicle_id: &config.vehicle_id,
+                        connected_vehicle_ids,
+                    }).await?;
                 }
-                SwarmEvent::ConnectionClosed { peer_id, num_established, .. } if num_established == 0 => {
-                    if connected.remove(&peer_id) {
-                        let mut connected_vehicle_ids: Vec<_> = connected
-                            .iter()
-                            .filter_map(|peer| peer_by_id.get(peer).map(String::as_str))
-                            .collect();
-                        connected_vehicle_ids.sort_unstable();
-                        send_event(&mut writer, &PeerHealthEvent {
-                            r#type: "peer_health",
-                            vehicle_id: &config.vehicle_id,
-                            connected_vehicle_ids,
-                        }).await?;
-                    }
+                SwarmEvent::ConnectionClosed { peer_id, num_established: 0, .. }
+                    if connected.remove(&peer_id) => {
+                    let mut connected_vehicle_ids: Vec<_> = connected
+                        .iter()
+                        .filter_map(|peer| peer_by_id.get(peer).map(String::as_str))
+                        .collect();
+                    connected_vehicle_ids.sort_unstable();
+                    send_event(&mut writer, &PeerHealthEvent {
+                        r#type: "peer_health",
+                        vehicle_id: &config.vehicle_id,
+                        connected_vehicle_ids,
+                    }).await?;
                 }
                 SwarmEvent::Behaviour(BehaviourEvent::Gossipsub(gossipsub::Event::Message {
                     message,

@@ -2,10 +2,12 @@
 
 import asyncio
 from copy import deepcopy
+import json
 from pathlib import Path
 import socket
 import tempfile
 import unittest
+from unittest.mock import Mock
 
 from mockvehicle2d.local_state import (
     FREE,
@@ -97,6 +99,24 @@ class TestMapSyncState(unittest.TestCase):
         self.assertEqual(combined[(10, 5)], OCCUPIED)
         self.assertEqual(combined[(20, 10)], FREE)
         self.assertEqual(local.dirty_count, 1)
+        self.assertTrue(local.snapshot()["collaborative_view_current"])
+        self.assertEqual(local.snapshot()["collaborative_known_cells"], 2)
+
+    def test_snapshot_does_not_materialize_the_collaborative_view(self) -> None:
+        local = state(1)
+        local.configure_network("peer_1", {"vehicle_2": ("peer_2", anchor(2))})
+        local.record_local(LocalMapDelta((MapCellUpdate(0, 0, OCCUPIED),)))
+        local.collaborative_cells = Mock(side_effect=AssertionError("hot-path projection"))
+        local._project = Mock(side_effect=AssertionError("hot-path transform"))
+
+        snapshot = local.snapshot()
+
+        self.assertEqual(snapshot["own_known_cells"], 1)
+        self.assertEqual(snapshot["collaborative_evidence_cells"], 1)
+        self.assertFalse(snapshot["collaborative_view_current"])
+        self.assertIsNone(snapshot["collaborative_known_cells"])
+        local.collaborative_cells.assert_not_called()
+        local._project.assert_not_called()
 
     def test_settings_reject_unknown_or_invalid_values(self) -> None:
         with self.assertRaises(ValueError):
@@ -122,15 +142,105 @@ def free_ports(count: int) -> list[int]:
             candidate.close()
 
 
+class TestP2PRuntimeOwnership(unittest.IsolatedAsyncioTestCase):
+    def make_runtime(self, runtime_dir: Path) -> P2PFleetSync:
+        settings = P2PSettings(Path("/bin/true"), runtime_dir)
+        return P2PFleetSync("session_1", settings, (), {})
+
+    async def test_runtime_directory_has_one_live_owner(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            first = self.make_runtime(Path(temporary))
+            second = self.make_runtime(Path(temporary))
+            first._acquire_runtime_lease()
+
+            with self.assertRaisesRegex(RuntimeError, "already in use"):
+                second._acquire_runtime_lease()
+            await second.close()
+
+            third = self.make_runtime(Path(temporary))
+            with self.assertRaisesRegex(RuntimeError, "already in use"):
+                third._acquire_runtime_lease()
+            await first.close()
+            third._acquire_runtime_lease()
+            await third.close()
+
+    async def test_bridge_refuses_to_remove_a_non_socket_path(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            file_path = root / "p1.sock"
+            file_path.write_text("keep me", encoding="utf-8")
+            directory_path = root / "p2.sock"
+            directory_path.mkdir()
+
+            for path in (file_path, directory_path):
+                bridge = self._bridge(path)
+                with self.subTest(path=path), self.assertRaisesRegex(
+                    RuntimeError,
+                    "not a Unix socket",
+                ):
+                    await bridge.start_server()
+                await bridge.close()
+
+            self.assertEqual(file_path.read_text(encoding="utf-8"), "keep me")
+            self.assertTrue(directory_path.is_dir())
+
+    async def test_bridge_replaces_stale_socket_and_removes_only_its_socket(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "p1.sock"
+            stale = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            stale.bind(str(path))
+            stale.close()
+            bridge = self._bridge(path)
+
+            await bridge.start_server()
+            self.assertTrue(path.is_socket())
+            await bridge.close()
+
+            self.assertFalse(path.exists())
+
+    async def test_failed_bridge_close_does_not_remove_live_owner_socket(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "p1.sock"
+            owner = self._bridge(path, vehicle_id="vehicle_1")
+            contender = self._bridge(path, vehicle_id="vehicle_2")
+            await owner.start_server()
+
+            with self.assertRaisesRegex(RuntimeError, "already active"):
+                await contender.start_server()
+            await contender.close()
+            self.assertTrue(path.is_socket())
+
+            _reader, writer = await asyncio.open_unix_connection(path)
+            writer.close()
+            await writer.wait_closed()
+            await owner.close()
+
+    def _bridge(self, path: Path, vehicle_id: str = "vehicle_1"):
+        from mockvehicle2d.map_sync import _NodeBridge
+
+        return _NodeBridge(vehicle_id, path, state(1))
+
+
 @unittest.skipUnless(SIDECAR.is_file(), "build map-sync-node before live libp2p test")
 class TestLiveLibp2pMesh(unittest.IsolatedAsyncioTestCase):
     async def test_four_peers_propagate_and_survive_one_peer_exit(self) -> None:
-        from mockvehicle2d.fleet import AnchorPose, FleetRuntime, FleetScenario, FleetVehicleSpec
+        from websockets.asyncio.client import connect
+        from websockets.asyncio.server import serve
+
+        from mockvehicle2d.fleet import (
+            AnchorPose,
+            FleetRuntime,
+            FleetScenario,
+            FleetVehicleSpec,
+            fleet_handler,
+        )
 
         temporary = tempfile.TemporaryDirectory()
         runtime: P2PFleetSync | None = None
+        servers = []
+        connections = []
         try:
-            ports = free_ports(4)
+            ports = free_ports(8)
             settings = P2PSettings(
                 SIDECAR,
                 Path(temporary.name),
@@ -141,10 +251,10 @@ class TestLiveLibp2pMesh(unittest.IsolatedAsyncioTestCase):
                 tuple(
                     FleetVehicleSpec(
                         f"vehicle_{number}",
-                        19089 + number,
+                        ports[number - 1],
                         f"spawn_{number}",
                         AnchorPose(number * 10.0, number * 5.0, 0.0),
-                        ports[number - 1],
+                        ports[number + 3],
                     )
                     for number in range(1, 5)
                 ),
@@ -172,6 +282,23 @@ class TestLiveLibp2pMesh(unittest.IsolatedAsyncioTestCase):
             )
             self.assertEqual(len({item.local_peer_id for item in states.values()}), 4)
 
+            for spec in scenario.vehicles:
+                async def configured_handler(
+                    websocket,
+                    vehicle_id: str = spec.vehicle_id,
+                ) -> None:
+                    await fleet_handler(websocket, fleet=fleet, vehicle_id=vehicle_id)
+
+                servers.append(await serve(configured_handler, "127.0.0.1", spec.operator_port))
+            for spec in scenario.vehicles:
+                connections.append(await connect(f"ws://127.0.0.1:{spec.operator_port}"))
+            hellos = [json.loads(await connection.recv()) for connection in connections]
+            self.assertEqual(
+                {hello["vehicle_id"] for hello in hellos},
+                {spec.vehicle_id for spec in scenario.vehicles},
+            )
+            self.assertTrue(all(hello["protocol_version"] == 4 for hello in hellos))
+
             states["vehicle_1"].record_local(
                 LocalMapDelta((MapCellUpdate(7, 8, OCCUPIED),))
             )
@@ -197,6 +324,14 @@ class TestLiveLibp2pMesh(unittest.IsolatedAsyncioTestCase):
                 )
             )
         finally:
+            await asyncio.gather(
+                *(connection.close() for connection in connections),
+                return_exceptions=True,
+            )
+            for server in servers:
+                server.close()
+            if servers:
+                await asyncio.gather(*(server.wait_closed() for server in servers))
             if runtime is not None:
                 await runtime.close()
             temporary.cleanup()

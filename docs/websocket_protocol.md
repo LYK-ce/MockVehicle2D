@@ -396,7 +396,9 @@ cell 状态：`0` 可通行、`1` 墙、`2` 无地面/落差。客户端用
     "peer_sources": {
       "mock_vehicle_02": {"map_epoch": 1, "last_sequence": 3, "known_cells": 72}
     },
-    "collaborative_known_cells": 196
+    "collaborative_evidence_cells": 200,
+    "collaborative_view_current": false,
+    "collaborative_known_cells": null
   }
 }
 ```
@@ -404,7 +406,10 @@ cell 状态：`0` 可通行、`1` 墙、`2` 无地面/落差。客户端用
 `pose` 不泄露绝对仿真真值。`controller` 是模式、队列和导航的权威快照。
 `localization.quality` 为 `nominal`、`degraded` 或 `lost`。
 没有启用场景级 P2P 时，`p2p_map_sync` 为 `{"enabled":false}`。协同摘要仅供观察，
-远端地图当前不会改变本车 D* Lite 或安全控制。
+远端地图当前不会改变本车 D* Lite 或安全控制。常规遥测不会物化完整协同地图：
+`collaborative_evidence_cells` 是各来源证据格数量之和；只有调用显式协同视图查询后，
+`collaborative_view_current` 才为 `true`，此时 `collaborative_known_cells` 才是去重投影后的
+精确数量，否则为 `null`。
 
 ### scan
 
