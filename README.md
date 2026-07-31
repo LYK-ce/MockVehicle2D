@@ -58,10 +58,41 @@ mockvehicle2d serve \
 
 # 完整真值地图上的 A* 离线调试工具，不属于自主运行链路
 mockvehicle2d pathfind --start-m 10,10 --goal-m 200,200
+
+# 一个隐藏物理世界中的四个独立逻辑车辆，端口为 19090～19093
+mockvehicle2d fleet --scenario examples/four_vehicle_scenario.json
 ```
 
 依赖安装在仓库本地 `.venv/`。公开接口统一使用 SI 单位：米、秒、弧度、米/秒和
 弧度/秒。
+
+## 多车共享世界
+
+`fleet` 入口在一个进程中运行唯一的确定性物理世界和 1～4 个隔离车辆节点。每个节点
+拥有自己的 `RobotController`、任务队列、odometry、`ObservedGrid`、D* Lite、控制租约
+和 WebSocket endpoint；节点不能读取其他车辆的控制状态、地图或世界真值。
+
+```text
+SharedWorld（仅仿真器可见）
+  ├── 静态真值、统一 100 ms tick、Tmini 射线和碰撞仲裁
+  ├── RobotNode 01 ── ws://127.0.0.1:19090
+  ├── RobotNode 02 ── ws://127.0.0.1:19091
+  ├── RobotNode 03 ── ws://127.0.0.1:19092
+  └── RobotNode 04 ── ws://127.0.0.1:19093
+```
+
+场景 JSON 为每辆车声明唯一的 `vehicle_id`、`operator_port`、`spawn_id` 和
+`anchor_pose {x_m,y_m,yaw_rad}`。启动是原子的：车辆数量、身份、端口、出生点、世界
+边界、静态障碍、安全余量和车间重叠全部通过后才创建任何车辆。真值初始位姿等于
+`anchor_pose`，但车辆自己的 odometry 从 `(0,0,0)` 开始，只通过运动增量和传感器更新。
+
+每个 tick 对所有车辆使用同一快照，先独立控制，再计算候选运动、统一处理静态/车间
+碰撞并同时提交。其他车辆会产生动态 Tmini 回波和物理碰撞，但动态回波不会永久写成
+本车 `ObservedGrid` 的静态 Occupied，避免车辆离开后留下幽灵障碍。
+
+Pictor 中分别创建以上四个 WebSocket 连接即可同时显示四辆车。当前里程碑有意不实现
+libp2p 或协同地图融合；后续 P2P 只能交换各节点自己建立的地图增量，不能访问
+`SharedWorld`。
 
 ## 控制方式
 
@@ -133,6 +164,7 @@ src/mockvehicle2d/
 ├── controller.py          # 模式、队列、任务生命周期和唯一控制权
 ├── protocol.py            # WebSocket v4 严格 JSON 边界
 ├── server.py              # 独占连接、帧调度和遥测
+├── fleet.py               # 1～4 车场景、共享物理世界和独立 endpoint
 ├── navigation.py          # 有限视野 Goto 决策
 ├── local_state.py         # 锚点、odometry、scan matching、ObservedGrid
 ├── safety.py              # 障碍/边缘净空和故障停车

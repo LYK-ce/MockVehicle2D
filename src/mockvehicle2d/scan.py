@@ -14,13 +14,17 @@ class LaserPoint:
     angle: float
     range: float
     intensity: float
+    dynamic: bool = False
 
-    def as_dict(self) -> dict[str, float]:
-        return {
+    def as_dict(self) -> dict[str, float | bool]:
+        point: dict[str, float | bool] = {
             "angle": self.angle,
             "range": round(self.range, 2),
             "intensity": self.intensity,
         }
+        if self.dynamic:
+            point["dynamic"] = True
+        return point
 
 
 @dataclass(frozen=True)
@@ -124,8 +128,39 @@ def _first_wall_range(
             return max(config.min_range, distance)
 
 
+def _first_circle_range(
+    x: float,
+    y: float,
+    world_angle: float,
+    circles: Iterable[tuple[float, float, float]],
+    config: ScanConfig,
+) -> float | None:
+    direction_x, direction_y = math.cos(world_angle), math.sin(world_angle)
+    nearest = math.inf
+    for center_x, center_y, radius in circles:
+        if not all(math.isfinite(value) for value in (center_x, center_y, radius)) or radius <= 0:
+            raise ValueError("scan circles must have finite coordinates and positive radii")
+        offset_x, offset_y = center_x - x, center_y - y
+        projection = offset_x * direction_x + offset_y * direction_y
+        perpendicular_squared = offset_x**2 + offset_y**2 - projection**2
+        radius_squared = radius**2
+        if perpendicular_squared > radius_squared:
+            continue
+        entry = projection - math.sqrt(max(0.0, radius_squared - perpendicular_squared))
+        if entry < 0 or entry > config.max_range:
+            continue
+        nearest = min(nearest, max(config.min_range, entry))
+    return None if math.isinf(nearest) else nearest
+
+
 def scan_grid(
-    grid: MapGrid, x: float, y: float, yaw: float, config: ScanConfig = TMINI_SCAN_CONFIG
+    grid: MapGrid,
+    x: float,
+    y: float,
+    yaw: float,
+    config: ScanConfig = TMINI_SCAN_CONFIG,
+    *,
+    circles: Iterable[tuple[float, float, float]] = (),
 ) -> list[LaserPoint]:
     """Cast a full local scan from pose ``(x, y, yaw)`` through ``grid``.
 
@@ -133,15 +168,32 @@ def scan_grid(
     positive angles turn toward +y, i.e. clockwise when viewed from above.
     """
 
+    dynamic_obstacles = tuple(circles)
     points = []
     for index in range(config.sample_count()):
         angle = config.min_angle + index * config.angle_increment
-        distance = _first_wall_range(grid, x, y, yaw + angle, config)
+        wall_range = _first_wall_range(grid, x, y, yaw + angle, config)
+        circle_range = (
+            _first_circle_range(
+                x,
+                y,
+                yaw + angle,
+                dynamic_obstacles,
+                config,
+            )
+            if dynamic_obstacles
+            else None
+        )
+        dynamic = circle_range is not None and (
+            wall_range is None or circle_range < wall_range
+        )
+        distance = circle_range if dynamic else wall_range
         points.append(
             LaserPoint(
                 angle,
                 distance if distance is not None else 0.0,
                 1.0 if distance is not None else 0.0,
+                dynamic,
             )
         )
     return points

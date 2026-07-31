@@ -224,7 +224,11 @@ class CorrelativeScanMatcher:
         for index, point in enumerate(points):
             if not _finite(point.angle, point.range, point.intensity) or point.range < 0:
                 raise ValueError("scan points must be finite and ranges cannot be negative")
-            if index % self.config.sample_stride == 0 and point.range > 0:
+            if (
+                index % self.config.sample_stride == 0
+                and point.range > 0
+                and not point.dynamic
+            ):
                 hits.append(point)
         if len(hits) < self.config.min_support:
             return self._rejected("insufficient_support")
@@ -597,8 +601,9 @@ class ObservedGrid:
                 raise ValueError("scan points must be finite and ranges cannot be negative")
             if point.range > config.max_range:
                 raise ValueError("scan range exceeds configured maximum")
-            hit = point.range > 0
-            distance = point.range if hit else config.max_range
+            has_return = point.range > 0
+            occupied_hit = has_return and not point.dynamic
+            distance = point.range if has_return else config.max_range
             world_angle = pose.yaw_rad + point.angle
             direction_x, direction_y = math.cos(world_angle), math.sin(world_angle)
             if math.isclose(direction_x, 0.0, abs_tol=1e-12):
@@ -608,7 +613,7 @@ class ObservedGrid:
             start = self._cell(pose.x_m, pose.y_m)
             end_x = pose.x_m + distance * direction_x
             end_y = pose.y_m + distance * direction_y
-            if hit:
+            if has_return:
                 end = (
                     _hit_axis_cell(end_x, direction_x, self.resolution_m),
                     _hit_axis_cell(end_y, direction_y, self.resolution_m),
@@ -616,9 +621,9 @@ class ObservedGrid:
             else:
                 end = self._cell(end_x, end_y)
             ray = tuple(_bresenham(*start, *end))
-            for cell in ray[:-1] if hit else ray:
+            for cell in ray[:-1] if has_return else ray:
                 updates.setdefault(cell, FREE)
-            if hit:
+            if occupied_hit:
                 updates[ray[-1]] = OCCUPIED
 
         cosine, sine = math.cos(pose.yaw_rad), math.sin(pose.yaw_rad)

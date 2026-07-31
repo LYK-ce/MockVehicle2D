@@ -98,3 +98,32 @@ def is_swept_circle_passable(
             if is_strict_overlap(distance_squared, radius_squared):
                 return False
     return True
+
+
+def swept_circles_overlap(
+    first_start: tuple[float, float],
+    first_end: tuple[float, float],
+    first_radius: float,
+    second_start: tuple[float, float],
+    second_end: tuple[float, float],
+    second_radius: float,
+) -> bool:
+    """Whether two circles overlap while moving synchronously along two segments."""
+    values = (*first_start, *first_end, first_radius, *second_start, *second_end, second_radius)
+    if not all(math.isfinite(value) for value in values) or min(first_radius, second_radius) <= 0:
+        raise ValueError("circle trajectories must be finite and radii must be positive")
+    relative_start = (
+        first_start[0] - second_start[0],
+        first_start[1] - second_start[1],
+    )
+    relative_end = (
+        first_end[0] - second_end[0],
+        first_end[1] - second_end[1],
+    )
+    distance_squared = _point_segment_distance_squared(
+        0.0,
+        0.0,
+        *relative_start,
+        *relative_end,
+    )
+    return is_strict_overlap(distance_squared, (first_radius + second_radius) ** 2)
