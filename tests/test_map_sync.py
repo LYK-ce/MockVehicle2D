@@ -593,6 +593,82 @@ class TestP2PRuntimeOwnership(unittest.IsolatedAsyncioTestCase):
 
             self.assertFalse(path.exists())
 
+    async def test_socket_unlink_failure_retains_runtime_ownership_until_retry(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            runtime_dir = Path(temporary)
+            runtime = self.make_runtime(runtime_dir)
+            runtime._acquire_runtime_lease()
+            bridge = self._bridge(runtime_dir / "p1.sock")
+            owned_socket = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            owned_socket.bind(str(bridge.socket_path))
+            owned_socket.close()
+            created = bridge.socket_path.lstat()
+            bridge._owned_socket = (created.st_dev, created.st_ino)
+            runtime._bridges["vehicle_1"] = bridge
+            real_unlink = Path.unlink
+            failed = False
+
+            def fail_once(path: Path, *args, **kwargs) -> None:
+                nonlocal failed
+                if path == bridge.socket_path and not failed:
+                    failed = True
+                    raise OSError("injected socket unlink failure")
+                real_unlink(path, *args, **kwargs)
+
+            with (
+                patch.object(Path, "unlink", new=fail_once),
+                self.assertRaisesRegex(RuntimeError, "injected socket unlink failure"),
+            ):
+                await runtime.close()
+
+            self.assertIn("vehicle_1", runtime._bridges)
+            self.assertIsNotNone(runtime._runtime_lock_fd)
+            self.assertTrue(bridge.socket_path.exists())
+            contender = self.make_runtime(runtime_dir)
+            with self.assertRaisesRegex(RuntimeError, "already in use"):
+                contender._acquire_runtime_lease()
+
+            await runtime.close()
+            self.assertFalse(bridge.socket_path.exists())
+            contender._acquire_runtime_lease()
+            await contender.close()
+
+    async def test_config_unlink_failure_retains_runtime_ownership_until_retry(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            runtime_dir = Path(temporary)
+            runtime = self.make_runtime(runtime_dir)
+            runtime._acquire_runtime_lease()
+            config_path = runtime_dir / "vehicle_1.json"
+            config_path.write_text("{}", encoding="utf-8")
+            runtime._config_paths.append(config_path)
+            real_unlink = Path.unlink
+            failed = False
+
+            def fail_once(path: Path, *args, **kwargs) -> None:
+                nonlocal failed
+                if path == config_path and not failed:
+                    failed = True
+                    raise OSError("injected config unlink failure")
+                real_unlink(path, *args, **kwargs)
+
+            with (
+                patch.object(Path, "unlink", new=fail_once),
+                self.assertRaisesRegex(RuntimeError, "injected config unlink failure"),
+            ):
+                await runtime.close()
+
+            self.assertIn(config_path, runtime._config_paths)
+            self.assertIsNotNone(runtime._runtime_lock_fd)
+            self.assertTrue(config_path.exists())
+            contender = self.make_runtime(runtime_dir)
+            with self.assertRaisesRegex(RuntimeError, "already in use"):
+                contender._acquire_runtime_lease()
+
+            await runtime.close()
+            self.assertFalse(config_path.exists())
+            contender._acquire_runtime_lease()
+            await contender.close()
+
     async def test_failed_bridge_close_does_not_remove_live_owner_socket(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             path = Path(temporary) / "p1.sock"

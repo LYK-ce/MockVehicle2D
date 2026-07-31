@@ -658,15 +658,16 @@ class _NodeBridge:
 
     def _remove_owned_socket(self) -> None:
         owned = self._owned_socket
-        self._owned_socket = None
         if owned is None:
             return
         try:
             current = self.socket_path.lstat()
         except FileNotFoundError:
+            self._owned_socket = None
             return
         if stat.S_ISSOCK(current.st_mode) and (current.st_dev, current.st_ino) == owned:
             self.socket_path.unlink()
+        self._owned_socket = None
 
     def _track(self, task: asyncio.Task[object]) -> None:
         self._tasks.add(task)
@@ -855,6 +856,7 @@ class _NodeBridge:
         try:
             self._remove_owned_socket()
         except BaseException as error:
+            pending_cleanup = True
             errors.append(error)
         try:
             self.state.network_disconnected()
@@ -1082,13 +1084,11 @@ class P2PFleetSync:
 
     def _release_runtime_lease(self) -> None:
         fd = self._runtime_lock_fd
-        self._runtime_lock_fd = None
         if fd is None:
             return
-        try:
-            fcntl.flock(fd, fcntl.LOCK_UN)
-        finally:
-            os.close(fd)
+        fcntl.flock(fd, fcntl.LOCK_UN)
+        os.close(fd)
+        self._runtime_lock_fd = None
 
     async def _ensure_identity(self, vehicle_id: str) -> str:
         process = await asyncio.create_subprocess_exec(
@@ -1219,18 +1219,28 @@ class P2PFleetSync:
                 except BaseException as error:
                     errors.append(error)
                 self._bridges.pop(vehicle_id, None)
+        remaining_paths = []
         for path in tuple(dict.fromkeys(self._config_paths)):
             try:
                 path.unlink(missing_ok=True)
             except BaseException as error:
+                pending_cleanup = True
                 errors.append(error)
-        self._config_paths.clear()
-        if not pending_cleanup and self._flush_task is None and not self._bridges:
+                remaining_paths.append(path)
+        self._config_paths = remaining_paths
+        if (
+            not pending_cleanup
+            and self._flush_task is None
+            and not self._bridges
+            and not self._config_paths
+        ):
             try:
                 self._release_runtime_lease()
             except BaseException as error:
+                pending_cleanup = True
                 errors.append(error)
-            self._closed = True
+            else:
+                self._closed = True
         if errors:
             error_type = _CleanupPending if pending_cleanup else _CleanupError
             raise error_type("cannot close libp2p fleet sync", errors)

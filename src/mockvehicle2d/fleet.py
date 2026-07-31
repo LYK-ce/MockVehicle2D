@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+from collections import deque
 import copy
 from dataclasses import dataclass, field, replace
 from hashlib import sha256
@@ -24,6 +25,7 @@ from mockvehicle2d.local_state import (
     AnchoredLocalState,
     LocalMapDelta,
     OdometryConfig,
+    PoseEstimate,
 )
 from mockvehicle2d.map_grid import MapGrid, WALL
 from mockvehicle2d.map_sync import (
@@ -56,6 +58,17 @@ MAX_VEHICLES = 4
 DEFAULT_TICK_MS = 100
 DEFAULT_SPAWN_SAFETY_MARGIN_M = 0.25
 FLEET_CLEANUP_TIMEOUT_S = 2.0
+TELEMETRY_BUFFER_FRAMES = 64
+
+
+class TelemetryOverflowError(RuntimeError):
+    def __init__(self, requested_after: int, oldest: int, latest: int) -> None:
+        super().__init__(
+            f"telemetry cursor {requested_after} is older than buffered range "
+            f"{oldest}..{latest}"
+        )
+        self.oldest = oldest
+        self.latest = latest
 
 
 def _vehicle_odometry_config(config: OdometryConfig, vehicle_id: str) -> OdometryConfig:
@@ -523,6 +536,14 @@ class SharedWorld:
 
 
 @dataclass
+class FleetSensorFrame:
+    sequence: int
+    frame: RuntimeFrame
+    truth_pose: tuple[float, float, float]
+    estimate: PoseEstimate
+
+
+@dataclass
 class RobotNode:
     """Vehicle-owned controller, odometry and local map; no shared-world truth."""
 
@@ -533,6 +554,10 @@ class RobotNode:
     map_sync: MapSyncState | None = None
     frame_sequence: int = 0
     latest_frame: RuntimeFrame | None = None
+    _frames: deque[FleetSensorFrame] = field(
+        default_factory=lambda: deque(maxlen=TELEMETRY_BUFFER_FRAMES),
+        repr=False,
+    )
     controller_lease: asyncio.Lock = field(default_factory=asyncio.Lock, repr=False)
     _pending_map_delta: LocalMapDelta | None = field(default=None, repr=False)
     _pending_advance: SafetyAdvanceResult = field(
@@ -597,6 +622,21 @@ class RobotNode:
         if self.map_sync is not None:
             self.map_sync.record_local(delta)
         self.latest_frame = RuntimeFrame(scan_points, wall_timestamp)
+        self._frames.append(
+            FleetSensorFrame(
+                self.frame_sequence,
+                self.latest_frame,
+                truth_pose,
+                self.local_state.pose,
+            )
+        )
+
+    def frames_after(self, sequence: int) -> tuple[FleetSensorFrame, ...]:
+        oldest = self._frames[0].sequence
+        latest = self._frames[-1].sequence
+        if sequence < oldest - 1:
+            raise TelemetryOverflowError(sequence, oldest, latest)
+        return tuple(frame for frame in self._frames if frame.sequence > sequence)
 
     def record_advance(self, result: SafetyAdvanceResult) -> None:
         self._pending_advance = result
@@ -755,12 +795,14 @@ class FleetRuntime:
     def telemetry_messages(
         self,
         vehicle_id: str,
+        sampled: FleetSensorFrame | None = None,
     ) -> tuple[dict[str, object], dict[str, object]]:
         node = self.nodes[vehicle_id]
-        frame = node.latest_frame
-        assert frame is not None
+        if sampled is None:
+            sampled = node._frames[-1]
+        frame = sampled.frame
         vehicle = self.world.vehicle(vehicle_id)
-        estimate = node.local_state.pose
+        estimate = sampled.estimate
         x_m, y_m, yaw_rad = node.local_state.anchor.anchor_to_global(
             estimate.x_m,
             estimate.y_m,
@@ -770,7 +812,7 @@ class FleetRuntime:
         pose = {
             "type": "pose",
             "timestamp_s": frame.timestamp,
-            "seq": node.frame_sequence,
+            "seq": sampled.sequence,
             "source": "anchored_odometry",
             "frame_id": "global_map",
             "x_m": x_m,
@@ -799,16 +841,17 @@ class FleetRuntime:
                 else node.map_sync.snapshot()
             ),
         }
+        truth_x_m, truth_y_m, truth_yaw_rad = sampled.truth_pose
         scan = scan_message(
             self.world.debug_grid,
-            vehicle.x,
-            vehicle.y,
-            vehicle.yaw,
+            truth_x_m,
+            truth_y_m,
+            truth_yaw_rad,
             frame.timestamp,
             TMINI_SCAN_CONFIG,
             frame.scan_points,
         )
-        scan["seq"] = node.frame_sequence
+        scan["seq"] = sampled.sequence
         return pose, scan
 
     def _sample_all(self, wall_timestamp: float) -> None:
@@ -844,12 +887,12 @@ class FleetRuntime:
                     scan_time,
                 )
                 node = self.nodes[vehicle_id]
+                node.frame_sequence += 1
                 node.sample(
                     truth_pose,
                     scan_points,
                     self._wall_time_offset + scan_time,
                 )
-                node.frame_sequence += 1
                 self._next_scan_index[vehicle_id] += 1
 
 
@@ -922,12 +965,28 @@ async def fleet_handler(websocket, *, fleet: FleetRuntime, vehicle_id: str) -> N
         pose, scan = fleet.telemetry_messages(vehicle_id)
         await _send_json(websocket, pose)
         await _send_json(websocket, scan)
-        sent_frame_sequence = node.frame_sequence
+        sent_frame_sequence = int(scan["seq"])
         last_command_sequence: int | None = None
 
         while True:
-            if node.frame_sequence != sent_frame_sequence:
-                pose, scan = fleet.telemetry_messages(vehicle_id)
+            try:
+                pending_frames = node.frames_after(sent_frame_sequence)
+            except TelemetryOverflowError as error:
+                await _send_json(
+                    websocket,
+                    {
+                        "type": "error",
+                        "timestamp_s": time.time(),
+                        "seq": None,
+                        "code": "telemetry_overflow",
+                        "message": str(error),
+                        "oldest_available_seq": error.oldest,
+                        "latest_available_seq": error.latest,
+                    },
+                )
+                return
+            for sampled in pending_frames:
+                pose, scan = fleet.telemetry_messages(vehicle_id, sampled)
                 await _send_json(websocket, pose)
                 await _send_json(websocket, scan)
                 event_cursor = await _send_pending_events(
@@ -936,7 +995,7 @@ async def fleet_handler(websocket, *, fleet: FleetRuntime, vehicle_id: str) -> N
                     event_cursor,
                     pose["timestamp_s"],
                 )
-                sent_frame_sequence = node.frame_sequence
+                sent_frame_sequence = sampled.sequence
 
             try:
                 raw = await asyncio.wait_for(

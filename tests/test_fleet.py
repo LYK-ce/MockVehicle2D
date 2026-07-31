@@ -15,6 +15,7 @@ from mockvehicle2d.fleet import (
     FleetRuntime,
     FleetScenario,
     FleetVehicleSpec,
+    fleet_handler,
 )
 from mockvehicle2d.local_state import OdometryConfig
 from mockvehicle2d.map_grid import MapGrid
@@ -440,6 +441,113 @@ class TestFleetRuntime(unittest.TestCase):
         self.assertEqual(len(ranges), 6)
         for measured in ranges:
             self.assertAlmostEqual(measured, 1.5, places=9)
+
+
+class TestFleetTelemetryWebSocket(unittest.IsolatedAsyncioTestCase):
+    async def test_every_scheduled_tmini_frame_reaches_the_client(self) -> None:
+        from websockets.asyncio.client import connect
+        from websockets.asyncio.server import serve
+
+        for tick_ms in (50, 100, 250, 1000):
+            with self.subTest(tick_ms=tick_ms):
+                fleet = FleetRuntime.create(
+                    scenario(spec(1, 5.0, 5.0), tick_ms=tick_ms),
+                    grid=free_grid(),
+                    started_at=10.0,
+                    timestamp=1_000.0,
+                    command_timeout=10.0,
+                )
+
+                async def handler(websocket) -> None:
+                    await fleet_handler(
+                        websocket,
+                        fleet=fleet,
+                        vehicle_id="vehicle_1",
+                    )
+
+                server = await serve(handler, "127.0.0.1", 0)
+                port = server.sockets[0].getsockname()[1]
+                try:
+                    async with connect(f"ws://127.0.0.1:{port}") as websocket:
+                        while True:
+                            raw = await websocket.recv()
+                            if isinstance(raw, bytes):
+                                continue
+                            initial = json.loads(raw)
+                            if initial.get("type") == "scan":
+                                self.assertEqual(initial["seq"], 0)
+                                break
+
+                        for _ in range(round(2.0 / fleet.tick_s)):
+                            fleet.tick(-123.0)
+
+                        scans = []
+                        while len(scans) < 12:
+                            message = json.loads(
+                                await asyncio.wait_for(websocket.recv(), timeout=1.0)
+                            )
+                            if message.get("type") == "scan":
+                                scans.append(message)
+
+                        self.assertEqual([scan["seq"] for scan in scans], list(range(1, 13)))
+                        for sequence, scan in enumerate(scans, 1):
+                            self.assertAlmostEqual(
+                                scan["timestamp_s"],
+                                1_000.0 + sequence / 6,
+                                places=9,
+                            )
+                finally:
+                    server.close()
+                    await server.wait_closed()
+
+    async def test_slow_client_gets_explicit_overflow_without_blocking_ticks(self) -> None:
+        from websockets.asyncio.client import connect
+        from websockets.asyncio.server import serve
+
+        fleet = FleetRuntime.create(
+            scenario(spec(1, 5.0, 5.0), tick_ms=1000),
+            grid=free_grid(),
+            started_at=10.0,
+            timestamp=1_000.0,
+            command_timeout=20.0,
+        )
+
+        async def handler(websocket) -> None:
+            await fleet_handler(websocket, fleet=fleet, vehicle_id="vehicle_1")
+
+        server = await serve(handler, "127.0.0.1", 0)
+        port = server.sockets[0].getsockname()[1]
+        try:
+            async with connect(f"ws://127.0.0.1:{port}") as websocket:
+                while True:
+                    raw = await websocket.recv()
+                    if isinstance(raw, str):
+                        initial = json.loads(raw)
+                        if initial.get("type") == "scan":
+                            break
+
+                for _ in range(11):
+                    fleet.tick(-123.0)
+
+                self.assertAlmostEqual(fleet.world.now, 21.0)
+                while True:
+                    raw = await asyncio.wait_for(websocket.recv(), timeout=1.0)
+                    if isinstance(raw, str):
+                        message = json.loads(raw)
+                        if message.get("type") == "error":
+                            break
+                self.assertEqual(message["code"], "telemetry_overflow")
+                self.assertEqual(message["oldest_available_seq"], 3)
+                self.assertEqual(message["latest_available_seq"], 66)
+                self.assertEqual(
+                    message["latest_available_seq"]
+                    - message["oldest_available_seq"]
+                    + 1,
+                    64,
+                )
+        finally:
+            server.close()
+            await server.wait_closed()
 
 
 class TestFleetMainCleanup(unittest.IsolatedAsyncioTestCase):
