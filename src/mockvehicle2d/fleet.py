@@ -26,6 +26,12 @@ from mockvehicle2d.local_state import (
     OdometryConfig,
 )
 from mockvehicle2d.map_grid import MapGrid, WALL
+from mockvehicle2d.map_sync import (
+    MapSyncState,
+    P2PFleetSync,
+    P2PSettings,
+    P2PVehicleConfig,
+)
 from mockvehicle2d.protocol import ProtocolError, command_ack, error_message, parse_command
 from mockvehicle2d.safety import LocalSafetyRuntime, SafetyAdvanceResult
 from mockvehicle2d.scan import LaserPoint, TMINI_SCAN_CONFIG, scan_grid, scan_message
@@ -114,6 +120,7 @@ class FleetVehicleSpec:
     operator_port: int
     spawn_id: str
     anchor_pose: AnchorPose
+    p2p_port: int | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.vehicle_id, str) or not isinstance(self.spawn_id, str):
@@ -128,16 +135,20 @@ class FleetVehicleSpec:
             raise ValueError("operator_port must be an integer from 1 to 65535")
         if not isinstance(self.anchor_pose, AnchorPose):
             raise ValueError("anchor_pose must be an AnchorPose")
+        if self.p2p_port is not None and (
+            isinstance(self.p2p_port, bool)
+            or not isinstance(self.p2p_port, int)
+            or not 1 <= self.p2p_port <= 65535
+        ):
+            raise ValueError("p2p_port must be an integer from 1 to 65535")
 
     @classmethod
     def from_json(cls, value: object) -> "FleetVehicleSpec":
         body = _strict_object(
             value,
-            required=frozenset(
-                ("vehicle_id", "operator_port", "spawn_id", "anchor_pose")
-            ),
+            required=frozenset(("vehicle_id", "operator_port", "spawn_id", "anchor_pose")),
             allowed=frozenset(
-                ("vehicle_id", "operator_port", "spawn_id", "anchor_pose")
+                ("vehicle_id", "operator_port", "spawn_id", "anchor_pose", "p2p_port")
             ),
             name="vehicle",
         )
@@ -152,7 +163,20 @@ class FleetVehicleSpec:
         validate_vehicle_id(spawn_id)
         if isinstance(port, bool) or not isinstance(port, int) or not 1 <= port <= 65535:
             raise ValueError("operator_port must be an integer from 1 to 65535")
-        return cls(vehicle_id, port, spawn_id, AnchorPose.from_json(body["anchor_pose"]))
+        p2p_port = body.get("p2p_port")
+        if p2p_port is not None and (
+            isinstance(p2p_port, bool)
+            or not isinstance(p2p_port, int)
+            or not 1 <= p2p_port <= 65535
+        ):
+            raise ValueError("p2p_port must be an integer from 1 to 65535")
+        return cls(
+            vehicle_id,
+            port,
+            spawn_id,
+            AnchorPose.from_json(body["anchor_pose"]),
+            p2p_port,
+        )
 
 
 @dataclass(frozen=True)
@@ -160,6 +184,7 @@ class FleetScenario:
     scenario_id: str
     vehicles: tuple[FleetVehicleSpec, ...]
     tick_ms: int = DEFAULT_TICK_MS
+    p2p: P2PSettings | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.scenario_id, str):
@@ -175,6 +200,8 @@ class FleetScenario:
             raise ValueError("tick_ms must be an integer")
         if not 10 <= self.tick_ms <= 1000:
             raise ValueError("tick_ms must be from 10 to 1000")
+        if self.p2p is not None and not isinstance(self.p2p, P2PSettings):
+            raise ValueError("p2p must be P2PSettings")
         for field_name, values in (
             ("vehicle_id", [spec.vehicle_id for spec in self.vehicles]),
             ("operator_port", [spec.operator_port for spec in self.vehicles]),
@@ -182,6 +209,16 @@ class FleetScenario:
         ):
             if len(values) != len(set(values)):
                 raise ValueError(f"scenario {field_name} values must be unique")
+        p2p_ports = [spec.p2p_port for spec in self.vehicles]
+        if self.p2p is None and any(port is not None for port in p2p_ports):
+            raise ValueError("p2p_port requires top-level p2p configuration")
+        if self.p2p is not None:
+            if any(port is None for port in p2p_ports):
+                raise ValueError("every vehicle requires p2p_port when p2p is enabled")
+            if len(p2p_ports) != len(set(p2p_ports)):
+                raise ValueError("scenario p2p_port values must be unique")
+            if set(p2p_ports) & {spec.operator_port for spec in self.vehicles}:
+                raise ValueError("operator and p2p ports must not overlap")
 
     @property
     def tick_s(self) -> float:
@@ -192,7 +229,7 @@ class FleetScenario:
         body = _strict_object(
             value,
             required=frozenset(("scenario_id", "vehicles")),
-            allowed=frozenset(("scenario_id", "vehicles", "tick_ms")),
+            allowed=frozenset(("scenario_id", "vehicles", "tick_ms", "p2p")),
             name="scenario",
         )
         scenario_id = body["scenario_id"]
@@ -208,6 +245,7 @@ class FleetScenario:
             scenario_id,
             tuple(FleetVehicleSpec.from_json(item) for item in vehicles),
             tick_ms,
+            None if "p2p" not in body else P2PSettings.from_json(body["p2p"]),
         )
 
     @classmethod
@@ -451,6 +489,7 @@ class RobotNode:
     controller: RobotController
     safety: LocalSafetyRuntime
     local_state: AnchoredLocalState
+    map_sync: MapSyncState | None = None
     frame_sequence: int = 0
     latest_frame: RuntimeFrame | None = None
     controller_lease: asyncio.Lock = field(default_factory=asyncio.Lock, repr=False)
@@ -497,6 +536,8 @@ class RobotNode:
                 else (self.safety.observation.edge_point_vehicle_m,)
             ),
         )
+        if self.map_sync is not None:
+            self.map_sync.record_local(self._pending_map_delta)
         self.latest_frame = RuntimeFrame(scan_points, wall_timestamp)
 
     def record_advance(self, result: SafetyAdvanceResult) -> None:
@@ -566,21 +607,32 @@ class FleetRuntime:
         for spec in scenario.vehicles:
             pose = spec.anchor_pose
             anchor = AnchorSpec(spec.spawn_id, pose.x_m, pose.y_m, pose.yaw_rad)
+            local_state = AnchoredLocalState(
+                anchor,
+                truth_x_m=pose.x_m,
+                truth_y_m=pose.y_m,
+                truth_yaw_rad=pose.yaw_rad,
+                odometry_config=_vehicle_odometry_config(
+                    odometry_config,
+                    spec.vehicle_id,
+                ),
+                timestamp=timestamp,
+                map_resolution_m=LOCAL_MAP_RESOLUTION_M,
+            )
             nodes[spec.vehicle_id] = RobotNode(
                 spec,
                 RobotController(mission_capacity=mission_capacity),
                 LocalSafetyRuntime(healthy=safety_healthy),
-                AnchoredLocalState(
-                    anchor,
-                    truth_x_m=pose.x_m,
-                    truth_y_m=pose.y_m,
-                    truth_yaw_rad=pose.yaw_rad,
-                    odometry_config=_vehicle_odometry_config(
-                        odometry_config,
+                local_state,
+                (
+                    None
+                    if scenario.p2p is None
+                    else MapSyncState(
+                        scenario.scenario_id,
                         spec.vehicle_id,
-                    ),
-                    timestamp=timestamp,
-                    map_resolution_m=LOCAL_MAP_RESOLUTION_M,
+                        anchor,
+                        local_state.local_map.resolution_m,
+                    )
                 ),
             )
         runtime = cls(scenario, world, nodes)
@@ -681,6 +733,11 @@ class FleetRuntime:
                     else {"scan_match": node.local_state.last_scan_match.as_dict()}
                 ),
             },
+            "p2p_map_sync": (
+                {"enabled": False}
+                if node.map_sync is None
+                else node.map_sync.snapshot()
+            ),
         }
         scan = scan_message(
             self.world.debug_grid,
@@ -881,6 +938,7 @@ async def main(
             odometry_seed,
         ),
     )
+    p2p_sync: P2PFleetSync | None = None
     stop = asyncio.Event()
     shutting_down = False
 
@@ -900,6 +958,28 @@ async def main(
     tick_task: asyncio.Task[None] | None = None
     stop_task: asyncio.Task[bool] | None = None
     try:
+        if scenario.p2p is not None:
+            p2p_sync = await P2PFleetSync.start(
+                scenario.scenario_id,
+                scenario.p2p,
+                tuple(
+                    P2PVehicleConfig(
+                        spec.vehicle_id,
+                        spec.p2p_port,
+                        fleet.nodes[spec.vehicle_id].local_state.anchor,
+                    )
+                    for spec in scenario.vehicles
+                ),
+                {
+                    vehicle_id: node.map_sync
+                    for vehicle_id, node in fleet.nodes.items()
+                    if node.map_sync is not None
+                },
+            )
+            print(
+                f"libp2p map sync ready for {len(scenario.vehicles)} vehicle(s) "
+                f"in session {scenario.scenario_id}"
+            )
         for spec in scenario.vehicles:
             async def configured_handler(
                 websocket,
@@ -931,6 +1011,8 @@ async def main(
             server.close()
         if servers:
             await asyncio.gather(*(server.wait_closed() for server in servers))
+        if p2p_sync is not None:
+            await p2p_sync.close()
         for vehicle_id in fleet.nodes:
             fleet.disconnect(vehicle_id)
         for caught_signal in (signal.SIGINT, signal.SIGTERM):

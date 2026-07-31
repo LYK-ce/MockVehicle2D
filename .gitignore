@@ -30,6 +30,8 @@ Thumbs.db
 
 # Project
 *.log
+.runtime/
+target/
 
 # Agents
 AGENTS.md

@@ -380,12 +380,31 @@ cell 状态：`0` 可通行、`1` 墙、`2` 无地面/落差。客户端用
     "timestamp_s": 1717800000.4,
     "revision": 12,
     "local_map_revision": 8
+  },
+  "p2p_map_sync": {
+    "enabled": true,
+    "ready": true,
+    "peer_id": "12D3KooW...",
+    "connected_vehicle_ids": ["mock_vehicle_02", "mock_vehicle_03", "mock_vehicle_04"],
+    "own_known_cells": 128,
+    "own_dirty_cells": 0,
+    "published_deltas": 4,
+    "received_deltas": 9,
+    "rejected_deltas": 0,
+    "publish_failures": 0,
+    "sequence_gaps": 0,
+    "peer_sources": {
+      "mock_vehicle_02": {"map_epoch": 1, "last_sequence": 3, "known_cells": 72}
+    },
+    "collaborative_known_cells": 196
   }
 }
 ```
 
 `pose` 不泄露绝对仿真真值。`controller` 是模式、队列和导航的权威快照。
 `localization.quality` 为 `nominal`、`degraded` 或 `lost`。
+没有启用场景级 P2P 时，`p2p_map_sync` 为 `{"enabled":false}`。协同摘要仅供观察，
+远端地图当前不会改变本车 D* Lite 或安全控制。
 
 ### scan
 

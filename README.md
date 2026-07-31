@@ -60,6 +60,7 @@ mockvehicle2d serve \
 mockvehicle2d pathfind --start-m 10,10 --goal-m 200,200
 
 # 一个隐藏物理世界中的四个独立逻辑车辆，端口为 19090～19093
+cargo build --bin map-sync-node
 mockvehicle2d fleet --scenario examples/four_vehicle_scenario.json
 ```
 
@@ -90,9 +91,41 @@ SharedWorld（仅仿真器可见）
 碰撞并同时提交。其他车辆会产生动态 Tmini 回波和物理碰撞，但动态回波不会永久写成
 本车 `ObservedGrid` 的静态 Occupied，避免车辆离开后留下幽灵障碍。
 
-Pictor 中分别创建以上四个 WebSocket 连接即可同时显示四辆车。当前里程碑有意不实现
-libp2p 或协同地图融合；后续 P2P 只能交换各节点自己建立的地图增量，不能访问
-`SharedWorld`。
+Pictor 中分别创建以上四个 WebSocket 连接即可同时显示四辆车。
+
+示例场景还为四车启动四个独立的 Rust `map-sync-node` 进程，使用 TCP
+`20090～20093` 组成固定 localhost libp2p Gossipsub mesh。`cargo test` 会构建并验证
+sidecar；默认无顶层 `p2p` 的场景不启动任何网络进程。每辆车每 100 ms 最多发布一批
+自己 `ObservedGrid` 新产生的 dirty cells；没有变化时不发消息，发送和接收都不会等待
+其他节点。身份密钥保存在配置的 `runtime_dir`，进程重启后 PeerId 保持稳定。
+
+每车严格维护 OwnMap、按来源划分的 PeerEvidence 和只读 CollaborativeView。远端证据
+不会进入 OwnMap、不会重新发布，也暂不改变 D* Lite 或本地安全决策。P2P 健康度、
+本地/远端 delta 计数和协同视图摘要通过每车 `pose.p2p_map_sync` 遥测提供。当前仅实现
+在线增量和重复/过期拒绝；离线缺包与后加入节点的 tile 快照恢复留到下一里程碑。
+
+Gossipsub topic 为 `mockvehicle2d/<session_id>/map-delta/1`，payload 是严格的
+`mockvehicle2d-map-delta/1` JSON：
+
+```json
+{
+  "protocol": "mockvehicle2d-map-delta/1",
+  "session_id": "four_vehicle_exploration",
+  "source_vehicle_id": "mock_vehicle_01",
+  "map_epoch": 1,
+  "sequence": 7,
+  "source_frame": "anchor_map",
+  "anchor_id": "spawn_north_west",
+  "transform_epoch": 1,
+  "transform_to_global_map": {"x_m": 9.0, "y_m": 9.0, "yaw_rad": 0.0},
+  "resolution_m": 1.0,
+  "cells": [{"gx": 3, "gy": 4, "state": 1}]
+}
+```
+
+接收端同时校验 Gossipsub 签名作者 PeerId、车辆白名单、session、frame、anchor、epoch、
+resolution、sequence、消息大小和每个 cell。Python 与对应 sidecar 只通过运行目录中的
+Unix domain socket 交换有界 JSONL 消息，控制 tick 不等待该 socket。
 
 ## 控制方式
 
@@ -165,6 +198,7 @@ src/mockvehicle2d/
 ├── protocol.py            # WebSocket v4 严格 JSON 边界
 ├── server.py              # 独占连接、帧调度和遥测
 ├── fleet.py               # 1～4 车场景、共享物理世界和独立 endpoint
+├── map_sync.py            # OwnMap 增量、PeerEvidence、UDS sidecar 生命周期
 ├── navigation.py          # 有限视野 Goto 决策
 ├── local_state.py         # 锚点、odometry、scan matching、ObservedGrid
 ├── safety.py              # 障碍/边缘净空和故障停车
@@ -176,6 +210,9 @@ src/mockvehicle2d/
     ├── d_star_lite.py     # 在线增量规划
     └── a_star.py          # 离线全真值调试
 ```
+
+Rust sidecar 位于 `rust/map_sync_node.rs`：每车使用独立签名 PeerId、TCP+Noise+Yamux 和
+Gossipsub；固定四车仿真只配置 localhost peer，不启用 DHT、relay、NAT 或公网发现。
 
 ## 仿真边界
 
