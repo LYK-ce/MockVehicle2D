@@ -500,6 +500,101 @@ class TestFleetTelemetryWebSocket(unittest.IsolatedAsyncioTestCase):
                     server.close()
                     await server.wait_closed()
 
+    async def test_backlogged_frames_keep_the_state_from_their_scan_time(self) -> None:
+        from websockets.asyncio.client import connect
+        from websockets.asyncio.server import serve
+
+        with tempfile.TemporaryDirectory() as temporary:
+            vehicle_spec = FleetVehicleSpec(
+                "vehicle_1",
+                19090,
+                "spawn_1",
+                AnchorPose(5.0, 5.0, 0.0),
+                20090,
+            )
+            fleet = FleetRuntime.create(
+                FleetScenario(
+                    "snapshot_scenario",
+                    (vehicle_spec,),
+                    1000,
+                    P2PSettings(Path("/bin/true"), Path(temporary)),
+                ),
+                grid=free_grid(),
+                started_at=10.0,
+                timestamp=1_000.0,
+                command_timeout=20.0,
+            )
+            node = fleet.nodes["vehicle_1"]
+
+            async def handler(websocket) -> None:
+                await fleet_handler(websocket, fleet=fleet, vehicle_id="vehicle_1")
+
+            server = await serve(handler, "127.0.0.1", 0)
+            port = server.sockets[0].getsockname()[1]
+            try:
+                async with connect(f"ws://127.0.0.1:{port}") as websocket:
+                    while True:
+                        raw = await websocket.recv()
+                        if isinstance(raw, str) and json.loads(raw).get("type") == "scan":
+                            break
+
+                    node.map_sync.published_deltas = 1
+                    fleet.handle_command(
+                        "vehicle_1",
+                        ManualCommand(1, ManualAction.DRIVE, 0.5, 0.0),
+                    )
+                    fleet.tick(-123.0)
+                    node.map_sync.published_deltas = 2
+                    fleet.handle_command(
+                        "vehicle_1",
+                        ManualCommand(2, ManualAction.STOP),
+                    )
+                    node.safety.decision = type(node.safety.decision)(
+                        0.0,
+                        0.0,
+                        "fault",
+                        "injected_after_first_tick",
+                    )
+                    fleet.tick(-123.0)
+                    node.map_sync.published_deltas = 99
+
+                    poses = []
+                    while len(poses) < 12:
+                        message = json.loads(
+                            await asyncio.wait_for(websocket.recv(), timeout=1.0)
+                        )
+                        if message.get("type") == "pose" and message["seq"]:
+                            poses.append(message)
+
+                    self.assertEqual([pose["seq"] for pose in poses], list(range(1, 13)))
+                    self.assertEqual(
+                        [pose["actuator_command"] for pose in poses],
+                        ["drive"] * 6 + ["stop"] * 6,
+                    )
+                    self.assertEqual(
+                        [pose["controller"]["manual_setpoint_active"] for pose in poses],
+                        [True] * 6 + [False] * 6,
+                    )
+                    self.assertEqual(
+                        [pose["safety"]["reason"] for pose in poses],
+                        [None] * 6 + ["injected_after_first_tick"] * 6,
+                    )
+                    self.assertEqual(
+                        [pose["p2p_map_sync"]["published_deltas"] for pose in poses],
+                        [1] * 6 + [2] * 6,
+                    )
+                    self.assertEqual(
+                        [pose["localization"]["scan_match"]["revision"] for pose in poses],
+                        list(range(2, 14)),
+                    )
+                    for pose in poses[:6]:
+                        self.assertAlmostEqual(pose["vx_mps"], 0.5)
+                    for pose in poses[6:]:
+                        self.assertEqual((pose["vx_mps"], pose["vy_mps"]), (0.0, 0.0))
+            finally:
+                server.close()
+                await server.wait_closed()
+
     async def test_slow_client_gets_explicit_overflow_without_blocking_ticks(self) -> None:
         from websockets.asyncio.client import connect
         from websockets.asyncio.server import serve

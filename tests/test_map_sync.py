@@ -167,6 +167,64 @@ class TestP2PRuntimeOwnership(unittest.IsolatedAsyncioTestCase):
             third._acquire_runtime_lease()
             await third.close()
 
+    async def test_close_error_before_kernel_close_keeps_lease_without_retrying_fd(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            runtime_dir = Path(temporary)
+            runtime = self.make_runtime(runtime_dir)
+            runtime._acquire_runtime_lease()
+            lease_fd = runtime._runtime_lock_fd
+
+            with (
+                patch(
+                    "mockvehicle2d.map_sync.os.close",
+                    side_effect=OSError("injected close failure"),
+                ),
+                self.assertRaisesRegex(RuntimeError, "injected close failure"),
+            ):
+                await runtime.close()
+
+            contender = self.make_runtime(runtime_dir)
+            with self.assertRaisesRegex(RuntimeError, "already in use"):
+                contender._acquire_runtime_lease()
+            with self.assertRaisesRegex(RuntimeError, "release outcome is unknown"):
+                await runtime.close()
+
+            os.close(lease_fd)
+            contender._acquire_runtime_lease()
+            await contender.close()
+
+    async def test_close_error_after_kernel_close_never_closes_reused_fd(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            runtime_dir = Path(temporary)
+            sentinel = runtime_dir / "sentinel"
+            runtime = self.make_runtime(runtime_dir)
+            runtime._acquire_runtime_lease()
+            lease_fd = runtime._runtime_lock_fd
+            reused_fd = None
+            real_close = os.close
+
+            def close_then_fail(fd: int) -> None:
+                nonlocal reused_fd
+                real_close(fd)
+                reused_fd = os.open(sentinel, os.O_RDWR | os.O_CREAT, 0o600)
+                self.assertEqual(reused_fd, lease_fd)
+                raise OSError("injected ambiguous close failure")
+
+            with (
+                patch("mockvehicle2d.map_sync.os.close", side_effect=close_then_fail),
+                self.assertRaisesRegex(RuntimeError, "ambiguous close failure"),
+            ):
+                await runtime.close()
+
+            contender = self.make_runtime(runtime_dir)
+            contender._acquire_runtime_lease()
+            with self.assertRaisesRegex(RuntimeError, "release outcome is unknown"):
+                await runtime.close()
+            os.fstat(reused_fd)
+
+            real_close(reused_fd)
+            await contender.close()
+
     async def test_completed_close_is_idempotent(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             runtime = self.make_runtime(Path(temporary))
@@ -558,6 +616,47 @@ class TestP2PRuntimeOwnership(unittest.IsolatedAsyncioTestCase):
             replace.assert_called_once()
             self.assertFalse((runtime_dir / "vehicle_1.json").exists())
             self.assertFalse(any(".tmp" in path.name for path in runtime_dir.iterdir()))
+
+    async def test_failed_atomic_config_cleanup_remains_tracked_until_close_retry(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            runtime_dir = Path(temporary)
+            runtime = self.make_runtime(runtime_dir)
+            runtime._acquire_runtime_lease()
+            config_path = runtime_dir / "vehicle_1.json"
+            runtime._config_paths.append(config_path)
+            real_unlink = Path.unlink
+            failed = False
+
+            def fail_temp_once(path: Path, *args, **kwargs) -> None:
+                nonlocal failed
+                if path.suffix == ".tmp" and not failed:
+                    failed = True
+                    raise OSError("injected temporary unlink failure")
+                real_unlink(path, *args, **kwargs)
+
+            with (
+                patch(
+                    "mockvehicle2d.map_sync.os.replace",
+                    side_effect=OSError("injected replace failure"),
+                ),
+                patch.object(Path, "unlink", new=fail_temp_once),
+                self.assertRaisesRegex(OSError, "temporary unlink failure"),
+            ):
+                runtime._write_config(config_path, {"vehicle_id": "vehicle_1"})
+
+            temporary_paths = [
+                path for path in runtime._config_paths if path.suffix == ".tmp"
+            ]
+            self.assertEqual(len(temporary_paths), 1)
+            self.assertTrue(temporary_paths[0].exists())
+            contender = self.make_runtime(runtime_dir)
+            with self.assertRaisesRegex(RuntimeError, "already in use"):
+                contender._acquire_runtime_lease()
+
+            await runtime.close()
+            self.assertFalse(temporary_paths[0].exists())
+            contender._acquire_runtime_lease()
+            await contender.close()
 
     async def test_bridge_refuses_to_remove_a_non_socket_path(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

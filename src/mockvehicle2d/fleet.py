@@ -541,6 +541,7 @@ class FleetSensorFrame:
     frame: RuntimeFrame
     truth_pose: tuple[float, float, float]
     estimate: PoseEstimate
+    runtime_state: dict[str, object]
 
 
 @dataclass
@@ -585,6 +586,7 @@ class RobotNode:
         truth_pose: tuple[float, float, float],
         scan_points: tuple[LaserPoint, ...],
         wall_timestamp: float,
+        vehicle: Vehicle,
     ) -> None:
         truth_x_m, truth_y_m, truth_yaw_rad = truth_pose
         self.local_state.update_from_truth(
@@ -622,12 +624,37 @@ class RobotNode:
         if self.map_sync is not None:
             self.map_sync.record_local(delta)
         self.latest_frame = RuntimeFrame(scan_points, wall_timestamp)
+        estimate = self.local_state.pose
+        linear_mps, omega_rps = vehicle.body_velocities()
+        runtime_state = {
+            "linear_mps": linear_mps,
+            "omega_rps": omega_rps,
+            "collision": vehicle.collision,
+            "actuator_command": vehicle.command,
+            "controller": self.controller.snapshot(),
+            "safety": self.safety.snapshot(),
+            "localization": {
+                **estimate.as_dict(),
+                "local_map_revision": self.local_state.local_map.revision,
+                **(
+                    {}
+                    if self.local_state.last_scan_match is None
+                    else {"scan_match": self.local_state.last_scan_match.as_dict()}
+                ),
+            },
+            "p2p_map_sync": (
+                {"enabled": False}
+                if self.map_sync is None
+                else self.map_sync.snapshot()
+            ),
+        }
         self._frames.append(
             FleetSensorFrame(
                 self.frame_sequence,
                 self.latest_frame,
                 truth_pose,
-                self.local_state.pose,
+                estimate,
+                runtime_state,
             )
         )
 
@@ -801,14 +828,14 @@ class FleetRuntime:
         if sampled is None:
             sampled = node._frames[-1]
         frame = sampled.frame
-        vehicle = self.world.vehicle(vehicle_id)
         estimate = sampled.estimate
+        state = sampled.runtime_state
         x_m, y_m, yaw_rad = node.local_state.anchor.anchor_to_global(
             estimate.x_m,
             estimate.y_m,
             estimate.yaw_rad,
         )
-        linear_mps, omega_rps = vehicle.body_velocities()
+        linear_mps = state["linear_mps"]
         pose = {
             "type": "pose",
             "timestamp_s": frame.timestamp,
@@ -821,25 +848,13 @@ class FleetRuntime:
             "yaw_rad": yaw_rad,
             "vx_mps": linear_mps * math.cos(yaw_rad),
             "vy_mps": linear_mps * math.sin(yaw_rad),
-            "omega_rps": omega_rps,
-            "collision": vehicle.collision,
-            "actuator_command": vehicle.command,
-            "controller": node.controller.snapshot(),
-            "safety": node.safety.snapshot(),
-            "localization": {
-                **estimate.as_dict(),
-                "local_map_revision": node.local_state.local_map.revision,
-                **(
-                    {}
-                    if node.local_state.last_scan_match is None
-                    else {"scan_match": node.local_state.last_scan_match.as_dict()}
-                ),
-            },
-            "p2p_map_sync": (
-                {"enabled": False}
-                if node.map_sync is None
-                else node.map_sync.snapshot()
-            ),
+            "omega_rps": state["omega_rps"],
+            "collision": state["collision"],
+            "actuator_command": state["actuator_command"],
+            "controller": state["controller"],
+            "safety": state["safety"],
+            "localization": state["localization"],
+            "p2p_map_sync": state["p2p_map_sync"],
         }
         truth_x_m, truth_y_m, truth_yaw_rad = sampled.truth_pose
         scan = scan_message(
@@ -868,6 +883,7 @@ class FleetRuntime:
                 ),
                 scans[vehicle_id],
                 wall_timestamp,
+                self.world.vehicle(vehicle_id),
             )
 
     def _sample_due_scans(self) -> None:
@@ -892,6 +908,7 @@ class FleetRuntime:
                     truth_pose,
                     scan_points,
                     self._wall_time_offset + scan_time,
+                    self.world.vehicle(vehicle_id),
                 )
                 self._next_scan_index[vehicle_id] += 1
 

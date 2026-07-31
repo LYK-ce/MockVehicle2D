@@ -909,6 +909,7 @@ class P2PFleetSync:
         self._config_paths: list[Path] = []
         self._flush_task: asyncio.Task[None] | None = None
         self._runtime_lock_fd: int | None = None
+        self._runtime_lease_release_unknown = False
         self._close_task: asyncio.Task[None] | None = None
         self._closed = False
 
@@ -1007,6 +1008,8 @@ class P2PFleetSync:
         self._flush_task = asyncio.create_task(self._flush_loop())
 
     def _acquire_runtime_lease(self) -> None:
+        if self._runtime_lease_release_unknown:
+            raise RuntimeError("map-sync runtime lease release outcome is unknown")
         if self._runtime_lock_fd is not None:
             raise RuntimeError("map-sync runtime lease is already held")
         try:
@@ -1076,18 +1079,23 @@ class P2PFleetSync:
             if fd >= 0:
                 os.close(fd)
             if temporary_path is not None:
-                try:
-                    temporary_path.unlink(missing_ok=True)
-                finally:
-                    if temporary_path in self._config_paths:
-                        self._config_paths.remove(temporary_path)
+                temporary_path.unlink(missing_ok=True)
+                if temporary_path in self._config_paths:
+                    self._config_paths.remove(temporary_path)
 
     def _release_runtime_lease(self) -> None:
+        if self._runtime_lease_release_unknown:
+            raise RuntimeError("map-sync runtime lease release outcome is unknown")
         fd = self._runtime_lock_fd
         if fd is None:
             return
-        fcntl.flock(fd, fcntl.LOCK_UN)
-        os.close(fd)
+        try:
+            # Closing the descriptor is the atomic flock release.  Retrying an
+            # ambiguous close could instead close a newly reused descriptor.
+            os.close(fd)
+        except BaseException:
+            self._runtime_lease_release_unknown = True
+            raise
         self._runtime_lock_fd = None
 
     async def _ensure_identity(self, vehicle_id: str) -> str:
