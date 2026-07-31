@@ -1687,6 +1687,7 @@ name = "map-sync-node"
 version = "0.1.0"
 dependencies = [
  "futures",
+ "libc",
  "libp2p",
  "serde",
  "serde_json",

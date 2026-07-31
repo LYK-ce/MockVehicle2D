@@ -167,6 +167,19 @@ class TestP2PRuntimeOwnership(unittest.IsolatedAsyncioTestCase):
             third._acquire_runtime_lease()
             await third.close()
 
+    async def test_completed_close_is_idempotent(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            runtime = self.make_runtime(Path(temporary))
+            runtime._acquire_runtime_lease()
+            await runtime.close()
+            await runtime.close()
+
+        with tempfile.TemporaryDirectory() as temporary:
+            bridge = self._bridge(Path(temporary) / "p1.sock")
+            await bridge.start_server()
+            await bridge.close()
+            await bridge.close()
+
     async def test_start_preserves_original_error_when_cleanup_also_fails(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             settings = P2PSettings(Path("/bin/true"), Path(temporary))
@@ -345,6 +358,143 @@ class TestP2PRuntimeOwnership(unittest.IsolatedAsyncioTestCase):
             replacement = self.make_runtime(runtime_dir)
             replacement._acquire_runtime_lease()
             await replacement.close()
+
+    async def test_bridge_writer_runtime_error_does_not_skip_remaining_cleanup(self) -> None:
+        class BrokenWriter:
+            def write(self, _data: bytes) -> None:
+                raise RuntimeError("injected writer failure")
+
+            async def drain(self) -> None:
+                return None
+
+            def close(self) -> None:
+                return None
+
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "p1.sock"
+            bridge = self._bridge(path)
+            await bridge.start_server()
+            bridge._writer = BrokenWriter()
+
+            with self.assertRaisesRegex(RuntimeError, "injected writer failure"):
+                await asyncio.wait_for(bridge.close(), timeout=0.5)
+
+            self.assertIsNone(bridge.server)
+            self.assertFalse(path.exists())
+            self.assertFalse(bridge._tasks)
+
+    async def test_stubborn_bridge_handler_keeps_runtime_lease_until_retry(self) -> None:
+        release = asyncio.Event()
+        cancelled = asyncio.Event()
+
+        async def stubborn_handler() -> None:
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                cancelled.set()
+                await release.wait()
+
+        with tempfile.TemporaryDirectory() as temporary:
+            runtime_dir = Path(temporary)
+            runtime = self.make_runtime(runtime_dir)
+            runtime._acquire_runtime_lease()
+            bridge = self._bridge(runtime_dir / "p1.sock")
+            handler = asyncio.create_task(stubborn_handler())
+            bridge._track(handler)
+            runtime._bridges["vehicle_1"] = bridge
+
+            with (
+                patch("mockvehicle2d.map_sync.PROCESS_STOP_TIMEOUT_S", 0.05),
+                self.assertRaisesRegex(RuntimeError, "did not stop"),
+            ):
+                await asyncio.wait_for(runtime.close(), timeout=0.5)
+            await asyncio.wait_for(cancelled.wait(), timeout=0.2)
+
+            contender = self.make_runtime(runtime_dir)
+            with self.assertRaisesRegex(RuntimeError, "already in use"):
+                contender._acquire_runtime_lease()
+
+            release.set()
+            await asyncio.wait_for(handler, timeout=0.2)
+            await asyncio.wait_for(runtime.close(), timeout=0.5)
+            contender._acquire_runtime_lease()
+            await contender.close()
+
+    async def test_stubborn_flush_is_bounded_and_keeps_runtime_lease(self) -> None:
+        release = asyncio.Event()
+        cancelled = asyncio.Event()
+
+        async def stubborn_flush() -> None:
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                cancelled.set()
+                await release.wait()
+
+        with tempfile.TemporaryDirectory() as temporary:
+            runtime_dir = Path(temporary)
+            runtime = self.make_runtime(runtime_dir)
+            runtime._acquire_runtime_lease()
+            runtime._flush_task = asyncio.create_task(stubborn_flush())
+
+            with patch("mockvehicle2d.map_sync.PROCESS_STOP_TIMEOUT_S", 0.05):
+                close_task = asyncio.create_task(runtime.close())
+                done, _ = await asyncio.wait((close_task,), timeout=0.3)
+            if close_task not in done:
+                release.set()
+                await asyncio.wait_for(close_task, timeout=0.5)
+                self.fail("close must not hang on flush cancellation")
+            with self.assertRaisesRegex(RuntimeError, "flush"):
+                await close_task
+            await asyncio.wait_for(cancelled.wait(), timeout=0.2)
+
+            contender = self.make_runtime(runtime_dir)
+            with self.assertRaisesRegex(RuntimeError, "already in use"):
+                contender._acquire_runtime_lease()
+
+            release.set()
+            await asyncio.wait_for(runtime._flush_task, timeout=0.2)
+            await asyncio.wait_for(runtime.close(), timeout=0.5)
+            contender._acquire_runtime_lease()
+            await contender.close()
+
+    async def test_stubborn_process_wait_is_bounded_and_retryable(self) -> None:
+        class StubbornProcess:
+            def __init__(self) -> None:
+                self.returncode = None
+                self.release = asyncio.Event()
+                self.terminated = False
+                self.killed = False
+
+            def terminate(self) -> None:
+                self.terminated = True
+
+            def kill(self) -> None:
+                self.killed = True
+
+            async def wait(self) -> int:
+                try:
+                    await self.release.wait()
+                except asyncio.CancelledError:
+                    await self.release.wait()
+                self.returncode = -9
+                return self.returncode
+
+        process = StubbornProcess()
+        with tempfile.TemporaryDirectory() as temporary:
+            bridge = self._bridge(Path(temporary) / "p1.sock")
+            bridge.process = process
+            with (
+                patch("mockvehicle2d.map_sync.PROCESS_STOP_TIMEOUT_S", 0.03),
+                self.assertRaisesRegex(RuntimeError, "child wait did not stop"),
+            ):
+                await asyncio.wait_for(bridge.close(), timeout=0.4)
+
+            self.assertTrue(process.terminated)
+            self.assertTrue(process.killed)
+            process.release.set()
+            await self._wait_until(lambda: process.returncode is not None)
+            await asyncio.wait_for(bridge.close(), timeout=0.2)
 
     async def test_partial_config_write_is_removed_after_start_failure(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

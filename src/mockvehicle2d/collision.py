@@ -131,18 +131,18 @@ def swept_circles_overlap(
 
 
 def swept_trajectories_overlap(
-    first: Sequence[tuple[float, float, float]],
+    first: Sequence[tuple[float, ...]],
     first_radius: float,
-    second: Sequence[tuple[float, float, float]],
+    second: Sequence[tuple[float, ...]],
     second_radius: float,
 ) -> bool:
     """Whether two timed, piecewise-linear circle trajectories overlap."""
     for trajectory in (first, second):
         if not trajectory or any(
-            len(point) != 3 or not all(math.isfinite(value) for value in point)
+            len(point) not in (3, 4) or not all(math.isfinite(value) for value in point)
             for point in trajectory
         ):
-            raise ValueError("trajectories must contain finite (time, x, y) points")
+            raise ValueError("trajectories must contain finite (time, x, y[, yaw]) points")
         if any(
             current[0] >= following[0]
             for current, following in zip(trajectory, trajectory[1:])
@@ -175,7 +175,7 @@ def swept_trajectories_overlap(
 
 
 def _trajectory_position(
-    trajectory: Sequence[tuple[float, float, float]], timestamp: float
+    trajectory: Sequence[tuple[float, ...]], timestamp: float
 ) -> tuple[float, float]:
     for current, following in zip(trajectory, trajectory[1:]):
         if timestamp <= following[0]:

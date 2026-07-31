@@ -8,6 +8,43 @@ from mockvehicle2d.collision import is_swept_circle_passable
 from mockvehicle2d.map_grid import MapGrid
 
 
+TimedPose = tuple[float, float, float, float]
+
+
+def interpolate_timed_pose(
+    trajectory: tuple[TimedPose, ...], timestamp: float
+) -> tuple[float, float, float]:
+    """Interpolate one vehicle's unique motion history at a sensor timestamp."""
+    if not trajectory or not math.isfinite(timestamp):
+        raise ValueError("trajectory and timestamp must be finite")
+    epsilon = 1e-12
+    if (
+        timestamp < trajectory[0][0] - epsilon
+        or timestamp > trajectory[-1][0] + epsilon
+    ):
+        raise ValueError("timestamp is outside the vehicle trajectory")
+    timestamp = min(max(timestamp, trajectory[0][0]), trajectory[-1][0])
+    for current, following in zip(trajectory, trajectory[1:]):
+        if timestamp <= following[0]:
+            duration = following[0] - current[0]
+            if duration <= 0:
+                raise ValueError("trajectory time must be strictly increasing")
+            ratio = (timestamp - current[0]) / duration
+            yaw_delta = math.atan2(
+                math.sin(following[3] - current[3]),
+                math.cos(following[3] - current[3]),
+            )
+            return (
+                current[1] + ratio * (following[1] - current[1]),
+                current[2] + ratio * (following[2] - current[2]),
+                math.atan2(
+                    math.sin(current[3] + ratio * yaw_delta),
+                    math.cos(current[3] + ratio * yaw_delta),
+                ),
+            )
+    return trajectory[-1][1:]
+
+
 class Vehicle:
     """A circular differential-drive vehicle in the simulator's screen coordinates."""
 
@@ -76,7 +113,7 @@ class Vehicle:
         now: float,
         *,
         limited_velocities: tuple[float, float] | None = None,
-        trajectory: list[tuple[float, float, float]] | None = None,
+        trajectory: list[TimedPose] | None = None,
     ) -> bool:
         """Integrate through ``now`` and optionally record timed positions."""
         if now < self._last_update:
@@ -84,7 +121,7 @@ class Vehicle:
         if trajectory is not None:
             if trajectory:
                 raise ValueError("trajectory output must be empty")
-            trajectory.append((self._last_update, self.x, self.y))
+            trajectory.append((self._last_update, self.x, self.y, self.yaw))
 
         collided = False
         motion_until = min(now, self._command_deadline) if self._command_deadline is not None else now
@@ -115,7 +152,7 @@ class Vehicle:
                 collided = True
 
         if trajectory is not None and trajectory[-1][0] < now:
-            trajectory.append((now, self.x, self.y))
+            trajectory.append((now, self.x, self.y, self.yaw))
 
         self._last_update = now
         if self._command_deadline is not None and now >= self._command_deadline:
@@ -153,11 +190,13 @@ class Vehicle:
         *,
         started_at: float,
         ended_at: float,
-        trajectory: list[tuple[float, float, float]] | None,
+        trajectory: list[TimedPose] | None,
     ) -> bool:
         if distance == 0:
             self.yaw = math.atan2(math.sin(self.yaw + rotation), math.cos(self.yaw + rotation))
             self.collision = False
+            if trajectory is not None and ended_at > trajectory[-1][0]:
+                trajectory.append((ended_at, self.x, self.y, self.yaw))
             return True
 
         # Short chords retain a nearby last-safe pose while approximating an arc.
@@ -174,6 +213,10 @@ class Vehicle:
             x = self.x + step_distance * math.cos(mid_yaw)
             y = self.y + step_distance * math.sin(mid_yaw)
             if step_distance and not is_swept_circle_passable(grid, self.x, self.y, x, y, self.radius):
+                if trajectory is not None:
+                    timestamp = started_at + (ended_at - started_at) * (step + 1) / steps
+                    if timestamp > trajectory[-1][0]:
+                        trajectory.append((timestamp, self.x, self.y, self.yaw))
                 return False
             self.x, self.y = x, y
             self.yaw = math.atan2(math.sin(self.yaw + step_rotation), math.cos(self.yaw + step_rotation))
@@ -184,7 +227,7 @@ class Vehicle:
                     else started_at + (ended_at - started_at) * (step + 1) / steps
                 )
                 trajectory.append(
-                    (timestamp, self.x, self.y)
+                    (timestamp, self.x, self.y, self.yaw)
                 )
         self.collision = False
         return True

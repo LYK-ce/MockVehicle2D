@@ -45,19 +45,30 @@ class _CleanupError(RuntimeError):
         super().__init__(f"{context}: {details}")
 
 
+class _CleanupPending(_CleanupError):
+    """Cleanup stopped at its deadline while owned work was still alive."""
+
+
 async def _finish_cleanup(
     task: asyncio.Task[None],
 ) -> tuple[asyncio.CancelledError | None, BaseException | None]:
     cancellation: asyncio.CancelledError | None = None
-    while not task.done():
+    waiter = asyncio.create_task(
+        asyncio.wait((task,), timeout=PROCESS_STOP_TIMEOUT_S * 8)
+    )
+    while not waiter.done():
         try:
-            await asyncio.shield(task)
+            await asyncio.shield(waiter)
         except asyncio.CancelledError as error:
-            if task.cancelled():
-                break
             cancellation = cancellation or error
         except BaseException:
             break
+    if waiter.cancelled():
+        return cancellation, RuntimeError("cleanup waiter was cancelled")
+    done, _ = waiter.result()
+    if task not in done:
+        task.cancel()
+        return cancellation, TimeoutError("cleanup exceeded its bounded deadline")
     try:
         task.result()
     except BaseException as error:
@@ -71,6 +82,38 @@ async def _terminate_and_reap(
     terminate_first: bool,
 ) -> None:
     errors: list[BaseException] = []
+    pending_wait = False
+
+    async def wait_once() -> bool:
+        nonlocal pending_wait
+        wait_task = asyncio.ensure_future(process.wait())
+        done, pending = await asyncio.wait(
+            (wait_task,),
+            timeout=PROCESS_STOP_TIMEOUT_S,
+        )
+        if pending:
+            wait_task.cancel()
+            errors.append(TimeoutError("map-sync child wait did not stop"))
+            cancelled, still_pending = await asyncio.wait(
+                (wait_task,),
+                timeout=PROCESS_STOP_TIMEOUT_S,
+            )
+            if still_pending:
+                wait_task.add_done_callback(_consume_task_result)
+                pending_wait = True
+            elif wait_task in cancelled and not wait_task.cancelled():
+                try:
+                    wait_task.result()
+                except BaseException:
+                    pass
+            return False
+        try:
+            wait_task.result()
+        except BaseException as error:
+            errors.append(error)
+            return False
+        return True
+
     if terminate_first and process.returncode is None:
         try:
             process.terminate()
@@ -79,40 +122,27 @@ async def _terminate_and_reap(
         except BaseException as error:
             errors.append(error)
     if process.returncode is None:
-        try:
-            await asyncio.wait_for(process.wait(), timeout=PROCESS_STOP_TIMEOUT_S)
-        except asyncio.TimeoutError:
+        if not await wait_once() and process.returncode is None:
             try:
                 process.kill()
             except ProcessLookupError:
                 pass
             except BaseException as error:
                 errors.append(error)
-            try:
-                await asyncio.wait_for(
-                    process.wait(),
-                    timeout=PROCESS_STOP_TIMEOUT_S,
-                )
-            except BaseException as error:
-                errors.append(error)
-        except BaseException as error:
-            errors.append(error)
             if process.returncode is None:
-                try:
-                    process.kill()
-                except ProcessLookupError:
-                    pass
-                except BaseException as kill_error:
-                    errors.append(kill_error)
-                try:
-                    await asyncio.wait_for(
-                        process.wait(),
-                        timeout=PROCESS_STOP_TIMEOUT_S,
-                    )
-                except BaseException as wait_error:
-                    errors.append(wait_error)
+                await wait_once()
     if errors:
-        raise _CleanupError("cannot reap map-sync child", errors)
+        error_type = _CleanupPending if pending_wait else _CleanupError
+        raise error_type("cannot reap map-sync child", errors)
+
+
+def _consume_task_result(task: asyncio.Future[object]) -> None:
+    if task.cancelled():
+        return
+    try:
+        task.result()
+    except BaseException:
+        pass
 
 
 def _sync_directory(path: Path) -> None:
@@ -569,6 +599,7 @@ class _NodeBridge:
         self._tasks: set[asyncio.Task[object]] = set()
         self._owned_socket: tuple[int, int] | None = None
         self._close_task: asyncio.Task[None] | None = None
+        self._closed = False
 
     async def start_server(self) -> None:
         self._remove_stale_socket()
@@ -735,22 +766,47 @@ class _NodeBridge:
                     self.state.publish_result(payload["sequence"], False)
 
     async def _close(self) -> None:
+        if self._closed:
+            return
         errors: list[BaseException] = []
+        pending_cleanup = False
         writer = self._writer
         shutdown_sent = False
         if writer is not None:
             try:
                 writer.write(b'{"type":"shutdown"}\n')
-                await asyncio.wait_for(writer.drain(), timeout=1.0)
-                shutdown_sent = True
-            except (ConnectionError, asyncio.TimeoutError):
+            except ConnectionError:
                 pass
+            except BaseException as error:
+                errors.append(error)
+            else:
+                drain_task = asyncio.create_task(writer.drain())
+                done, pending = await asyncio.wait(
+                    (drain_task,),
+                    timeout=PROCESS_STOP_TIMEOUT_S,
+                )
+                if pending:
+                    drain_task.cancel()
+                    self._track(drain_task)
+                    pending_cleanup = True
+                    errors.append(TimeoutError("map-sync writer drain did not stop"))
+                else:
+                    try:
+                        drain_task.result()
+                        shutdown_sent = True
+                    except ConnectionError:
+                        pass
+                    except BaseException as error:
+                        errors.append(error)
         if self.process is not None:
             try:
                 await _terminate_and_reap(
                     self.process,
                     terminate_first=not shutdown_sent,
                 )
+            except _CleanupPending as error:
+                pending_cleanup = True
+                errors.append(error)
             except BaseException as error:
                 errors.append(error)
         server = self.server
@@ -761,13 +817,17 @@ class _NodeBridge:
             except BaseException as error:
                 errors.append(error)
         if writer is not None:
-            writer.close()
+            try:
+                writer.close()
+            except BaseException as error:
+                errors.append(error)
         tasks = tuple(self._tasks)
         for task in tasks:
             task.cancel()
         if tasks:
             done, pending = await asyncio.wait(tasks, timeout=PROCESS_STOP_TIMEOUT_S)
             if pending:
+                pending_cleanup = True
                 errors.append(TimeoutError("map-sync bridge tasks did not stop"))
             for task in done:
                 if task.cancelled():
@@ -777,13 +837,21 @@ class _NodeBridge:
                 except BaseException as error:
                     errors.append(error)
         if server is not None:
-            try:
-                await asyncio.wait_for(
-                    server.wait_closed(),
-                    timeout=PROCESS_STOP_TIMEOUT_S,
-                )
-            except BaseException as error:
-                errors.append(error)
+            wait_task = asyncio.create_task(server.wait_closed())
+            done, pending = await asyncio.wait(
+                (wait_task,),
+                timeout=PROCESS_STOP_TIMEOUT_S,
+            )
+            if pending:
+                wait_task.cancel()
+                self._track(wait_task)
+                pending_cleanup = True
+                errors.append(TimeoutError("map-sync server wait did not stop"))
+            else:
+                try:
+                    wait_task.result()
+                except BaseException as error:
+                    errors.append(error)
         try:
             self._remove_owned_socket()
         except BaseException as error:
@@ -792,13 +860,25 @@ class _NodeBridge:
             self.state.network_disconnected()
         except BaseException as error:
             errors.append(error)
+        if not pending_cleanup:
+            self._writer = None
+            self._closed = True
         if errors:
-            raise _CleanupError(f"cannot close {self.vehicle_id} map-sync bridge", errors)
+            error_type = _CleanupPending if pending_cleanup else _CleanupError
+            raise error_type(
+                f"cannot close {self.vehicle_id} map-sync bridge",
+                errors,
+            )
 
     async def close(self) -> None:
+        if self._closed:
+            return
         if self._close_task is None:
             self._close_task = asyncio.create_task(self._close())
-        cancellation, error = await _finish_cleanup(self._close_task)
+        close_task = self._close_task
+        cancellation, error = await _finish_cleanup(close_task)
+        if close_task.done() and self._close_task is close_task:
+            self._close_task = None
         if cancellation is not None:
             if error is not None:
                 raise cancellation from error
@@ -828,6 +908,7 @@ class P2PFleetSync:
         self._flush_task: asyncio.Task[None] | None = None
         self._runtime_lock_fd: int | None = None
         self._close_task: asyncio.Task[None] | None = None
+        self._closed = False
 
     @classmethod
     async def start(
@@ -1088,47 +1169,81 @@ class P2PFleetSync:
             await asyncio.sleep(max(0.0, interval_s - (asyncio.get_running_loop().time() - started)))
 
     async def _close(self) -> None:
+        if self._closed:
+            return
         errors: list[BaseException] = []
-        try:
-            if self._flush_task is not None:
-                flush_task = self._flush_task
+        pending_cleanup = False
+        if self._flush_task is not None:
+            flush_task = self._flush_task
+            flush_task.cancel()
+            done, pending = await asyncio.wait(
+                (flush_task,),
+                timeout=PROCESS_STOP_TIMEOUT_S,
+            )
+            if pending:
+                pending_cleanup = True
+                errors.append(TimeoutError("map-sync flush task did not stop"))
+            else:
                 self._flush_task = None
-                flush_task.cancel()
-                results = await asyncio.gather(flush_task, return_exceptions=True)
-                errors.extend(
-                    result
-                    for result in results
-                    if isinstance(result, BaseException)
-                    and not isinstance(result, asyncio.CancelledError)
-                )
-            if self._bridges:
-                bridges = tuple(self._bridges.values())
-                results = await asyncio.gather(
-                    *(bridge.close() for bridge in bridges),
-                    return_exceptions=True,
-                )
-                errors.extend(
-                    result for result in results if isinstance(result, BaseException)
-                )
-                self._bridges.clear()
-            for path in tuple(dict.fromkeys(self._config_paths)):
+                if not flush_task.cancelled():
+                    try:
+                        flush_task.result()
+                    except BaseException as error:
+                        errors.append(error)
+        if self._bridges:
+            close_tasks = {
+                vehicle_id: asyncio.create_task(bridge.close())
+                for vehicle_id, bridge in self._bridges.items()
+            }
+            done, pending = await asyncio.wait(
+                tuple(close_tasks.values()),
+                timeout=PROCESS_STOP_TIMEOUT_S * 3,
+            )
+            for task in pending:
+                task.cancel()
+                pending_cleanup = True
+                errors.append(TimeoutError("map-sync bridge close did not stop"))
+            for vehicle_id, task in close_tasks.items():
+                if task not in done:
+                    continue
+                if task.cancelled():
+                    pending_cleanup = True
+                    errors.append(asyncio.CancelledError())
+                    continue
                 try:
-                    path.unlink(missing_ok=True)
+                    task.result()
+                except _CleanupPending as error:
+                    pending_cleanup = True
+                    errors.append(error)
+                    continue
                 except BaseException as error:
                     errors.append(error)
-            self._config_paths.clear()
-        finally:
+                self._bridges.pop(vehicle_id, None)
+        for path in tuple(dict.fromkeys(self._config_paths)):
+            try:
+                path.unlink(missing_ok=True)
+            except BaseException as error:
+                errors.append(error)
+        self._config_paths.clear()
+        if not pending_cleanup and self._flush_task is None and not self._bridges:
             try:
                 self._release_runtime_lease()
             except BaseException as error:
                 errors.append(error)
+            self._closed = True
         if errors:
-            raise _CleanupError("cannot close libp2p fleet sync", errors)
+            error_type = _CleanupPending if pending_cleanup else _CleanupError
+            raise error_type("cannot close libp2p fleet sync", errors)
 
     async def close(self) -> None:
+        if self._closed:
+            return
         if self._close_task is None:
             self._close_task = asyncio.create_task(self._close())
-        cancellation, error = await _finish_cleanup(self._close_task)
+        close_task = self._close_task
+        cancellation, error = await _finish_cleanup(close_task)
+        if close_task.done() and self._close_task is close_task:
+            self._close_task = None
         if cancellation is not None:
             if error is not None:
                 raise cancellation from error

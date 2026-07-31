@@ -1,10 +1,12 @@
 """Shared-world multi-vehicle simulation invariants."""
 
+import asyncio
 import json
 import math
 from pathlib import Path
 import tempfile
 import unittest
+from unittest.mock import AsyncMock, Mock, patch
 
 from mockvehicle2d.collision import is_strict_overlap
 from mockvehicle2d.controller import ManualAction, ManualCommand
@@ -16,6 +18,7 @@ from mockvehicle2d.fleet import (
 )
 from mockvehicle2d.local_state import OdometryConfig
 from mockvehicle2d.map_grid import MapGrid
+from mockvehicle2d.map_sync import P2PSettings
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -170,6 +173,7 @@ class TestFleetRuntime(unittest.TestCase):
         self.assertEqual(after["vehicle_2"], before["vehicle_2"])
         self.assertEqual(after["vehicle_3"], before["vehicle_3"])
         self.assertEqual(after["vehicle_4"], before["vehicle_4"])
+        fleet.tick(0.2)
         self.assertGreater(fleet.nodes["vehicle_1"].local_state.pose.x_m, 0.0)
         self.assertEqual(fleet.nodes["vehicle_2"].local_state.pose.x_m, 0.0)
         self.assertEqual(len({id(node.controller) for node in fleet.nodes.values()}), 4)
@@ -333,6 +337,241 @@ class TestFleetRuntime(unittest.TestCase):
 
         self.assertEqual(fleet.world.truth_snapshot()["vehicle_1"][:2], (5.0, 5.0))
         self.assertGreater(fleet.world.truth_snapshot()["vehicle_2"][0], 20.0)
+
+    def test_tmini_keeps_six_hz_schedule_independent_of_control_tick(self) -> None:
+        duration_s = 2.0
+        expected_offsets = [index / 6 for index in range(1, 13)]
+        observed_by_tick = {}
+
+        for tick_ms in (50, 100, 250, 1000):
+            fleet = FleetRuntime.create(
+                scenario(spec(1, 5.0, 5.0), tick_ms=tick_ms),
+                grid=free_grid(),
+                started_at=10.0,
+                timestamp=1_000.0,
+                command_timeout=10.0,
+            )
+            node = fleet.nodes["vehicle_1"]
+            _, initial_scan = fleet.telemetry_messages("vehicle_1")
+            self.assertEqual(initial_scan["seq"], 0)
+            self.assertEqual(initial_scan["timestamp_s"], 1_000.0)
+            self.assertEqual(initial_scan["config"]["scan_rate_hz"], 6)
+            self.assertAlmostEqual(initial_scan["config"]["scan_time"], 1 / 6)
+            original_sample = node.sample
+            timestamps = []
+
+            def record_sample(*args, **kwargs):
+                timestamps.append(args[2])
+                return original_sample(*args, **kwargs)
+
+            node.sample = record_sample
+            for _ in range(round(duration_s / fleet.tick_s)):
+                fleet.tick(-123.0)
+
+            observed_by_tick[tick_ms] = timestamps
+            self.assertEqual(len(timestamps), 12)
+            for actual, offset in zip(timestamps, expected_offsets):
+                self.assertAlmostEqual(actual, 1_000.0 + offset, places=9)
+            self.assertEqual(node.frame_sequence, 12)
+            self.assertAlmostEqual(node.latest_frame.timestamp, 1_002.0, places=9)
+
+        baseline = observed_by_tick[50]
+        for timestamps in observed_by_tick.values():
+            self.assertEqual(len(timestamps), len(baseline))
+            for actual, expected in zip(timestamps, baseline):
+                self.assertAlmostEqual(actual, expected, places=9)
+
+    def test_large_tick_samples_intermediate_curved_poses(self) -> None:
+        fleet = FleetRuntime.create(
+            scenario(spec(1, 5.0, 5.0), tick_ms=1000),
+            grid=free_grid(),
+            linear_speed=1.0,
+            angular_speed=math.pi / 2,
+            command_timeout=10.0,
+        )
+        fleet.handle_command(
+            "vehicle_1",
+            ManualCommand(1, ManualAction.DRIVE, 1.0, math.pi / 2),
+        )
+        sampled_poses = []
+
+        from mockvehicle2d import fleet as fleet_module
+
+        real_scan_grid = fleet_module.scan_grid
+
+        def record_scan(grid, x, y, yaw, config, *, circles=()):
+            sampled_poses.append((x, y, yaw))
+            return real_scan_grid(grid, x, y, yaw, config, circles=circles)
+
+        with patch("mockvehicle2d.fleet.scan_grid", side_effect=record_scan):
+            fleet.tick(999.0)
+
+        self.assertEqual(len(sampled_poses), 6)
+        self.assertNotEqual(sampled_poses[0], sampled_poses[-1])
+        self.assertLess(sampled_poses[0][0], sampled_poses[-1][0])
+        self.assertLess(sampled_poses[0][1], sampled_poses[-1][1])
+        self.assertAlmostEqual(sampled_poses[0][2], math.pi / 12, places=2)
+        self.assertAlmostEqual(sampled_poses[-1][2], math.pi / 2, places=9)
+
+    def test_dynamic_vehicle_is_raycast_at_the_same_sensor_time(self) -> None:
+        fleet = FleetRuntime.create(
+            scenario(spec(1, 5.0, 5.0), spec(2, 7.0, 5.0), tick_ms=1000),
+            grid=free_grid(),
+            linear_speed=0.5,
+            command_timeout=10.0,
+            spawn_safety_margin_m=0.0,
+        )
+        for vehicle_id in fleet.nodes:
+            fleet.handle_command(
+                vehicle_id,
+                ManualCommand(1, ManualAction.DRIVE, 0.5, 0.0),
+            )
+        ranges = []
+        node = fleet.nodes["vehicle_1"]
+        original_sample = node.sample
+
+        def record_sample(*args, **kwargs):
+            ranges.append(args[1][0].range)
+            return original_sample(*args, **kwargs)
+
+        node.sample = record_sample
+        fleet.tick(1.0)
+
+        self.assertEqual(len(ranges), 6)
+        for measured in ranges:
+            self.assertAlmostEqual(measured, 1.5, places=9)
+
+
+class TestFleetMainCleanup(unittest.IsolatedAsyncioTestCase):
+    def configured_runtime(self, temporary: str):
+        ports = (19101, 19102, 20101, 20102)
+        settings = P2PSettings(Path("/bin/true"), Path(temporary))
+        fleet_scenario = FleetScenario(
+            "cleanup_scenario",
+            (
+                FleetVehicleSpec(
+                    "vehicle_1",
+                    ports[0],
+                    "spawn_1",
+                    AnchorPose(5.0, 5.0, 0.0),
+                    ports[2],
+                ),
+                FleetVehicleSpec(
+                    "vehicle_2",
+                    ports[1],
+                    "spawn_2",
+                    AnchorPose(20.0, 5.0, 0.0),
+                    ports[3],
+                ),
+            ),
+            100,
+            settings,
+        )
+        fleet = FleetRuntime.create(fleet_scenario, grid=free_grid())
+        fleet.run = AsyncMock(side_effect=ValueError("injected tick failure"))
+        fleet.disconnect = Mock(side_effect=[RuntimeError("disconnect one"), None])
+        return fleet_scenario, fleet
+
+    async def test_main_preserves_original_and_collects_every_cleanup_failure(self) -> None:
+        class Server:
+            def __init__(self, close_error=None, wait_error=None):
+                self.close_error = close_error
+                self.wait_error = wait_error
+                self.close_called = False
+                self.wait_called = False
+
+            def close(self):
+                self.close_called = True
+                if self.close_error is not None:
+                    raise self.close_error
+
+            async def wait_closed(self):
+                self.wait_called = True
+                if self.wait_error is not None:
+                    raise self.wait_error
+
+        with tempfile.TemporaryDirectory() as temporary:
+            fleet_scenario, fleet = self.configured_runtime(temporary)
+            first = Server(close_error=RuntimeError("server close one"))
+            second = Server(wait_error=RuntimeError("server wait two"))
+            sync = Mock()
+            sync.close = AsyncMock(side_effect=RuntimeError("p2p close"))
+
+            from mockvehicle2d import fleet as fleet_module
+
+            with (
+                patch.object(fleet_module.FleetScenario, "load", return_value=fleet_scenario),
+                patch.object(fleet_module.FleetRuntime, "create", return_value=fleet),
+                patch.object(
+                    fleet_module.P2PFleetSync,
+                    "start",
+                    new=AsyncMock(return_value=sync),
+                ),
+                patch(
+                    "websockets.asyncio.server.serve",
+                    new=AsyncMock(side_effect=[first, second]),
+                ),
+                self.assertRaisesRegex(ValueError, "injected tick failure") as raised,
+            ):
+                await fleet_module.main("unused.json")
+
+            cause = raised.exception.__cause__
+            self.assertIsNotNone(cause)
+            details = str(cause)
+            for message in (
+                "server close one",
+                "server wait two",
+                "p2p close",
+                "disconnect one",
+            ):
+                self.assertIn(message, details)
+            self.assertTrue(first.close_called and second.close_called)
+            self.assertTrue(first.wait_called and second.wait_called)
+            sync.close.assert_awaited_once()
+            self.assertEqual(fleet.disconnect.call_count, 2)
+
+    async def test_main_bounds_a_hanging_server_wait_and_continues_cleanup(self) -> None:
+        class HangingServer:
+            def __init__(self):
+                self.close_called = False
+                self.wait_started = asyncio.Event()
+
+            def close(self):
+                self.close_called = True
+
+            async def wait_closed(self):
+                self.wait_started.set()
+                await asyncio.Event().wait()
+
+        with tempfile.TemporaryDirectory() as temporary:
+            fleet_scenario, fleet = self.configured_runtime(temporary)
+            fleet.disconnect = Mock()
+            servers = (HangingServer(), HangingServer())
+            sync = Mock()
+            sync.close = AsyncMock()
+
+            from mockvehicle2d import fleet as fleet_module
+
+            with (
+                patch.object(fleet_module.FleetScenario, "load", return_value=fleet_scenario),
+                patch.object(fleet_module.FleetRuntime, "create", return_value=fleet),
+                patch.object(
+                    fleet_module.P2PFleetSync,
+                    "start",
+                    new=AsyncMock(return_value=sync),
+                ),
+                patch(
+                    "websockets.asyncio.server.serve",
+                    new=AsyncMock(side_effect=servers),
+                ),
+                patch.object(fleet_module, "FLEET_CLEANUP_TIMEOUT_S", 0.05),
+                self.assertRaisesRegex(ValueError, "injected tick failure") as raised,
+            ):
+                await asyncio.wait_for(fleet_module.main("unused.json"), timeout=0.5)
+
+            self.assertIn("WebSocket server wait did not stop", str(raised.exception.__cause__))
+            sync.close.assert_awaited_once()
+            self.assertEqual(fleet.disconnect.call_count, 2)
 
 
 if __name__ == "__main__":

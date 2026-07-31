@@ -31,6 +31,8 @@ from mockvehicle2d.map_sync import (
     P2PFleetSync,
     P2PSettings,
     P2PVehicleConfig,
+    _CleanupError,
+    _finish_cleanup,
 )
 from mockvehicle2d.protocol import ProtocolError, command_ack, error_message, parse_command
 from mockvehicle2d.safety import LocalSafetyRuntime, SafetyAdvanceResult
@@ -47,12 +49,13 @@ from mockvehicle2d.server import (
     generate_map,
     validate_vehicle_id,
 )
-from mockvehicle2d.vehicle import Vehicle
+from mockvehicle2d.vehicle import TimedPose, Vehicle, interpolate_timed_pose
 
 
 MAX_VEHICLES = 4
 DEFAULT_TICK_MS = 100
 DEFAULT_SPAWN_SAFETY_MARGIN_M = 0.25
+FLEET_CLEANUP_TIMEOUT_S = 2.0
 
 
 def _vehicle_odometry_config(config: OdometryConfig, vehicle_id: str) -> OdometryConfig:
@@ -339,6 +342,10 @@ class SharedWorld:
             for spec in specs
         }
         self.now = started_at
+        self.last_trajectories: dict[str, tuple[TimedPose, ...]] = {
+            vehicle_id: ((started_at, vehicle.x, vehicle.y, vehicle.yaw),)
+            for vehicle_id, vehicle in self._vehicles.items()
+        }
 
     @property
     def debug_grid(self) -> MapGrid:
@@ -374,6 +381,35 @@ class SharedWorld:
                 TMINI_SCAN_CONFIG,
                 circles=circles,
             )
+        )
+
+    def scan_at(
+        self,
+        vehicle_id: str,
+        trajectories: dict[str, tuple[TimedPose, ...]],
+        timestamp: float,
+    ) -> tuple[tuple[float, float, float], tuple[LaserPoint, ...]]:
+        x_m, y_m, yaw_rad = interpolate_timed_pose(
+            trajectories[vehicle_id],
+            timestamp,
+        )
+        circles = tuple(
+            (*interpolate_timed_pose(trajectories[other_id], timestamp)[:2], other.radius)
+            for other_id, other in sorted(self._vehicles.items())
+            if other_id != vehicle_id
+        )
+        return (
+            (x_m, y_m, yaw_rad),
+            tuple(
+                scan_grid(
+                    self._grid,
+                    x_m,
+                    y_m,
+                    yaw_rad,
+                    TMINI_SCAN_CONFIG,
+                    circles=circles,
+                )
+            ),
         )
 
     def sensor_grid(self, vehicle_id: str) -> MapGrid:
@@ -415,11 +451,11 @@ class SharedWorld:
             for vehicle_id, vehicle in self._vehicles.items()
         }
         candidates: dict[str, Vehicle] = {}
-        trajectories: dict[str, tuple[tuple[float, float, float], ...]] = {}
+        trajectories: dict[str, tuple[TimedPose, ...]] = {}
         results: dict[str, SafetyAdvanceResult] = {}
         for vehicle_id, vehicle in sorted(self._vehicles.items()):
             candidate = copy.copy(vehicle)
-            trajectory: list[tuple[float, float, float]] = []
+            trajectory: list[TimedPose] = []
             collided = candidate.advance(
                 self._grid,
                 target_time,
@@ -433,9 +469,12 @@ class SharedWorld:
         vehicle_ids = sorted(candidates)
         stationary = {
             vehicle_id: (
-                ((self.now, *start), (target_time, *start))
+                (
+                    (self.now, *start, self._vehicles[vehicle_id].yaw),
+                    (target_time, *start, self._vehicles[vehicle_id].yaw),
+                )
                 if target_time > self.now
-                else ((self.now, *start),)
+                else ((self.now, *start, self._vehicles[vehicle_id].yaw),)
             )
             for vehicle_id, start in starts.items()
         }
@@ -472,11 +511,13 @@ class SharedWorld:
             stopped.stop(target_time)
             stopped.collision = False
             candidates[vehicle_id] = stopped
+            trajectories[vehicle_id] = stationary[vehicle_id]
             results[vehicle_id] = SafetyAdvanceResult(
                 stopped=True,
                 reason="safety_obstacle",
             )
         self._vehicles = candidates
+        self.last_trajectories = trajectories
         self.now = target_time
         return results
 
@@ -516,17 +557,18 @@ class RobotNode:
 
     def sample(
         self,
-        vehicle: Vehicle,
+        truth_pose: tuple[float, float, float],
         scan_points: tuple[LaserPoint, ...],
         wall_timestamp: float,
     ) -> None:
+        truth_x_m, truth_y_m, truth_yaw_rad = truth_pose
         self.local_state.update_from_truth(
-            vehicle.x,
-            vehicle.y,
-            vehicle.yaw,
+            truth_x_m,
+            truth_y_m,
+            truth_yaw_rad,
             timestamp=wall_timestamp,
         )
-        self._pending_map_delta = self.local_state.match_and_integrate_scan(
+        delta = self.local_state.match_and_integrate_scan(
             scan_points,
             wall_timestamp,
             TMINI_SCAN_CONFIG,
@@ -536,8 +578,24 @@ class RobotNode:
                 else (self.safety.observation.edge_point_vehicle_m,)
             ),
         )
+        if delta is not None:
+            pending = {
+                (update.gx, update.gy): update
+                for update in (
+                    ()
+                    if self._pending_map_delta is None
+                    else self._pending_map_delta.changed_cells
+                )
+            }
+            pending.update(
+                ((update.gx, update.gy), update)
+                for update in delta.changed_cells
+            )
+            self._pending_map_delta = LocalMapDelta(
+                tuple(pending[cell] for cell in sorted(pending))
+            )
         if self.map_sync is not None:
-            self.map_sync.record_local(self._pending_map_delta)
+            self.map_sync.record_local(delta)
         self.latest_frame = RuntimeFrame(scan_points, wall_timestamp)
 
     def record_advance(self, result: SafetyAdvanceResult) -> None:
@@ -552,10 +610,14 @@ class FleetRuntime:
         scenario: FleetScenario,
         world: SharedWorld,
         nodes: dict[str, RobotNode],
+        wall_time_offset: float,
     ) -> None:
         self.scenario = scenario
         self.world = world
         self.nodes = nodes
+        self._wall_time_offset = wall_time_offset
+        self._sensor_epoch = world.now
+        self._next_scan_index = {vehicle_id: 1 for vehicle_id in nodes}
         self.map_chunks = _encode_map_chunks(world.debug_voxels, world.debug_grid.width)
 
     @classmethod
@@ -635,7 +697,7 @@ class FleetRuntime:
                     )
                 ),
             )
-        runtime = cls(scenario, world, nodes)
+        runtime = cls(scenario, world, nodes, timestamp - started_at)
         runtime._sample_all(timestamp)
         return runtime
 
@@ -681,9 +743,7 @@ class FleetRuntime:
         results = self.world.advance_to(self.world.now + self.tick_s)
         for vehicle_id, result in results.items():
             self.nodes[vehicle_id].record_advance(result)
-        self._sample_all(wall_timestamp)
-        for node in self.nodes.values():
-            node.frame_sequence += 1
+        self._sample_due_scans()
 
     async def run(self, stop: asyncio.Event) -> None:
         while not stop.is_set():
@@ -758,10 +818,39 @@ class FleetRuntime:
         }
         for vehicle_id in sorted(self.nodes):
             self.nodes[vehicle_id].sample(
-                self.world.vehicle(vehicle_id),
+                (
+                    self.world.vehicle(vehicle_id).x,
+                    self.world.vehicle(vehicle_id).y,
+                    self.world.vehicle(vehicle_id).yaw,
+                ),
                 scans[vehicle_id],
                 wall_timestamp,
             )
+
+    def _sample_due_scans(self) -> None:
+        period_s = TMINI_SCAN_CONFIG.scan_time
+        epsilon = 1e-12
+        for vehicle_id in sorted(self.nodes):
+            while True:
+                scan_time = (
+                    self._sensor_epoch
+                    + self._next_scan_index[vehicle_id] * period_s
+                )
+                if scan_time > self.world.now + epsilon:
+                    break
+                truth_pose, scan_points = self.world.scan_at(
+                    vehicle_id,
+                    self.world.last_trajectories,
+                    scan_time,
+                )
+                node = self.nodes[vehicle_id]
+                node.sample(
+                    truth_pose,
+                    scan_points,
+                    self._wall_time_offset + scan_time,
+                )
+                node.frame_sequence += 1
+                self._next_scan_index[vehicle_id] += 1
 
 
 def _map_metadata(grid: MapGrid) -> dict[str, object]:
@@ -909,6 +998,106 @@ async def fleet_handler(websocket, *, fleet: FleetRuntime, vehicle_id: str) -> N
         print(f"[-] {vehicle_id} controller disconnected: {address}")
 
 
+def _consume_background_result(task: asyncio.Task[object]) -> None:
+    if task.cancelled():
+        return
+    try:
+        task.result()
+    except BaseException:
+        pass
+
+
+async def _wait_cleanup_tasks(
+    tasks: tuple[asyncio.Task[object], ...],
+    *,
+    context: str,
+    errors: list[BaseException],
+) -> None:
+    if not tasks:
+        return
+    done, pending = await asyncio.wait(tasks, timeout=FLEET_CLEANUP_TIMEOUT_S)
+    for task in pending:
+        task.cancel()
+        task.add_done_callback(_consume_background_result)
+        errors.append(TimeoutError(f"{context} did not stop"))
+    for task in done:
+        if task.cancelled():
+            continue
+        try:
+            task.result()
+        except BaseException as error:
+            errors.append(error)
+
+
+async def _cleanup_fleet_main(
+    *,
+    fleet: FleetRuntime,
+    stop: asyncio.Event,
+    tick_task: asyncio.Task[None] | None,
+    stop_task: asyncio.Task[bool] | None,
+    servers: tuple[object, ...],
+    p2p_sync: P2PFleetSync | None,
+    loop: asyncio.AbstractEventLoop,
+    registered_signals: tuple[signal.Signals, ...],
+) -> None:
+    errors: list[BaseException] = []
+    stop.set()
+
+    background = []
+    if tick_task is not None:
+        background.append(tick_task)
+    if stop_task is not None:
+        stop_task.cancel()
+        background.append(stop_task)
+    await _wait_cleanup_tasks(
+        tuple(background),
+        context="fleet background task",
+        errors=errors,
+    )
+
+    for server in servers:
+        try:
+            server.close()
+        except BaseException as error:
+            errors.append(error)
+    server_waiters = []
+    for server in servers:
+        try:
+            server_waiters.append(asyncio.create_task(server.wait_closed()))
+        except BaseException as error:
+            errors.append(error)
+    await _wait_cleanup_tasks(
+        tuple(server_waiters),
+        context="WebSocket server wait",
+        errors=errors,
+    )
+
+    if p2p_sync is not None:
+        try:
+            p2p_task = asyncio.create_task(p2p_sync.close())
+        except BaseException as error:
+            errors.append(error)
+        else:
+            await _wait_cleanup_tasks(
+                (p2p_task,),
+                context="libp2p fleet sync close",
+                errors=errors,
+            )
+
+    for vehicle_id in fleet.nodes:
+        try:
+            fleet.disconnect(vehicle_id)
+        except BaseException as error:
+            errors.append(error)
+    for caught_signal in registered_signals:
+        try:
+            loop.remove_signal_handler(caught_signal)
+        except BaseException as error:
+            errors.append(error)
+    if errors:
+        raise _CleanupError("cannot close fleet runtime", errors)
+
+
 async def main(
     scenario_path: str | Path,
     *,
@@ -951,13 +1140,16 @@ async def main(
         raise KeyboardInterrupt
 
     loop = asyncio.get_running_loop()
-    for caught_signal in (signal.SIGINT, signal.SIGTERM):
-        loop.add_signal_handler(caught_signal, signal_handler)
-
+    registered_signals = []
     servers = []
     tick_task: asyncio.Task[None] | None = None
     stop_task: asyncio.Task[bool] | None = None
+    original_error: BaseException | None = None
+    original_traceback = None
     try:
+        for caught_signal in (signal.SIGINT, signal.SIGTERM):
+            loop.add_signal_handler(caught_signal, signal_handler)
+            registered_signals.append(caught_signal)
         if scenario.p2p is not None:
             p2p_sync = await P2PFleetSync.start(
                 scenario.scenario_id,
@@ -1000,20 +1192,30 @@ async def main(
         )
         if tick_task in completed:
             await tick_task
-    finally:
-        stop.set()
-        if tick_task is not None:
-            await asyncio.gather(tick_task, return_exceptions=True)
-        if stop_task is not None and not stop_task.done():
-            stop_task.cancel()
-            await asyncio.gather(stop_task, return_exceptions=True)
-        for server in servers:
-            server.close()
-        if servers:
-            await asyncio.gather(*(server.wait_closed() for server in servers))
-        if p2p_sync is not None:
-            await p2p_sync.close()
-        for vehicle_id in fleet.nodes:
-            fleet.disconnect(vehicle_id)
-        for caught_signal in (signal.SIGINT, signal.SIGTERM):
-            loop.remove_signal_handler(caught_signal)
+    except BaseException as error:
+        original_error = error
+        original_traceback = error.__traceback__
+
+    cleanup_task = asyncio.create_task(
+        _cleanup_fleet_main(
+            fleet=fleet,
+            stop=stop,
+            tick_task=tick_task,
+            stop_task=stop_task,
+            servers=tuple(servers),
+            p2p_sync=p2p_sync,
+            loop=loop,
+            registered_signals=tuple(registered_signals),
+        )
+    )
+    cancellation, cleanup_error = await _finish_cleanup(cleanup_task)
+    if original_error is not None:
+        if cleanup_error is not None:
+            raise original_error.with_traceback(original_traceback) from cleanup_error
+        raise original_error.with_traceback(original_traceback)
+    if cancellation is not None:
+        if cleanup_error is not None:
+            raise cancellation from cleanup_error
+        raise cancellation
+    if cleanup_error is not None:
+        raise cleanup_error

@@ -2,11 +2,17 @@ use std::{
     collections::{HashMap, HashSet, hash_map::DefaultHasher},
     env,
     error::Error,
-    ffi::OsString,
+    ffi::{CString, OsString},
     fs::{self, File, OpenOptions},
     hash::{Hash, Hasher},
-    io::{self, Write},
-    os::unix::fs::{OpenOptionsExt, PermissionsExt},
+    io::{self, Read, Write},
+    os::{
+        fd::{AsRawFd, FromRawFd},
+        unix::{
+            ffi::OsStrExt,
+            fs::{MetadataExt, OpenOptionsExt, PermissionsExt},
+        },
+    },
     path::{Path, PathBuf},
     process,
     str::FromStr,
@@ -177,17 +183,86 @@ fn identity_parent(path: &Path) -> &Path {
         .unwrap_or_else(|| Path::new("."))
 }
 
+fn effective_user_id() -> u32 {
+    // SAFETY: geteuid has no preconditions and does not dereference pointers.
+    unsafe { libc::geteuid() }
+}
+
+fn secure_identity_parent(path: &Path, create: bool) -> Result<File, BoxError> {
+    let parent = identity_parent(path);
+    if create {
+        fs::create_dir_all(parent)?;
+    }
+    let directory = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_CLOEXEC | libc::O_DIRECTORY | libc::O_NOFOLLOW)
+        .open(parent)
+        .map_err(|error| {
+            io::Error::new(
+                error.kind(),
+                format!("identity parent directory is unsafe: {error}"),
+            )
+        })?;
+    let metadata = directory.metadata()?;
+    if !metadata.is_dir() || metadata.uid() != effective_user_id() || metadata.mode() & 0o022 != 0 {
+        return Err(format!(
+            "identity parent directory is unsafe: it must be owned by this user and not group/world writable (uid={}, expected_uid={}, mode={:o})",
+            metadata.uid(),
+            effective_user_id(),
+            metadata.mode() & 0o777,
+        )
+        .into());
+    }
+    Ok(directory)
+}
+
+fn identity_file_name(path: &Path) -> Result<CString, BoxError> {
+    let name = path.file_name().ok_or("identity path must name a file")?;
+    CString::new(name.as_bytes()).map_err(|_| "identity filename contains a NUL byte".into())
+}
+
+fn open_identity_at(directory: &File, name: &CString, flags: i32, mode: u32) -> io::Result<File> {
+    // SAFETY: directory and name remain alive for the call; openat returns a new owned fd.
+    let fd = unsafe { libc::openat(directory.as_raw_fd(), name.as_ptr(), flags, mode) };
+    if fd < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: the successful openat result is a new descriptor now owned by File.
+    Ok(unsafe { File::from_raw_fd(fd) })
+}
+
+fn unlink_identity_at(directory: &File, name: &CString) -> io::Result<()> {
+    // SAFETY: directory and name remain alive and name is relative to the held directory fd.
+    if unsafe { libc::unlinkat(directory.as_raw_fd(), name.as_ptr(), 0) } == 0 {
+        Ok(())
+    } else {
+        Err(io::Error::last_os_error())
+    }
+}
+
 fn existing_identity(path: &Path) -> Result<Option<identity::Keypair>, BoxError> {
-    let metadata = match fs::symlink_metadata(path) {
-        Ok(metadata) => metadata,
+    let parent = secure_identity_parent(path, false)?;
+    let name = identity_file_name(path)?;
+    let mut file = match open_identity_at(
+        &parent,
+        &name,
+        libc::O_RDONLY | libc::O_CLOEXEC | libc::O_NOFOLLOW,
+        0,
+    ) {
+        Ok(file) => file,
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) if error.raw_os_error() == Some(libc::ELOOP) => {
+            return Err("existing identity path is a symlink; refusing to follow it".into());
+        }
         Err(error) => return Err(error.into()),
     };
-    if !metadata.file_type().is_file() {
+    let metadata = file.metadata()?;
+    if !metadata.is_file() || metadata.uid() != effective_user_id() {
         return Err("existing identity path is not a regular file; refusing to replace".into());
     }
-    fs::set_permissions(path, fs::Permissions::from_mode(0o600))?;
-    let bytes = fs::read(path)?;
+    file.set_permissions(fs::Permissions::from_mode(0o600))?;
+    let mut bytes = Vec::new();
+    file.read_to_end(&mut bytes)?;
     identity::Keypair::from_protobuf_encoding(&bytes)
         .map(Some)
         .map_err(|error| {
@@ -199,7 +274,10 @@ fn existing_identity(path: &Path) -> Result<Option<identity::Keypair>, BoxError>
         })
 }
 
-fn create_identity_temporary(path: &Path) -> Result<(PathBuf, File), BoxError> {
+fn create_identity_temporary(
+    path: &Path,
+    directory: &File,
+) -> Result<(PathBuf, CString, File), BoxError> {
     let parent = identity_parent(path);
     let file_name = path.file_name().ok_or("identity path must name a file")?;
     for _ in 0..100 {
@@ -211,16 +289,17 @@ fn create_identity_temporary(path: &Path) -> Result<(PathBuf, File), BoxError> {
             IDENTITY_TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed)
         ));
         let temporary_path = parent.join(temporary_name);
-        match OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .mode(0o600)
-            .open(&temporary_path)
-        {
+        let temporary_name = identity_file_name(&temporary_path)?;
+        match open_identity_at(
+            directory,
+            &temporary_name,
+            libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_CLOEXEC | libc::O_NOFOLLOW,
+            0o600,
+        ) {
             Ok(file) => {
                 if let Err(error) = file.set_permissions(fs::Permissions::from_mode(0o600)) {
                     drop(file);
-                    return match fs::remove_file(&temporary_path) {
+                    return match unlink_identity_at(directory, &temporary_name) {
                         Ok(()) => Err(error.into()),
                         Err(cleanup_error) => Err(io::Error::other(format!(
                             "cannot secure identity temporary ({error}) and cannot remove it: \
@@ -229,7 +308,7 @@ fn create_identity_temporary(path: &Path) -> Result<(PathBuf, File), BoxError> {
                         .into()),
                     };
                 }
-                return Ok((temporary_path, file));
+                return Ok((temporary_path, temporary_name, file));
             }
             Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
             Err(error) => return Err(error.into()),
@@ -242,25 +321,45 @@ fn write_identity_atomically_with<F>(
     path: &Path,
     bytes: &[u8],
     before_publish: F,
-) -> Result<(), BoxError>
+) -> Result<bool, BoxError>
 where
     F: FnOnce(&Path) -> io::Result<()>,
 {
-    let parent = identity_parent(path);
-    fs::create_dir_all(parent)?;
-    let (temporary_path, mut file) = create_identity_temporary(path)?;
-    let result = (|| -> Result<(), BoxError> {
+    let directory = secure_identity_parent(path, true)?;
+    let final_name = identity_file_name(path)?;
+    let (temporary_path, temporary_name, mut file) = create_identity_temporary(path, &directory)?;
+    let result = (|| -> Result<bool, BoxError> {
         file.write_all(bytes)?;
         file.sync_all()?;
         before_publish(&temporary_path)?;
         drop(file);
-        fs::rename(&temporary_path, path)?;
-        File::open(parent)?.sync_all()?;
-        Ok(())
+        // SAFETY: both names are relative to the same held directory fd; linkat never replaces.
+        let linked = unsafe {
+            libc::linkat(
+                directory.as_raw_fd(),
+                temporary_name.as_ptr(),
+                directory.as_raw_fd(),
+                final_name.as_ptr(),
+                0,
+            )
+        };
+        let published = if linked == 0 {
+            true
+        } else {
+            let error = io::Error::last_os_error();
+            if error.kind() == io::ErrorKind::AlreadyExists {
+                false
+            } else {
+                return Err(error.into());
+            }
+        };
+        unlink_identity_at(&directory, &temporary_name)?;
+        directory.sync_all()?;
+        Ok(published)
     })();
     if let Err(original) = &result {
         let original_error = original.to_string();
-        match fs::remove_file(&temporary_path) {
+        match unlink_identity_at(&directory, &temporary_name) {
             Ok(()) => {}
             Err(error) if error.kind() == io::ErrorKind::NotFound => {}
             Err(cleanup_error) => {
@@ -275,19 +374,34 @@ where
     result
 }
 
-fn write_identity_atomically(path: &Path, bytes: &[u8]) -> Result<(), BoxError> {
-    write_identity_atomically_with(path, bytes, |_| Ok(()))
-}
-
-fn load_or_create_identity(path: &Path) -> Result<identity::Keypair, BoxError> {
+fn load_or_create_identity_with<F>(
+    path: &Path,
+    before_publish: F,
+) -> Result<identity::Keypair, BoxError>
+where
+    F: FnOnce(&Path) -> io::Result<()>,
+{
+    secure_identity_parent(path, true)?;
     if let Some(key) = existing_identity(path)? {
         return Ok(key);
     }
 
     let key = identity::Keypair::generate_ed25519();
     let bytes = key.to_protobuf_encoding()?;
-    write_identity_atomically(path, &bytes)?;
-    Ok(key)
+    if write_identity_atomically_with(path, &bytes, before_publish)? {
+        return Ok(key);
+    }
+    existing_identity(path)?.ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::NotFound,
+            "identity was concurrently published but is no longer present",
+        )
+        .into()
+    })
+}
+
+fn load_or_create_identity(path: &Path) -> Result<identity::Keypair, BoxError> {
+    load_or_create_identity_with(path, |_| Ok(()))
 }
 
 async fn send_event(writer: &mut OwnedWriteHalf, event: &impl Serialize) -> Result<(), BoxError> {
@@ -537,10 +651,18 @@ async fn main() -> Result<(), BoxError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::{Arc, Barrier};
+    use std::thread;
+
+    fn private_tempdir() -> tempfile::TempDir {
+        let directory = tempfile::tempdir().unwrap();
+        fs::set_permissions(directory.path(), fs::Permissions::from_mode(0o700)).unwrap();
+        directory
+    }
 
     #[test]
     fn identity_is_stable_and_unique() {
-        let directory = tempfile::tempdir().unwrap();
+        let directory = private_tempdir();
         let first_path = directory.path().join("first.key");
         let second_path = directory.path().join("second.key");
         let first = load_or_create_identity(&first_path)
@@ -565,8 +687,87 @@ mod tests {
     }
 
     #[test]
+    fn concurrent_identity_creation_returns_the_single_published_identity() {
+        let directory = private_tempdir();
+        let path = Arc::new(directory.path().join("identity.key"));
+        let barrier = Arc::new(Barrier::new(8));
+        let handles: Vec<_> = (0..8)
+            .map(|_| {
+                let path = Arc::clone(&path);
+                let barrier = Arc::clone(&barrier);
+                thread::spawn(move || {
+                    load_or_create_identity_with(&path, |_| {
+                        barrier.wait();
+                        Ok(())
+                    })
+                    .unwrap()
+                    .public()
+                    .to_peer_id()
+                })
+            })
+            .collect();
+        let peers: Vec<_> = handles
+            .into_iter()
+            .map(|handle| handle.join().unwrap())
+            .collect();
+
+        assert!(peers.iter().all(|peer| peer == &peers[0]));
+        assert_eq!(
+            load_or_create_identity(&path)
+                .unwrap()
+                .public()
+                .to_peer_id(),
+            peers[0]
+        );
+        assert_eq!(
+            fs::metadata(&*path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        assert_eq!(
+            fs::read_dir(directory.path()).unwrap().count(),
+            1,
+            "concurrent creation must clean every private temporary"
+        );
+    }
+
+    #[test]
+    fn identity_rejects_symlink_and_unsafe_parent() {
+        use std::os::unix::fs::symlink;
+
+        let directory = private_tempdir();
+        let victim = directory.path().join("victim");
+        fs::write(&victim, b"do not touch").unwrap();
+        let link = directory.path().join("identity.key");
+        symlink(&victim, &link).unwrap();
+
+        let error = load_or_create_identity(&link).unwrap_err().to_string();
+        assert!(error.contains("symlink") || error.contains("regular file"));
+        assert_eq!(fs::read(&victim).unwrap(), b"do not touch");
+
+        let unsafe_parent = directory.path().join("unsafe");
+        fs::create_dir(&unsafe_parent).unwrap();
+        fs::set_permissions(&unsafe_parent, fs::Permissions::from_mode(0o777)).unwrap();
+        let error = load_or_create_identity(&unsafe_parent.join("identity.key"))
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("identity parent directory is unsafe"));
+        assert!(!unsafe_parent.join("identity.key").exists());
+
+        let private_parent = directory.path().join("private");
+        fs::create_dir(&private_parent).unwrap();
+        fs::set_permissions(&private_parent, fs::Permissions::from_mode(0o700)).unwrap();
+        let parent_link = directory.path().join("parent-link");
+        symlink(&private_parent, &parent_link).unwrap();
+        let error = load_or_create_identity(&parent_link.join("identity.key"))
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("identity parent directory is unsafe"));
+        assert!(!private_parent.join("identity.key").exists());
+    }
+
+    #[test]
     fn corrupt_identity_is_not_silently_replaced() {
-        let directory = tempfile::tempdir().unwrap();
+        let directory = private_tempdir();
         let path = directory.path().join("identity.key");
         let corrupt = b"not a protobuf identity";
         fs::write(&path, corrupt).unwrap();
@@ -584,7 +785,7 @@ mod tests {
 
     #[test]
     fn failed_identity_publish_preserves_final_and_cleans_private_temporary() {
-        let directory = tempfile::tempdir().unwrap();
+        let directory = private_tempdir();
         let path = directory.path().join("identity.key");
         let original = identity::Keypair::generate_ed25519()
             .to_protobuf_encoding()
