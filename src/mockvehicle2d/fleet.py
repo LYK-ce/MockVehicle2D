@@ -4,7 +4,8 @@ from __future__ import annotations
 
 import asyncio
 import copy
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
+from hashlib import sha256
 import json
 import math
 from pathlib import Path
@@ -15,7 +16,7 @@ from mockvehicle2d.collision import (
     cell_overlaps_circle,
     is_strict_overlap,
     is_swept_circle_passable,
-    swept_circles_overlap,
+    swept_trajectories_overlap,
 )
 from mockvehicle2d.controller import Command, CommandResult, RobotController
 from mockvehicle2d.local_state import (
@@ -46,6 +47,12 @@ from mockvehicle2d.vehicle import Vehicle
 MAX_VEHICLES = 4
 DEFAULT_TICK_MS = 100
 DEFAULT_SPAWN_SAFETY_MARGIN_M = 0.25
+
+
+def _vehicle_odometry_config(config: OdometryConfig, vehicle_id: str) -> OdometryConfig:
+    material = f"{config.seed}\0{vehicle_id}".encode()
+    seed = int.from_bytes(sha256(material).digest()[:8], "big")
+    return replace(config, seed=seed)
 
 
 def _strict_object(
@@ -370,33 +377,50 @@ class SharedWorld:
             for vehicle_id, vehicle in self._vehicles.items()
         }
         candidates: dict[str, Vehicle] = {}
+        trajectories: dict[str, tuple[tuple[float, float, float], ...]] = {}
         results: dict[str, SafetyAdvanceResult] = {}
         for vehicle_id, vehicle in sorted(self._vehicles.items()):
             candidate = copy.copy(vehicle)
-            collided = candidate.advance(self._grid, target_time)
+            trajectory: list[tuple[float, float, float]] = []
+            collided = candidate.advance(
+                self._grid,
+                target_time,
+                trajectory=trajectory,
+            )
             candidates[vehicle_id] = candidate
+            trajectories[vehicle_id] = tuple(trajectory)
             results[vehicle_id] = SafetyAdvanceResult(collided=collided)
 
         blocked: set[str] = set()
         vehicle_ids = sorted(candidates)
+        stationary = {
+            vehicle_id: (
+                ((self.now, *start), (target_time, *start))
+                if target_time > self.now
+                else ((self.now, *start),)
+            )
+            for vehicle_id, start in starts.items()
+        }
         while True:
             newly_blocked: set[str] = set()
             for index, first_id in enumerate(vehicle_ids):
                 first = candidates[first_id]
-                first_end = starts[first_id] if first_id in blocked else (first.x, first.y)
+                first_trajectory = (
+                    stationary[first_id]
+                    if first_id in blocked
+                    else trajectories[first_id]
+                )
                 for second_id in vehicle_ids[index + 1 :]:
                     second = candidates[second_id]
-                    second_end = (
-                        starts[second_id]
+                    second_trajectory = (
+                        stationary[second_id]
                         if second_id in blocked
-                        else (second.x, second.y)
+                        else trajectories[second_id]
                     )
-                    if swept_circles_overlap(
-                        starts[first_id],
-                        first_end,
+                    if swept_trajectories_overlap(
+                        first_trajectory,
                         first.radius,
-                        starts[second_id],
-                        second_end,
+                        second_trajectory,
                         second.radius,
                     ):
                         newly_blocked.update((first_id, second_id))
@@ -551,7 +575,10 @@ class FleetRuntime:
                     truth_x_m=pose.x_m,
                     truth_y_m=pose.y_m,
                     truth_yaw_rad=pose.yaw_rad,
-                    odometry_config=odometry_config,
+                    odometry_config=_vehicle_odometry_config(
+                        odometry_config,
+                        spec.vehicle_id,
+                    ),
                     timestamp=timestamp,
                     map_resolution_m=LOCAL_MAP_RESOLUTION_M,
                 ),

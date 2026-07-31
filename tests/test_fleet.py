@@ -14,6 +14,7 @@ from mockvehicle2d.fleet import (
     FleetScenario,
     FleetVehicleSpec,
 )
+from mockvehicle2d.local_state import OdometryConfig
 from mockvehicle2d.map_grid import MapGrid
 
 
@@ -200,6 +201,50 @@ class TestFleetRuntime(unittest.TestCase):
         self.assertEqual(first.world.truth_snapshot(), second.world.truth_snapshot())
         self.assertEqual(first.world.now, second.world.now)
 
+    def test_odometry_noise_is_vehicle_specific_and_order_independent(self) -> None:
+        ordered = scenario(spec(1, 5.0, 5.0), spec(2, 20.0, 5.0))
+        reversed_order = scenario(spec(2, 20.0, 5.0), spec(1, 5.0, 5.0))
+        config = OdometryConfig(0.1, 0.05, 42)
+
+        poses_by_run = []
+        seeds_by_run = []
+        for fleet_scenario in (ordered, reversed_order):
+            fleet = FleetRuntime.create(
+                fleet_scenario,
+                grid=free_grid(),
+                odometry_config=config,
+            )
+            poses = {}
+            seeds = {}
+            for vehicle_id in sorted(fleet.nodes):
+                vehicle = fleet.world.vehicle(vehicle_id)
+                local_state = fleet.nodes[vehicle_id].local_state
+                poses[vehicle_id] = local_state.update_from_truth(
+                    vehicle.x + 1.0,
+                    vehicle.y,
+                    vehicle.yaw + 0.1,
+                    timestamp=1.0,
+                )
+                seeds[vehicle_id] = local_state.odometry.config.seed
+            poses_by_run.append(poses)
+            seeds_by_run.append(seeds)
+
+        self.assertNotEqual(seeds_by_run[0]["vehicle_1"], seeds_by_run[0]["vehicle_2"])
+        self.assertNotEqual(
+            (
+                poses_by_run[0]["vehicle_1"].x_m,
+                poses_by_run[0]["vehicle_1"].y_m,
+                poses_by_run[0]["vehicle_1"].yaw_rad,
+            ),
+            (
+                poses_by_run[0]["vehicle_2"].x_m,
+                poses_by_run[0]["vehicle_2"].y_m,
+                poses_by_run[0]["vehicle_2"].yaw_rad,
+            ),
+        )
+        self.assertEqual(seeds_by_run[0], seeds_by_run[1])
+        self.assertEqual(poses_by_run[0], poses_by_run[1])
+
     def test_simultaneous_arbitration_prevents_order_dependent_overlap(self) -> None:
         fleet = FleetRuntime.create(
             scenario(
@@ -235,6 +280,41 @@ class TestFleetRuntime(unittest.TestCase):
             fleet.world.vehicle("vehicle_2").body_velocities(),
             (0.0, 0.0),
         )
+
+    def test_curved_motion_cannot_pass_through_another_vehicle(self) -> None:
+        for tick_ms in (100, 1000):
+            with self.subTest(tick_ms=tick_ms):
+                fleet = FleetRuntime.create(
+                    scenario(
+                        spec(1, 5.0, 5.0),
+                        spec(2, 5.897, 4.421),
+                        tick_ms=tick_ms,
+                    ),
+                    grid=free_grid(),
+                    command_timeout=10.0,
+                    spawn_safety_margin_m=0.0,
+                )
+                moving = fleet.world.vehicle("vehicle_1")
+                moving.install_drive(0.5, math.pi / 2, fleet.world.now)
+                stopped = False
+
+                for _ in range(1000 // tick_ms):
+                    results = fleet.world.advance_to(
+                        fleet.world.now + tick_ms / 1000
+                    )
+                    stopped = stopped or results["vehicle_1"].stopped
+                    first = fleet.world.vehicle("vehicle_1")
+                    second = fleet.world.vehicle("vehicle_2")
+                    distance_squared = (
+                        (first.x - second.x) ** 2 + (first.y - second.y) ** 2
+                    )
+                    self.assertFalse(is_strict_overlap(distance_squared, 1.0))
+
+                self.assertTrue(stopped)
+                self.assertEqual(
+                    fleet.world.vehicle("vehicle_1").body_velocities(),
+                    (0.0, 0.0),
+                )
 
     def test_disconnecting_one_endpoint_does_not_stop_another_vehicle(self) -> None:
         fleet = FleetRuntime.create(

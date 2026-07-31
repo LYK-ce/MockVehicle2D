@@ -1,5 +1,6 @@
 """Continuous circular-vehicle collision geometry."""
 
+from collections.abc import Sequence
 import math
 
 from mockvehicle2d.map_grid import MapGrid
@@ -127,3 +128,60 @@ def swept_circles_overlap(
         *relative_end,
     )
     return is_strict_overlap(distance_squared, (first_radius + second_radius) ** 2)
+
+
+def swept_trajectories_overlap(
+    first: Sequence[tuple[float, float, float]],
+    first_radius: float,
+    second: Sequence[tuple[float, float, float]],
+    second_radius: float,
+) -> bool:
+    """Whether two timed, piecewise-linear circle trajectories overlap."""
+    for trajectory in (first, second):
+        if not trajectory or any(
+            len(point) != 3 or not all(math.isfinite(value) for value in point)
+            for point in trajectory
+        ):
+            raise ValueError("trajectories must contain finite (time, x, y) points")
+        if any(
+            current[0] >= following[0]
+            for current, following in zip(trajectory, trajectory[1:])
+        ):
+            raise ValueError("trajectory time must be strictly increasing")
+    if first[0][0] != second[0][0] or first[-1][0] != second[-1][0]:
+        raise ValueError("trajectories must cover the same time interval")
+
+    times = sorted({point[0] for point in first} | {point[0] for point in second})
+    if len(times) == 1:
+        return swept_circles_overlap(
+            first[0][1:],
+            first[0][1:],
+            first_radius,
+            second[0][1:],
+            second[0][1:],
+            second_radius,
+        )
+    return any(
+        swept_circles_overlap(
+            _trajectory_position(first, started_at),
+            _trajectory_position(first, ended_at),
+            first_radius,
+            _trajectory_position(second, started_at),
+            _trajectory_position(second, ended_at),
+            second_radius,
+        )
+        for started_at, ended_at in zip(times, times[1:])
+    )
+
+
+def _trajectory_position(
+    trajectory: Sequence[tuple[float, float, float]], timestamp: float
+) -> tuple[float, float]:
+    for current, following in zip(trajectory, trajectory[1:]):
+        if timestamp <= following[0]:
+            ratio = (timestamp - current[0]) / (following[0] - current[0])
+            return (
+                current[1] + ratio * (following[1] - current[1]),
+                current[2] + ratio * (following[2] - current[2]),
+            )
+    return trajectory[-1][1], trajectory[-1][2]
