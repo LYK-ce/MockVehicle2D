@@ -11,40 +11,6 @@ from mockvehicle2d.map_grid import MapGrid
 TimedPose = tuple[float, float, float, float]
 
 
-def interpolate_timed_pose(
-    trajectory: tuple[TimedPose, ...], timestamp: float
-) -> tuple[float, float, float]:
-    """Interpolate one vehicle's unique motion history at a sensor timestamp."""
-    if not trajectory or not math.isfinite(timestamp):
-        raise ValueError("trajectory and timestamp must be finite")
-    epsilon = 1e-12
-    if (
-        timestamp < trajectory[0][0] - epsilon
-        or timestamp > trajectory[-1][0] + epsilon
-    ):
-        raise ValueError("timestamp is outside the vehicle trajectory")
-    timestamp = min(max(timestamp, trajectory[0][0]), trajectory[-1][0])
-    for current, following in zip(trajectory, trajectory[1:]):
-        if timestamp <= following[0]:
-            duration = following[0] - current[0]
-            if duration <= 0:
-                raise ValueError("trajectory time must be strictly increasing")
-            ratio = (timestamp - current[0]) / duration
-            yaw_delta = math.atan2(
-                math.sin(following[3] - current[3]),
-                math.cos(following[3] - current[3]),
-            )
-            return (
-                current[1] + ratio * (following[1] - current[1]),
-                current[2] + ratio * (following[2] - current[2]),
-                math.atan2(
-                    math.sin(current[3] + ratio * yaw_delta),
-                    math.cos(current[3] + ratio * yaw_delta),
-                ),
-            )
-    return trajectory[-1][1:]
-
-
 class Vehicle:
     """A circular differential-drive vehicle in the simulator's screen coordinates."""
 

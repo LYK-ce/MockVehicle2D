@@ -305,7 +305,12 @@ class RobotController:
             raise ValueError("event_seq must be a non-negative integer")
         return tuple(self._events[event_seq:])
 
-    def snapshot(self) -> dict[str, object]:
+    def snapshot(self, *, now: float | None = None) -> dict[str, object]:
+        manual_setpoint_active = self._manual_setpoint is not None and (
+            now is None
+            or self._manual_deadline is None
+            or now < self._manual_deadline
+        )
         return {
             "mode": self.mode.value,
             "auto_state": self.auto_state.value,
@@ -317,7 +322,7 @@ class RobotController:
                 "capacity": self.mission_capacity,
                 "mission_ids": [mission.mission_id for mission in self._pending],
             },
-            "manual_setpoint_active": self._manual_setpoint is not None,
+            "manual_setpoint_active": manual_setpoint_active,
             "navigation": self.navigation.snapshot(),
             "mission_events": {
                 "event_epoch": self.event_epoch,

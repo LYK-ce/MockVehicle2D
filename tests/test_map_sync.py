@@ -428,6 +428,9 @@ class TestP2PRuntimeOwnership(unittest.IsolatedAsyncioTestCase):
             def close(self) -> None:
                 return None
 
+            async def wait_closed(self) -> None:
+                return None
+
         with tempfile.TemporaryDirectory() as temporary:
             path = Path(temporary) / "p1.sock"
             bridge = self._bridge(path)
@@ -440,6 +443,106 @@ class TestP2PRuntimeOwnership(unittest.IsolatedAsyncioTestCase):
             self.assertIsNone(bridge.server)
             self.assertFalse(path.exists())
             self.assertFalse(bridge._tasks)
+
+    async def test_unconfirmed_bridge_resources_keep_runtime_ownership_until_retry(self) -> None:
+        class RetryServer:
+            def __init__(self) -> None:
+                self.close_calls = 0
+                self.wait_calls = 0
+
+            def close(self) -> None:
+                self.close_calls += 1
+                if self.close_calls == 1:
+                    raise RuntimeError("injected server close failure")
+
+            async def wait_closed(self) -> None:
+                self.wait_calls += 1
+                if self.wait_calls == 1:
+                    raise RuntimeError("injected server wait failure")
+
+        class RetryWriter:
+            def __init__(self) -> None:
+                self.close_calls = 0
+                self.wait_calls = 0
+
+            def write(self, _data: bytes) -> None:
+                return None
+
+            async def drain(self) -> None:
+                return None
+
+            def close(self) -> None:
+                self.close_calls += 1
+                if self.close_calls == 1:
+                    raise RuntimeError("injected writer close failure")
+
+            async def wait_closed(self) -> None:
+                self.wait_calls += 1
+                if self.wait_calls == 1:
+                    raise RuntimeError("injected writer wait failure")
+
+        class RetryProcess:
+            def __init__(self) -> None:
+                self.returncode = None
+                self.wait_calls = 0
+
+            def terminate(self) -> None:
+                return None
+
+            def kill(self) -> None:
+                return None
+
+            async def wait(self) -> int:
+                self.wait_calls += 1
+                if self.wait_calls <= 2:
+                    raise RuntimeError("injected child wait failure")
+                self.returncode = -9
+                return self.returncode
+
+        with tempfile.TemporaryDirectory() as temporary:
+            runtime_dir = Path(temporary)
+            runtime = self.make_runtime(runtime_dir)
+            runtime._acquire_runtime_lease()
+            config_path = runtime_dir / "vehicle_1.json"
+            config_path.write_text("{}", encoding="utf-8")
+            runtime._config_paths.append(config_path)
+            bridge = self._bridge(runtime_dir / "p1.sock")
+            server = RetryServer()
+            writer = RetryWriter()
+            process = RetryProcess()
+            bridge.server = server
+            bridge._writer = writer
+            bridge.process = process
+            runtime._bridges["vehicle_1"] = bridge
+
+            with self.assertRaisesRegex(RuntimeError, "server close failure"):
+                await runtime.close()
+
+            self.assertIs(bridge.server, server)
+            self.assertIs(bridge._writer, writer)
+            self.assertIs(bridge.process, process)
+            self.assertFalse(bridge._closed)
+            self.assertIn("vehicle_1", runtime._bridges)
+            self.assertTrue(config_path.exists())
+            contender = self.make_runtime(runtime_dir)
+            with self.assertRaisesRegex(RuntimeError, "already in use"):
+                contender._acquire_runtime_lease()
+
+            with self.assertRaisesRegex(RuntimeError, "server wait failure"):
+                await runtime.close()
+            self.assertIn("vehicle_1", runtime._bridges)
+            self.assertTrue(config_path.exists())
+
+            await runtime.close()
+
+            self.assertGreaterEqual(server.close_calls, 3)
+            self.assertEqual(server.wait_calls, 2)
+            self.assertGreaterEqual(writer.close_calls, 3)
+            self.assertEqual(writer.wait_calls, 2)
+            self.assertIsNotNone(process.returncode)
+            self.assertFalse(config_path.exists())
+            contender._acquire_runtime_lease()
+            await contender.close()
 
     async def test_stubborn_bridge_handler_keeps_runtime_lease_until_retry(self) -> None:
         release = asyncio.Event()

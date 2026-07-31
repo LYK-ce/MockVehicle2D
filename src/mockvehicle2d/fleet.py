@@ -34,7 +34,9 @@ from mockvehicle2d.map_sync import (
     P2PSettings,
     P2PVehicleConfig,
     _CleanupError,
+    _CleanupPending,
     _finish_cleanup,
+    fleet_sync_cleanup_timeout_s,
 )
 from mockvehicle2d.protocol import ProtocolError, command_ack, error_message, parse_command
 from mockvehicle2d.safety import LocalSafetyRuntime, SafetyAdvanceResult
@@ -51,7 +53,7 @@ from mockvehicle2d.server import (
     generate_map,
     validate_vehicle_id,
 )
-from mockvehicle2d.vehicle import TimedPose, Vehicle, interpolate_timed_pose
+from mockvehicle2d.vehicle import TimedPose, Vehicle
 
 
 MAX_VEHICLES = 4
@@ -355,10 +357,6 @@ class SharedWorld:
             for spec in specs
         }
         self.now = started_at
-        self.last_trajectories: dict[str, tuple[TimedPose, ...]] = {
-            vehicle_id: ((started_at, vehicle.x, vehicle.y, vehicle.yaw),)
-            for vehicle_id, vehicle in self._vehicles.items()
-        }
 
     @property
     def debug_grid(self) -> MapGrid:
@@ -394,35 +392,6 @@ class SharedWorld:
                 TMINI_SCAN_CONFIG,
                 circles=circles,
             )
-        )
-
-    def scan_at(
-        self,
-        vehicle_id: str,
-        trajectories: dict[str, tuple[TimedPose, ...]],
-        timestamp: float,
-    ) -> tuple[tuple[float, float, float], tuple[LaserPoint, ...]]:
-        x_m, y_m, yaw_rad = interpolate_timed_pose(
-            trajectories[vehicle_id],
-            timestamp,
-        )
-        circles = tuple(
-            (*interpolate_timed_pose(trajectories[other_id], timestamp)[:2], other.radius)
-            for other_id, other in sorted(self._vehicles.items())
-            if other_id != vehicle_id
-        )
-        return (
-            (x_m, y_m, yaw_rad),
-            tuple(
-                scan_grid(
-                    self._grid,
-                    x_m,
-                    y_m,
-                    yaw_rad,
-                    TMINI_SCAN_CONFIG,
-                    circles=circles,
-                )
-            ),
         )
 
     def sensor_grid(self, vehicle_id: str) -> MapGrid:
@@ -530,7 +499,6 @@ class SharedWorld:
                 reason="safety_obstacle",
             )
         self._vehicles = candidates
-        self.last_trajectories = trajectories
         self.now = target_time
         return results
 
@@ -631,7 +599,7 @@ class RobotNode:
             "omega_rps": omega_rps,
             "collision": vehicle.collision,
             "actuator_command": vehicle.command,
-            "controller": self.controller.snapshot(),
+            "controller": self.controller.snapshot(now=vehicle.last_update),
             "safety": self.safety.snapshot(),
             "localization": {
                 **estimate.as_dict(),
@@ -666,7 +634,12 @@ class RobotNode:
         return tuple(frame for frame in self._frames if frame.sequence > sequence)
 
     def record_advance(self, result: SafetyAdvanceResult) -> None:
-        self._pending_advance = result
+        previous = self._pending_advance
+        self._pending_advance = SafetyAdvanceResult(
+            collided=previous.collided or result.collided,
+            stopped=previous.stopped or result.stopped,
+            reason=previous.reason or result.reason,
+        )
 
 
 class FleetRuntime:
@@ -807,10 +780,10 @@ class FleetRuntime:
                 sensor_grids[vehicle_id],
                 self.world.now,
             )
-        results = self.world.advance_to(self.world.now + self.tick_s)
-        for vehicle_id, result in results.items():
-            self.nodes[vehicle_id].record_advance(result)
-        self._sample_due_scans()
+        target_time = self.world.now + self.tick_s
+        self._sample_due_scans(target_time)
+        if self.world.now < target_time:
+            self._advance_world(target_time)
 
     async def run(self, stop: asyncio.Event) -> None:
         while not stop.is_set():
@@ -886,29 +859,44 @@ class FleetRuntime:
                 self.world.vehicle(vehicle_id),
             )
 
-    def _sample_due_scans(self) -> None:
+    def _advance_world(self, target_time: float) -> None:
+        results = self.world.advance_to(target_time)
+        for vehicle_id, result in results.items():
+            self.nodes[vehicle_id].record_advance(result)
+
+    def _sample_due_scans(self, target_time: float) -> None:
         period_s = TMINI_SCAN_CONFIG.scan_time
         epsilon = 1e-12
-        for vehicle_id in sorted(self.nodes):
-            while True:
-                scan_time = (
+        while True:
+            scan_time = min(
+                self._sensor_epoch + index * period_s
+                for index in self._next_scan_index.values()
+            )
+            if scan_time > target_time + epsilon:
+                return
+            if scan_time < self.world.now - epsilon:
+                raise RuntimeError("sensor schedule moved behind simulation time")
+            self._advance_world(max(self.world.now, min(scan_time, target_time)))
+            due = (
+                vehicle_id
+                for vehicle_id in sorted(self.nodes)
+                if math.isclose(
                     self._sensor_epoch
-                    + self._next_scan_index[vehicle_id] * period_s
-                )
-                if scan_time > self.world.now + epsilon:
-                    break
-                truth_pose, scan_points = self.world.scan_at(
-                    vehicle_id,
-                    self.world.last_trajectories,
+                    + self._next_scan_index[vehicle_id] * period_s,
                     scan_time,
+                    rel_tol=0.0,
+                    abs_tol=epsilon,
                 )
+            )
+            for vehicle_id in due:
+                vehicle = self.world.vehicle(vehicle_id)
                 node = self.nodes[vehicle_id]
                 node.frame_sequence += 1
                 node.sample(
-                    truth_pose,
-                    scan_points,
+                    (vehicle.x, vehicle.y, vehicle.yaw),
+                    self.world.scan(vehicle_id),
                     self._wall_time_offset + scan_time,
-                    self.world.vehicle(vehicle_id),
+                    vehicle,
                 )
                 self._next_scan_index[vehicle_id] += 1
 
@@ -1088,14 +1076,33 @@ async def _wait_cleanup_tasks(
     *,
     context: str,
     errors: list[BaseException],
+    timeout_s: float | None = None,
 ) -> None:
     if not tasks:
         return
-    done, pending = await asyncio.wait(tasks, timeout=FLEET_CLEANUP_TIMEOUT_S)
+    timeout_s = FLEET_CLEANUP_TIMEOUT_S if timeout_s is None else timeout_s
+    done, pending = await asyncio.wait(tasks, timeout=timeout_s)
+    timed_out = bool(pending)
     for task in pending:
         task.cancel()
-        task.add_done_callback(_consume_background_result)
+    if pending:
+        cancelled, still_pending = await asyncio.wait(
+            pending,
+            timeout=FLEET_CLEANUP_TIMEOUT_S,
+        )
+        done.update(cancelled)
+        pending = still_pending
+    if timed_out:
         errors.append(TimeoutError(f"{context} did not stop"))
+    for task in pending:
+        task.add_done_callback(_consume_background_result)
+    if pending:
+        errors.append(
+            _CleanupPending(
+                f"{context} remains alive",
+                (TimeoutError("task ignored cancellation"),),
+            )
+        )
     for task in done:
         if task.cancelled():
             continue
@@ -1158,6 +1165,8 @@ async def _cleanup_fleet_main(
                 (p2p_task,),
                 context="libp2p fleet sync close",
                 errors=errors,
+                timeout_s=fleet_sync_cleanup_timeout_s()
+                + FLEET_CLEANUP_TIMEOUT_S,
             )
 
     for vehicle_id in fleet.nodes:
@@ -1171,7 +1180,12 @@ async def _cleanup_fleet_main(
         except BaseException as error:
             errors.append(error)
     if errors:
-        raise _CleanupError("cannot close fleet runtime", errors)
+        error_type = (
+            _CleanupPending
+            if any(isinstance(error, _CleanupPending) for error in errors)
+            else _CleanupError
+        )
+        raise error_type("cannot close fleet runtime", errors)
 
 
 async def main(
@@ -1284,7 +1298,13 @@ async def main(
             registered_signals=tuple(registered_signals),
         )
     )
-    cancellation, cleanup_error = await _finish_cleanup(cleanup_task)
+    cancellation, cleanup_error = await _finish_cleanup(
+        cleanup_task,
+        timeout_s=(
+            fleet_sync_cleanup_timeout_s()
+            + FLEET_CLEANUP_TIMEOUT_S * 6
+        ),
+    )
     if original_error is not None:
         if cleanup_error is not None:
             raise original_error.with_traceback(original_traceback) from cleanup_error
