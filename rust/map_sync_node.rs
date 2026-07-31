@@ -2,11 +2,15 @@ use std::{
     collections::{HashMap, HashSet, hash_map::DefaultHasher},
     env,
     error::Error,
-    fs::{self, OpenOptions},
+    ffi::OsString,
+    fs::{self, File, OpenOptions},
     hash::{Hash, Hasher},
     io::{self, Write},
+    os::unix::fs::{OpenOptionsExt, PermissionsExt},
     path::{Path, PathBuf},
+    process,
     str::FromStr,
+    sync::atomic::{AtomicU64, Ordering},
     time::Duration,
 };
 
@@ -28,6 +32,7 @@ const SIDECAR_PROTOCOL: &str = "mockvehicle2d-map-sync-sidecar/1";
 const DELTA_PROTOCOL: &str = "mockvehicle2d-map-delta/1";
 const MAX_MESSAGE_BYTES: usize = 256 * 1024;
 const MAX_PEERS: usize = 3;
+static IDENTITY_TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 type BoxError = Box<dyn Error + Send + Sync>;
 
@@ -166,34 +171,123 @@ impl NodeConfig {
     }
 }
 
+fn identity_parent(path: &Path) -> &Path {
+    path.parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."))
+}
+
+fn existing_identity(path: &Path) -> Result<Option<identity::Keypair>, BoxError> {
+    let metadata = match fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error.into()),
+    };
+    if !metadata.file_type().is_file() {
+        return Err("existing identity path is not a regular file; refusing to replace".into());
+    }
+    fs::set_permissions(path, fs::Permissions::from_mode(0o600))?;
+    let bytes = fs::read(path)?;
+    identity::Keypair::from_protobuf_encoding(&bytes)
+        .map(Some)
+        .map_err(|error| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("existing identity file is invalid; refusing to replace: {error}"),
+            )
+            .into()
+        })
+}
+
+fn create_identity_temporary(path: &Path) -> Result<(PathBuf, File), BoxError> {
+    let parent = identity_parent(path);
+    let file_name = path.file_name().ok_or("identity path must name a file")?;
+    for _ in 0..100 {
+        let mut temporary_name = OsString::from(".");
+        temporary_name.push(file_name);
+        temporary_name.push(format!(
+            ".tmp.{}.{}",
+            process::id(),
+            IDENTITY_TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed)
+        ));
+        let temporary_path = parent.join(temporary_name);
+        match OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&temporary_path)
+        {
+            Ok(file) => {
+                if let Err(error) = file.set_permissions(fs::Permissions::from_mode(0o600)) {
+                    drop(file);
+                    return match fs::remove_file(&temporary_path) {
+                        Ok(()) => Err(error.into()),
+                        Err(cleanup_error) => Err(io::Error::other(format!(
+                            "cannot secure identity temporary ({error}) and cannot remove it: \
+                             {cleanup_error}"
+                        ))
+                        .into()),
+                    };
+                }
+                return Ok((temporary_path, file));
+            }
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(error.into()),
+        }
+    }
+    Err("cannot create a unique identity temporary file".into())
+}
+
+fn write_identity_atomically_with<F>(
+    path: &Path,
+    bytes: &[u8],
+    before_publish: F,
+) -> Result<(), BoxError>
+where
+    F: FnOnce(&Path) -> io::Result<()>,
+{
+    let parent = identity_parent(path);
+    fs::create_dir_all(parent)?;
+    let (temporary_path, mut file) = create_identity_temporary(path)?;
+    let result = (|| -> Result<(), BoxError> {
+        file.write_all(bytes)?;
+        file.sync_all()?;
+        before_publish(&temporary_path)?;
+        drop(file);
+        fs::rename(&temporary_path, path)?;
+        File::open(parent)?.sync_all()?;
+        Ok(())
+    })();
+    if let Err(original) = &result {
+        let original_error = original.to_string();
+        match fs::remove_file(&temporary_path) {
+            Ok(()) => {}
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(cleanup_error) => {
+                return Err(io::Error::other(format!(
+                    "identity write failed ({original_error}) and temporary cleanup failed: \
+                     {cleanup_error}"
+                ))
+                .into());
+            }
+        }
+    }
+    result
+}
+
+fn write_identity_atomically(path: &Path, bytes: &[u8]) -> Result<(), BoxError> {
+    write_identity_atomically_with(path, bytes, |_| Ok(()))
+}
+
 fn load_or_create_identity(path: &Path) -> Result<identity::Keypair, BoxError> {
-    match fs::read(path) {
-        Ok(bytes) => return Ok(identity::Keypair::from_protobuf_encoding(&bytes)?),
-        Err(error) if error.kind() != io::ErrorKind::NotFound => return Err(error.into()),
-        Err(_) => {}
+    if let Some(key) = existing_identity(path)? {
+        return Ok(key);
     }
 
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)?;
-    }
     let key = identity::Keypair::generate_ed25519();
     let bytes = key.to_protobuf_encoding()?;
-    match OpenOptions::new().write(true).create_new(true).open(path) {
-        Ok(mut file) => {
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::PermissionsExt;
-                file.set_permissions(fs::Permissions::from_mode(0o600))?;
-            }
-            file.write_all(&bytes)?;
-            file.sync_all()?;
-            Ok(key)
-        }
-        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
-            Ok(identity::Keypair::from_protobuf_encoding(&fs::read(path)?)?)
-        }
-        Err(error) => Err(error.into()),
-    }
+    write_identity_atomically(path, &bytes)?;
+    Ok(key)
 }
 
 async fn send_event(writer: &mut OwnedWriteHalf, event: &impl Serialize) -> Result<(), BoxError> {
@@ -464,6 +558,60 @@ mod tests {
 
         assert_eq!(first, repeated);
         assert_ne!(first, second);
+        assert_eq!(
+            fs::metadata(first_path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+    }
+
+    #[test]
+    fn corrupt_identity_is_not_silently_replaced() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("identity.key");
+        let corrupt = b"not a protobuf identity";
+        fs::write(&path, corrupt).unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o666)).unwrap();
+
+        let error = load_or_create_identity(&path).unwrap_err().to_string();
+
+        assert!(error.contains("invalid; refusing to replace"));
+        assert_eq!(fs::read(&path).unwrap(), corrupt);
+        assert_eq!(
+            fs::metadata(path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+    }
+
+    #[test]
+    fn failed_identity_publish_preserves_final_and_cleans_private_temporary() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("identity.key");
+        let original = identity::Keypair::generate_ed25519()
+            .to_protobuf_encoding()
+            .unwrap();
+        let replacement = identity::Keypair::generate_ed25519()
+            .to_protobuf_encoding()
+            .unwrap();
+        fs::write(&path, &original).unwrap();
+
+        let error = write_identity_atomically_with(&path, &replacement, |temporary| {
+            assert_eq!(
+                fs::metadata(temporary).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+            assert_eq!(fs::read(temporary).unwrap(), replacement);
+            Err(io::Error::other("injected before identity rename"))
+        })
+        .unwrap_err()
+        .to_string();
+
+        assert!(error.contains("injected before identity rename"));
+        assert_eq!(fs::read(&path).unwrap(), original);
+        let entries: Vec<_> = fs::read_dir(directory.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect();
+        assert_eq!(entries, vec![OsString::from("identity.key")]);
     }
 
     #[test]

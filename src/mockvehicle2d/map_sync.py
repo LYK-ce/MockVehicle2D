@@ -12,6 +12,7 @@ import os
 from pathlib import Path
 import socket
 import stat
+import tempfile
 from typing import Iterable
 
 from mockvehicle2d.local_state import (
@@ -32,6 +33,97 @@ MAX_GRID_COORDINATE = 1_000_000
 MAP_EPOCH = 1
 TRANSFORM_EPOCH = 1
 ALLOWED_CELL_STATES = frozenset((FREE, OCCUPIED, FORBIDDEN))
+PROCESS_STOP_TIMEOUT_S = 2.0
+
+
+class _CleanupError(RuntimeError):
+    def __init__(self, context: str, errors: Iterable[BaseException]) -> None:
+        self.errors = tuple(errors)
+        details = "; ".join(
+            f"{type(error).__name__}: {error}" for error in self.errors
+        )
+        super().__init__(f"{context}: {details}")
+
+
+async def _finish_cleanup(
+    task: asyncio.Task[None],
+) -> tuple[asyncio.CancelledError | None, BaseException | None]:
+    cancellation: asyncio.CancelledError | None = None
+    while not task.done():
+        try:
+            await asyncio.shield(task)
+        except asyncio.CancelledError as error:
+            if task.cancelled():
+                break
+            cancellation = cancellation or error
+        except BaseException:
+            break
+    try:
+        task.result()
+    except BaseException as error:
+        return cancellation, error
+    return cancellation, None
+
+
+async def _terminate_and_reap(
+    process: asyncio.subprocess.Process,
+    *,
+    terminate_first: bool,
+) -> None:
+    errors: list[BaseException] = []
+    if terminate_first and process.returncode is None:
+        try:
+            process.terminate()
+        except ProcessLookupError:
+            pass
+        except BaseException as error:
+            errors.append(error)
+    if process.returncode is None:
+        try:
+            await asyncio.wait_for(process.wait(), timeout=PROCESS_STOP_TIMEOUT_S)
+        except asyncio.TimeoutError:
+            try:
+                process.kill()
+            except ProcessLookupError:
+                pass
+            except BaseException as error:
+                errors.append(error)
+            try:
+                await asyncio.wait_for(
+                    process.wait(),
+                    timeout=PROCESS_STOP_TIMEOUT_S,
+                )
+            except BaseException as error:
+                errors.append(error)
+        except BaseException as error:
+            errors.append(error)
+            if process.returncode is None:
+                try:
+                    process.kill()
+                except ProcessLookupError:
+                    pass
+                except BaseException as kill_error:
+                    errors.append(kill_error)
+                try:
+                    await asyncio.wait_for(
+                        process.wait(),
+                        timeout=PROCESS_STOP_TIMEOUT_S,
+                    )
+                except BaseException as wait_error:
+                    errors.append(wait_error)
+    if errors:
+        raise _CleanupError("cannot reap map-sync child", errors)
+
+
+def _sync_directory(path: Path) -> None:
+    flags = os.O_RDONLY | os.O_CLOEXEC
+    if hasattr(os, "O_DIRECTORY"):
+        flags |= os.O_DIRECTORY
+    fd = os.open(path, flags)
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
 
 
 def _strict_object(
@@ -472,11 +564,11 @@ class _NodeBridge:
         self.server: asyncio.AbstractServer | None = None
         self.process: asyncio.subprocess.Process | None = None
         self.ready_event = asyncio.Event()
-        self.health_event = asyncio.Event()
         self._writer: asyncio.StreamWriter | None = None
         self._outbound: asyncio.Queue[dict[str, object]] = asyncio.Queue(maxsize=1)
         self._tasks: set[asyncio.Task[object]] = set()
         self._owned_socket: tuple[int, int] | None = None
+        self._close_task: asyncio.Task[None] | None = None
 
     async def start_server(self) -> None:
         self._remove_stale_socket()
@@ -492,6 +584,7 @@ class _NodeBridge:
             self.server = None
             raise RuntimeError(f"map-sync path is not a Unix socket: {self.socket_path}")
         self._owned_socket = (created.st_dev, created.st_ino)
+        os.chmod(self.socket_path, 0o600)
         self._track(asyncio.create_task(self._send_loop()))
 
     def _remove_stale_socket(self) -> None:
@@ -599,7 +692,6 @@ class _NodeBridge:
                     if event.get("vehicle_id") != self.vehicle_id or not isinstance(connected, list):
                         raise ValueError("invalid peer health event")
                     self.state.set_health(ready=True, connected_vehicle_ids=connected)
-                    self.health_event.set()
                 elif event_type == "publish_result":
                     sequence = event.get("sequence")
                     accepted = event.get("accepted")
@@ -642,34 +734,77 @@ class _NodeBridge:
                 if isinstance(payload, dict) and type(payload.get("sequence")) is int:
                     self.state.publish_result(payload["sequence"], False)
 
-    async def close(self) -> None:
+    async def _close(self) -> None:
+        errors: list[BaseException] = []
         writer = self._writer
+        shutdown_sent = False
         if writer is not None:
             try:
                 writer.write(b'{"type":"shutdown"}\n')
-                await writer.drain()
-            except ConnectionError:
+                await asyncio.wait_for(writer.drain(), timeout=1.0)
+                shutdown_sent = True
+            except (ConnectionError, asyncio.TimeoutError):
                 pass
         if self.process is not None:
             try:
-                await asyncio.wait_for(self.process.wait(), timeout=2.0)
-            except asyncio.TimeoutError:
-                self.process.terminate()
-                try:
-                    await asyncio.wait_for(self.process.wait(), timeout=2.0)
-                except asyncio.TimeoutError:
-                    self.process.kill()
-                    await self.process.wait()
-        if self.server is not None:
-            self.server.close()
-            await self.server.wait_closed()
-            self.server = None
-        for task in tuple(self._tasks):
+                await _terminate_and_reap(
+                    self.process,
+                    terminate_first=not shutdown_sent,
+                )
+            except BaseException as error:
+                errors.append(error)
+        server = self.server
+        self.server = None
+        if server is not None:
+            try:
+                server.close()
+            except BaseException as error:
+                errors.append(error)
+        if writer is not None:
+            writer.close()
+        tasks = tuple(self._tasks)
+        for task in tasks:
             task.cancel()
-        if self._tasks:
-            await asyncio.gather(*self._tasks, return_exceptions=True)
-        self._remove_owned_socket()
-        self.state.network_disconnected()
+        if tasks:
+            done, pending = await asyncio.wait(tasks, timeout=PROCESS_STOP_TIMEOUT_S)
+            if pending:
+                errors.append(TimeoutError("map-sync bridge tasks did not stop"))
+            for task in done:
+                if task.cancelled():
+                    continue
+                try:
+                    task.result()
+                except BaseException as error:
+                    errors.append(error)
+        if server is not None:
+            try:
+                await asyncio.wait_for(
+                    server.wait_closed(),
+                    timeout=PROCESS_STOP_TIMEOUT_S,
+                )
+            except BaseException as error:
+                errors.append(error)
+        try:
+            self._remove_owned_socket()
+        except BaseException as error:
+            errors.append(error)
+        try:
+            self.state.network_disconnected()
+        except BaseException as error:
+            errors.append(error)
+        if errors:
+            raise _CleanupError(f"cannot close {self.vehicle_id} map-sync bridge", errors)
+
+    async def close(self) -> None:
+        if self._close_task is None:
+            self._close_task = asyncio.create_task(self._close())
+        cancellation, error = await _finish_cleanup(self._close_task)
+        if cancellation is not None:
+            if error is not None:
+                raise cancellation from error
+            raise cancellation
+        if error is not None:
+            raise error
 
 
 class P2PFleetSync:
@@ -692,6 +827,7 @@ class P2PFleetSync:
         self._config_paths: list[Path] = []
         self._flush_task: asyncio.Task[None] | None = None
         self._runtime_lock_fd: int | None = None
+        self._close_task: asyncio.Task[None] | None = None
 
     @classmethod
     async def start(
@@ -705,8 +841,15 @@ class P2PFleetSync:
         try:
             await runtime._start()
             return runtime
-        except BaseException:
-            await runtime.close()
+        except BaseException as original:
+            try:
+                await runtime.close()
+            except asyncio.CancelledError as cancellation:
+                if isinstance(original, asyncio.CancelledError):
+                    raise original from cancellation.__cause__
+                raise cancellation from original
+            except BaseException as cleanup_error:
+                raise original from cleanup_error
             raise
 
     async def _start(self) -> None:
@@ -762,8 +905,8 @@ class P2PFleetSync:
                     if remote.vehicle_id != vehicle.vehicle_id
                 ],
             }
-            config_path.write_text(json.dumps(config, indent=2), encoding="utf-8")
             self._config_paths.append(config_path)
+            self._write_config(config_path, config)
             bridge.process = await asyncio.create_subprocess_exec(
                 str(self.sidecar_path),
                 "run",
@@ -783,7 +926,12 @@ class P2PFleetSync:
     def _acquire_runtime_lease(self) -> None:
         if self._runtime_lock_fd is not None:
             raise RuntimeError("map-sync runtime lease is already held")
-        self.runtime_dir.mkdir(parents=True, exist_ok=True)
+        try:
+            self.runtime_dir.mkdir(parents=True, mode=0o700)
+        except FileExistsError:
+            pass
+        else:
+            os.chmod(self.runtime_dir, 0o700)
         directory = self.runtime_dir.stat()
         if (
             not stat.S_ISDIR(directory.st_mode)
@@ -819,6 +967,38 @@ class P2PFleetSync:
             raise
         self._runtime_lock_fd = fd
 
+    def _write_config(self, path: Path, value: dict[str, object]) -> None:
+        fd = -1
+        temporary_path: Path | None = None
+        try:
+            fd, temporary_name = tempfile.mkstemp(
+                prefix=f".{path.name}.",
+                suffix=".tmp",
+                dir=self.runtime_dir,
+            )
+            temporary_path = Path(temporary_name)
+            self._config_paths.append(temporary_path)
+            os.fchmod(fd, 0o600)
+            with os.fdopen(fd, "w", encoding="utf-8") as output:
+                fd = -1
+                json.dump(value, output, indent=2)
+                output.write("\n")
+                output.flush()
+                os.fsync(output.fileno())
+            os.replace(temporary_path, path)
+            self._config_paths.remove(temporary_path)
+            temporary_path = None
+            _sync_directory(self.runtime_dir)
+        finally:
+            if fd >= 0:
+                os.close(fd)
+            if temporary_path is not None:
+                try:
+                    temporary_path.unlink(missing_ok=True)
+                finally:
+                    if temporary_path in self._config_paths:
+                        self._config_paths.remove(temporary_path)
+
     def _release_runtime_lease(self) -> None:
         fd = self._runtime_lock_fd
         self._runtime_lock_fd = None
@@ -843,9 +1023,28 @@ class P2PFleetSync:
                 timeout=self.settings.startup_timeout_s,
             )
         except asyncio.TimeoutError:
-            process.kill()
-            await process.wait()
-            raise RuntimeError(f"timed out initializing {vehicle_id} libp2p identity") from None
+            cleanup_task = asyncio.create_task(
+                _terminate_and_reap(process, terminate_first=True)
+            )
+            cancellation, cleanup_error = await _finish_cleanup(cleanup_task)
+            error = RuntimeError(f"timed out initializing {vehicle_id} libp2p identity")
+            if cancellation is not None:
+                raise cancellation from cleanup_error or error
+            if cleanup_error is not None:
+                raise error from cleanup_error
+            raise error from None
+        except BaseException as original:
+            cleanup_task = asyncio.create_task(
+                _terminate_and_reap(process, terminate_first=True)
+            )
+            cancellation, cleanup_error = await _finish_cleanup(cleanup_task)
+            if isinstance(original, asyncio.CancelledError):
+                raise original from cleanup_error
+            if cancellation is not None:
+                raise cancellation from cleanup_error or original
+            if cleanup_error is not None:
+                raise original from cleanup_error
+            raise
         if process.returncode != 0:
             raise RuntimeError(
                 f"cannot initialize {vehicle_id} libp2p identity: {stderr.decode(errors='replace').strip()}"
@@ -888,17 +1087,51 @@ class P2PFleetSync:
             self.flush_once()
             await asyncio.sleep(max(0.0, interval_s - (asyncio.get_running_loop().time() - started)))
 
-    async def close(self) -> None:
+    async def _close(self) -> None:
+        errors: list[BaseException] = []
         try:
             if self._flush_task is not None:
-                self._flush_task.cancel()
-                await asyncio.gather(self._flush_task, return_exceptions=True)
+                flush_task = self._flush_task
                 self._flush_task = None
+                flush_task.cancel()
+                results = await asyncio.gather(flush_task, return_exceptions=True)
+                errors.extend(
+                    result
+                    for result in results
+                    if isinstance(result, BaseException)
+                    and not isinstance(result, asyncio.CancelledError)
+                )
             if self._bridges:
-                await asyncio.gather(*(bridge.close() for bridge in self._bridges.values()))
+                bridges = tuple(self._bridges.values())
+                results = await asyncio.gather(
+                    *(bridge.close() for bridge in bridges),
+                    return_exceptions=True,
+                )
+                errors.extend(
+                    result for result in results if isinstance(result, BaseException)
+                )
                 self._bridges.clear()
-            for path in self._config_paths:
-                path.unlink(missing_ok=True)
+            for path in tuple(dict.fromkeys(self._config_paths)):
+                try:
+                    path.unlink(missing_ok=True)
+                except BaseException as error:
+                    errors.append(error)
             self._config_paths.clear()
         finally:
-            self._release_runtime_lease()
+            try:
+                self._release_runtime_lease()
+            except BaseException as error:
+                errors.append(error)
+        if errors:
+            raise _CleanupError("cannot close libp2p fleet sync", errors)
+
+    async def close(self) -> None:
+        if self._close_task is None:
+            self._close_task = asyncio.create_task(self._close())
+        cancellation, error = await _finish_cleanup(self._close_task)
+        if cancellation is not None:
+            if error is not None:
+                raise cancellation from error
+            raise cancellation
+        if error is not None:
+            raise error
