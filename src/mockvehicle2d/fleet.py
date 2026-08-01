@@ -14,13 +14,13 @@ import signal
 import time
 
 from mockvehicle2d.collision import (
-    cell_overlaps_circle,
     is_strict_overlap,
     is_swept_circle_passable,
     swept_trajectories_overlap,
 )
 from mockvehicle2d.controller import Command, CommandResult, RobotController
 from mockvehicle2d.local_state import (
+    FORBIDDEN,
     OCCUPIED,
     AnchorSpec,
     AnchoredLocalState,
@@ -31,7 +31,7 @@ from mockvehicle2d.local_state import (
     PoseEstimate,
     _hit_axis_cell,
 )
-from mockvehicle2d.map_grid import MapGrid, WALL
+from mockvehicle2d.map_grid import MapGrid
 from mockvehicle2d.map_sync import (
     MapSyncState,
     P2PFleetSync,
@@ -44,7 +44,11 @@ from mockvehicle2d.map_sync import (
     fleet_sync_cleanup_timeout_s,
 )
 from mockvehicle2d.protocol import ProtocolError, command_ack, error_message, parse_command
-from mockvehicle2d.safety import LocalSafetyRuntime, SafetyAdvanceResult
+from mockvehicle2d.safety import (
+    AUTOMATIC_MINIMUM_CLEARANCE_M,
+    LocalSafetyRuntime,
+    SafetyAdvanceResult,
+)
 from mockvehicle2d.scan import LaserPoint, TMINI_SCAN_CONFIG, scan_grid, scan_message
 from mockvehicle2d.server import (
     HOST,
@@ -66,6 +70,7 @@ DEFAULT_TICK_MS = 100
 DEFAULT_SPAWN_SAFETY_MARGIN_M = 0.25
 FLEET_CLEANUP_TIMEOUT_S = 2.0
 TELEMETRY_BUFFER_FRAMES = 64
+PeerExclusion = tuple[float, float, float]
 
 
 class TelemetryOverflowError(RuntimeError):
@@ -409,25 +414,6 @@ class SharedWorld:
             for gx in range(max(0, center_x - reach), min(self._grid.width, center_x + reach + 1)):
                 sensed.set_cell(gx, gy, self._grid.get_cell(gx, gy))
 
-        for other_id, other in sorted(self._vehicles.items()):
-            if other_id == vehicle_id:
-                continue
-            for gy in range(
-                math.floor(other.y - other.radius),
-                math.floor(other.y + other.radius) + 1,
-            ):
-                for gx in range(
-                    math.floor(other.x - other.radius),
-                    math.floor(other.x + other.radius) + 1,
-                ):
-                    if sensed.in_bounds(gx, gy) and cell_overlaps_circle(
-                        gx,
-                        gy,
-                        other.x,
-                        other.y,
-                        other.radius**2,
-                    ):
-                        sensed.set_cell(gx, gy, WALL)
         return sensed
 
     def advance_to(self, target_time: float) -> dict[str, SafetyAdvanceResult]:
@@ -523,28 +509,43 @@ class _TransientPlanningGrid:
     def __init__(self, persistent: ObservedGrid) -> None:
         self._persistent = persistent
         self._cells: set[tuple[int, int]] = set()
+        self._occupied_cells: set[tuple[int, int]] = set()
+        self._peer_forbidden_cells: set[tuple[int, int]] = set()
+        self._peer_exclusion_circles: tuple[PeerExclusion, ...] = ()
         self.resolution_m = persistent.resolution_m
 
     def update(
         self,
         cells: set[tuple[int, int]],
         persistent_delta: LocalMapDelta | None,
+        *,
+        peer_forbidden_cells: set[tuple[int, int]] | None = None,
+        peer_exclusion_circles: tuple[PeerExclusion, ...] = (),
     ) -> LocalMapDelta:
-        changed = self._cells ^ cells
+        peers = set() if peer_forbidden_cells is None else peer_forbidden_cells
+        combined = cells | peers
+        changed = self._cells ^ combined
+        changed.update(self._peer_forbidden_cells ^ peers)
         if persistent_delta is not None:
             changed.update(
                 (update.gx, update.gy)
                 for update in persistent_delta.changed_cells
             )
-        self._cells = cells
+        self._cells = combined
+        self._occupied_cells = set(cells)
+        self._peer_forbidden_cells = set(peers)
+        self._peer_exclusion_circles = peer_exclusion_circles
         return LocalMapDelta(
             tuple(
                 MapCellUpdate(gx, gy, self.get_cell(gx, gy))
                 for gx, gy in sorted(changed, key=lambda cell: (cell[1], cell[0]))
-            )
+            ),
+            tuple(sorted(peers, key=lambda cell: (cell[1], cell[0]))),
         )
 
     def get_cell(self, gx: int, gy: int) -> int:
+        if (gx, gy) in self._peer_forbidden_cells:
+            return FORBIDDEN
         return (
             OCCUPIED
             if (gx, gy) in self._cells
@@ -555,7 +556,19 @@ class _TransientPlanningGrid:
         return (gx, gy) not in self._cells and self._persistent.is_unknown(gx, gy)
 
     def is_forbidden(self, gx: int, gy: int) -> bool:
-        return (gx, gy) not in self._cells and self._persistent.is_forbidden(gx, gy)
+        return (gx, gy) in self._peer_forbidden_cells or (
+            (gx, gy) not in self._cells and self._persistent.is_forbidden(gx, gy)
+        )
+
+    def cell_without_peers(self, gx: int, gy: int) -> int:
+        return (
+            OCCUPIED
+            if (gx, gy) in self._occupied_cells
+            else self._persistent.get_cell(gx, gy)
+        )
+
+    def peer_exclusion_circles(self) -> tuple[PeerExclusion, ...]:
+        return self._peer_exclusion_circles
 
     def snapshot(self) -> dict[str, object]:
         snapshot = self._persistent.snapshot()
@@ -564,10 +577,18 @@ class _TransientPlanningGrid:
             for cell in snapshot["cells"]
         }
         states.update((cell, OCCUPIED) for cell in self._cells)
+        states.update((cell, FORBIDDEN) for cell in self._peer_forbidden_cells)
         snapshot["cells"] = [
             MapCellUpdate(gx, gy, state).as_dict()
             for (gx, gy), state in sorted(
                 states.items(), key=lambda item: (item[0][1], item[0][0])
+            )
+        ]
+        snapshot["peer_forbidden_cells"] = [
+            {"gx": gx, "gy": gy}
+            for gx, gy in sorted(
+                self._peer_forbidden_cells,
+                key=lambda cell: (cell[1], cell[0]),
             )
         ]
         return snapshot
@@ -601,35 +622,19 @@ def _dynamic_hit_cells(
     return cells
 
 
-def _circle_cells(
-    x_m: float,
-    y_m: float,
-    radius_m: float,
-    resolution_m: float,
-) -> set[tuple[int, int]]:
-    center_x = x_m / resolution_m
-    center_y = y_m / resolution_m
-    radius = radius_m / resolution_m
-    return {
-        (gx, gy)
-        for gy in range(
-            math.floor(center_y - radius),
-            math.floor(center_y + radius) + 1,
-        )
-        for gx in range(
-            math.floor(center_x - radius),
-            math.floor(center_x + radius) + 1,
-        )
-        if cell_overlaps_circle(gx, gy, center_x, center_y, radius**2)
-    }
-
-
-def _peer_vehicle_cells(
+def _peer_vehicle_exclusions(
     states: tuple[PeerVehicleState, ...],
     anchor: AnchorSpec,
     resolution_m: float,
-) -> set[tuple[int, int]]:
+    own_radius_m: float,
+) -> tuple[
+    set[tuple[int, int]],
+    tuple[PeerExclusion, ...],
+    tuple[PeerExclusion, ...],
+]:
     cells = set()
+    circles = []
+    hit_envelopes = []
     for state in states:
         x_m, y_m, _ = anchor.global_to_anchor(
             state.global_x_m,
@@ -637,15 +642,45 @@ def _peer_vehicle_cells(
             state.global_yaw_rad,
         )
         uncertainty_m = math.sqrt(max(state.covariance[:2]))
-        cells.update(
-            _circle_cells(
+        exclusion_radius_m = (
+            own_radius_m
+            + state.radius_m
+            + uncertainty_m
+            + AUTOMATIC_MINIMUM_CLEARANCE_M
+        )
+        circles.append((x_m, y_m, exclusion_radius_m))
+        hit_envelopes.append(
+            (
                 x_m,
                 y_m,
-                state.radius_m + uncertainty_m,
-                resolution_m,
+                state.radius_m
+                + uncertainty_m
+                + resolution_m / math.sqrt(2),
             )
         )
-    return cells
+        min_gx = math.ceil(
+            (x_m - exclusion_radius_m) / resolution_m - 0.5 - 1e-12
+        )
+        max_gx = math.floor(
+            (x_m + exclusion_radius_m) / resolution_m - 0.5 + 1e-12
+        )
+        min_gy = math.ceil(
+            (y_m - exclusion_radius_m) / resolution_m - 0.5 - 1e-12
+        )
+        max_gy = math.floor(
+            (y_m + exclusion_radius_m) / resolution_m - 0.5 + 1e-12
+        )
+        cells.update(
+            (gx, gy)
+            for gy in range(min_gy, max_gy + 1)
+            for gx in range(min_gx, max_gx + 1)
+            if math.hypot(
+                (gx + 0.5) * resolution_m - x_m,
+                (gy + 0.5) * resolution_m - y_m,
+            )
+            <= exclusion_radius_m + 1e-12
+        )
+    return cells, tuple(circles), tuple(hit_envelopes)
 
 
 @dataclass
@@ -674,25 +709,32 @@ class RobotNode:
         default_factory=set,
         repr=False,
     )
+    _own_radius_m: float = field(default=0.5, init=False, repr=False)
+    _latest_scan_monotonic_s: float | None = field(
+        default=None,
+        init=False,
+        repr=False,
+    )
 
     def __post_init__(self) -> None:
         self._planning_map = _TransientPlanningGrid(self.local_state.local_map)
 
     def control(self, vehicle: Vehicle, sensor_grid: MapGrid, now: float) -> None:
+        self._own_radius_m = vehicle.radius
         peer_states = (
             () if self.map_sync is None else self.map_sync.peer_vehicle_states()
         )
         self._update_planning_map(peer_states=peer_states)
-        for state in peer_states:
-            uncertainty_m = math.sqrt(max(state.covariance[:2]))
-            for gx, gy in _circle_cells(
-                state.global_x_m,
-                state.global_y_m,
-                state.radius_m + uncertainty_m,
-                1.0,
-            ):
-                if sensor_grid.in_bounds(gx, gy):
-                    sensor_grid.set_cell(gx, gy, WALL)
+        scan_age_s = (
+            None
+            if self._latest_scan_monotonic_s is None
+            else now - self._latest_scan_monotonic_s
+        )
+        scan_fresh = (
+            self.latest_frame is not None
+            and scan_age_s is not None
+            and -1e-12 <= scan_age_s <= TMINI_SCAN_CONFIG.scan_time + 1e-12
+        )
         self.controller.tick(
             vehicle=vehicle,
             grid=sensor_grid,
@@ -703,6 +745,10 @@ class RobotNode:
             map_delta=self._pending_map_delta,
             advance_result=self._pending_advance,
             now=now,
+            safety_scan_points=(
+                self.latest_frame.scan_points if scan_fresh else ()
+            ),
+            safety_scan_healthy=scan_fresh,
         )
         self._pending_map_delta = None
         self._pending_advance = SafetyAdvanceResult()
@@ -717,14 +763,31 @@ class RobotNode:
             peer_states = (
                 () if self.map_sync is None else self.map_sync.peer_vehicle_states()
             )
+        peer_cells, peer_circles, peer_hit_envelopes = _peer_vehicle_exclusions(
+            peer_states,
+            self.local_state.anchor,
+            self.local_state.local_map.resolution_m,
+            self._own_radius_m,
+        )
+        dynamic_cells = {
+            cell
+            for cell in self._lidar_dynamic_cells
+            if all(
+                math.hypot(
+                    (cell[0] + 0.5) * self.local_state.local_map.resolution_m
+                    - peer_x_m,
+                    (cell[1] + 0.5) * self.local_state.local_map.resolution_m
+                    - peer_y_m,
+                )
+                > radius_m + 1e-12
+                for peer_x_m, peer_y_m, radius_m in peer_hit_envelopes
+            )
+        }
         planning_delta = self._planning_map.update(
-            self._lidar_dynamic_cells
-            | _peer_vehicle_cells(
-                peer_states,
-                self.local_state.anchor,
-                self.local_state.local_map.resolution_m,
-            ),
+            dynamic_cells,
             persistent_delta,
+            peer_forbidden_cells=peer_cells,
+            peer_exclusion_circles=peer_circles,
         )
         if not planning_delta.changed_cells:
             return
@@ -744,7 +807,8 @@ class RobotNode:
             tuple(
                 pending[cell]
                 for cell in sorted(pending, key=lambda cell: (cell[1], cell[0]))
-            )
+            ),
+            planning_delta.peer_forbidden_cells,
         )
 
     def sample(
@@ -752,9 +816,12 @@ class RobotNode:
         truth_pose: tuple[float, float, float],
         scan_points: tuple[LaserPoint, ...],
         wall_timestamp: float,
+        monotonic_timestamp: float,
         vehicle: Vehicle,
     ) -> None:
         truth_x_m, truth_y_m, truth_yaw_rad = truth_pose
+        self._own_radius_m = vehicle.radius
+        self._latest_scan_monotonic_s = monotonic_timestamp
         self.local_state.update_from_truth(
             truth_x_m,
             truth_y_m,
@@ -1050,6 +1117,7 @@ class FleetRuntime:
                 ),
                 scans[vehicle_id],
                 wall_timestamp,
+                self.world.now,
                 self.world.vehicle(vehicle_id),
             )
 
@@ -1090,6 +1158,7 @@ class FleetRuntime:
                     (vehicle.x, vehicle.y, vehicle.yaw),
                     self.world.scan(vehicle_id),
                     self._wall_time_offset + scan_time,
+                    scan_time,
                     vehicle,
                 )
                 self._next_scan_index[vehicle_id] += 1

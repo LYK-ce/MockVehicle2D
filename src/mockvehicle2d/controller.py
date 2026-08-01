@@ -20,6 +20,7 @@ if TYPE_CHECKING:
         PoseEstimate,
     )
     from mockvehicle2d.map_grid import MapGrid
+    from mockvehicle2d.scan import LaserPoint
     from mockvehicle2d.safety import LocalSafetyRuntime, SafetyAdvanceResult
     from mockvehicle2d.vehicle import Vehicle
 
@@ -191,6 +192,7 @@ class RobotController:
         self._manual_setpoint: tuple[float, float] | None = None
         self._manual_deadline: float | None = None
         self._needs_start = False
+        self._deferred_edge_cell: tuple[int, int] | None = None
 
     @property
     def is_automatic_motion_active(self) -> bool:
@@ -225,9 +227,18 @@ class RobotController:
         map_delta: LocalMapDelta | None,
         advance_result: SafetyAdvanceResult,
         now: float,
+        safety_scan_points: tuple[LaserPoint, ...] | None = None,
+        safety_scan_healthy: bool = True,
     ) -> None:
         if self.mode is OpMode.MANUAL:
-            self._tick_manual(vehicle, grid, safety, now)
+            self._tick_manual(
+                vehicle,
+                grid,
+                safety,
+                now,
+                safety_scan_points,
+                safety_scan_healthy,
+            )
             return
         self._manual_setpoint = None
         self._manual_deadline = None
@@ -263,6 +274,8 @@ class RobotController:
             desired[0],
             desired[1],
             automatic=True,
+            scan_points=safety_scan_points,
+            scan_healthy=safety_scan_healthy,
         )
         if decision.state == "fault":
             vehicle.stop()
@@ -270,7 +283,20 @@ class RobotController:
             self._finish_blocked(vehicle)
             return
         if decision.state == "stopped":
-            vehicle.install_drive(0.0, decision.angular_rps, now)
+            vehicle.stop(now)
+            if self.navigation.finish_nearby_safe_stop(pose, decision.reason):
+                self._finish_reached(vehicle)
+                return
+            edge_cell = (
+                self.navigation.unmapped_edge_evidence_cell(safety, pose, local_map)
+                if decision.reason == "safety_edge"
+                else None
+            )
+            if edge_cell is not None and edge_cell != self._deferred_edge_cell:
+                self._deferred_edge_cell = edge_cell
+                return
+            self.navigation.block(decision.reason or "safety_obstacle")
+            self._finish_blocked(vehicle)
             return
         vehicle.install_drive(decision.linear_mps, decision.angular_rps, now)
 
@@ -470,6 +496,8 @@ class RobotController:
         grid: MapGrid,
         safety: LocalSafetyRuntime,
         now: float,
+        scan_points: tuple[LaserPoint, ...] | None,
+        scan_healthy: bool,
     ) -> None:
         if (
             self._manual_setpoint is None
@@ -485,6 +513,8 @@ class RobotController:
             grid,
             *self._manual_setpoint,
             automatic=False,
+            scan_points=scan_points,
+            scan_healthy=scan_healthy,
         )
         if decision.state == "fault" or (
             decision.state == "stopped" and decision.angular_rps == 0.0
@@ -503,6 +533,7 @@ class RobotController:
         vehicle_radius_m: float,
     ) -> None:
         self._needs_start = False
+        self._deferred_edge_cell = None
         if self.active_mission is None:
             if not self._pending:
                 self.auto_state = AutoState.IDLE

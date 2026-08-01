@@ -527,12 +527,19 @@ class AnchoredOdometry:
     ) -> PoseEstimate:
         if not _finite(dx_m, dy_m, dyaw_rad, timestamp):
             raise ValueError("scan-match correction must be finite")
+        covariance = tuple(
+            variance + correction**2
+            for variance, correction in zip(
+                self._pose.covariance,
+                (dx_m, dy_m, dyaw_rad),
+            )
+        )
         self._pose = PoseEstimate(
             self.anchor.anchor_id,
             self._pose.x_m + dx_m,
             self._pose.y_m + dy_m,
             _wrapped(self._pose.yaw_rad + dyaw_rad),
-            self._pose.covariance,
+            covariance,
             self._pose.quality,
             timestamp,
             self._pose.revision + 1,
@@ -553,6 +560,7 @@ class MapCellUpdate:
 @dataclass(frozen=True)
 class LocalMapDelta:
     changed_cells: tuple[MapCellUpdate, ...]
+    peer_forbidden_cells: tuple[tuple[int, int], ...] | None = None
 
 
 class ObservedGrid:
@@ -813,7 +821,7 @@ class AnchoredLocalState:
         self.last_scan_match = self.scan_matcher.match(
             scan_points, self.pose, self.local_map
         )
-        if self.last_scan_match.accepted:
+        if self.last_scan_match.accepted and any(self.pose.covariance):
             self.odometry.apply_correction(
                 self.last_scan_match.correction_x_m,
                 self.last_scan_match.correction_y_m,

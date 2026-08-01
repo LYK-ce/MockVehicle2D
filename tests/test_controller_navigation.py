@@ -22,12 +22,20 @@ from mockvehicle2d.controller import (
 from mockvehicle2d.local_state import (
     AnchorSpec,
     AnchoredLocalState,
+    LocalMapDelta,
+    MapCellUpdate,
+    OCCUPIED,
     OdometryConfig,
     ObservedGrid,
     PoseEstimate,
 )
 from mockvehicle2d.map_grid import MapGrid
-from mockvehicle2d.safety import LocalSafetyRuntime, SafetyAdvanceResult
+from mockvehicle2d.safety import (
+    LocalSafetyRuntime,
+    SafetyAdvanceResult,
+    SafetyDecision,
+    SafetyObservation,
+)
 from mockvehicle2d.server import VehicleRuntime
 from mockvehicle2d.vehicle import Vehicle
 
@@ -79,6 +87,136 @@ def start_missions(runtime: VehicleRuntime, *missions: GotoMission) -> None:
 
 
 class TestControllerNavigation(unittest.TestCase):
+    def test_nearby_safe_candidates_prefer_the_current_side(self) -> None:
+        local_map = ObservedGrid(
+            AnchorSpec("candidate-anchor", 0.0, 0.0, 0.0),
+            resolution_m=0.5,
+        )
+        pose = PoseEstimate(
+            "candidate-anchor",
+            0.0,
+            0.0,
+            0.0,
+            (0.0, 0.0, 0.0),
+            "nominal",
+            0.0,
+            0,
+        )
+        navigation = RobotController().navigation
+        navigation.start(4.0, 0.0, local_map=local_map, pose=pose)
+
+        first = navigation._build_safe_candidates(pose, local_map)
+        second = navigation._build_safe_candidates(pose, local_map)
+
+        self.assertEqual(first, second)
+        self.assertEqual(
+            len(first),
+            len({access_cell for _, access_cell in first}),
+        )
+        self.assertLessEqual(len(first), 64)
+        self.assertTrue(
+            all(
+                navigation._point_approach_distance_m(point) <= 0.95 + 1e-9
+                for point, _ in first
+            )
+        )
+        self.assertEqual(
+            {
+                access_cell
+                for point, access_cell in first
+                if math.isclose(point[0], 2.55) and math.isclose(point[1], 0.0)
+            },
+            {(5, -1), (5, 0)},
+        )
+        self.assertEqual(
+            math.dist((pose.x_m, pose.y_m), first[0][0]),
+            min(
+                math.dist((pose.x_m, pose.y_m), point)
+                for point, _ in first
+            ),
+        )
+
+    def test_nearby_completion_accounts_for_position_uncertainty(self) -> None:
+        local_map = ObservedGrid(
+            AnchorSpec("uncertain-anchor", 0.0, 0.0, 0.0),
+            resolution_m=0.5,
+        )
+        uncertain_pose = PoseEstimate(
+            "uncertain-anchor",
+            0.6,
+            0.0,
+            0.0,
+            (0.04, 0.0, 0.0),
+            "nominal",
+            0.0,
+            0,
+        )
+        navigation = RobotController().navigation
+        navigation.start(2.0, 0.0, local_map=local_map, pose=uncertain_pose)
+
+        candidates = navigation._build_safe_candidates(
+            uncertain_pose,
+            local_map,
+        )
+
+        self.assertTrue(candidates)
+        self.assertTrue(
+            all(
+                navigation._point_approach_distance_m(point)
+                <= 0.75 + 1e-9
+                for point, _ in candidates
+            )
+        )
+        self.assertFalse(navigation.finish_nearby_safe_stop(uncertain_pose))
+        certain_pose = PoseEstimate(
+            "uncertain-anchor",
+            0.6,
+            0.0,
+            0.0,
+            (0.0, 0.0, 0.0),
+            "nominal",
+            0.0,
+            1,
+        )
+        self.assertTrue(navigation.finish_nearby_safe_stop(certain_pose))
+
+    def test_new_obstacle_exits_final_approach_and_replans(self) -> None:
+        local_map = ObservedGrid(
+            AnchorSpec("final-approach-anchor", 0.0, 0.0, 0.0),
+            resolution_m=1.0,
+        )
+        pose = PoseEstimate(
+            "final-approach-anchor",
+            0.5,
+            0.5,
+            0.0,
+            (0.0, 0.0, 0.0),
+            "nominal",
+            0.0,
+            0,
+        )
+        navigation = RobotController().navigation
+        navigation.start(3.5, 0.5, local_map=local_map, pose=pose)
+        unsafe_endpoint = 1.5, 0.5
+        navigation._clear_pending_planning()
+        navigation.goal = unsafe_endpoint
+        navigation.goal_mode = "nearby_safe"
+        navigation._goal_access_cell = (0, 0)
+        navigation._set_path([(0, 0)])
+        navigation._final_approach = True
+
+        desired = navigation.update(
+            pose=pose,
+            local_map=local_map,
+            max_linear_mps=1.0,
+            max_angular_rps=1.0,
+            map_delta=LocalMapDelta((MapCellUpdate(1, 0, OCCUPIED),)),
+        )
+
+        self.assertFalse(navigation.snapshot()["final_approach"])
+        self.assertEqual(desired, (0.0, 0.0))
+        self.assertTrue(navigation.snapshot()["planning"])
+
     def test_unknown_dead_end_turns_around_exits_and_replans(self) -> None:
         walls = {
             *((x, y) for x in range(3, 16) for y in (3, 7)),
@@ -205,6 +343,71 @@ class TestControllerNavigation(unittest.TestCase):
         self.assertIn(runtime.controller.navigation.status, {"blocked", "reached"})
         if runtime.controller.navigation.status == "blocked":
             self.assertEqual(runtime.controller.navigation.reason, "no_path")
+
+    def test_fresh_edge_stop_is_absorbed_then_replanned(self) -> None:
+        class OneShotEdgeSafety(LocalSafetyRuntime):
+            def __init__(self) -> None:
+                super().__init__()
+                self.fired = False
+
+            def evaluate(
+                self,
+                vehicle,
+                grid,
+                desired_linear_mps,
+                desired_angular_rps,
+                *,
+                automatic,
+                scan_points=None,
+                scan_healthy=True,
+            ) -> SafetyDecision:
+                if automatic and desired_linear_mps and not self.fired:
+                    self.fired = True
+                    self.observation = SafetyObservation(
+                        edge_clearance_m=0.25,
+                        edge_point_vehicle_m=(1.5, 0.0),
+                    )
+                    self.decision = SafetyDecision(
+                        0.0,
+                        desired_angular_rps,
+                        "stopped",
+                        "safety_edge",
+                    )
+                    return self.decision
+                return super().evaluate(
+                    vehicle,
+                    grid,
+                    desired_linear_mps,
+                    desired_angular_rps,
+                    automatic=automatic,
+                    scan_points=scan_points,
+                    scan_healthy=scan_healthy,
+                )
+
+        runtime = make_runtime(
+            MapGrid.from_wall_set(20, 12, set()),
+            map_resolution_m=0.5,
+        )
+        runtime.safety = OneShotEdgeSafety()
+        start_missions(
+            runtime,
+            GotoMission("fresh-edge", "global_map", 8.5, 5.5, 2),
+        )
+
+        deferred = False
+        for tick in range(1, 300):
+            runtime.update(tick / 6, tick / 6)
+            deferred |= (
+                runtime.controller.auto_state is AutoState.ACTIVE
+                and runtime.safety.decision.state == "stopped"
+            )
+            if runtime.controller.auto_state is not AutoState.ACTIVE:
+                break
+
+        self.assertTrue(deferred)
+        self.assertFalse(runtime.vehicle.collision)
+        self.assertEqual(runtime.controller.auto_state, AutoState.IDLE)
+        self.assertEqual(runtime.controller.navigation.status, "reached")
 
     def test_unknown_next_cell_is_traversable_but_speed_limited(self) -> None:
         anchor = AnchorSpec("unknown-anchor", 10.0, 10.0, 0.0)
@@ -333,7 +536,7 @@ class TestControllerNavigation(unittest.TestCase):
         )
         self.assertGreater(max_lateral_deviation, 1.0)
 
-    def test_obstacle_goal_finishes_at_confirmed_safe_stop_within_one_metre(self) -> None:
+    def test_obstacle_goal_blocks_when_one_metre_and_clearance_are_incompatible(self) -> None:
         grid = MapGrid.from_wall_set(16, 12, {(8, 5)})
         runtime = make_runtime(grid, map_resolution_m=0.5)
         requested = (8.5, 5.5)
@@ -342,31 +545,25 @@ class TestControllerNavigation(unittest.TestCase):
             GotoMission("blocked-goal", "global_map", *requested, 2),
         )
 
-        event_cursor = runtime.controller.latest_event_seq
+        # A radius-0.5 vehicle needs sqrt(2) * 0.5 + 0.8 = 1.507 m
+        # centre distance around this cell corner, so the 1 m body-distance
+        # terminal bound and 0.30 m clearance have no intersection.
         for tick in range(1, 900):
             runtime.update(tick / 6, tick / 6)
-            new_events = runtime.controller.events_after(event_cursor)
-            if new_events:
-                event_cursor = new_events[-1].event_seq
-            reached = next(
-                (
-                    event
-                    for event in new_events
-                    if event.status == "reached"
-                ),
-                None,
-            )
-            if reached is not None:
+            if runtime.controller.auto_state is not AutoState.ACTIVE:
                 break
+        else:
+            self.fail(runtime.controller.snapshot())
 
-        self.assertIsNotNone(reached, runtime.controller.snapshot())
         self.assertFalse(runtime.vehicle.collision)
-        self.assertEqual(runtime.controller.navigation.goal_mode, "nearby_safe")
-        self.assertEqual(runtime.controller.navigation.reason, "nearby_safe_stop")
-        self.assertLessEqual(
-            runtime.controller.navigation.snapshot()["approach_distance_m"],
-            1.0,
+        self.assertEqual(runtime.controller.auto_state, AutoState.BLOCKED)
+        self.assertEqual(runtime.controller.navigation.status, "blocked")
+        self.assertEqual(runtime.controller.navigation.reason, "no_path")
+        self.assertEqual(
+            runtime.controller.navigation.detail,
+            "nearby_safe_goal_unavailable",
         )
+        self.assertEqual(runtime.vehicle.body_velocities(), (0.0, 0.0))
 
     def test_planning_work_is_sliced_and_out_of_range_search_terminates(self) -> None:
         anchor = AnchorSpec("budget-anchor", 10.0, 10.0, 0.0)

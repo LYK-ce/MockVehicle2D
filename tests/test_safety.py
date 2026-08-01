@@ -12,7 +12,9 @@ sys.path.insert(0, str(REPO_ROOT / "src"))
 from mockvehicle2d.collision import is_swept_circle_passable
 from mockvehicle2d.map_grid import MapGrid
 from mockvehicle2d.safety import (
+    AUTOMATIC_MINIMUM_CLEARANCE_M,
     HARD_STOP_CLEARANCE_M,
+    MAX_TRANSLATION_STEP_M,
     SLOW_ZONE_CLEARANCE_M,
     LocalSafetyRuntime,
     SafetyGovernor,
@@ -59,6 +61,26 @@ class MapStateSafetyTest(unittest.TestCase):
 
 
 class SafetySensingTest(unittest.TestCase):
+    def test_supplied_tmini_scan_stops_at_the_automatic_clearance_band(self) -> None:
+        vehicle = Vehicle(4.0, 4.0, now=0.0)
+        decision = LocalSafetyRuntime().evaluate(
+            vehicle,
+            MapGrid(8, 8),
+            0.5,
+            0.0,
+            automatic=True,
+            scan_points=(
+                LaserPoint(
+                    0.0,
+                    vehicle.radius + AUTOMATIC_MINIMUM_CLEARANCE_M - 1e-6,
+                    1.0,
+                    True,
+                ),
+            ),
+        )
+
+        self.assertEqual((decision.state, decision.reason), ("stopped", "safety_obstacle"))
+
     def test_obstacle_clearance_selects_travel_direction_and_ignores_no_return(self) -> None:
         points = [
             LaserPoint(0.0, 0.0, 0.0),
@@ -121,6 +143,21 @@ class SafetyGovernorTest(unittest.TestCase):
         self.assertEqual(decision.reason, "safety_obstacle")
         self.assertAlmostEqual(decision.linear_mps, 0.25)
         self.assertEqual(decision.angular_rps, 0.2)
+
+    def test_automatic_stops_one_motion_step_before_hard_clearance(self) -> None:
+        decision = self.governor.limit(
+            0.5,
+            0.0,
+            SafetyObservation(obstacle_clearance_m=AUTOMATIC_MINIMUM_CLEARANCE_M),
+            True,
+        )
+
+        self.assertEqual(
+            AUTOMATIC_MINIMUM_CLEARANCE_M,
+            HARD_STOP_CLEARANCE_M + MAX_TRANSLATION_STEP_M,
+        )
+        self.assertEqual((decision.state, decision.reason), ("stopped", "safety_obstacle"))
+        self.assertEqual(decision.linear_mps, 0.0)
 
     def test_hard_edge_stops_manual_translation_but_allows_rotation(self) -> None:
         decision = self.governor.limit(

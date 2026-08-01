@@ -17,6 +17,7 @@ from mockvehicle2d.local_state import (
     ObservedGrid,
     PoseEstimate,
     ScanMatchConfig,
+    ScanMatchResult,
 )
 from mockvehicle2d.scan import LaserPoint, ScanConfig
 
@@ -223,6 +224,7 @@ def test_accepted_correction_persists_into_following_odometry() -> None:
         LANDMARK_SCAN, state.pose, 0.0, SCAN_CONFIG
     )
     state.odometry.apply_correction(0.4, -0.3, math.radians(5), timestamp=1.0)
+    prior = state.pose
 
     state.match_and_integrate_scan(LANDMARK_SCAN, 2.0, SCAN_CONFIG)
     corrected_error = math.hypot(state.pose.x_m, state.pose.y_m) + abs(
@@ -230,6 +232,40 @@ def test_accepted_correction_persists_into_following_odometry() -> None:
     )
     assert state.last_scan_match is not None and state.last_scan_match.accepted
     assert corrected_error < math.hypot(0.4, 0.3) + math.radians(5)
+    assert state.pose.covariance != prior.covariance
+    assert all(
+        corrected >= before
+        for corrected, before in zip(state.pose.covariance, prior.covariance)
+    )
 
     state.update_from_truth(1.0, 0.0, 0.0, timestamp=3.0)
     assert abs(state.pose.x_m - 1.0) < 0.4
+
+
+def test_perfect_odometry_is_not_shifted_by_automatic_scan_matching() -> None:
+    state = AnchoredLocalState(
+        ANCHOR,
+        truth_x_m=0.0,
+        truth_y_m=0.0,
+        truth_yaw_rad=0.0,
+        timestamp=0.0,
+        map_resolution_m=0.25,
+    )
+    state.scan_matcher.match = lambda *_: ScanMatchResult(
+        True,
+        0.9,
+        7,
+        0.1,
+        0.1,
+        0.2,
+        math.radians(1),
+        1,
+        None,
+        7,
+    )
+
+    state.match_and_integrate_scan(LANDMARK_SCAN, 1.0, SCAN_CONFIG)
+
+    assert state.last_scan_match is not None and state.last_scan_match.accepted
+    assert state.pose.x_m == state.pose.y_m == state.pose.yaw_rad == 0.0
+    assert state.pose.covariance == (0.0, 0.0, 0.0)

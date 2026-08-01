@@ -8,6 +8,7 @@ import math
 from typing import Iterable, Literal
 
 from mockvehicle2d.collision import (
+    _point_segment_distance_squared,
     cell_overlaps_circle,
     is_strict_overlap,
     segment_aabb_distance_squared,
@@ -69,6 +70,7 @@ class DStarLitePlanner:
             or max_cells <= 0
         ):
             raise ValueError("invalid D* Lite configuration")
+        self._grid = grid
         self.resolution_m = grid.resolution_m
         self.vehicle_radius_m = vehicle_radius_m
         self.hard_clearance_m = hard_clearance_m
@@ -81,9 +83,14 @@ class DStarLitePlanner:
             vehicle_radius_m + hard_clearance_m
         ) / grid.resolution_m
         self._inflation_cells = math.ceil(self._planning_radius_cells)
+        snapshot = grid.snapshot()
         self._states = {
             (cell["gx"], cell["gy"]): cell["state"]
-            for cell in grid.snapshot()["cells"]
+            for cell in snapshot["cells"]
+        }
+        self._peer_forbidden_cells = {
+            (cell["gx"], cell["gy"])
+            for cell in snapshot.get("peer_forbidden_cells", ())
         }
         self._bounds: tuple[int, int, int, int] | None = None
         self._start: Cell | None = None
@@ -123,6 +130,30 @@ class DStarLitePlanner:
         return self._bounds_cell_count(
             self._planning_bounds(start, goal)
         ) <= self.max_cells
+
+    def observe_changes(
+        self,
+        changed_cells: Iterable[MapCellUpdate],
+    ) -> tuple[MapCellUpdate, ...]:
+        """Absorb occupancy updates without changing the active route endpoints."""
+        changes = self._record_changes(changed_cells)
+        if changes and self._bounds is not None:
+            self._apply_changes(changes)
+        return changes
+
+    def set_peer_forbidden_cells(
+        self,
+        cells: Iterable[Cell],
+    ) -> None:
+        updated = set(cells)
+        if any(
+            not isinstance(cell, tuple)
+            or len(cell) != 2
+            or any(type(value) is not int for value in cell)
+            for cell in updated
+        ):
+            raise ValueError("peer forbidden cells must be integer pairs")
+        self._peer_forbidden_cells = updated
 
     def validate_plan_request(self, start: Cell, goal: Cell) -> None:
         """Reject a request that cannot fit inside this planner's hard bounds."""
@@ -175,7 +206,8 @@ class DStarLitePlanner:
             ) / self.resolution_m,
             block_tangent=extra_clearance_m > 0,
             require_observed=require_observed,
-        )
+            ignore_peer_forbidden=True,
+        ) and not self._peer_circle_segment_blocked(source_m, destination_m)
 
     def best_start_connection(
         self,
@@ -295,13 +327,7 @@ class DStarLitePlanner:
         previous_start_position = self._start_position_cells
         self._start_position_cells = start_position_cells
 
-        changes = tuple(changed_cells)
-        for change in changes:
-            self._validate_update(change)
-            if change.state == UNKNOWN:
-                self._states.pop((change.gx, change.gy), None)
-            else:
-                self._states[(change.gx, change.gy)] = change.state
+        changes = self._record_changes(changed_cells)
 
         new_planning_session = (
             not self._planning_pending or self._goal != goal
@@ -398,6 +424,19 @@ class DStarLitePlanner:
         for cell in sorted(affected):
             self._update_vertex(cell)
         self._incremental_updates += len(affected)
+
+    def _record_changes(
+        self,
+        changed_cells: Iterable[MapCellUpdate],
+    ) -> tuple[MapCellUpdate, ...]:
+        changes = tuple(changed_cells)
+        for change in changes:
+            self._validate_update(change)
+            if change.state == UNKNOWN:
+                self._states.pop((change.gx, change.gy), None)
+            else:
+                self._states[(change.gx, change.gy)] = change.state
+        return changes
 
     def _advance_shortest_path(self, expansion_budget: int) -> bool:
         assert self._start is not None
@@ -504,6 +543,7 @@ class DStarLitePlanner:
         radius_cells: float | None = None,
         block_tangent: bool = False,
         require_observed: bool = False,
+        ignore_peer_forbidden: bool = False,
     ) -> bool:
         source_x, source_y = source
         destination_x, destination_y = destination
@@ -522,6 +562,15 @@ class DStarLitePlanner:
                 math.floor(max(source_x, destination_x) + radius) + 1,
             ):
                 state = self._states.get((gx, gy), UNKNOWN)
+                peer_forbidden = (gx, gy) in self._peer_forbidden_cells
+                if peer_forbidden and ignore_peer_forbidden:
+                    base_state = getattr(self._grid, "cell_without_peers", None)
+                    state = (
+                        UNKNOWN
+                        if base_state is None
+                        else base_state(gx, gy)
+                    )
+                    peer_forbidden = False
                 if state not in {OCCUPIED, FORBIDDEN} and not (
                     require_observed and state != FREE
                 ):
@@ -536,17 +585,26 @@ class DStarLitePlanner:
                     gx + 1,
                     gy + 1,
                 )
-                if is_strict_overlap(
-                    distance_squared, radius_squared
-                ) or (
-                    block_tangent
-                    and math.isclose(
+                blocked = (
+                    math.isclose(
                         distance_squared,
-                        radius_squared,
-                        rel_tol=1e-12,
+                        0.0,
+                        rel_tol=0.0,
                         abs_tol=1e-12,
                     )
-                ):
+                    if peer_forbidden
+                    else is_strict_overlap(distance_squared, radius_squared)
+                    or (
+                        block_tangent
+                        and math.isclose(
+                            distance_squared,
+                            radius_squared,
+                            rel_tol=1e-12,
+                            abs_tol=1e-12,
+                        )
+                    )
+                )
+                if blocked:
                     if (
                         (allow_forbidden_egress and state == FORBIDDEN)
                         or (
@@ -620,6 +678,27 @@ class DStarLitePlanner:
                     return True
         return False
 
+    def _peer_circle_segment_blocked(
+        self,
+        source_m: tuple[float, float],
+        destination_m: tuple[float, float],
+    ) -> bool:
+        circles = getattr(self._grid, "peer_exclusion_circles", None)
+        if circles is None:
+            return False
+        return any(
+            _point_segment_distance_squared(
+                center_x,
+                center_y,
+                source_m[0],
+                source_m[1],
+                destination_m[0],
+                destination_m[1],
+            )
+            <= radius_m**2 + 1e-12
+            for center_x, center_y, radius_m in circles()
+        )
+
     def _has_start_egress(self) -> bool:
         assert self._start is not None
         return any(
@@ -654,11 +733,14 @@ class DStarLitePlanner:
     def _blocked(self, cell: Cell) -> bool:
         if not self._inside(cell):
             return True
+        if cell in self._peer_forbidden_cells:
+            return True
         radius = self._inflation_cells
         centre_x, centre_y = cell[0] + 0.5, cell[1] + 0.5
         radius_squared = self._planning_radius_cells**2
         return any(
             self._states.get((gx, gy), UNKNOWN) in {OCCUPIED, FORBIDDEN}
+            and (gx, gy) not in self._peer_forbidden_cells
             and (
                 (gx, gy) == cell
                 or cell_overlaps_circle(

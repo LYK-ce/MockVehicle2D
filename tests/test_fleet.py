@@ -25,10 +25,20 @@ from mockvehicle2d.fleet import (
     FleetVehicleSpec,
     fleet_handler,
 )
-from mockvehicle2d.local_state import OdometryConfig, PoseEstimate
+from mockvehicle2d.local_state import (
+    OCCUPIED,
+    LocalMapDelta,
+    OdometryConfig,
+    PoseEstimate,
+)
 from mockvehicle2d.map_grid import WALL, MapGrid
 from mockvehicle2d.map_sync import PEER_STATE_TTL_S, P2PSettings
-from mockvehicle2d.safety import HARD_STOP_CLEARANCE_M
+from mockvehicle2d.scan import TMINI_SCAN_CONFIG
+from mockvehicle2d.safety import (
+    AUTOMATIC_MINIMUM_CLEARANCE_M,
+    HARD_STOP_CLEARANCE_M,
+)
+from mockvehicle2d.server import generate_map
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -56,7 +66,13 @@ def free_grid(size: int = 40) -> MapGrid:
     return MapGrid.from_wall_set(size, size, set())
 
 
-def peer_fleet(first: AnchorPose, second: AnchorPose) -> FleetRuntime:
+def peer_fleet(
+    first: AnchorPose,
+    second: AnchorPose,
+    *,
+    grid: MapGrid | None = None,
+    voxels: list[dict[str, object]] | None = None,
+) -> FleetRuntime:
     specs = tuple(
         FleetVehicleSpec(
             f"vehicle_{number}",
@@ -74,7 +90,8 @@ def peer_fleet(first: AnchorPose, second: AnchorPose) -> FleetRuntime:
             100,
             P2PSettings(Path("map-sync-node"), Path("runtime")),
         ),
-        grid=free_grid(),
+        grid=free_grid() if grid is None else grid,
+        voxels=voxels,
     )
     for vehicle_id, node in fleet.nodes.items():
         node.map_sync.configure_network(
@@ -182,6 +199,92 @@ class TestFleetScenario(unittest.TestCase):
 
 
 class TestFleetRuntime(unittest.TestCase):
+    def test_missing_or_stale_tmini_scan_blocks_automatic_motion(self) -> None:
+        for latest_scan_time in (
+            None,
+            -TMINI_SCAN_CONFIG.scan_time - 0.01,
+        ):
+            with self.subTest(latest_scan_time=latest_scan_time):
+                fleet = FleetRuntime.create(
+                    scenario(spec(1, 5.0, 5.0)),
+                    grid=free_grid(),
+                )
+                node = fleet.nodes["vehicle_1"]
+                fleet.handle_command(
+                    "vehicle_1",
+                    ModeCommand(1, ModeAction.SWITCH_TO_AUTO),
+                )
+                fleet.handle_command(
+                    "vehicle_1",
+                    AutoCommand(
+                        2,
+                        AutoAction.PUSH,
+                        (GotoMission("scan-health", "global_map", 8.0, 5.0, 2),),
+                    ),
+                )
+                node._latest_scan_monotonic_s = latest_scan_time
+
+                fleet.tick(fleet.tick_s)
+
+                self.assertEqual(node.controller.auto_state.value, "blocked")
+                self.assertEqual(
+                    node.controller.navigation.reason,
+                    "safety_sensor_fault",
+                )
+                self.assertEqual(
+                    fleet.world.vehicle("vehicle_1").body_velocities(),
+                    (0.0, 0.0),
+                )
+
+    def test_peer_forbidden_delta_distinguishes_unchanged_from_cleared(self) -> None:
+        self.assertIsNone(LocalMapDelta(()).peer_forbidden_cells)
+        fleet = peer_fleet(
+            AnchorPose(5.0, 5.0, 0.0),
+            AnchorPose(10.0, 10.0, 0.0),
+        )
+        source = fleet.nodes["vehicle_1"].map_sync
+        receiver = fleet.nodes["vehicle_2"]
+        payload = source.prepare_peer_state()
+        self.assertTrue(
+            receiver.map_sync.receive_peer_state(
+                "peer_1",
+                "vehicle_1",
+                payload,
+                received_at_s=1.0,
+            )
+        )
+
+        peer_hit = (-10, -10)
+        outside_peer_footprint = (-8, -10)
+        receiver._lidar_dynamic_cells = {
+            peer_hit,
+            outside_peer_footprint,
+        }
+        receiver._update_planning_map(
+            peer_states=receiver.map_sync.peer_vehicle_states(now_s=1.0)
+        )
+        self.assertTrue(receiver._pending_map_delta.peer_forbidden_cells)
+        self.assertEqual(
+            receiver._planning_map.cell_without_peers(*peer_hit),
+            receiver.local_state.local_map.get_cell(*peer_hit),
+        )
+        self.assertEqual(
+            receiver._planning_map.cell_without_peers(*outside_peer_footprint),
+            OCCUPIED,
+        )
+        receiver._pending_map_delta = None
+        receiver._update_planning_map(peer_states=())
+
+        self.assertEqual(receiver._pending_map_delta.peer_forbidden_cells, ())
+        self.assertEqual(
+            receiver._planning_map.cell_without_peers(*peer_hit),
+            OCCUPIED,
+        )
+        self.assertEqual(
+            receiver._planning_map.peer_exclusion_circles(),
+            (),
+        )
+
     def test_each_vehicle_starts_at_truth_anchor_with_zero_local_odometry(self) -> None:
         fleet = FleetRuntime.create(
             scenario(spec(1, 5.0, 6.0, math.pi / 2)),
@@ -244,7 +347,7 @@ class TestFleetRuntime(unittest.TestCase):
         )
         self.assertEqual(persistent.occupied_cells(), ())
 
-    def test_two_vehicles_with_same_goal_finish_without_replanning_forever(self) -> None:
+    def test_same_goal_without_peer_identity_blocks_in_bounded_time(self) -> None:
         fleet = FleetRuntime.create(
             scenario(spec(1, 10.5, 10.5), spec(2, 7.5, 10.5)),
             grid=free_grid(),
@@ -287,7 +390,7 @@ class TestFleetRuntime(unittest.TestCase):
             self.assertFalse(first.collision)
             self.assertFalse(second.collision)
             if all(
-                node.controller.snapshot()["auto_state"] == "idle"
+                node.controller.auto_state.value != "active"
                 for node in fleet.nodes.values()
             ):
                 break
@@ -302,23 +405,123 @@ class TestFleetRuntime(unittest.TestCase):
         front = fleet.world.vehicle("vehicle_1")
         trailing = fleet.world.vehicle("vehicle_2")
         self.assertLessEqual(math.dist((front.x, front.y), goal), 0.11)
+        # Without P2P identity the rear robot only has anonymous, flickering
+        # LiDAR cells, so it must stop conservatively instead of looping forever.
+        trailing_controller = fleet.nodes["vehicle_2"].controller
+        self.assertEqual(trailing_controller.auto_state.value, "blocked")
+        self.assertEqual(trailing_controller.navigation.status, "blocked")
         self.assertEqual(
-            fleet.nodes["vehicle_2"].controller.navigation.reason,
-            "nearby_safe_stop",
+            trailing_controller.navigation.reason,
+            "no_path",
         )
-        self.assertLessEqual(
-            math.dist((trailing.x, trailing.y), goal) - trailing.radius,
-            1.0,
+        self.assertEqual(
+            trailing_controller.navigation.detail,
+            "nearby_safe_goal_unavailable",
         )
+        self.assertEqual(front.body_velocities(), (0.0, 0.0))
+        self.assertEqual(trailing.body_velocities(), (0.0, 0.0))
         self.assertGreaterEqual(
             minimum_separation,
-            front.radius + trailing.radius + HARD_STOP_CLEARANCE_M - 1e-9,
+            front.radius
+            + trailing.radius
+            + AUTOMATIC_MINIMUM_CLEARANCE_M
+            - 1e-9,
         )
         self.assertTrue(
             all(
                 not node.local_state.local_map.occupied_cells()
                 for node in fleet.nodes.values()
             )
+        )
+
+    def test_occupied_goal_finishes_at_a_nearby_safe_pose(self) -> None:
+        voxels, grid = generate_map(size=40)
+        goal = 15.5, 10.5
+        follower_start = 14.299, 12.124
+        fleet = peer_fleet(
+            AnchorPose(*follower_start, math.atan2(-1.624, 1.201)),
+            AnchorPose(*goal, 0.0),
+            grid=grid,
+            voxels=voxels,
+        )
+        follower_id = "vehicle_1"
+        leader_id = "vehicle_2"
+        fleet.handle_command(
+            follower_id,
+            ModeCommand(1, ModeAction.SWITCH_TO_AUTO),
+        )
+        fleet.handle_command(
+            follower_id,
+            AutoCommand(
+                2,
+                AutoAction.PUSH,
+                (GotoMission("occupied-goal", "global_map", *goal, 2),),
+            ),
+        )
+
+        minimum_separation = math.inf
+        final_approach_distances = []
+        final_approach_started = False
+        for tick in range(180):
+            relay_peer_states(fleet)
+            fleet.tick((tick + 1) * fleet.tick_s)
+            follower = fleet.world.vehicle(follower_id)
+            leader = fleet.world.vehicle(leader_id)
+            minimum_separation = min(
+                minimum_separation,
+                math.dist((follower.x, follower.y), (leader.x, leader.y)),
+            )
+            self.assertFalse(follower.collision)
+            self.assertFalse(leader.collision)
+            controller = fleet.nodes[follower_id].controller
+            snapshot = controller.navigation.snapshot()
+            final_approach = snapshot["final_approach"]
+            if final_approach:
+                final_approach_started = True
+                final_approach_distances.append(
+                    math.dist((follower.x, follower.y), goal)
+                )
+            elif final_approach_started and controller.auto_state.value != "idle":
+                self.fail("safe final approach returned to its access cell")
+            if controller.auto_state.value == "idle":
+                break
+        else:
+            self.fail(fleet.nodes[follower_id].controller.snapshot())
+
+        follower = fleet.world.vehicle(follower_id)
+        leader = fleet.world.vehicle(leader_id)
+        controller = fleet.nodes[follower_id].controller
+        self.assertEqual(controller.auto_state.value, "idle")
+        self.assertIsNone(controller.active_mission)
+        self.assertEqual(controller.snapshot()["mission_queue"]["size"], 0)
+        self.assertEqual(controller.navigation.status, "reached")
+        self.assertEqual(controller.navigation.reason, "nearby_safe_stop")
+        self.assertTrue(final_approach_distances)
+        self.assertTrue(
+            all(
+                after <= before + 1e-9
+                for before, after in zip(
+                    final_approach_distances,
+                    final_approach_distances[1:],
+                )
+            )
+        )
+        self.assertLessEqual(
+            math.dist((follower.x, follower.y), goal) - follower.radius,
+            1.0 + 1e-9,
+        )
+        self.assertGreaterEqual(
+            minimum_separation,
+            follower.radius
+            + leader.radius
+            + AUTOMATIC_MINIMUM_CLEARANCE_M
+            - 1e-9,
+        )
+        self.assertEqual(follower.body_velocities(), (0.0, 0.0))
+        self.assertEqual(leader.body_velocities(), (0.0, 0.0))
+        self.assertEqual(
+            controller.events_after(0)[-1].status,
+            "reached",
         )
 
     def test_two_vehicles_from_example_spawns_settle_at_one_goal(self) -> None:
