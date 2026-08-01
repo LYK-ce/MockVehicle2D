@@ -27,7 +27,12 @@ from mockvehicle2d.local_state import (
     PoseEstimate,
 )
 from mockvehicle2d.map_grid import MapGrid
-from mockvehicle2d.safety import LocalSafetyRuntime, SafetyAdvanceResult
+from mockvehicle2d.safety import (
+    LocalSafetyRuntime,
+    SafetyAdvanceResult,
+    SafetyDecision,
+    SafetyObservation,
+)
 from mockvehicle2d.vehicle import Vehicle
 
 
@@ -401,9 +406,8 @@ def case_manual_and_auto_are_both_gated_by_safety() -> None:
     harness.mode(2, ModeAction.SWITCH_TO_AUTO)
     harness.auto(3, AutoAction.PUSH, (mission("safe", 14.0),))
     harness.tick(0.0)
-    linear_mps, angular_rps = harness.vehicle.body_velocities()
-    assert linear_mps == 0.0
-    assert angular_rps > 0.0
+    assert harness.vehicle.body_velocities() == (0.0, 0.0)
+    assert harness.controller.auto_state is AutoState.BLOCKED
     assert harness.safety.snapshot()["reason"] == "safety_obstacle"
 
     manual_turn = Harness()
@@ -412,6 +416,57 @@ def case_manual_and_auto_are_both_gated_by_safety() -> None:
     limited = manual_turn.manual(4, ManualAction.DRIVE, 0.5, -0.3)
     assert limited.accepted
     assert manual_turn.vehicle.body_velocities() == (0.0, -0.3)
+
+
+def case_automatic_safety_stop_finishes_nearby_or_blocks() -> None:
+    class StoppedSafety(LocalSafetyRuntime):
+        def evaluate(self, *args, **kwargs) -> SafetyDecision:
+            return SafetyDecision(0.0, 0.0, "stopped", "safety_obstacle")
+
+    for goal_x_m, expected_state in ((11.5, AutoState.IDLE), (14.0, AutoState.BLOCKED)):
+        harness = Harness()
+        harness.safety = StoppedSafety()
+        harness.mode(1, ModeAction.SWITCH_TO_AUTO)
+        harness.auto(2, AutoAction.PUSH, (mission("safety-stop", goal_x_m),))
+
+        harness.tick(0.0, advance=SafetyAdvanceResult())
+
+        assert harness.controller.auto_state is expected_state
+        assert harness.vehicle.body_velocities() == (0.0, 0.0)
+        if expected_state is AutoState.IDLE:
+            assert harness.controller.active_mission is None
+            assert harness.controller.navigation.status == "reached"
+            assert harness.controller.navigation.reason == "nearby_safe_stop"
+        else:
+            assert harness.controller.active_mission is not None
+            assert harness.controller.navigation.status == "blocked"
+            assert harness.controller.navigation.reason == "safety_obstacle"
+
+
+def case_unabsorbed_edge_stop_is_deferred_only_once() -> None:
+    class RepeatedEdgeSafety(LocalSafetyRuntime):
+        def __init__(self) -> None:
+            super().__init__()
+            self.observation = SafetyObservation(
+                edge_clearance_m=0.25,
+                edge_point_vehicle_m=(1.0, 0.0),
+            )
+
+        def evaluate(self, *args, **kwargs) -> SafetyDecision:
+            return SafetyDecision(0.0, 0.0, "stopped", "safety_edge")
+
+    harness = Harness()
+    harness.safety = RepeatedEdgeSafety()
+    harness.mode(1, ModeAction.SWITCH_TO_AUTO)
+    harness.auto(2, AutoAction.PUSH, (mission("repeated-edge", 14.0),))
+
+    harness.tick(0.0, advance=SafetyAdvanceResult())
+    assert harness.controller.auto_state is AutoState.ACTIVE
+    assert harness.vehicle.body_velocities() == (0.0, 0.0)
+
+    harness.tick(0.1, advance=SafetyAdvanceResult())
+    assert harness.controller.auto_state is AutoState.BLOCKED
+    assert harness.controller.navigation.reason == "safety_edge"
 
 
 def case_disconnect_pauses_auto_and_stops_manual() -> None:
@@ -514,6 +569,12 @@ class TestRobotController(unittest.TestCase):
         case_manual_setpoint_refreshes_watchdog_then_expires_without_resume
     )
     test_safety_gate = staticmethod(case_manual_and_auto_are_both_gated_by_safety)
+    test_auto_safety_stop_terminal_state = staticmethod(
+        case_automatic_safety_stop_finishes_nearby_or_blocks
+    )
+    test_unabsorbed_edge_stop_is_bounded = staticmethod(
+        case_unabsorbed_edge_stop_is_deferred_only_once
+    )
     test_disconnect = staticmethod(case_disconnect_pauses_auto_and_stops_manual)
     test_stop_motion = staticmethod(
         case_stop_motion_is_global_task_preserving_and_idempotent

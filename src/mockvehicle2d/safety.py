@@ -12,6 +12,7 @@ from mockvehicle2d.vehicle import Vehicle
 HARD_STOP_CLEARANCE_M = 0.25
 SLOW_ZONE_CLEARANCE_M = 1.0
 MAX_TRANSLATION_STEP_M = 0.05
+AUTOMATIC_MINIMUM_CLEARANCE_M = HARD_STOP_CLEARANCE_M + MAX_TRANSLATION_STEP_M
 MAX_ROTATION_STEP_RAD = math.radians(1)
 MAX_SAFETY_ADVANCE_STEPS = 10_000
 EDGE_LOOKAHEAD_M = 2.0
@@ -174,7 +175,9 @@ class SafetyGovernor:
             return SafetyDecision(linear_mps, angular_rps, "clear", None)
 
         clearance, reason = nearest
-        if clearance < HARD_STOP_CLEARANCE_M:
+        if clearance < HARD_STOP_CLEARANCE_M or (
+            automatic and clearance <= AUTOMATIC_MINIMUM_CLEARANCE_M
+        ):
             return SafetyDecision(0.0, angular_rps, "stopped", reason)
         if automatic and linear_mps and clearance < SLOW_ZONE_CLEARANCE_M:
             scale = (clearance - HARD_STOP_CLEARANCE_M) / (
@@ -206,9 +209,17 @@ class LocalSafetyRuntime:
         desired_angular_rps: float,
         *,
         automatic: bool,
+        scan_points: Iterable[LaserPoint] | None = None,
+        scan_healthy: bool = True,
     ) -> SafetyDecision:
+        if type(scan_healthy) is not bool:
+            raise ValueError("scan_healthy must be a bool")
         points = (
-            scan_grid(grid, vehicle.x, vehicle.y, vehicle.yaw, TMINI_SCAN_CONFIG)
+            (
+                scan_grid(grid, vehicle.x, vehicle.y, vehicle.yaw, TMINI_SCAN_CONFIG)
+                if scan_points is None
+                else tuple(scan_points)
+            )
             if desired_linear_mps
             else ()
         )
@@ -226,7 +237,7 @@ class LocalSafetyRuntime:
             ),
             edge_clearance_m=edge_clearance,
             edge_point_vehicle_m=edge_point,
-            healthy=self.healthy,
+            healthy=self.healthy and scan_healthy,
         )
         self.decision = self._governor.limit(
             desired_linear_mps, desired_angular_rps, self.observation, automatic

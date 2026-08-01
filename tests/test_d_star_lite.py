@@ -24,6 +24,7 @@ from mockvehicle2d.local_state import (
 )
 from mockvehicle2d.map_grid import MapGrid
 from mockvehicle2d.pathfinding.d_star_lite import DStarLitePlanner, _key_less
+from mockvehicle2d.safety import AUTOMATIC_MINIMUM_CLEARANCE_M
 
 
 ANCHOR = AnchorSpec("planner-test", 0.0, 0.0, 0.0)
@@ -192,6 +193,149 @@ def test_obstacle_insert_and_remove_reuses_search_state() -> None:
     assert search.stats["key_modifier_cost"] > 0
 
 
+def test_observed_change_is_absorbed_without_changing_route_endpoints() -> None:
+    search = planner(bounds_margin_m=2.0)
+    original = search.plan((0, 0), (6, 0))
+    resets = search.stats["resets"]
+
+    changes = search.observe_changes((MapCellUpdate(3, 0, OCCUPIED),))
+    detour = search.plan((0, 0), (6, 0))
+
+    assert changes == (MapCellUpdate(3, 0, OCCUPIED),)
+    assert original is not None and detour is not None
+    assert (3, 0) not in detour
+    assert geometric_cost(detour) > geometric_cost(original)
+    assert search.stats["resets"] == resets
+
+
+def test_peer_forbidden_cells_are_not_inflated_twice_and_move_cleanly() -> None:
+    grid = ObservedGrid(ANCHOR, resolution_m=0.5)
+    peer = DStarLitePlanner(
+        grid,
+        vehicle_radius_m=0.5,
+        hard_clearance_m=AUTOMATIC_MINIMUM_CLEARANCE_M,
+        bounds_margin_m=2.0,
+    )
+    peer.set_peer_forbidden_cells(((2, 0),))
+    peer.plan((-2, 0), (6, 0))
+
+    assert peer._blocked((2, 0))
+    assert not peer._blocked((0, 0))
+
+    peer.set_peer_forbidden_cells(((4, 0),))
+
+    assert not peer._blocked((2, 0))
+    assert peer._blocked((4, 0))
+
+    static = DStarLitePlanner(
+        grid,
+        vehicle_radius_m=0.5,
+        hard_clearance_m=AUTOMATIC_MINIMUM_CLEARANCE_M,
+        bounds_margin_m=2.0,
+    )
+    static.plan(
+        (-2, 0),
+        (6, 0),
+        changed_cells=(MapCellUpdate(2, 0, OCCUPIED),),
+    )
+    assert static._blocked((0, 0))
+
+
+def test_peer_overlay_never_hides_base_forbidden_inflation() -> None:
+    search = DStarLitePlanner(
+        ObservedGrid(ANCHOR, resolution_m=0.5),
+        vehicle_radius_m=0.5,
+        hard_clearance_m=AUTOMATIC_MINIMUM_CLEARANCE_M,
+        bounds_margin_m=2.0,
+    )
+    search.plan(
+        (-2, 0),
+        (6, 0),
+        changed_cells=(MapCellUpdate(0, 0, FORBIDDEN),),
+    )
+
+    search.set_peer_forbidden_cells(((0, 0),))
+    assert search._blocked((2, 0))
+
+    search.set_peer_forbidden_cells(((4, 0),))
+    assert search._blocked((2, 0))
+
+
+def test_peer_overlay_does_not_hide_static_obstacle_inflation() -> None:
+    class PeerOverStaticGrid(ObservedGrid):
+        def snapshot(self):
+            return {
+                "cells": [{"gx": 0, "gy": 0, "state": FORBIDDEN}],
+                "peer_forbidden_cells": [{"gx": 0, "gy": 0}],
+            }
+
+        def cell_without_peers(self, gx, gy):
+            return OCCUPIED if (gx, gy) == (0, 0) else UNKNOWN
+
+    search = DStarLitePlanner(
+        PeerOverStaticGrid(ANCHOR, resolution_m=0.5),
+        vehicle_radius_m=0.5,
+        hard_clearance_m=AUTOMATIC_MINIMUM_CLEARANCE_M,
+        bounds_margin_m=2.0,
+    )
+    search.plan((-2, 0), (6, 0))
+
+    assert search._blocked((2, 0))
+    search.set_peer_forbidden_cells(())
+    search.observe_changes((MapCellUpdate(0, 0, OCCUPIED),))
+    assert search._blocked((2, 0))
+
+
+def test_peer_circle_rechecks_continuous_access_segments() -> None:
+    class PeerGrid(ObservedGrid):
+        def peer_exclusion_circles(self):
+            return ((1.0, 0.0, 0.5),)
+
+    search = DStarLitePlanner(
+        PeerGrid(ANCHOR, resolution_m=0.5),
+        vehicle_radius_m=0.0,
+    )
+
+    assert not search.is_segment_passable((0.0, 0.0), (2.0, 0.0))
+    assert search.is_segment_passable((0.0, 0.6), (2.0, 0.6))
+
+
+@pytest.mark.parametrize(
+    ("base_state", "expected"),
+    ((FREE, True), (UNKNOWN, False)),
+)
+def test_peer_overlay_preserves_base_observation_semantics(
+    base_state: int,
+    expected: bool,
+) -> None:
+    class PeerGrid(ObservedGrid):
+        def snapshot(self):
+            return {
+                "cells": [{"gx": 0, "gy": 0, "state": FORBIDDEN}],
+                "peer_forbidden_cells": [{"gx": 0, "gy": 0}],
+            }
+
+        def cell_without_peers(self, gx, gy):
+            return base_state if (gx, gy) == (0, 0) else UNKNOWN
+
+        def peer_exclusion_circles(self):
+            return ()
+
+    search = DStarLitePlanner(
+        PeerGrid(ANCHOR, resolution_m=0.5),
+        vehicle_radius_m=0.1,
+    )
+
+    assert (
+        search.is_segment_passable(
+            (0.25, 0.25),
+            (0.25, 0.25),
+            require_observed=True,
+        )
+        is expected
+    )
+
+
 def test_diagonal_corner_cutting_is_forbidden() -> None:
     search = planner(bounds_margin_m=0.0)
     assert (
@@ -289,6 +433,39 @@ def test_floating_tangency_matches_runtime_but_real_penetration_blocks() -> None
     )
     assert not search.is_segment_passable(penetration[:2], penetration[2:])
     assert not is_swept_circle_passable(truth, *penetration, 0.5)
+
+
+def test_automatic_planning_clearance_matches_safety_stop_boundary() -> None:
+    search = DStarLitePlanner(
+        ObservedGrid(ANCHOR),
+        vehicle_radius_m=0.5,
+        hard_clearance_m=AUTOMATIC_MINIMUM_CLEARANCE_M,
+        bounds_margin_m=2.0,
+    )
+    search.plan(
+        (0, 0),
+        (0, 2),
+        changed_cells=(MapCellUpdate(1, 0, OCCUPIED),),
+    )
+    clearance_025 = (0.25, 0.5, 0.25, 1.5)
+    clearance_030 = (0.20, 0.5, 0.20, 1.5)
+    clearance_031 = (0.19, 0.5, 0.19, 1.5)
+
+    assert not search.is_segment_passable(
+        clearance_025[:2],
+        clearance_025[2:],
+        extra_clearance_m=AUTOMATIC_MINIMUM_CLEARANCE_M,
+    )
+    assert not search.is_segment_passable(
+        clearance_030[:2],
+        clearance_030[2:],
+        extra_clearance_m=AUTOMATIC_MINIMUM_CLEARANCE_M,
+    )
+    assert search.is_segment_passable(
+        clearance_031[:2],
+        clearance_031[2:],
+        extra_clearance_m=AUTOMATIC_MINIMUM_CLEARANCE_M,
+    )
 
 
 def test_hard_clearance_keeps_two_metre_corridor_traversable() -> None:

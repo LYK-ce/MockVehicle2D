@@ -3,6 +3,7 @@
 import argparse
 import asyncio
 import math
+from pathlib import Path
 import random
 
 
@@ -140,6 +141,24 @@ def _cmd_pathfind(args) -> None:
             )
 
 
+def _cmd_fleet(args) -> None:
+    from mockvehicle2d.fleet import main as fleet_main
+
+    asyncio.run(
+        fleet_main(
+            args.scenario,
+            linear_speed=args.linear_speed_mps,
+            angular_speed=args.angular_speed_rps,
+            radius=args.vehicle_radius_m,
+            command_timeout=args.command_timeout_s,
+            mission_capacity=args.mission_capacity,
+            odometry_translation_noise_stddev_m=args.odom_translation_noise_m,
+            odometry_yaw_noise_stddev_rad=args.odom_yaw_noise_rad,
+            odometry_seed=args.odom_seed,
+        )
+    )
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(
         prog="mockvehicle2d",
@@ -208,6 +227,55 @@ def main() -> None:
     )
     serve.add_argument("--odom-seed", type=_integer, default=0, metavar="INTEGER")
 
+    fleet = subcommands.add_parser(
+        "fleet",
+        help="Start 1-4 isolated vehicles in one deterministic shared world",
+    )
+    fleet.add_argument("--scenario", type=Path, required=True, metavar="JSON")
+    fleet.add_argument(
+        "--linear-speed-mps",
+        type=_positive_float,
+        default=0.5,
+        metavar="MPS",
+    )
+    fleet.add_argument(
+        "--angular-speed-rps",
+        type=_positive_float,
+        default=math.pi / 2,
+        metavar="RPS",
+    )
+    fleet.add_argument(
+        "--vehicle-radius-m",
+        type=_positive_float,
+        default=0.5,
+        metavar="M",
+    )
+    fleet.add_argument(
+        "--command-timeout-s",
+        type=_positive_float,
+        default=1.0,
+        metavar="S",
+    )
+    fleet.add_argument(
+        "--mission-capacity",
+        type=_positive_integer,
+        default=16,
+        metavar="N",
+    )
+    fleet.add_argument(
+        "--odom-translation-noise-m",
+        type=_nonnegative_float,
+        default=0.0,
+        metavar="M",
+    )
+    fleet.add_argument(
+        "--odom-yaw-noise-rad",
+        type=_nonnegative_float,
+        default=0.0,
+        metavar="RAD",
+    )
+    fleet.add_argument("--odom-seed", type=_integer, default=0, metavar="INTEGER")
+
     pathfind = subcommands.add_parser(
         "pathfind",
         help="Run the full-truth A* debug tool",
@@ -235,6 +303,7 @@ def main() -> None:
     args = parser.parse_args()
     commands = {
         "serve": _cmd_serve,
+        "fleet": _cmd_fleet,
         "pathfind": _cmd_pathfind,
     }
     commands[args.command](args)

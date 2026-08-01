@@ -8,6 +8,9 @@ from mockvehicle2d.collision import is_swept_circle_passable
 from mockvehicle2d.map_grid import MapGrid
 
 
+TimedPose = tuple[float, float, float, float]
+
+
 class Vehicle:
     """A circular differential-drive vehicle in the simulator's screen coordinates."""
 
@@ -76,10 +79,15 @@ class Vehicle:
         now: float,
         *,
         limited_velocities: tuple[float, float] | None = None,
+        trajectory: list[TimedPose] | None = None,
     ) -> bool:
-        """Integrate through ``now``, optionally using a safety-reduced velocity."""
+        """Integrate through ``now`` and optionally record timed positions."""
         if now < self._last_update:
             raise ValueError("monotonic time moved backwards")
+        if trajectory is not None:
+            if trajectory:
+                raise ValueError("trajectory output must be empty")
+            trajectory.append((self._last_update, self.x, self.y, self.yaw))
 
         collided = False
         motion_until = min(now, self._command_deadline) if self._command_deadline is not None else now
@@ -97,10 +105,20 @@ class Vehicle:
                 ):
                     raise ValueError("limited velocities must reduce the active command")
                 linear, angular = limited_linear, limited_angular
-            if (linear or angular) and not self._move(grid, linear * elapsed, angular * elapsed):
+            if (linear or angular) and not self._move(
+                grid,
+                linear * elapsed,
+                angular * elapsed,
+                started_at=self._last_update,
+                ended_at=motion_until,
+                trajectory=trajectory,
+            ):
                 self.collision = True
                 self.stop()
                 collided = True
+
+        if trajectory is not None and trajectory[-1][0] < now:
+            trajectory.append((now, self.x, self.y, self.yaw))
 
         self._last_update = now
         if self._command_deadline is not None and now >= self._command_deadline:
@@ -130,10 +148,21 @@ class Vehicle:
         self._angular_rps = angular_rps
         self._command_deadline = now + self.command_timeout
 
-    def _move(self, grid: MapGrid, distance: float, rotation: float) -> bool:
+    def _move(
+        self,
+        grid: MapGrid,
+        distance: float,
+        rotation: float,
+        *,
+        started_at: float,
+        ended_at: float,
+        trajectory: list[TimedPose] | None,
+    ) -> bool:
         if distance == 0:
             self.yaw = math.atan2(math.sin(self.yaw + rotation), math.cos(self.yaw + rotation))
             self.collision = False
+            if trajectory is not None and ended_at > trajectory[-1][0]:
+                trajectory.append((ended_at, self.x, self.y, self.yaw))
             return True
 
         # Short chords retain a nearby last-safe pose while approximating an arc.
@@ -145,13 +174,26 @@ class Vehicle:
         )
         step_distance = distance / steps
         step_rotation = rotation / steps
-        for _ in range(steps):
+        for step in range(steps):
             mid_yaw = self.yaw + step_rotation / 2
             x = self.x + step_distance * math.cos(mid_yaw)
             y = self.y + step_distance * math.sin(mid_yaw)
             if step_distance and not is_swept_circle_passable(grid, self.x, self.y, x, y, self.radius):
+                if trajectory is not None:
+                    timestamp = started_at + (ended_at - started_at) * (step + 1) / steps
+                    if timestamp > trajectory[-1][0]:
+                        trajectory.append((timestamp, self.x, self.y, self.yaw))
                 return False
             self.x, self.y = x, y
             self.yaw = math.atan2(math.sin(self.yaw + step_rotation), math.cos(self.yaw + step_rotation))
+            if trajectory is not None:
+                timestamp = (
+                    ended_at
+                    if step + 1 == steps
+                    else started_at + (ended_at - started_at) * (step + 1) / steps
+                )
+                trajectory.append(
+                    (timestamp, self.x, self.y, self.yaw)
+                )
         self.collision = False
         return True

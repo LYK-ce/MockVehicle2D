@@ -442,6 +442,12 @@ async def handler(
                 "vehicle_id": vehicle_id,
                 "control_lease": "exclusive",
                 "mission_frame_id": "global_map",
+                "birth_anchor": {
+                    "anchor_id": runtime.local_state.anchor.anchor_id,
+                    "x_m": runtime.local_state.anchor.global_x_m,
+                    "y_m": runtime.local_state.anchor.global_y_m,
+                    "yaw_rad": runtime.local_state.anchor.global_yaw_rad,
+                },
                 "map": _map_metadata(runtime.grid, runtime.local_state.anchor),
                 "controller": runtime.controller.snapshot(),
             },

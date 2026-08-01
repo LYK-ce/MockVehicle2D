@@ -7,8 +7,9 @@ from typing import TYPE_CHECKING
 
 from mockvehicle2d.pathfinding.d_star_lite import DStarLitePlanner
 from mockvehicle2d.safety import (
-    HARD_STOP_CLEARANCE_M,
+    AUTOMATIC_MINIMUM_CLEARANCE_M,
     LocalSafetyRuntime,
+    MAX_TRANSLATION_STEP_M,
     SafetyAdvanceResult,
 )
 
@@ -29,7 +30,8 @@ NEARBY_SAFE_BODY_DISTANCE_M = 1.0
 # deadline on the target Jetson.
 PLANNING_EXPANSIONS_PER_UPDATE = 256
 CANDIDATE_INSPECTIONS_PER_UPDATE = 256
-SafeCandidate = tuple[tuple[float, float], tuple[int, int], bool]
+MAX_CANDIDATE_INSPECTIONS_PER_MISSION = 256
+SafeCandidate = tuple[tuple[float, float], tuple[int, int]]
 
 
 class GotoController:
@@ -54,6 +56,8 @@ class GotoController:
         self._path_resolution_m = 1.0
         self._nearby_detail: str | None = None
         self._vehicle_radius_m = 0.5
+        self._goal_access_cell: tuple[int, int] | None = None
+        self._final_approach = False
         self._planning_kind: str | None = None
         self._planning_map_changed = False
         self._planning_previous_path: list[tuple[int, int]] = []
@@ -62,6 +66,7 @@ class GotoController:
         self._pending_candidate: SafeCandidate | None = None
         self._candidate_inspections = 0
         self._skip_goal_connected_candidates = False
+        self._waiting_safe_stop_goal: tuple[float, float] | None = None
 
     def start(
         self,
@@ -88,6 +93,8 @@ class GotoController:
         self._path_resolution_m = local_map.resolution_m
         self._nearby_detail = None
         self._vehicle_radius_m = vehicle_radius_m
+        self._goal_access_cell = None
+        self._final_approach = False
         self._planning_kind = "goal"
         self._planning_map_changed = False
         self._planning_previous_path = []
@@ -96,10 +103,11 @@ class GotoController:
         self._pending_candidate = None
         self._candidate_inspections = 0
         self._skip_goal_connected_candidates = False
+        self._waiting_safe_stop_goal = None
         self._planner = DStarLitePlanner(
             local_map,
             vehicle_radius_m=vehicle_radius_m,
-            hard_clearance_m=HARD_STOP_CLEARANCE_M,
+            hard_clearance_m=AUTOMATIC_MINIMUM_CLEARANCE_M,
         )
         self._planner.validate_plan_request(
             self._pose_cell(pose, local_map),
@@ -108,15 +116,19 @@ class GotoController:
 
     def cancel(self, reason: str) -> None:
         if self.status in {"active", "blocked"}:
+            self._final_approach = False
             self.status = "cancelled"
             self.reason = reason
             self.detail = None
+            self._waiting_safe_stop_goal = None
             self._clear_pending_planning()
 
     def block(self, reason: str, detail: str | None = None) -> None:
+        self._final_approach = False
         self.status = "blocked"
         self.reason = reason
         self.detail = detail
+        self._waiting_safe_stop_goal = None
         self._clear_pending_planning()
 
     def block_for_localization_loss(self, pose: PoseEstimate) -> bool:
@@ -124,6 +136,45 @@ class GotoController:
             return False
         self.block("localization_lost")
         return True
+
+    def finish_nearby_safe_stop(
+        self,
+        pose: PoseEstimate,
+        detail: str | None = None,
+    ) -> bool:
+        if (
+            self.status != "active"
+            or self.requested_goal is None
+            or pose.quality == "lost"
+            or self._pose_approach_distance_m(pose)
+            + _radial_uncertainty_m(pose)
+            > NEARBY_SAFE_BODY_DISTANCE_M + 1e-9
+        ):
+            return False
+        self.goal = pose.x_m, pose.y_m
+        self._goal_access_cell = None
+        self._final_approach = False
+        self.goal_mode = "nearby_safe"
+        self.status = "reached"
+        self.reason = "nearby_safe_stop"
+        self.detail = self._nearby_detail or detail
+        self._current_waypoint = None
+        self._waiting_safe_stop_goal = None
+        self._clear_pending_planning()
+        return True
+
+    def unmapped_edge_evidence_cell(
+        self,
+        safety: LocalSafetyRuntime,
+        pose: PoseEstimate,
+        local_map: ObservedGrid,
+    ) -> tuple[int, int] | None:
+        if self.status != "active" or self._planner is None:
+            return None
+        cell = _edge_evidence_cell(safety, pose, local_map)
+        if cell is None or local_map.is_forbidden(*cell):
+            return None
+        return cell
 
     def snapshot(self) -> dict[str, object]:
         goal = (
@@ -157,6 +208,7 @@ class GotoController:
             "reason": self.reason,
             "detail": self.detail,
             "approach_distance_m": self._approach_distance_m(),
+            "final_approach": self._final_approach,
             "planning": self._planning_kind is not None,
         }
         if self._planner is None:
@@ -210,10 +262,7 @@ class GotoController:
 
         was_active = self.status == "active"
         if was_active and self._planner is None:
-            self.status = "blocked"
-            self.reason = "local_state_unavailable"
-            self.detail = None
-            self._clear_pending_planning()
+            self.block("local_state_unavailable")
             return 0.0, 0.0
         if was_active and self.block_for_localization_loss(pose):
             return 0.0, 0.0
@@ -226,10 +275,7 @@ class GotoController:
         if not was_active:
             return 0.0, 0.0
         if collided:
-            self.status = "blocked"
-            self.reason = "collision"
-            self.detail = None
-            self._clear_pending_planning()
+            self.block("collision")
             return 0.0, 0.0
         if safety_stop is not None and not (
             self._planner is not None
@@ -244,24 +290,39 @@ class GotoController:
                 )
             )
         ):
-            self.status = "blocked"
-            self.reason = safety_stop
-            self.detail = None
-            self._clear_pending_planning()
+            self.block(safety_stop)
             return 0.0, 0.0
 
         assert self.goal is not None
         assert self._planner is not None
         x_m, y_m, yaw_rad = pose.x_m, pose.y_m, pose.yaw_rad
-        start_changed = (
-            not self._path
-            or self._path[0] != self._pose_cell(pose, local_map)
-        )
+        if map_delta is not None and map_delta.peer_forbidden_cells is not None:
+            self._planner.set_peer_forbidden_cells(
+                map_delta.peer_forbidden_cells
+            )
         changes = () if map_delta is None else map_delta.changed_cells
-        if self._planning_kind is None and (start_changed or changes):
-            self._planning_kind = "goal"
-            self._planning_previous_path = list(self._path)
-            self._current_waypoint = None
+        if self._final_approach:
+            if changes:
+                self._planner.observe_changes(changes)
+                self._planning_map_changed = True
+            if not self._final_approach_segment_is_safe(pose):
+                self._final_approach = False
+                self._begin_safe_goal_search(
+                    pose,
+                    local_map,
+                    skip_goal_connected=False,
+                )
+                return 0.0, 0.0
+            changes = ()
+        else:
+            start_changed = (
+                not self._path
+                or self._path[0] != self._pose_cell(pose, local_map)
+            )
+            if self._planning_kind is None and (start_changed or changes):
+                self._planning_kind = "goal"
+                self._planning_previous_path = list(self._path)
+                self._current_waypoint = None
         self._planning_map_changed |= bool(changes)
         if self._planning_kind is not None:
             self._advance_planning(
@@ -273,21 +334,35 @@ class GotoController:
         if self._planning_kind is not None or self.status != "active":
             return 0.0, 0.0
         if not self._path:
-            self.status = "blocked"
-            self.reason = "no_path"
-            self._clear_pending_planning()
+            self._block_no_path(self.detail)
             return 0.0, 0.0
+
+        if self._can_start_final_approach(pose, local_map):
+            self._final_approach = True
 
         dx, dy = self.goal[0] - x_m, self.goal[1] - y_m
         distance = math.hypot(dx, dy)
         within_approach_limit = (
             self.goal_mode == "exact"
             or self._pose_approach_distance_m(pose)
+            + _radial_uncertainty_m(pose)
             <= NEARBY_SAFE_BODY_DISTANCE_M + 1e-9
         )
         if distance <= self.goal_tolerance_m and within_approach_limit:
             if self.goal_mode == "approaching_safe_stop":
-                return 0.0, 0.0
+                if self._candidate_is_safe(
+                    self.goal,
+                    self._goal_cell(local_map),
+                    require_observed=True,
+                ):
+                    self.goal_mode = "nearby_safe"
+                elif self._waiting_safe_stop_goal != self.goal:
+                    self._waiting_safe_stop_goal = self.goal
+                    return 0.0, 0.0
+                else:
+                    self._block_no_path("nearby_safe_goal_unconfirmed")
+                    return 0.0, 0.0
+            self._final_approach = False
             self.status = "reached"
             if self.goal_mode == "nearby_safe":
                 self.reason = "nearby_safe_stop"
@@ -295,19 +370,20 @@ class GotoController:
             else:
                 self.reason = "goal_tolerance"
                 self.detail = None
+            self._waiting_safe_stop_goal = None
             self._clear_pending_planning()
             return 0.0, 0.0
 
         target_x, target_y = self.goal
         target_cell: tuple[int, int] | None = None
-        if len(self._path) > 1:
+        if not self._final_approach and len(self._path) > 1:
             target_cell = self._path[1]
             target_x = (target_cell[0] + 0.5) * local_map.resolution_m
             target_y = (target_cell[1] + 0.5) * local_map.resolution_m
             if not self._planner.is_segment_passable(
                 (x_m, y_m),
                 (target_x, target_y),
-                extra_clearance_m=HARD_STOP_CLEARANCE_M,
+                extra_clearance_m=AUTOMATIC_MINIMUM_CLEARANCE_M,
             ) and (
                 safety_stop is not None
                 or not self._planner.is_segment_passable(
@@ -320,11 +396,7 @@ class GotoController:
                     self._path[0],
                 )
                 if target_cell is None:
-                    self.status = "blocked"
-                    self.reason = "no_path"
-                    self.detail = "start_connection_unsafe"
-                    self._current_waypoint = None
-                    self._clear_pending_planning()
+                    self._block_no_path("start_connection_unsafe")
                     return 0.0, 0.0
                 target_x = (target_cell[0] + 0.5) * local_map.resolution_m
                 target_y = (target_cell[1] + 0.5) * local_map.resolution_m
@@ -414,6 +486,7 @@ class GotoController:
             if self._nearby_detail is None:
                 self._nearby_detail = failure
             self._begin_safe_goal_search(
+                pose,
                 local_map,
                 skip_goal_connected=failure == "goal_unreachable",
             )
@@ -427,17 +500,21 @@ class GotoController:
 
     def _begin_safe_goal_search(
         self,
+        pose: PoseEstimate,
         local_map: ObservedGrid,
         *,
         skip_goal_connected: bool,
     ) -> None:
+        self._final_approach = False
         self._planning_kind = "candidate"
         self.goal_mode = "approaching_safe_stop"
-        self._safe_candidates = self._build_safe_candidates(local_map)
+        self._goal_access_cell = None
+        self._safe_candidates = self._build_safe_candidates(pose, local_map)
         self._skip_goal_connected_candidates = skip_goal_connected
         self._safe_candidate_index = 0
         self._pending_candidate = None
         self._current_waypoint = None
+        self._waiting_safe_stop_goal = None
 
     def _advance_safe_candidate(
         self,
@@ -464,11 +541,13 @@ class GotoController:
                     if self._safe_candidate_index == len(self._safe_candidates):
                         self._block_no_path("nearby_safe_goal_unavailable")
                     return
+                if self.goal != self._pending_candidate[0]:
+                    self._waiting_safe_stop_goal = None
                 self.goal = self._pending_candidate[0]
                 self.goal_mode = "approaching_safe_stop"
             if remaining <= 0:
                 return
-            point, goal_cell, requested_confirmed = self._pending_candidate
+            point, goal_cell = self._pending_candidate
             before = self._planner.stats["expansions"]
             progress = self._planner.advance_plan(
                 self._pose_cell(pose, local_map),
@@ -479,18 +558,10 @@ class GotoController:
             )
             remaining -= self._planner.stats["expansions"] - before
             changes = ()
-            generally_safe = self._candidate_is_safe(
+            requested_safe = self._candidate_is_safe(
                 point,
                 goal_cell,
                 require_observed=False,
-            )
-            requested_safe = generally_safe and (
-                not requested_confirmed
-                or self._candidate_is_safe(
-                    point,
-                    goal_cell,
-                    require_observed=True,
-                )
             )
             if not requested_safe or progress.status == "unreachable":
                 self._pending_candidate = None
@@ -510,6 +581,7 @@ class GotoController:
                 require_observed=True,
             )
             self.goal = point
+            self._goal_access_cell = goal_cell
             self.goal_mode = (
                 "nearby_safe" if confirmed else "approaching_safe_stop"
             )
@@ -531,12 +603,14 @@ class GotoController:
         while (
             self._safe_candidate_index < len(self._safe_candidates)
             and inspected < inspection_budget
+            and self._candidate_inspections
+            < MAX_CANDIDATE_INSPECTIONS_PER_MISSION
         ):
             candidate = self._safe_candidates[self._safe_candidate_index]
             self._safe_candidate_index += 1
             inspected += 1
             self._candidate_inspections += 1
-            point, goal_cell, confirmed = candidate
+            point, goal_cell = candidate
             if not self._planner.planning_budget_allows(start, goal_cell):
                 continue
             if (
@@ -545,49 +619,84 @@ class GotoController:
                 and self._planner.is_segment_passable(
                     point,
                     self.requested_goal,
-                    extra_clearance_m=HARD_STOP_CLEARANCE_M,
+                    extra_clearance_m=AUTOMATIC_MINIMUM_CLEARANCE_M,
                 )
             ):
                 continue
             if allow_stale_geometry or self._candidate_is_safe(
                 point,
                 goal_cell,
-                require_observed=confirmed,
+                require_observed=False,
             ):
                 return candidate, inspected
+        if self._candidate_inspections >= MAX_CANDIDATE_INSPECTIONS_PER_MISSION:
+            self._safe_candidate_index = len(self._safe_candidates)
         return None, inspected
 
     def _build_safe_candidates(
         self,
+        pose: PoseEstimate,
         local_map: ObservedGrid,
     ) -> list[SafeCandidate]:
         assert self.requested_goal is not None
         resolution = local_map.resolution_m
         requested_x, requested_y = self.requested_goal
-        radius = NEARBY_SAFE_BODY_DISTANCE_M + self._vehicle_radius_m
-        sample_step = min(resolution, HARD_STOP_CLEARANCE_M)
+        candidate_body_distance = (
+            NEARBY_SAFE_BODY_DISTANCE_M
+            - MAX_TRANSLATION_STEP_M
+            - _radial_uncertainty_m(pose)
+        )
+        if candidate_body_distance < 0:
+            return []
+        radius = candidate_body_distance + self._vehicle_radius_m
         candidates = []
-        for offset_x in _axis_offsets(radius, sample_step):
-            for offset_y in _axis_offsets(radius, sample_step):
-                distance_squared = offset_x**2 + offset_y**2
-                if distance_squared > radius**2:
+        min_gx = math.floor((requested_x - radius) / resolution)
+        max_gx = math.floor((requested_x + radius) / resolution)
+        min_gy = math.floor((requested_y - radius) / resolution)
+        max_gy = math.floor((requested_y + radius) / resolution)
+        for gy in range(min_gy, max_gy + 1):
+            for gx in range(min_gx, max_gx + 1):
+                closest_x = max(gx * resolution, min(requested_x, (gx + 1) * resolution))
+                closest_y = max(gy * resolution, min(requested_y, (gy + 1) * resolution))
+                if math.hypot(closest_x - requested_x, closest_y - requested_y) > radius:
                     continue
-                point = requested_x + offset_x, requested_y + offset_y
-                goal_cell = (
-                    math.floor(point[0] / resolution),
-                    math.floor(point[1] / resolution),
-                )
+                center_x = (gx + 0.5) * resolution
+                center_y = (gy + 0.5) * resolution
+                point_x = max(gx * resolution, min(pose.x_m, (gx + 1) * resolution))
+                point_y = max(gy * resolution, min(pose.y_m, (gy + 1) * resolution))
+                dx, dy = point_x - requested_x, point_y - requested_y
+                point_distance = math.hypot(dx, dy)
+                if point_distance <= radius:
+                    point = point_x, point_y
+                else:
+                    scale = radius / point_distance
+                    point = requested_x + dx * scale, requested_y + dy * scale
+                if not (
+                    gx * resolution - 1e-9 <= point[0] <= (gx + 1) * resolution + 1e-9
+                    and gy * resolution - 1e-9
+                    <= point[1]
+                    <= (gy + 1) * resolution + 1e-9
+                ):
+                    continue
                 candidates.append(
-                    (distance_squared, point[1], point[0], point, goal_cell)
+                    (
+                        (point[0] - pose.x_m) ** 2
+                        + (point[1] - pose.y_m) ** 2,
+                        (point[0] - requested_x) ** 2
+                        + (point[1] - requested_y) ** 2,
+                        point[1],
+                        point[0],
+                        (center_x - point[0]) ** 2
+                        + (center_y - point[1]) ** 2,
+                        gy,
+                        gx,
+                        point,
+                        (gx, gy),
+                    )
                 )
-        ordered = [
-            (point, goal_cell)
-            for _, _, _, point, goal_cell in sorted(candidates)
-        ]
         return [
-            (point, goal_cell, confirmed)
-            for confirmed in (True, False)
-            for point, goal_cell in ordered
+            (point, goal_cell)
+            for _, _, _, _, _, _, _, point, goal_cell in sorted(candidates)
         ]
 
     def _candidate_is_safe(
@@ -605,12 +714,12 @@ class GotoController:
         return self._planner.is_segment_passable(
             point,
             point,
-            extra_clearance_m=HARD_STOP_CLEARANCE_M,
+            extra_clearance_m=AUTOMATIC_MINIMUM_CLEARANCE_M,
             require_observed=require_observed,
         ) and self._planner.is_segment_passable(
             cell_center,
             point,
-            extra_clearance_m=HARD_STOP_CLEARANCE_M,
+            extra_clearance_m=AUTOMATIC_MINIMUM_CLEARANCE_M,
             require_observed=require_observed,
         )
 
@@ -638,6 +747,27 @@ class GotoController:
             is not None
         )
 
+    def _can_start_final_approach(
+        self,
+        pose: PoseEstimate,
+        local_map: ObservedGrid,
+    ) -> bool:
+        return (
+            not self._final_approach
+            and self.goal_mode in {"nearby_safe", "approaching_safe_stop"}
+            and len(self._path) == 1
+            and self._path[0] == self._pose_cell(pose, local_map)
+            and self._final_approach_segment_is_safe(pose)
+        )
+
+    def _final_approach_segment_is_safe(self, pose: PoseEstimate) -> bool:
+        assert self.goal is not None and self._planner is not None
+        return self._planner.is_segment_passable(
+            (pose.x_m, pose.y_m),
+            self.goal,
+            extra_clearance_m=AUTOMATIC_MINIMUM_CLEARANCE_M,
+        )
+
     def _execution_goal_failure(self) -> str | None:
         assert self.goal is not None and self._planner is not None
         if (
@@ -645,7 +775,7 @@ class GotoController:
             or not self._planner.is_segment_passable(
                 self.goal,
                 self.goal,
-                extra_clearance_m=HARD_STOP_CLEARANCE_M,
+                extra_clearance_m=AUTOMATIC_MINIMUM_CLEARANCE_M,
             )
         ):
             return "goal_blocked"
@@ -676,13 +806,10 @@ class GotoController:
         self._current_waypoint = None
         self._clear_pending_planning()
 
-    def _block_no_path(self, detail: str) -> None:
+    def _block_no_path(self, detail: str | None) -> None:
         self._set_path(None)
-        self.status = "blocked"
-        self.reason = "no_path"
-        self.detail = detail
         self._current_waypoint = None
-        self._clear_pending_planning()
+        self.block("no_path", detail)
 
     def _clear_pending_planning(self) -> None:
         self._planning_kind = None
@@ -696,17 +823,16 @@ class GotoController:
     def _approach_distance_m(self) -> float | None:
         if self.requested_goal is None or self.goal is None:
             return None
-        return max(
-            0.0,
-            math.dist(self.requested_goal, self.goal) - self._vehicle_radius_m,
-        )
+        return self._point_approach_distance_m(self.goal)
 
     def _pose_approach_distance_m(self, pose: PoseEstimate) -> float:
+        return self._point_approach_distance_m((pose.x_m, pose.y_m))
+
+    def _point_approach_distance_m(self, point: tuple[float, float]) -> float:
         assert self.requested_goal is not None
         return max(
             0.0,
-            math.dist(self.requested_goal, (pose.x_m, pose.y_m))
-            - self._vehicle_radius_m,
+            math.dist(self.requested_goal, point) - self._vehicle_radius_m,
         )
 
     def _set_path(self, path: list[tuple[int, int]] | None) -> None:
@@ -722,6 +848,8 @@ class GotoController:
 
     def _goal_cell(self, local_map: ObservedGrid) -> tuple[int, int]:
         assert self.goal is not None
+        if self._goal_access_cell is not None:
+            return self._goal_access_cell
         return (
             math.floor(self.goal[0] / local_map.resolution_m),
             math.floor(self.goal[1] / local_map.resolution_m),
@@ -736,12 +864,8 @@ class GotoController:
             math.floor(pose.y_m / local_map.resolution_m),
         )
 
-def _axis_offsets(radius: float, max_step: float) -> tuple[float, ...]:
-    intervals = max(1, math.ceil(2 * radius / max_step))
-    return tuple(
-        -radius + 2 * radius * index / intervals
-        for index in range(intervals + 1)
-    )
+def _radial_uncertainty_m(pose: PoseEstimate) -> float:
+    return math.sqrt(pose.covariance[0] + pose.covariance[1])
 
 
 def _edge_evidence_is_mapped(
@@ -749,13 +873,22 @@ def _edge_evidence_is_mapped(
     pose: PoseEstimate,
     local_map: ObservedGrid,
 ) -> bool:
+    cell = _edge_evidence_cell(safety, pose, local_map)
+    return cell is not None and local_map.is_forbidden(*cell)
+
+
+def _edge_evidence_cell(
+    safety: LocalSafetyRuntime,
+    pose: PoseEstimate,
+    local_map: ObservedGrid,
+) -> tuple[int, int] | None:
     point = safety.observation.edge_point_vehicle_m
     if point is None:
-        return False
+        return None
     cosine, sine = math.cos(pose.yaw_rad), math.sin(pose.yaw_rad)
     x_m = pose.x_m + cosine * point[0] - sine * point[1]
     y_m = pose.y_m + sine * point[0] + cosine * point[1]
-    return local_map.is_forbidden(
+    return (
         math.floor(x_m / local_map.resolution_m),
         math.floor(y_m / local_map.resolution_m),
     )
