@@ -531,9 +531,10 @@ class TestFleetTelemetryWebSocket(unittest.IsolatedAsyncioTestCase):
 
         async def receive_scan(websocket, sequence: int) -> dict[str, object]:
             while True:
-                message = json.loads(
-                    await asyncio.wait_for(websocket.recv(), timeout=1.0)
-                )
+                raw = await asyncio.wait_for(websocket.recv(), timeout=1.0)
+                if isinstance(raw, bytes):
+                    continue
+                message = json.loads(raw)
                 if message.get("type") == "scan" and message.get("seq") == sequence:
                     return message
 
