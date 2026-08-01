@@ -37,6 +37,7 @@ from mockvehicle2d.map_sync import (
     P2PFleetSync,
     P2PSettings,
     P2PVehicleConfig,
+    PeerVehicleState,
     _CleanupError,
     _CleanupPending,
     _finish_cleanup,
@@ -600,6 +601,53 @@ def _dynamic_hit_cells(
     return cells
 
 
+def _circle_cells(
+    x_m: float,
+    y_m: float,
+    radius_m: float,
+    resolution_m: float,
+) -> set[tuple[int, int]]:
+    center_x = x_m / resolution_m
+    center_y = y_m / resolution_m
+    radius = radius_m / resolution_m
+    return {
+        (gx, gy)
+        for gy in range(
+            math.floor(center_y - radius),
+            math.floor(center_y + radius) + 1,
+        )
+        for gx in range(
+            math.floor(center_x - radius),
+            math.floor(center_x + radius) + 1,
+        )
+        if cell_overlaps_circle(gx, gy, center_x, center_y, radius**2)
+    }
+
+
+def _peer_vehicle_cells(
+    states: tuple[PeerVehicleState, ...],
+    anchor: AnchorSpec,
+    resolution_m: float,
+) -> set[tuple[int, int]]:
+    cells = set()
+    for state in states:
+        x_m, y_m, _ = anchor.global_to_anchor(
+            state.global_x_m,
+            state.global_y_m,
+            state.global_yaw_rad,
+        )
+        uncertainty_m = math.sqrt(max(state.covariance[:2]))
+        cells.update(
+            _circle_cells(
+                x_m,
+                y_m,
+                state.radius_m + uncertainty_m,
+                resolution_m,
+            )
+        )
+    return cells
+
+
 @dataclass
 class RobotNode:
     """Vehicle-owned controller, odometry and local map; no shared-world truth."""
@@ -622,11 +670,29 @@ class RobotNode:
         repr=False,
     )
     _planning_map: _TransientPlanningGrid = field(init=False, repr=False)
+    _lidar_dynamic_cells: set[tuple[int, int]] = field(
+        default_factory=set,
+        repr=False,
+    )
 
     def __post_init__(self) -> None:
         self._planning_map = _TransientPlanningGrid(self.local_state.local_map)
 
     def control(self, vehicle: Vehicle, sensor_grid: MapGrid, now: float) -> None:
+        peer_states = (
+            () if self.map_sync is None else self.map_sync.peer_vehicle_states()
+        )
+        self._update_planning_map(peer_states=peer_states)
+        for state in peer_states:
+            uncertainty_m = math.sqrt(max(state.covariance[:2]))
+            for gx, gy in _circle_cells(
+                state.global_x_m,
+                state.global_y_m,
+                state.radius_m + uncertainty_m,
+                1.0,
+            ):
+                if sensor_grid.in_bounds(gx, gy):
+                    sensor_grid.set_cell(gx, gy, WALL)
         self.controller.tick(
             vehicle=vehicle,
             grid=sensor_grid,
@@ -640,6 +706,46 @@ class RobotNode:
         )
         self._pending_map_delta = None
         self._pending_advance = SafetyAdvanceResult()
+
+    def _update_planning_map(
+        self,
+        *,
+        peer_states: tuple[PeerVehicleState, ...] | None = None,
+        persistent_delta: LocalMapDelta | None = None,
+    ) -> None:
+        if peer_states is None:
+            peer_states = (
+                () if self.map_sync is None else self.map_sync.peer_vehicle_states()
+            )
+        planning_delta = self._planning_map.update(
+            self._lidar_dynamic_cells
+            | _peer_vehicle_cells(
+                peer_states,
+                self.local_state.anchor,
+                self.local_state.local_map.resolution_m,
+            ),
+            persistent_delta,
+        )
+        if not planning_delta.changed_cells:
+            return
+        pending = {
+            (update.gx, update.gy): update
+            for update in (
+                ()
+                if self._pending_map_delta is None
+                else self._pending_map_delta.changed_cells
+            )
+        }
+        pending.update(
+            ((update.gx, update.gy), update)
+            for update in planning_delta.changed_cells
+        )
+        self._pending_map_delta = LocalMapDelta(
+            tuple(
+                pending[cell]
+                for cell in sorted(pending, key=lambda cell: (cell[1], cell[0]))
+            )
+        )
 
     def sample(
         self,
@@ -665,35 +771,23 @@ class RobotNode:
                 else (self.safety.observation.edge_point_vehicle_m,)
             ),
         )
-        planning_delta = self._planning_map.update(
-            _dynamic_hit_cells(
-                scan_points,
-                self.local_state.pose,
-                self.local_state.local_map.resolution_m,
-            ),
-            persistent_delta,
+        self._lidar_dynamic_cells = _dynamic_hit_cells(
+            scan_points,
+            self.local_state.pose,
+            self.local_state.local_map.resolution_m,
         )
-        if planning_delta.changed_cells:
-            pending = {
-                (update.gx, update.gy): update
-                for update in (
-                    ()
-                    if self._pending_map_delta is None
-                    else self._pending_map_delta.changed_cells
-                )
-            }
-            pending.update(
-                ((update.gx, update.gy), update)
-                for update in planning_delta.changed_cells
-            )
-            self._pending_map_delta = LocalMapDelta(
-                tuple(pending[cell] for cell in sorted(pending))
-            )
+        linear_mps, omega_rps = vehicle.body_velocities()
         if self.map_sync is not None:
             self.map_sync.record_local(persistent_delta)
+            self.map_sync.record_vehicle_state(
+                self.local_state.pose,
+                radius_m=vehicle.radius,
+                linear_mps=linear_mps,
+                omega_rps=omega_rps,
+            )
+        self._update_planning_map(persistent_delta=persistent_delta)
         self.latest_frame = RuntimeFrame(scan_points, wall_timestamp)
         estimate = self.local_state.pose
-        linear_mps, omega_rps = vehicle.body_velocities()
         runtime_state = {
             "linear_mps": linear_mps,
             "omega_rps": omega_rps,

@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 import errno
 import fcntl
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 import json
 import math
 import os
@@ -13,25 +13,32 @@ from pathlib import Path
 import socket
 import stat
 import tempfile
+import time
 from typing import Iterable
+import uuid
 
 from mockvehicle2d.local_state import (
     FREE,
     FORBIDDEN,
+    LOCALIZATION_QUALITIES,
     OCCUPIED,
     AnchorSpec,
     LocalMapDelta,
     MapCellUpdate,
+    PoseEstimate,
 )
 
 
 SIDECAR_PROTOCOL = "mockvehicle2d-map-sync-sidecar/1"
 DELTA_PROTOCOL = "mockvehicle2d-map-delta/1"
+PEER_STATE_PROTOCOL = "mockvehicle2d-peer-state/1"
 MAX_DELTA_CELLS = 512
 MAX_MESSAGE_BYTES = 256 * 1024
 MAX_GRID_COORDINATE = 1_000_000
 MAP_EPOCH = 1
 TRANSFORM_EPOCH = 1
+PEER_STATE_TTL_S = 0.35
+MAX_PEER_RADIUS_M = 10.0
 ALLOWED_CELL_STATES = frozenset((FREE, OCCUPIED, FORBIDDEN))
 PROCESS_STOP_TIMEOUT_S = 2.0
 
@@ -291,6 +298,65 @@ class P2PVehicleConfig:
             raise ValueError("invalid P2P vehicle configuration")
 
 
+@dataclass(frozen=True)
+class PeerVehicleState:
+    source_vehicle_id: str
+    state_epoch: str
+    sequence: int
+    timestamp_s: float
+    global_x_m: float
+    global_y_m: float
+    global_yaw_rad: float
+    covariance: tuple[float, float, float]
+    quality: str
+    vx_mps: float
+    vy_mps: float
+    omega_rps: float
+    radius_m: float
+
+    def as_payload(
+        self,
+        session_id: str,
+        source_anchor: AnchorSpec,
+    ) -> dict[str, object]:
+        x_m, y_m, yaw_rad = source_anchor.global_to_anchor(
+            self.global_x_m,
+            self.global_y_m,
+            self.global_yaw_rad,
+        )
+        cosine = math.cos(source_anchor.global_yaw_rad)
+        sine = math.sin(source_anchor.global_yaw_rad)
+        return {
+            "protocol": PEER_STATE_PROTOCOL,
+            "session_id": session_id,
+            "source_vehicle_id": self.source_vehicle_id,
+            "state_epoch": self.state_epoch,
+            "sequence": self.sequence,
+            "source_frame": "anchor_map",
+            "anchor_id": source_anchor.anchor_id,
+            "transform_epoch": TRANSFORM_EPOCH,
+            "transform_to_global_map": {
+                "x_m": source_anchor.global_x_m,
+                "y_m": source_anchor.global_y_m,
+                "yaw_rad": source_anchor.global_yaw_rad,
+            },
+            "timestamp_s": self.timestamp_s,
+            "pose": {
+                "x_m": x_m,
+                "y_m": y_m,
+                "yaw_rad": yaw_rad,
+                "covariance_diagonal": list(self.covariance),
+                "quality": self.quality,
+            },
+            "velocity": {
+                "vx_mps": cosine * self.vx_mps + sine * self.vy_mps,
+                "vy_mps": -sine * self.vx_mps + cosine * self.vy_mps,
+                "omega_rps": self.omega_rps,
+            },
+            "footprint_radius_m": self.radius_m,
+        }
+
+
 class MapSyncState:
     """Keeps local evidence, remote evidence and a derived read-only view separate."""
 
@@ -312,6 +378,17 @@ class MapSyncState:
         self._peer_evidence: dict[str, dict[tuple[int, int], int]] = {}
         self._peer_epoch: dict[str, int] = {}
         self._peer_sequence: dict[str, int] = {}
+        self._state_epoch = uuid.uuid4().hex
+        self._state_sequence = 0
+        self._state_inflight: PeerVehicleState | None = None
+        self._local_vehicle_state: PeerVehicleState | None = None
+        self._peer_vehicle_states: dict[
+            str,
+            tuple[PeerVehicleState, float],
+        ] = {}
+        self._peer_state_epoch: dict[str, str] = {}
+        self._peer_state_seen_epochs: dict[str, set[str]] = {}
+        self._peer_state_sequence: dict[str, int] = {}
         self._connected_vehicle_ids: tuple[str, ...] = ()
         self.ready = False
         self.published_deltas = 0
@@ -319,6 +396,10 @@ class MapSyncState:
         self.rejected_deltas = 0
         self.publish_failures = 0
         self.sequence_gaps = 0
+        self.published_peer_states = 0
+        self.received_peer_states = 0
+        self.rejected_peer_states = 0
+        self.peer_state_publish_failures = 0
         self._collaborative_cache: dict[tuple[int, int], int] | None = None
 
     def configure_network(
@@ -353,6 +434,64 @@ class MapSyncState:
             self._dirty[coordinate] = cell.state
         if delta.changed_cells:
             self._collaborative_cache = None
+
+    def record_vehicle_state(
+        self,
+        pose: PoseEstimate,
+        *,
+        radius_m: float,
+        linear_mps: float,
+        omega_rps: float,
+    ) -> None:
+        if not isinstance(pose, PoseEstimate) or pose.anchor_id != self.anchor.anchor_id:
+            raise ValueError("peer state pose must use the configured anchor")
+        values = radius_m, linear_mps, omega_rps
+        if not all(math.isfinite(value) for value in values) or radius_m <= 0:
+            raise ValueError("peer state motion and footprint must be finite")
+        global_x_m, global_y_m, global_yaw_rad = self.anchor.anchor_to_global(
+            pose.x_m,
+            pose.y_m,
+            pose.yaw_rad,
+        )
+        self._local_vehicle_state = PeerVehicleState(
+            self.vehicle_id,
+            self._state_epoch,
+            0,
+            pose.timestamp,
+            global_x_m,
+            global_y_m,
+            global_yaw_rad,
+            pose.covariance,
+            pose.quality,
+            linear_mps * math.cos(global_yaw_rad),
+            linear_mps * math.sin(global_yaw_rad),
+            omega_rps,
+            radius_m,
+        )
+
+    def prepare_peer_state(self) -> dict[str, object] | None:
+        if self._state_inflight is not None or self._local_vehicle_state is None:
+            return None
+        state = replace(
+            self._local_vehicle_state,
+            sequence=self._state_sequence + 1,
+        )
+        payload = state.as_payload(self.session_id, self.anchor)
+        if len(json.dumps(payload, separators=(",", ":")).encode()) > MAX_MESSAGE_BYTES:
+            raise RuntimeError("peer vehicle state unexpectedly exceeds message limit")
+        self._state_inflight = state
+        return payload
+
+    def publish_peer_state_result(self, sequence: int, accepted: bool) -> None:
+        if self._state_inflight is None or self._state_inflight.sequence != sequence:
+            self.rejected_peer_states += 1
+            return
+        self._state_inflight = None
+        if not accepted:
+            self.peer_state_publish_failures += 1
+            return
+        self._state_sequence = sequence
+        self.published_peer_states += 1
 
     def prepare_delta(self) -> dict[str, object] | None:
         if self._inflight is not None or not self._dirty:
@@ -404,6 +543,35 @@ class MapSyncState:
         self._connected_vehicle_ids = ()
         if self._inflight is not None:
             self.publish_result(int(self._inflight["sequence"]), False)
+        if self._state_inflight is not None:
+            self.publish_peer_state_result(self._state_inflight.sequence, False)
+
+    def publish_transport_result(
+        self,
+        protocol: str,
+        sequence: int,
+        accepted: bool,
+    ) -> None:
+        if protocol == DELTA_PROTOCOL:
+            self.publish_result(sequence, accepted)
+        elif protocol == PEER_STATE_PROTOCOL:
+            self.publish_peer_state_result(sequence, accepted)
+        else:
+            raise ValueError("unknown map-sync payload protocol")
+
+    def receive_transport(
+        self,
+        source_peer_id: str,
+        source_vehicle_id: str,
+        payload: object,
+    ) -> bool:
+        protocol = payload.get("protocol") if isinstance(payload, dict) else None
+        if protocol == DELTA_PROTOCOL:
+            return self.receive(source_peer_id, source_vehicle_id, payload)
+        if protocol == PEER_STATE_PROTOCOL:
+            return self.receive_peer_state(source_peer_id, source_vehicle_id, payload)
+        self.rejected_peer_states += 1
+        return False
 
     def set_health(self, *, ready: bool, connected_vehicle_ids: Iterable[str] = ()) -> None:
         connected = tuple(sorted(set(connected_vehicle_ids)))
@@ -448,6 +616,200 @@ class MapSyncState:
         self.received_deltas += 1
         self._collaborative_cache = None
         return True
+
+    def receive_peer_state(
+        self,
+        source_peer_id: str,
+        reported_source_vehicle_id: str,
+        payload: object,
+        *,
+        received_at_s: float | None = None,
+    ) -> bool:
+        receipt = time.monotonic() if received_at_s is None else received_at_s
+        if not math.isfinite(receipt):
+            raise ValueError("peer state receipt time must be finite")
+        try:
+            state = self._validate_peer_state(
+                source_peer_id,
+                reported_source_vehicle_id,
+                payload,
+            )
+        except (TypeError, ValueError):
+            self.rejected_peer_states += 1
+            return False
+
+        source = state.source_vehicle_id
+        current_epoch = self._peer_state_epoch.get(source)
+        if current_epoch != state.state_epoch:
+            seen = self._peer_state_seen_epochs.setdefault(source, set())
+            if state.state_epoch in seen:
+                self.rejected_peer_states += 1
+                return False
+            if current_epoch is not None:
+                seen.add(current_epoch)
+            self._peer_state_epoch[source] = state.state_epoch
+            self._peer_state_sequence[source] = 0
+        if state.sequence <= self._peer_state_sequence[source]:
+            self.rejected_peer_states += 1
+            return False
+        self._peer_state_sequence[source] = state.sequence
+        self._peer_vehicle_states[source] = state, receipt
+        self.received_peer_states += 1
+        return True
+
+    def _validate_peer_state(
+        self,
+        source_peer_id: str,
+        reported_source_vehicle_id: str,
+        payload: object,
+    ) -> PeerVehicleState:
+        if len(json.dumps(payload, separators=(",", ":")).encode()) > MAX_MESSAGE_BYTES:
+            raise ValueError("remote peer state exceeds size limit")
+        fields = (
+            "protocol",
+            "session_id",
+            "source_vehicle_id",
+            "state_epoch",
+            "sequence",
+            "source_frame",
+            "anchor_id",
+            "transform_epoch",
+            "transform_to_global_map",
+            "timestamp_s",
+            "pose",
+            "velocity",
+            "footprint_radius_m",
+        )
+        body = _strict_object(
+            payload,
+            required=frozenset(fields),
+            allowed=frozenset(fields),
+            name="peer_vehicle_state",
+        )
+        source = body["source_vehicle_id"]
+        expected = self._expected_peers.get(source) if isinstance(source, str) else None
+        if (
+            source != reported_source_vehicle_id
+            or expected is None
+            or expected[0] != source_peer_id
+        ):
+            raise ValueError("peer state source is not allowed")
+        expected_anchor = expected[1]
+        epoch = body["state_epoch"]
+        if (
+            body["protocol"] != PEER_STATE_PROTOCOL
+            or body["session_id"] != self.session_id
+            or body["source_frame"] != "anchor_map"
+            or body["anchor_id"] != expected_anchor.anchor_id
+            or _positive_integer(body["transform_epoch"], "transform_epoch")
+            != TRANSFORM_EPOCH
+            or not isinstance(epoch, str)
+            or not 1 <= len(epoch) <= 128
+            or any(not (character.isalnum() or character in "._-") for character in epoch)
+        ):
+            raise ValueError("peer state protocol, epoch, frame or transform is incompatible")
+        transform = _strict_object(
+            body["transform_to_global_map"],
+            required=frozenset(("x_m", "y_m", "yaw_rad")),
+            allowed=frozenset(("x_m", "y_m", "yaw_rad")),
+            name="transform_to_global_map",
+        )
+        received_transform = tuple(
+            _finite(transform[name], f"transform_to_global_map.{name}")
+            for name in ("x_m", "y_m", "yaw_rad")
+        )
+        expected_transform = (
+            expected_anchor.global_x_m,
+            expected_anchor.global_y_m,
+            expected_anchor.global_yaw_rad,
+        )
+        if any(
+            not math.isclose(actual, wanted, rel_tol=0.0, abs_tol=1e-9)
+            for actual, wanted in zip(received_transform, expected_transform)
+        ):
+            raise ValueError("peer state anchor transform does not match the allowlist")
+        pose = _strict_object(
+            body["pose"],
+            required=frozenset(
+                ("x_m", "y_m", "yaw_rad", "covariance_diagonal", "quality")
+            ),
+            allowed=frozenset(
+                ("x_m", "y_m", "yaw_rad", "covariance_diagonal", "quality")
+            ),
+            name="peer_pose",
+        )
+        local_pose = tuple(
+            _finite(pose[name], f"pose.{name}")
+            for name in ("x_m", "y_m", "yaw_rad")
+        )
+        covariance = pose["covariance_diagonal"]
+        if not isinstance(covariance, list) or len(covariance) != 3:
+            raise ValueError("peer pose covariance or quality is invalid")
+        covariance_values = tuple(
+            _finite(value, f"pose.covariance_diagonal[{index}]")
+            for index, value in enumerate(covariance)
+        )
+        if any(value < 0 for value in covariance_values) or (
+            pose["quality"] not in LOCALIZATION_QUALITIES
+        ):
+            raise ValueError("peer pose covariance or quality is invalid")
+        velocity = _strict_object(
+            body["velocity"],
+            required=frozenset(("vx_mps", "vy_mps", "omega_rps")),
+            allowed=frozenset(("vx_mps", "vy_mps", "omega_rps")),
+            name="peer_velocity",
+        )
+        local_velocity = tuple(
+            _finite(velocity[name], f"velocity.{name}")
+            for name in ("vx_mps", "vy_mps", "omega_rps")
+        )
+        radius_m = _finite(body["footprint_radius_m"], "footprint_radius_m")
+        if not 0 < radius_m <= MAX_PEER_RADIUS_M:
+            raise ValueError("peer footprint radius is outside the supported range")
+        global_x_m, global_y_m, global_yaw_rad = expected_anchor.anchor_to_global(
+            *local_pose
+        )
+        cosine = math.cos(expected_anchor.global_yaw_rad)
+        sine = math.sin(expected_anchor.global_yaw_rad)
+        return PeerVehicleState(
+            source,
+            epoch,
+            _positive_integer(body["sequence"], "sequence"),
+            _finite(body["timestamp_s"], "timestamp_s"),
+            global_x_m,
+            global_y_m,
+            global_yaw_rad,
+            covariance_values,
+            pose["quality"],
+            cosine * local_velocity[0] - sine * local_velocity[1],
+            sine * local_velocity[0] + cosine * local_velocity[1],
+            local_velocity[2],
+            radius_m,
+        )
+
+    def peer_vehicle_states(
+        self,
+        *,
+        now_s: float | None = None,
+    ) -> tuple[PeerVehicleState, ...]:
+        now = time.monotonic() if now_s is None else now_s
+        if not math.isfinite(now):
+            raise ValueError("peer state query time must be finite")
+        expired = [
+            source
+            for source, (_, received_at) in self._peer_vehicle_states.items()
+            if now - received_at > PEER_STATE_TTL_S + 1e-12
+        ]
+        for source in expired:
+            self._peer_vehicle_states.pop(source, None)
+        return tuple(
+            state
+            for state, received_at in sorted(
+                self._peer_vehicle_states.values(),
+                key=lambda item: item[0].source_vehicle_id,
+            )
+            if received_at <= now and state.quality != "lost"
+        )
 
     def _validate_remote(
         self,
@@ -606,6 +968,11 @@ class MapSyncState:
             "rejected_deltas": self.rejected_deltas,
             "publish_failures": self.publish_failures,
             "sequence_gaps": self.sequence_gaps,
+            "published_peer_states": self.published_peer_states,
+            "received_peer_states": self.received_peer_states,
+            "rejected_peer_states": self.rejected_peer_states,
+            "peer_state_publish_failures": self.peer_state_publish_failures,
+            "active_peer_vehicle_states": len(self.peer_vehicle_states()),
             "peer_sources": {
                 source: {
                     "map_epoch": self._peer_epoch[source],
@@ -633,7 +1000,7 @@ class _NodeBridge:
         self.ready_event = asyncio.Event()
         self._writer: asyncio.StreamWriter | None = None
         self._writers: set[asyncio.StreamWriter] = set()
-        self._outbound: asyncio.Queue[dict[str, object]] = asyncio.Queue(maxsize=1)
+        self._outbound: asyncio.Queue[dict[str, object]] = asyncio.Queue(maxsize=2)
         self._tasks: set[asyncio.Task[object]] = set()
         self._owned_socket: tuple[int, int] | None = None
         self._close_task: asyncio.Task[None] | None = None
@@ -766,17 +1133,26 @@ class _NodeBridge:
                         raise ValueError("invalid peer health event")
                     self.state.set_health(ready=True, connected_vehicle_ids=connected)
                 elif event_type == "publish_result":
+                    protocol = event.get("protocol")
                     sequence = event.get("sequence")
                     accepted = event.get("accepted")
-                    if type(sequence) is not int or type(accepted) is not bool:
+                    if (
+                        protocol not in {DELTA_PROTOCOL, PEER_STATE_PROTOCOL}
+                        or type(sequence) is not int
+                        or type(accepted) is not bool
+                    ):
                         raise ValueError("invalid publish result")
-                    self.state.publish_result(sequence, accepted)
+                    self.state.publish_transport_result(protocol, sequence, accepted)
                 elif event_type == "received":
                     source_peer_id = event.get("source_peer_id")
                     source_vehicle_id = event.get("source_vehicle_id")
                     if not isinstance(source_peer_id, str) or not isinstance(source_vehicle_id, str):
                         raise ValueError("invalid received event source")
-                    self.state.receive(source_peer_id, source_vehicle_id, event.get("payload"))
+                    self.state.receive_transport(
+                        source_peer_id,
+                        source_vehicle_id,
+                        event.get("payload"),
+                    )
                 else:
                     raise ValueError("unknown sidecar event")
         except (ConnectionError, json.JSONDecodeError, ValueError):
@@ -808,8 +1184,16 @@ class _NodeBridge:
                 await self._writer.drain()
             except (ConnectionError, ValueError):
                 payload = command.get("payload")
-                if isinstance(payload, dict) and type(payload.get("sequence")) is int:
-                    self.state.publish_result(payload["sequence"], False)
+                if (
+                    isinstance(payload, dict)
+                    and isinstance(payload.get("protocol"), str)
+                    and type(payload.get("sequence")) is int
+                ):
+                    self.state.publish_transport_result(
+                        payload["protocol"],
+                        payload["sequence"],
+                        False,
+                    )
 
     async def _close(self) -> None:
         if self._closed:
@@ -1246,11 +1630,14 @@ class P2PFleetSync:
         if len(self.vehicles) <= 1:
             return
         for vehicle_id, state in self.states.items():
-            payload = state.prepare_delta()
-            if payload is None:
-                continue
-            if not self._bridges[vehicle_id].enqueue(payload):
-                state.publish_result(int(payload["sequence"]), False)
+            bridge = self._bridges[vehicle_id]
+            for payload in (state.prepare_peer_state(), state.prepare_delta()):
+                if payload is not None and not bridge.enqueue(payload):
+                    state.publish_transport_result(
+                        payload["protocol"],
+                        int(payload["sequence"]),
+                        False,
+                    )
 
     async def _flush_loop(self) -> None:
         interval_s = self.settings.sync_interval_ms / 1000

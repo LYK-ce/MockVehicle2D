@@ -36,6 +36,7 @@ use tokio::{
 
 const SIDECAR_PROTOCOL: &str = "mockvehicle2d-map-sync-sidecar/1";
 const DELTA_PROTOCOL: &str = "mockvehicle2d-map-delta/1";
+const PEER_STATE_PROTOCOL: &str = "mockvehicle2d-peer-state/1";
 const MAX_MESSAGE_BYTES: usize = 256 * 1024;
 const MAX_PEERS: usize = 3;
 static IDENTITY_TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
@@ -108,6 +109,7 @@ struct ReceivedEvent<'a> {
 #[derive(Serialize)]
 struct PublishResult {
     r#type: &'static str,
+    protocol: String,
     sequence: u64,
     accepted: bool,
     error: Option<String>,
@@ -411,10 +413,14 @@ async fn send_event(writer: &mut OwnedWriteHalf, event: &impl Serialize) -> Resu
     Ok(())
 }
 
-fn delta_identity(payload: &Value) -> Result<(&str, &str, u64), &'static str> {
+fn payload_identity(payload: &Value) -> Result<(&str, &str, &str, u64), &'static str> {
     let object = payload.as_object().ok_or("payload must be an object")?;
-    if object.get("protocol").and_then(Value::as_str) != Some(DELTA_PROTOCOL) {
-        return Err("unsupported delta protocol");
+    let protocol = object
+        .get("protocol")
+        .and_then(Value::as_str)
+        .ok_or("missing protocol")?;
+    if !matches!(protocol, DELTA_PROTOCOL | PEER_STATE_PROTOCOL) {
+        return Err("unsupported map-sync protocol");
     }
     let session = object
         .get("session_id")
@@ -428,7 +434,7 @@ fn delta_identity(payload: &Value) -> Result<(&str, &str, u64), &'static str> {
         .get("sequence")
         .and_then(Value::as_u64)
         .ok_or("missing sequence")?;
-    Ok((session, vehicle, sequence))
+    Ok((protocol, session, vehicle, sequence))
 }
 
 fn authorized_payload<'a>(
@@ -437,7 +443,7 @@ fn authorized_payload<'a>(
     session_id: &str,
     peer_by_id: &'a HashMap<PeerId, String>,
 ) -> Option<(&'a str, u64)> {
-    let (session, vehicle, sequence) = delta_identity(payload).ok()?;
+    let (_, session, vehicle, sequence) = payload_identity(payload).ok()?;
     let expected_vehicle = peer_by_id.get(source)?;
     (session == session_id && vehicle == expected_vehicle)
         .then_some((expected_vehicle.as_str(), sequence))
@@ -480,7 +486,7 @@ async fn run(config: NodeConfig) -> Result<(), BoxError> {
         .with_behaviour(|_| behaviour)?
         .build();
     let topic =
-        gossipsub::IdentTopic::new(format!("mockvehicle2d/{}/map-delta/1", config.session_id));
+        gossipsub::IdentTopic::new(format!("mockvehicle2d/{}/fleet-sync/1", config.session_id));
     swarm.behaviour_mut().gossipsub.subscribe(&topic)?;
     for peer in &known_peers {
         swarm
@@ -524,19 +530,23 @@ async fn run(config: NodeConfig) -> Result<(), BoxError> {
                 match serde_json::from_str::<LocalCommand>(&line)? {
                     LocalCommand::Shutdown => break,
                     LocalCommand::Publish { payload } => {
-                        let identity = delta_identity(&payload);
-                        let sequence = identity.as_ref().map(|identity| identity.2).unwrap_or(0);
+                        let identity = payload_identity(&payload);
+                        let protocol = identity
+                            .as_ref()
+                            .map(|identity| identity.0)
+                            .unwrap_or("");
+                        let sequence = identity.as_ref().map(|identity| identity.3).unwrap_or(0);
                         let encoded = serde_json::to_vec(&payload)?;
                         let result = if identity
                             .as_ref()
-                            .map(|(session, vehicle, _)| {
+                            .map(|(_, session, vehicle, _)| {
                                 *session != config.session_id || *vehicle != config.vehicle_id
                             })
                             .unwrap_or(true)
                         {
-                            Err("local delta identity does not match the sidecar".to_string())
+                            Err("local payload identity does not match the sidecar".to_string())
                         } else if encoded.len() > MAX_MESSAGE_BYTES {
-                            Err("map delta exceeds size limit".to_string())
+                            Err("map-sync payload exceeds size limit".to_string())
                         } else {
                             swarm
                                 .behaviour_mut()
@@ -547,6 +557,7 @@ async fn run(config: NodeConfig) -> Result<(), BoxError> {
                         };
                         send_event(&mut writer, &PublishResult {
                             r#type: "publish_result",
+                            protocol: protocol.to_string(),
                             sequence,
                             accepted: result.is_ok(),
                             error: result.err(),
@@ -820,7 +831,7 @@ mod tests {
         let peer = identity::Keypair::generate_ed25519().public().to_peer_id();
         let peers = HashMap::from([(peer, "vehicle_1".to_string())]);
         let payload = serde_json::json!({
-            "protocol": DELTA_PROTOCOL,
+            "protocol": PEER_STATE_PROTOCOL,
             "session_id": "session_1",
             "source_vehicle_id": "vehicle_1",
             "sequence": 1

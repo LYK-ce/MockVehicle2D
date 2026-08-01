@@ -18,10 +18,13 @@ from mockvehicle2d.local_state import (
     AnchorSpec,
     LocalMapDelta,
     MapCellUpdate,
+    PoseEstimate,
 )
 from mockvehicle2d.map_grid import MapGrid
 from mockvehicle2d.map_sync import (
     MAX_DELTA_CELLS,
+    PEER_STATE_PROTOCOL,
+    PEER_STATE_TTL_S,
     MapSyncState,
     P2PFleetSync,
     P2PSettings,
@@ -42,6 +45,169 @@ def state(number: int) -> MapSyncState:
 
 
 class TestMapSyncState(unittest.TestCase):
+    def test_peer_state_is_independent_ordered_and_expires_by_receipt_time(self) -> None:
+        source = state(1)
+        receiver = state(2)
+        source.configure_network("peer_1", {"vehicle_2": ("peer_2", anchor(2))})
+        receiver.configure_network("peer_2", {"vehicle_1": ("peer_1", anchor(1))})
+        source.record_vehicle_state(
+            PoseEstimate(
+                anchor(1).anchor_id,
+                1.0,
+                2.0,
+                0.25,
+                (0.04, 0.09, 0.01),
+                "nominal",
+                100.0,
+                1,
+            ),
+            radius_m=0.5,
+            linear_mps=0.4,
+            omega_rps=0.1,
+        )
+
+        first = source.prepare_peer_state()
+
+        self.assertIsNone(source.prepare_delta())
+        self.assertTrue(
+            receiver.receive_peer_state(
+                "peer_1",
+                "vehicle_1",
+                first,
+                received_at_s=20.0,
+            )
+        )
+        peer = receiver.peer_vehicle_states(now_s=20.0 + PEER_STATE_TTL_S)[0]
+        self.assertEqual((peer.global_x_m, peer.global_y_m), (11.0, 7.0))
+        self.assertEqual(peer.covariance, (0.04, 0.09, 0.01))
+        self.assertFalse(
+            receiver.receive_peer_state(
+                "peer_1",
+                "vehicle_1",
+                first,
+                received_at_s=20.1,
+            )
+        )
+        self.assertEqual(
+            receiver.peer_vehicle_states(now_s=20.0 + PEER_STATE_TTL_S + 0.01),
+            (),
+        )
+
+        source.publish_peer_state_result(first["sequence"], True)
+        second = source.prepare_peer_state()
+        wrong_frame = deepcopy(second)
+        wrong_frame["anchor_id"] = "other"
+        self.assertFalse(
+            receiver.receive_peer_state(
+                "peer_1",
+                "vehicle_1",
+                wrong_frame,
+                received_at_s=21.0,
+            )
+        )
+        self.assertTrue(
+            receiver.receive_peer_state(
+                "peer_1",
+                "vehicle_1",
+                second,
+                received_at_s=21.0,
+            )
+        )
+        restarted = deepcopy(second)
+        restarted["state_epoch"] = "replacement"
+        restarted["sequence"] = 1
+        self.assertTrue(
+            receiver.receive_peer_state(
+                "peer_1",
+                "vehicle_1",
+                restarted,
+                received_at_s=21.1,
+            )
+        )
+        stale_epoch = deepcopy(second)
+        stale_epoch["sequence"] = 999
+        self.assertFalse(
+            receiver.receive_peer_state(
+                "peer_1",
+                "vehicle_1",
+                stale_epoch,
+                received_at_s=21.2,
+            )
+        )
+        self.assertEqual(receiver.peer_evidence("vehicle_1"), {})
+
+    def test_flush_publishes_peer_state_without_dirty_map_cells(self) -> None:
+        first = state(1)
+        second = state(2)
+        first.record_vehicle_state(
+            PoseEstimate(
+                anchor(1).anchor_id,
+                0.0,
+                0.0,
+                0.0,
+                (0.0, 0.0, 0.0),
+                "nominal",
+                1.0,
+                0,
+            ),
+            radius_m=0.5,
+            linear_mps=0.0,
+            omega_rps=0.0,
+        )
+        runtime = P2PFleetSync(
+            "session_1",
+            P2PSettings(Path("node"), Path("runtime")),
+            (
+                P2PVehicleConfig("vehicle_1", 20001, anchor(1)),
+                P2PVehicleConfig("vehicle_2", 20002, anchor(2)),
+            ),
+            {"vehicle_1": first, "vehicle_2": second},
+        )
+        runtime._bridges = {
+            "vehicle_1": Mock(enqueue=Mock(return_value=True)),
+            "vehicle_2": Mock(enqueue=Mock(return_value=True)),
+        }
+
+        runtime.flush_once()
+
+        payload = runtime._bridges["vehicle_1"].enqueue.call_args.args[0]
+        self.assertEqual(payload["protocol"], PEER_STATE_PROTOCOL)
+        self.assertIsNone(first.prepare_delta())
+        first.publish_peer_state_result(payload["sequence"], True)
+        runtime.flush_once()
+        self.assertEqual(runtime._bridges["vehicle_1"].enqueue.call_count, 2)
+
+    def test_lost_peer_localization_is_not_projected(self) -> None:
+        source = state(1)
+        receiver = state(2)
+        source.configure_network("peer_1", {"vehicle_2": ("peer_2", anchor(2))})
+        receiver.configure_network("peer_2", {"vehicle_1": ("peer_1", anchor(1))})
+        source.record_vehicle_state(
+            PoseEstimate(
+                anchor(1).anchor_id,
+                1.0,
+                2.0,
+                0.0,
+                (1.0, 1.0, 1.0),
+                "lost",
+                1.0,
+                1,
+            ),
+            radius_m=0.5,
+            linear_mps=0.0,
+            omega_rps=0.0,
+        )
+
+        self.assertTrue(
+            receiver.receive_peer_state(
+                "peer_1",
+                "vehicle_1",
+                source.prepare_peer_state(),
+                received_at_s=2.0,
+            )
+        )
+        self.assertEqual(receiver.peer_vehicle_states(now_s=2.0), ())
+
     def test_dirty_cells_are_merged_bounded_and_acknowledged(self) -> None:
         local = state(1)
         local.configure_network("peer_1", {"vehicle_2": ("peer_2", anchor(2))})

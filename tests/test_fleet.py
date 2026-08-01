@@ -56,6 +56,58 @@ def free_grid(size: int = 40) -> MapGrid:
     return MapGrid.from_wall_set(size, size, set())
 
 
+def peer_fleet(first: AnchorPose, second: AnchorPose) -> FleetRuntime:
+    specs = tuple(
+        FleetVehicleSpec(
+            f"vehicle_{number}",
+            19089 + number,
+            f"spawn_{number}",
+            pose,
+            20089 + number,
+        )
+        for number, pose in enumerate((first, second), 1)
+    )
+    fleet = FleetRuntime.create(
+        FleetScenario(
+            "peer_test",
+            specs,
+            100,
+            P2PSettings(Path("map-sync-node"), Path("runtime")),
+        ),
+        grid=free_grid(),
+    )
+    for vehicle_id, node in fleet.nodes.items():
+        node.map_sync.configure_network(
+            f"peer_{vehicle_id[-1]}",
+            {
+                other_id: (f"peer_{other_id[-1]}", other.local_state.anchor)
+                for other_id, other in fleet.nodes.items()
+                if other_id != vehicle_id
+            },
+        )
+    return fleet
+
+
+def relay_peer_states(fleet: FleetRuntime) -> None:
+    outbound = {
+        vehicle_id: node.map_sync.prepare_peer_state()
+        for vehicle_id, node in fleet.nodes.items()
+    }
+    for source_id, payload in outbound.items():
+        assert payload is not None
+        for receiver_id, receiver in fleet.nodes.items():
+            if receiver_id != source_id:
+                assert receiver.map_sync.receive_peer_state(
+                    f"peer_{source_id[-1]}",
+                    source_id,
+                    payload,
+                )
+        fleet.nodes[source_id].map_sync.publish_peer_state_result(
+            payload["sequence"],
+            True,
+        )
+
+
 class TestFleetScenario(unittest.TestCase):
     def test_example_declares_four_unique_endpoints_and_spawns(self) -> None:
         loaded = FleetScenario.load(
@@ -267,6 +319,120 @@ class TestFleetRuntime(unittest.TestCase):
                 not node.local_state.local_map.occupied_cells()
                 for node in fleet.nodes.values()
             )
+        )
+
+    def test_two_vehicles_from_example_spawns_settle_at_one_goal(self) -> None:
+        fleet = peer_fleet(
+            AnchorPose(9.0, 9.0, 0.0),
+            AnchorPose(11.0, 11.0, math.pi),
+        )
+        goal = 13.5, 8.5
+        for number, vehicle_id in enumerate(sorted(fleet.nodes), 1):
+            fleet.handle_command(
+                vehicle_id,
+                ModeCommand(1, ModeAction.SWITCH_TO_AUTO),
+            )
+            fleet.handle_command(
+                vehicle_id,
+                AutoCommand(
+                    2,
+                    AutoAction.PUSH,
+                    (GotoMission(f"angled-same-goal-{number}", "global_map", *goal, 2),),
+                ),
+            )
+
+        settled_tick = None
+        minimum_separation = math.inf
+        tail_positions = {vehicle_id: [] for vehicle_id in fleet.nodes}
+        revision_at_tail_start = None
+        for tick in range(600):
+            relay_peer_states(fleet)
+            fleet.tick((tick + 1) * fleet.tick_s)
+            first = fleet.world.vehicle("vehicle_1")
+            second = fleet.world.vehicle("vehicle_2")
+            minimum_separation = min(
+                minimum_separation,
+                math.dist((first.x, first.y), (second.x, second.y)),
+            )
+            self.assertFalse(first.collision)
+            self.assertFalse(second.collision)
+            if tick == 499:
+                revision_at_tail_start = {
+                    vehicle_id: node.controller.navigation.snapshot()["path_revision"]
+                    for vehicle_id, node in fleet.nodes.items()
+                }
+            if tick >= 500:
+                for vehicle_id in fleet.nodes:
+                    vehicle = fleet.world.vehicle(vehicle_id)
+                    tail_positions[vehicle_id].append((vehicle.x, vehicle.y))
+            if settled_tick is None and all(
+                node.controller.snapshot()["auto_state"] == "idle"
+                for node in fleet.nodes.values()
+            ):
+                settled_tick = tick + 1
+
+        snapshots = {
+            vehicle_id: node.controller.snapshot()
+            for vehicle_id, node in fleet.nodes.items()
+        }
+        self.assertIsNotNone(
+            settled_tick,
+            {
+                "controllers": snapshots,
+                "tail_motion_m": {
+                    vehicle_id: max(
+                        math.dist(points[0], point) for point in points
+                    )
+                    for vehicle_id, points in tail_positions.items()
+                },
+                "tail_path_revisions": {
+                    vehicle_id: node.controller.snapshot()
+                    ["navigation"]["path_revision"]
+                    - revision_at_tail_start[vehicle_id]
+                    for vehicle_id, node in fleet.nodes.items()
+                },
+            },
+        )
+        self.assertTrue(
+            all(
+                math.dist(points[0], point) <= 0.01
+                for points in tail_positions.values()
+                for point in points
+            )
+        )
+        self.assertTrue(
+            all(
+                node.controller.navigation.snapshot()["path_revision"]
+                == revision_at_tail_start[vehicle_id]
+                for vehicle_id, node in fleet.nodes.items()
+            )
+        )
+
+        self.assertTrue(
+            all(
+                node.controller.navigation.status == "reached"
+                and node.controller.navigation.goal_mode in {"exact", "nearby_safe"}
+                for node in fleet.nodes.values()
+            )
+        )
+        for vehicle_id, node in fleet.nodes.items():
+            if node.controller.navigation.goal_mode == "nearby_safe":
+                vehicle = fleet.world.vehicle(vehicle_id)
+                self.assertLessEqual(
+                    math.dist((vehicle.x, vehicle.y), goal) - vehicle.radius,
+                    1.0,
+                )
+        self.assertGreaterEqual(
+            minimum_separation,
+            first.radius + second.radius + HARD_STOP_CLEARANCE_M - 1e-9,
+        )
+        self.assertTrue(
+            all(
+                not node.local_state.local_map.occupied_cells()
+                and not node.map_sync.peer_evidence("vehicle_1")
+                and not node.map_sync.peer_evidence("vehicle_2")
+                for node in fleet.nodes.values()
+            ),
         )
 
     def test_four_vehicle_control_and_local_state_are_isolated(self) -> None:
