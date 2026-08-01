@@ -21,11 +21,15 @@ from mockvehicle2d.collision import (
 )
 from mockvehicle2d.controller import Command, CommandResult, RobotController
 from mockvehicle2d.local_state import (
+    OCCUPIED,
     AnchorSpec,
     AnchoredLocalState,
     LocalMapDelta,
+    MapCellUpdate,
     OdometryConfig,
+    ObservedGrid,
     PoseEstimate,
+    _hit_axis_cell,
 )
 from mockvehicle2d.map_grid import MapGrid, WALL
 from mockvehicle2d.map_sync import (
@@ -512,6 +516,90 @@ class FleetSensorFrame:
     runtime_state: dict[str, object]
 
 
+class _TransientPlanningGrid:
+    """Overlay current dynamic LiDAR hits without changing the persistent map."""
+
+    def __init__(self, persistent: ObservedGrid) -> None:
+        self._persistent = persistent
+        self._cells: set[tuple[int, int]] = set()
+        self.resolution_m = persistent.resolution_m
+
+    def update(
+        self,
+        cells: set[tuple[int, int]],
+        persistent_delta: LocalMapDelta | None,
+    ) -> LocalMapDelta:
+        changed = self._cells ^ cells
+        if persistent_delta is not None:
+            changed.update(
+                (update.gx, update.gy)
+                for update in persistent_delta.changed_cells
+            )
+        self._cells = cells
+        return LocalMapDelta(
+            tuple(
+                MapCellUpdate(gx, gy, self.get_cell(gx, gy))
+                for gx, gy in sorted(changed, key=lambda cell: (cell[1], cell[0]))
+            )
+        )
+
+    def get_cell(self, gx: int, gy: int) -> int:
+        return (
+            OCCUPIED
+            if (gx, gy) in self._cells
+            else self._persistent.get_cell(gx, gy)
+        )
+
+    def is_unknown(self, gx: int, gy: int) -> bool:
+        return (gx, gy) not in self._cells and self._persistent.is_unknown(gx, gy)
+
+    def is_forbidden(self, gx: int, gy: int) -> bool:
+        return (gx, gy) not in self._cells and self._persistent.is_forbidden(gx, gy)
+
+    def snapshot(self) -> dict[str, object]:
+        snapshot = self._persistent.snapshot()
+        states = {
+            (cell["gx"], cell["gy"]): cell["state"]
+            for cell in snapshot["cells"]
+        }
+        states.update((cell, OCCUPIED) for cell in self._cells)
+        snapshot["cells"] = [
+            MapCellUpdate(gx, gy, state).as_dict()
+            for (gx, gy), state in sorted(
+                states.items(), key=lambda item: (item[0][1], item[0][0])
+            )
+        ]
+        return snapshot
+
+
+def _dynamic_hit_cells(
+    points: tuple[LaserPoint, ...],
+    pose: PoseEstimate,
+    resolution_m: float,
+) -> set[tuple[int, int]]:
+    cells = set()
+    for point in points:
+        if not point.dynamic or point.range <= 0:
+            continue
+        angle = pose.yaw_rad + point.angle
+        direction_x, direction_y = math.cos(angle), math.sin(angle)
+        cells.add(
+            (
+                _hit_axis_cell(
+                    pose.x_m + point.range * direction_x,
+                    direction_x,
+                    resolution_m,
+                ),
+                _hit_axis_cell(
+                    pose.y_m + point.range * direction_y,
+                    direction_y,
+                    resolution_m,
+                ),
+            )
+        )
+    return cells
+
+
 @dataclass
 class RobotNode:
     """Vehicle-owned controller, odometry and local map; no shared-world truth."""
@@ -533,6 +621,10 @@ class RobotNode:
         default_factory=SafetyAdvanceResult,
         repr=False,
     )
+    _planning_map: _TransientPlanningGrid = field(init=False, repr=False)
+
+    def __post_init__(self) -> None:
+        self._planning_map = _TransientPlanningGrid(self.local_state.local_map)
 
     def control(self, vehicle: Vehicle, sensor_grid: MapGrid, now: float) -> None:
         self.controller.tick(
@@ -541,7 +633,7 @@ class RobotNode:
             safety=self.safety,
             anchor=self.local_state.anchor,
             pose=self.local_state.pose,
-            local_map=self.local_state.local_map,
+            local_map=self._planning_map,
             map_delta=self._pending_map_delta,
             advance_result=self._pending_advance,
             now=now,
@@ -563,7 +655,7 @@ class RobotNode:
             truth_yaw_rad,
             timestamp=wall_timestamp,
         )
-        delta = self.local_state.match_and_integrate_scan(
+        persistent_delta = self.local_state.match_and_integrate_scan(
             scan_points,
             wall_timestamp,
             TMINI_SCAN_CONFIG,
@@ -573,7 +665,15 @@ class RobotNode:
                 else (self.safety.observation.edge_point_vehicle_m,)
             ),
         )
-        if delta is not None:
+        planning_delta = self._planning_map.update(
+            _dynamic_hit_cells(
+                scan_points,
+                self.local_state.pose,
+                self.local_state.local_map.resolution_m,
+            ),
+            persistent_delta,
+        )
+        if planning_delta.changed_cells:
             pending = {
                 (update.gx, update.gy): update
                 for update in (
@@ -584,13 +684,13 @@ class RobotNode:
             }
             pending.update(
                 ((update.gx, update.gy), update)
-                for update in delta.changed_cells
+                for update in planning_delta.changed_cells
             )
             self._pending_map_delta = LocalMapDelta(
                 tuple(pending[cell] for cell in sorted(pending))
             )
         if self.map_sync is not None:
-            self.map_sync.record_local(delta)
+            self.map_sync.record_local(persistent_delta)
         self.latest_frame = RuntimeFrame(scan_points, wall_timestamp)
         estimate = self.local_state.pose
         linear_mps, omega_rps = vehicle.body_velocities()

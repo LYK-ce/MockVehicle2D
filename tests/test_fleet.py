@@ -9,7 +9,15 @@ import unittest
 from unittest.mock import AsyncMock, Mock, patch
 
 from mockvehicle2d.collision import is_strict_overlap
-from mockvehicle2d.controller import ManualAction, ManualCommand
+from mockvehicle2d.controller import (
+    AutoAction,
+    AutoCommand,
+    GotoMission,
+    ManualAction,
+    ManualCommand,
+    ModeAction,
+    ModeCommand,
+)
 from mockvehicle2d.fleet import (
     AnchorPose,
     FleetRuntime,
@@ -20,6 +28,7 @@ from mockvehicle2d.fleet import (
 from mockvehicle2d.local_state import OdometryConfig
 from mockvehicle2d.map_grid import WALL, MapGrid
 from mockvehicle2d.map_sync import P2PSettings
+from mockvehicle2d.safety import HARD_STOP_CLEARANCE_M
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -147,6 +156,117 @@ class TestFleetRuntime(unittest.TestCase):
         self.assertEqual(
             fleet.nodes["vehicle_1"].local_state.local_map.occupied_cells(),
             (),
+        )
+
+    def test_dynamic_vehicle_cells_are_removed_and_restore_the_persistent_map(self) -> None:
+        fleet = FleetRuntime.create(
+            scenario(spec(1, 5.5, 5.5), spec(2, 7.5, 5.5)),
+            grid=free_grid(),
+        )
+        node = fleet.nodes["vehicle_1"]
+        persistent = node.local_state.local_map
+        transient = {
+            (cell["gx"], cell["gy"])
+            for cell in node._planning_map.snapshot()["cells"]
+            if cell["state"] == WALL
+            and persistent.get_cell(cell["gx"], cell["gy"]) != WALL
+        }
+        self.assertTrue(transient)
+        self.assertEqual(persistent.occupied_cells(), ())
+
+        fleet.world.vehicle("vehicle_2").x = 30.5
+        fleet._sample_all(1.0)
+
+        self.assertTrue(
+            all(
+                node._planning_map.get_cell(*cell) == persistent.get_cell(*cell)
+                for cell in transient
+            )
+        )
+        pending = {
+            (update.gx, update.gy): update.state
+            for update in node._pending_map_delta.changed_cells
+        }
+        self.assertTrue(
+            all(pending.get(cell) == persistent.get_cell(*cell) for cell in transient)
+        )
+        self.assertEqual(persistent.occupied_cells(), ())
+
+    def test_two_vehicles_with_same_goal_finish_without_replanning_forever(self) -> None:
+        fleet = FleetRuntime.create(
+            scenario(spec(1, 10.5, 10.5), spec(2, 7.5, 10.5)),
+            grid=free_grid(),
+        )
+        goal = 15.5, 10.5
+        for number, vehicle_id in enumerate(sorted(fleet.nodes), 1):
+            self.assertTrue(
+                fleet.handle_command(
+                    vehicle_id,
+                    ModeCommand(1, ModeAction.SWITCH_TO_AUTO),
+                ).accepted
+            )
+            self.assertTrue(
+                fleet.handle_command(
+                    vehicle_id,
+                    AutoCommand(
+                        2,
+                        AutoAction.PUSH,
+                        (
+                            GotoMission(
+                                f"same-goal-{number}",
+                                "global_map",
+                                *goal,
+                                2,
+                            ),
+                        ),
+                    ),
+                ).accepted
+            )
+
+        minimum_separation = math.inf
+        for tick in range(600):
+            fleet.tick((tick + 1) * fleet.tick_s)
+            first = fleet.world.vehicle("vehicle_1")
+            second = fleet.world.vehicle("vehicle_2")
+            minimum_separation = min(
+                minimum_separation,
+                math.hypot(first.x - second.x, first.y - second.y),
+            )
+            self.assertFalse(first.collision)
+            self.assertFalse(second.collision)
+            if all(
+                node.controller.snapshot()["auto_state"] == "idle"
+                for node in fleet.nodes.values()
+            ):
+                break
+        else:
+            self.fail(
+                {
+                    vehicle_id: node.controller.snapshot()
+                    for vehicle_id, node in fleet.nodes.items()
+                }
+            )
+
+        front = fleet.world.vehicle("vehicle_1")
+        trailing = fleet.world.vehicle("vehicle_2")
+        self.assertLessEqual(math.dist((front.x, front.y), goal), 0.11)
+        self.assertEqual(
+            fleet.nodes["vehicle_2"].controller.navigation.reason,
+            "nearby_safe_stop",
+        )
+        self.assertLessEqual(
+            math.dist((trailing.x, trailing.y), goal) - trailing.radius,
+            1.0,
+        )
+        self.assertGreaterEqual(
+            minimum_separation,
+            front.radius + trailing.radius + HARD_STOP_CLEARANCE_M - 1e-9,
+        )
+        self.assertTrue(
+            all(
+                not node.local_state.local_map.occupied_cells()
+                for node in fleet.nodes.values()
+            )
         )
 
     def test_four_vehicle_control_and_local_state_are_isolated(self) -> None:
