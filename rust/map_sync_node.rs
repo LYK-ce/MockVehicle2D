@@ -834,6 +834,7 @@ mod tests {
             "protocol": PEER_STATE_PROTOCOL,
             "session_id": "session_1",
             "source_vehicle_id": "vehicle_1",
+            "state_generation": 42,
             "sequence": 1
         });
 

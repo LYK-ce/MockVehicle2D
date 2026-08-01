@@ -15,7 +15,6 @@ import stat
 import tempfile
 import time
 from typing import Iterable
-import uuid
 
 from mockvehicle2d.local_state import (
     FREE,
@@ -39,6 +38,10 @@ MAP_EPOCH = 1
 TRANSFORM_EPOCH = 1
 PEER_STATE_TTL_S = 0.35
 MAX_PEER_RADIUS_M = 10.0
+MAX_PEER_POSITION_STDDEV_M = 10.0
+MAX_PEER_OBSTACLE_RADIUS_CELLS = 64
+MAX_PEER_LINEAR_SPEED_MPS = 100.0
+MAX_PEER_ANGULAR_SPEED_RPS = 20.0
 ALLOWED_CELL_STATES = frozenset((FREE, OCCUPIED, FORBIDDEN))
 PROCESS_STOP_TIMEOUT_S = 2.0
 
@@ -230,6 +233,12 @@ def _positive_integer(value: object, name: str) -> int:
     return value
 
 
+def _nonnegative_integer(value: object, name: str) -> int:
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        raise ValueError(f"{name} must be a non-negative integer")
+    return value
+
+
 @dataclass(frozen=True)
 class P2PSettings:
     sidecar_path: Path
@@ -301,8 +310,9 @@ class P2PVehicleConfig:
 @dataclass(frozen=True)
 class PeerVehicleState:
     source_vehicle_id: str
-    state_epoch: str
+    state_generation: int
     sequence: int
+    pose_revision: int
     timestamp_s: float
     global_x_m: float
     global_y_m: float
@@ -330,7 +340,7 @@ class PeerVehicleState:
             "protocol": PEER_STATE_PROTOCOL,
             "session_id": session_id,
             "source_vehicle_id": self.source_vehicle_id,
-            "state_epoch": self.state_epoch,
+            "state_generation": self.state_generation,
             "sequence": self.sequence,
             "source_frame": "anchor_map",
             "anchor_id": source_anchor.anchor_id,
@@ -347,6 +357,7 @@ class PeerVehicleState:
                 "yaw_rad": yaw_rad,
                 "covariance_diagonal": list(self.covariance),
                 "quality": self.quality,
+                "revision": self.pose_revision,
             },
             "velocity": {
                 "vx_mps": cosine * self.vx_mps + sine * self.vy_mps,
@@ -378,7 +389,10 @@ class MapSyncState:
         self._peer_evidence: dict[str, dict[tuple[int, int], int]] = {}
         self._peer_epoch: dict[str, int] = {}
         self._peer_sequence: dict[str, int] = {}
-        self._state_epoch = uuid.uuid4().hex
+        # Per-source boot generation. A stable vehicle identity requires a
+        # non-regressing wall clock; rollback is rejected instead of replacing
+        # a newer peer state.
+        self._state_generation = time.time_ns()
         self._state_sequence = 0
         self._state_inflight: PeerVehicleState | None = None
         self._local_vehicle_state: PeerVehicleState | None = None
@@ -386,9 +400,10 @@ class MapSyncState:
             str,
             tuple[PeerVehicleState, float],
         ] = {}
-        self._peer_state_epoch: dict[str, str] = {}
-        self._peer_state_seen_epochs: dict[str, set[str]] = {}
+        self._peer_state_generation: dict[str, int] = {}
         self._peer_state_sequence: dict[str, int] = {}
+        self._peer_state_pose_revision: dict[str, int] = {}
+        self._peer_state_timestamp: dict[str, float] = {}
         self._connected_vehicle_ids: tuple[str, ...] = ()
         self.ready = False
         self.published_deltas = 0
@@ -455,8 +470,9 @@ class MapSyncState:
         )
         self._local_vehicle_state = PeerVehicleState(
             self.vehicle_id,
-            self._state_epoch,
+            self._state_generation,
             0,
+            pose.revision,
             pose.timestamp,
             global_x_m,
             global_y_m,
@@ -639,20 +655,27 @@ class MapSyncState:
             return False
 
         source = state.source_vehicle_id
-        current_epoch = self._peer_state_epoch.get(source)
-        if current_epoch != state.state_epoch:
-            seen = self._peer_state_seen_epochs.setdefault(source, set())
-            if state.state_epoch in seen:
-                self.rejected_peer_states += 1
-                return False
-            if current_epoch is not None:
-                seen.add(current_epoch)
-            self._peer_state_epoch[source] = state.state_epoch
+        current_generation = self._peer_state_generation.get(source, 0)
+        if state.state_generation < current_generation:
+            self.rejected_peer_states += 1
+            return False
+        if state.state_generation > current_generation:
+            self._peer_state_generation[source] = state.state_generation
             self._peer_state_sequence[source] = 0
+            self._peer_state_pose_revision[source] = -1
+            self._peer_state_timestamp[source] = -math.inf
         if state.sequence <= self._peer_state_sequence[source]:
             self.rejected_peer_states += 1
             return False
         self._peer_state_sequence[source] = state.sequence
+        if (
+            state.pose_revision <= self._peer_state_pose_revision[source]
+            or state.timestamp_s < self._peer_state_timestamp[source]
+        ):
+            self.rejected_peer_states += 1
+            return False
+        self._peer_state_pose_revision[source] = state.pose_revision
+        self._peer_state_timestamp[source] = state.timestamp_s
         self._peer_vehicle_states[source] = state, receipt
         self.received_peer_states += 1
         return True
@@ -669,7 +692,7 @@ class MapSyncState:
             "protocol",
             "session_id",
             "source_vehicle_id",
-            "state_epoch",
+            "state_generation",
             "sequence",
             "source_frame",
             "anchor_id",
@@ -695,7 +718,7 @@ class MapSyncState:
         ):
             raise ValueError("peer state source is not allowed")
         expected_anchor = expected[1]
-        epoch = body["state_epoch"]
+        generation = _positive_integer(body["state_generation"], "state_generation")
         if (
             body["protocol"] != PEER_STATE_PROTOCOL
             or body["session_id"] != self.session_id
@@ -703,11 +726,11 @@ class MapSyncState:
             or body["anchor_id"] != expected_anchor.anchor_id
             or _positive_integer(body["transform_epoch"], "transform_epoch")
             != TRANSFORM_EPOCH
-            or not isinstance(epoch, str)
-            or not 1 <= len(epoch) <= 128
-            or any(not (character.isalnum() or character in "._-") for character in epoch)
+            or generation > (1 << 64) - 1
         ):
-            raise ValueError("peer state protocol, epoch, frame or transform is incompatible")
+            raise ValueError(
+                "peer state protocol, generation, frame or transform is incompatible"
+            )
         transform = _strict_object(
             body["transform_to_global_map"],
             required=frozenset(("x_m", "y_m", "yaw_rad")),
@@ -731,10 +754,24 @@ class MapSyncState:
         pose = _strict_object(
             body["pose"],
             required=frozenset(
-                ("x_m", "y_m", "yaw_rad", "covariance_diagonal", "quality")
+                (
+                    "x_m",
+                    "y_m",
+                    "yaw_rad",
+                    "covariance_diagonal",
+                    "quality",
+                    "revision",
+                )
             ),
             allowed=frozenset(
-                ("x_m", "y_m", "yaw_rad", "covariance_diagonal", "quality")
+                (
+                    "x_m",
+                    "y_m",
+                    "yaw_rad",
+                    "covariance_diagonal",
+                    "quality",
+                    "revision",
+                )
             ),
             name="peer_pose",
         )
@@ -742,6 +779,9 @@ class MapSyncState:
             _finite(pose[name], f"pose.{name}")
             for name in ("x_m", "y_m", "yaw_rad")
         )
+        max_position_m = MAX_GRID_COORDINATE * self.resolution_m
+        if any(abs(value) > max_position_m for value in local_pose[:2]):
+            raise ValueError("peer pose is outside the supported map extent")
         covariance = pose["covariance_diagonal"]
         if not isinstance(covariance, list) or len(covariance) != 3:
             raise ValueError("peer pose covariance or quality is invalid")
@@ -749,10 +789,14 @@ class MapSyncState:
             _finite(value, f"pose.covariance_diagonal[{index}]")
             for index, value in enumerate(covariance)
         )
-        if any(value < 0 for value in covariance_values) or (
-            pose["quality"] not in LOCALIZATION_QUALITIES
+        if (
+            any(value < 0 for value in covariance_values)
+            or pose["quality"] not in LOCALIZATION_QUALITIES
         ):
             raise ValueError("peer pose covariance or quality is invalid")
+        position_stddev_m = math.sqrt(max(covariance_values[:2]))
+        if position_stddev_m > MAX_PEER_POSITION_STDDEV_M:
+            raise ValueError("peer position uncertainty is outside the supported range")
         velocity = _strict_object(
             body["velocity"],
             required=frozenset(("vx_mps", "vy_mps", "omega_rps")),
@@ -763,18 +807,35 @@ class MapSyncState:
             _finite(velocity[name], f"velocity.{name}")
             for name in ("vx_mps", "vy_mps", "omega_rps")
         )
+        if (
+            math.hypot(*local_velocity[:2]) > MAX_PEER_LINEAR_SPEED_MPS
+            or abs(local_velocity[2]) > MAX_PEER_ANGULAR_SPEED_RPS
+        ):
+            raise ValueError("peer velocity is outside the supported range")
         radius_m = _finite(body["footprint_radius_m"], "footprint_radius_m")
-        if not 0 < radius_m <= MAX_PEER_RADIUS_M:
+        if (
+            not 0 < radius_m <= MAX_PEER_RADIUS_M
+            or radius_m + position_stddev_m
+            > MAX_PEER_OBSTACLE_RADIUS_CELLS * self.resolution_m
+        ):
             raise ValueError("peer footprint radius is outside the supported range")
         global_x_m, global_y_m, global_yaw_rad = expected_anchor.anchor_to_global(
             *local_pose
         )
+        if (
+            not math.isfinite(global_x_m)
+            or not math.isfinite(global_y_m)
+            or abs(global_x_m) > max_position_m
+            or abs(global_y_m) > max_position_m
+        ):
+            raise ValueError("peer global pose is outside the supported map extent")
         cosine = math.cos(expected_anchor.global_yaw_rad)
         sine = math.sin(expected_anchor.global_yaw_rad)
         return PeerVehicleState(
             source,
-            epoch,
+            generation,
             _positive_integer(body["sequence"], "sequence"),
+            _nonnegative_integer(pose["revision"], "pose.revision"),
             _finite(body["timestamp_s"], "timestamp_s"),
             global_x_m,
             global_y_m,

@@ -94,6 +94,21 @@ class TestMapSyncState(unittest.TestCase):
         )
 
         source.publish_peer_state_result(first["sequence"], True)
+        source.record_vehicle_state(
+            PoseEstimate(
+                anchor(1).anchor_id,
+                1.0,
+                2.0,
+                0.25,
+                (0.04, 0.09, 0.01),
+                "nominal",
+                101.0,
+                2,
+            ),
+            radius_m=0.5,
+            linear_mps=0.4,
+            omega_rps=0.1,
+        )
         second = source.prepare_peer_state()
         wrong_frame = deepcopy(second)
         wrong_frame["anchor_id"] = "other"
@@ -113,9 +128,11 @@ class TestMapSyncState(unittest.TestCase):
                 received_at_s=21.0,
             )
         )
+        initial_generation = second["state_generation"]
         restarted = deepcopy(second)
-        restarted["state_epoch"] = "replacement"
-        restarted["sequence"] = 1
+        restarted["state_generation"] = initial_generation + 2
+        restarted["sequence"] = 5
+        restarted["pose"]["x_m"] = 3.0
         self.assertTrue(
             receiver.receive_peer_state(
                 "peer_1",
@@ -124,15 +141,47 @@ class TestMapSyncState(unittest.TestCase):
                 received_at_s=21.1,
             )
         )
-        stale_epoch = deepcopy(second)
-        stale_epoch["sequence"] = 999
+        stale_generation = deepcopy(second)
+        stale_generation["state_generation"] = initial_generation + 1
+        stale_generation["sequence"] = 999
+        stale_generation["pose"]["x_m"] = 99.0
         self.assertFalse(
             receiver.receive_peer_state(
                 "peer_1",
                 "vehicle_1",
-                stale_epoch,
+                stale_generation,
                 received_at_s=21.2,
             )
+        )
+        self.assertEqual(
+            receiver.peer_vehicle_states(now_s=21.2)[0].global_x_m,
+            13.0,
+        )
+        out_of_order = deepcopy(restarted)
+        out_of_order["sequence"] = 4
+        self.assertFalse(
+            receiver.receive_peer_state(
+                "peer_1",
+                "vehicle_1",
+                out_of_order,
+                received_at_s=21.3,
+            )
+        )
+        next_restart = deepcopy(restarted)
+        next_restart["state_generation"] = initial_generation + 3
+        next_restart["sequence"] = 1
+        next_restart["pose"]["x_m"] = 4.0
+        self.assertTrue(
+            receiver.receive_peer_state(
+                "peer_1",
+                "vehicle_1",
+                next_restart,
+                received_at_s=21.4,
+            )
+        )
+        self.assertEqual(
+            receiver.peer_vehicle_states(now_s=21.4)[0].global_x_m,
+            14.0,
         )
         self.assertEqual(receiver.peer_evidence("vehicle_1"), {})
 
@@ -1188,6 +1237,38 @@ class TestLiveLibp2pMesh(unittest.IsolatedAsyncioTestCase):
                 {spec.vehicle_id for spec in scenario.vehicles},
             )
             self.assertTrue(all(hello["protocol_version"] == 4 for hello in hellos))
+
+            await self._wait_until(lambda: states["vehicle_2"].dirty_count == 0)
+            local_pose = fleet.nodes["vehicle_2"].local_state.pose
+            states["vehicle_2"].record_vehicle_state(
+                PoseEstimate(
+                    "spawn_2",
+                    1.0,
+                    2.0,
+                    0.25,
+                    (0.04, 0.09, 0.01),
+                    "nominal",
+                    local_pose.timestamp + 1.0,
+                    local_pose.revision + 1,
+                ),
+                radius_m=0.5,
+                linear_mps=0.4,
+                omega_rps=0.1,
+            )
+            await self._wait_until(
+                lambda: any(
+                    peer.source_vehicle_id == "vehicle_2"
+                    and (peer.global_x_m, peer.global_y_m) == (21.0, 12.0)
+                    for peer in states["vehicle_1"].peer_vehicle_states()
+                )
+            )
+            peer = next(
+                peer
+                for peer in states["vehicle_1"].peer_vehicle_states()
+                if peer.source_vehicle_id == "vehicle_2"
+            )
+            self.assertEqual((peer.global_x_m, peer.global_y_m), (21.0, 12.0))
+            self.assertEqual(states["vehicle_2"].dirty_count, 0)
 
             states["vehicle_1"].record_local(
                 LocalMapDelta((MapCellUpdate(7, 8, OCCUPIED),))

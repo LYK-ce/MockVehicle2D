@@ -25,9 +25,9 @@ from mockvehicle2d.fleet import (
     FleetVehicleSpec,
     fleet_handler,
 )
-from mockvehicle2d.local_state import OdometryConfig
+from mockvehicle2d.local_state import OdometryConfig, PoseEstimate
 from mockvehicle2d.map_grid import WALL, MapGrid
-from mockvehicle2d.map_sync import P2PSettings
+from mockvehicle2d.map_sync import PEER_STATE_TTL_S, P2PSettings
 from mockvehicle2d.safety import HARD_STOP_CLEARANCE_M
 
 
@@ -97,7 +97,7 @@ def relay_peer_states(fleet: FleetRuntime) -> None:
         assert payload is not None
         for receiver_id, receiver in fleet.nodes.items():
             if receiver_id != source_id:
-                assert receiver.map_sync.receive_peer_state(
+                receiver.map_sync.receive_peer_state(
                     f"peer_{source_id[-1]}",
                     source_id,
                     payload,
@@ -434,6 +434,121 @@ class TestFleetRuntime(unittest.TestCase):
                 for node in fleet.nodes.values()
             ),
         )
+
+    def test_unbounded_peer_state_is_rejected_before_planning_projection(self) -> None:
+        fleet = peer_fleet(
+            AnchorPose(5.0, 5.0, 0.0),
+            AnchorPose(10.0, 10.0, 0.0),
+        )
+        fleet.tick(0.1)
+        source = fleet.nodes["vehicle_1"].map_sync
+        receiver = fleet.nodes["vehicle_2"]
+        payload = source.prepare_peer_state()
+        before = receiver._planning_map.snapshot()
+
+        huge_position = json.loads(json.dumps(payload))
+        huge_position["pose"]["x_m"] = 1e308
+        huge_covariance = json.loads(json.dumps(payload))
+        huge_covariance["pose"]["covariance_diagonal"][0] = 1e308
+        huge_radius = json.loads(json.dumps(payload))
+        huge_radius["footprint_radius_m"] = 1e308
+        huge_velocity = json.loads(json.dumps(payload))
+        huge_velocity["velocity"]["vx_mps"] = 1e308
+
+        for invalid in (
+            huge_position,
+            huge_covariance,
+            huge_radius,
+            huge_velocity,
+        ):
+            self.assertFalse(
+                receiver.map_sync.receive_peer_state(
+                    "peer_1",
+                    "vehicle_1",
+                    invalid,
+                    received_at_s=1.0,
+                )
+            )
+        receiver._update_planning_map()
+
+        self.assertEqual(receiver.map_sync.peer_vehicle_states(now_s=1.0), ())
+        self.assertEqual(receiver._planning_map.snapshot(), before)
+
+    def test_stale_peer_observation_does_not_refresh_ttl_or_planning(self) -> None:
+        fleet = peer_fleet(
+            AnchorPose(5.0, 5.0, 0.0),
+            AnchorPose(10.0, 10.0, 0.0),
+        )
+        fleet.tick(0.1)
+        source_node = fleet.nodes["vehicle_1"]
+        receiver = fleet.nodes["vehicle_2"]
+        source = source_node.map_sync
+        baseline = receiver._planning_map.snapshot()
+
+        first = source.prepare_peer_state()
+        self.assertTrue(
+            receiver.map_sync.receive_peer_state(
+                "peer_1",
+                "vehicle_1",
+                first,
+                received_at_s=1.0,
+            )
+        )
+        active = receiver.map_sync.peer_vehicle_states(now_s=1.0)
+        receiver._update_planning_map(peer_states=active)
+        self.assertNotEqual(receiver._planning_map.snapshot(), baseline)
+        source.publish_peer_state_result(first["sequence"], True)
+
+        for received_at_s in (1.2, 1.0 + PEER_STATE_TTL_S + 0.1):
+            stale = source.prepare_peer_state()
+            self.assertFalse(
+                receiver.map_sync.receive_peer_state(
+                    "peer_1",
+                    "vehicle_1",
+                    stale,
+                    received_at_s=received_at_s,
+                )
+            )
+            source.publish_peer_state_result(stale["sequence"], True)
+
+        expired = receiver.map_sync.peer_vehicle_states(
+            now_s=1.0 + PEER_STATE_TTL_S + 0.1
+        )
+        receiver._update_planning_map(peer_states=expired)
+        self.assertEqual(expired, ())
+        self.assertEqual(receiver._planning_map.snapshot(), baseline)
+
+        pose = source_node.local_state.pose
+        source.record_vehicle_state(
+            PoseEstimate(
+                pose.anchor_id,
+                pose.x_m,
+                pose.y_m,
+                pose.yaw_rad,
+                pose.covariance,
+                pose.quality,
+                pose.timestamp + 1.0,
+                pose.revision + 1,
+            ),
+            radius_m=fleet.world.vehicle("vehicle_1").radius,
+            linear_mps=0.0,
+            omega_rps=0.0,
+        )
+        resumed = source.prepare_peer_state()
+        self.assertTrue(
+            receiver.map_sync.receive_peer_state(
+                "peer_1",
+                "vehicle_1",
+                resumed,
+                received_at_s=1.0 + PEER_STATE_TTL_S + 0.2,
+            )
+        )
+        receiver._update_planning_map(
+            peer_states=receiver.map_sync.peer_vehicle_states(
+                now_s=1.0 + PEER_STATE_TTL_S + 0.2
+            )
+        )
+        self.assertNotEqual(receiver._planning_map.snapshot(), baseline)
 
     def test_four_vehicle_control_and_local_state_are_isolated(self) -> None:
         fleet = FleetRuntime.create(
