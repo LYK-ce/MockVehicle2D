@@ -285,6 +285,72 @@ class TestFleetRuntime(unittest.TestCase):
             (),
         )
 
+    def test_lidar_peer_dedup_uses_exact_cell_circle_intersection(self) -> None:
+        fleet = peer_fleet(
+            AnchorPose(5.0, 5.0, 0.0),
+            AnchorPose(10.0, 10.0, 0.0),
+        )
+        source_node = fleet.nodes["vehicle_1"]
+        source = source_node.map_sync
+        node = fleet.nodes["vehicle_2"]
+        source.record_vehicle_state(
+            PoseEstimate(
+                source_node.local_state.anchor.anchor_id,
+                4.95,
+                5.25,
+                0.0,
+                (0.0, 0.0, 0.0),
+                "nominal",
+                1.0,
+                1,
+            ),
+            radius_m=0.5,
+            linear_mps=0.0,
+            omega_rps=0.0,
+        )
+        payload = source.prepare_peer_state()
+        self.assertIsNotNone(payload)
+        self.assertTrue(
+            node.map_sync.receive_peer_state(
+                "peer_1",
+                "vehicle_1",
+                payload,
+                received_at_s=1.0,
+            )
+        )
+        active = node.map_sync.peer_vehicle_states(now_s=1.0)
+        self.assertEqual(len(active), 1)
+        self.assertAlmostEqual(active[0].global_x_m, 9.95)
+        self.assertAlmostEqual(active[0].global_y_m, 10.25)
+        intersects = (0, 0)
+        outside = (1, 0)
+        node._lidar_dynamic_cells = {intersects, outside}
+
+        node._update_planning_map(peer_states=active)
+
+        self.assertNotEqual(
+            node._planning_map.cell_without_peers(*intersects),
+            OCCUPIED,
+        )
+        self.assertEqual(
+            node._planning_map.cell_without_peers(*outside),
+            OCCUPIED,
+        )
+
+        expired = node.map_sync.peer_vehicle_states(
+            now_s=1.0 + PEER_STATE_TTL_S + 0.01
+        )
+        self.assertEqual(expired, ())
+        node._update_planning_map(peer_states=expired)
+        self.assertEqual(
+            node._planning_map.cell_without_peers(*intersects),
+            OCCUPIED,
+        )
+        self.assertEqual(
+            node._planning_map.cell_without_peers(*outside),
+            OCCUPIED,
+        )
+
     def test_each_vehicle_starts_at_truth_anchor_with_zero_local_odometry(self) -> None:
         fleet = FleetRuntime.create(
             scenario(spec(1, 5.0, 6.0, math.pi / 2)),

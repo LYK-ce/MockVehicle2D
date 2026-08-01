@@ -66,6 +66,7 @@ class GotoController:
         self._pending_candidate: SafeCandidate | None = None
         self._candidate_inspections = 0
         self._skip_goal_connected_candidates = False
+        self._waiting_safe_stop_goal: tuple[float, float] | None = None
 
     def start(
         self,
@@ -102,6 +103,7 @@ class GotoController:
         self._pending_candidate = None
         self._candidate_inspections = 0
         self._skip_goal_connected_candidates = False
+        self._waiting_safe_stop_goal = None
         self._planner = DStarLitePlanner(
             local_map,
             vehicle_radius_m=vehicle_radius_m,
@@ -118,6 +120,7 @@ class GotoController:
             self.status = "cancelled"
             self.reason = reason
             self.detail = None
+            self._waiting_safe_stop_goal = None
             self._clear_pending_planning()
 
     def block(self, reason: str, detail: str | None = None) -> None:
@@ -125,6 +128,7 @@ class GotoController:
         self.status = "blocked"
         self.reason = reason
         self.detail = detail
+        self._waiting_safe_stop_goal = None
         self._clear_pending_planning()
 
     def block_for_localization_loss(self, pose: PoseEstimate) -> bool:
@@ -155,6 +159,7 @@ class GotoController:
         self.reason = "nearby_safe_stop"
         self.detail = self._nearby_detail or detail
         self._current_waypoint = None
+        self._waiting_safe_stop_goal = None
         self._clear_pending_planning()
         return True
 
@@ -359,7 +364,18 @@ class GotoController:
         )
         if distance <= self.goal_tolerance_m and within_approach_limit:
             if self.goal_mode == "approaching_safe_stop":
-                return 0.0, 0.0
+                if self._candidate_is_safe(
+                    self.goal,
+                    self._goal_cell(local_map),
+                    require_observed=True,
+                ):
+                    self.goal_mode = "nearby_safe"
+                elif self._waiting_safe_stop_goal != self.goal:
+                    self._waiting_safe_stop_goal = self.goal
+                    return 0.0, 0.0
+                else:
+                    self._block_no_path("nearby_safe_goal_unconfirmed")
+                    return 0.0, 0.0
             self._final_approach = False
             self.status = "reached"
             if self.goal_mode == "nearby_safe":
@@ -368,6 +384,7 @@ class GotoController:
             else:
                 self.reason = "goal_tolerance"
                 self.detail = None
+            self._waiting_safe_stop_goal = None
             self._clear_pending_planning()
             return 0.0, 0.0
 
@@ -516,6 +533,7 @@ class GotoController:
         self._safe_candidate_index = 0
         self._pending_candidate = None
         self._current_waypoint = None
+        self._waiting_safe_stop_goal = None
 
     def _advance_safe_candidate(
         self,
@@ -542,6 +560,8 @@ class GotoController:
                     if self._safe_candidate_index == len(self._safe_candidates):
                         self._block_no_path("nearby_safe_goal_unavailable")
                     return
+                if self.goal != self._pending_candidate[0]:
+                    self._waiting_safe_stop_goal = None
                 self.goal = self._pending_candidate[0]
                 self.goal_mode = "approaching_safe_stop"
             if remaining <= 0:
@@ -812,6 +832,7 @@ class GotoController:
         self.reason = "no_path"
         self.detail = detail
         self._current_waypoint = None
+        self._waiting_safe_stop_goal = None
         self._clear_pending_planning()
 
     def _clear_pending_planning(self) -> None:

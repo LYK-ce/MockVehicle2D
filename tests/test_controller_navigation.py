@@ -22,6 +22,7 @@ from mockvehicle2d.controller import (
 from mockvehicle2d.local_state import (
     AnchorSpec,
     AnchoredLocalState,
+    FREE,
     LocalMapDelta,
     MapCellUpdate,
     OCCUPIED,
@@ -179,6 +180,97 @@ class TestControllerNavigation(unittest.TestCase):
             1,
         )
         self.assertTrue(navigation.finish_nearby_safe_stop(certain_pose))
+
+    def test_unconfirmed_safe_stop_blocks_after_one_observation_tick(self) -> None:
+        local_map = ObservedGrid(
+            AnchorSpec("unconfirmed-anchor", 0.0, 0.0, 0.0),
+            resolution_m=1.0,
+        )
+        pose = PoseEstimate(
+            "unconfirmed-anchor",
+            1.5,
+            0.5,
+            0.0,
+            (0.0, 0.0, 0.0),
+            "nominal",
+            0.0,
+            0,
+        )
+        navigation = RobotController().navigation
+        navigation.start(2.5, 0.5, local_map=local_map, pose=pose)
+        navigation._clear_pending_planning()
+        navigation.goal = (pose.x_m, pose.y_m)
+        navigation.goal_mode = "approaching_safe_stop"
+        navigation._goal_access_cell = (1, 0)
+        navigation._set_path([(1, 0)])
+
+        first = navigation.update(
+            pose=pose,
+            local_map=local_map,
+            max_linear_mps=1.0,
+            max_angular_rps=1.0,
+        )
+        second = navigation.update(
+            pose=pose,
+            local_map=local_map,
+            max_linear_mps=1.0,
+            max_angular_rps=1.0,
+        )
+
+        self.assertEqual(first, (0.0, 0.0))
+        self.assertEqual(second, (0.0, 0.0))
+        self.assertEqual(navigation.status, "blocked")
+        self.assertEqual(navigation.reason, "no_path")
+        self.assertEqual(navigation.detail, "nearby_safe_goal_unconfirmed")
+
+    def test_observation_confirms_safe_stop_on_the_next_tick(self) -> None:
+        local_map = ObservedGrid(
+            AnchorSpec("confirmed-anchor", 0.0, 0.0, 0.0),
+            resolution_m=1.0,
+        )
+        pose = PoseEstimate(
+            "confirmed-anchor",
+            1.5,
+            0.5,
+            0.0,
+            (0.0, 0.0, 0.0),
+            "nominal",
+            0.0,
+            0,
+        )
+        navigation = RobotController().navigation
+        navigation.start(2.5, 0.5, local_map=local_map, pose=pose)
+        navigation._clear_pending_planning()
+        navigation.goal = (pose.x_m, pose.y_m)
+        navigation.goal_mode = "approaching_safe_stop"
+        navigation._goal_access_cell = (1, 0)
+        navigation._set_path([(1, 0)])
+        navigation.update(
+            pose=pose,
+            local_map=local_map,
+            max_linear_mps=1.0,
+            max_angular_rps=1.0,
+        )
+        observed = LocalMapDelta(
+            tuple(
+                MapCellUpdate(gx, gy, FREE)
+                for gx in range(-1, 4)
+                for gy in range(-2, 3)
+            )
+        )
+
+        desired = navigation.update(
+            pose=pose,
+            local_map=local_map,
+            max_linear_mps=1.0,
+            max_angular_rps=1.0,
+            map_delta=observed,
+        )
+
+        self.assertEqual(desired, (0.0, 0.0))
+        self.assertEqual(navigation.status, "reached")
+        self.assertEqual(navigation.goal_mode, "nearby_safe")
+        self.assertEqual(navigation.reason, "nearby_safe_stop")
 
     def test_new_obstacle_exits_final_approach_and_replans(self) -> None:
         local_map = ObservedGrid(

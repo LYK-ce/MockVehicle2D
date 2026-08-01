@@ -654,8 +654,7 @@ def _peer_vehicle_exclusions(
                 x_m,
                 y_m,
                 state.radius_m
-                + uncertainty_m
-                + resolution_m / math.sqrt(2),
+                + uncertainty_m,
             )
         )
         min_gx = math.ceil(
@@ -681,6 +680,22 @@ def _peer_vehicle_exclusions(
             <= exclusion_radius_m + 1e-12
         )
     return cells, tuple(circles), tuple(hit_envelopes)
+
+
+def _cell_intersects_circle(
+    cell: tuple[int, int],
+    resolution_m: float,
+    center_x_m: float,
+    center_y_m: float,
+    radius_m: float,
+) -> bool:
+    min_x, min_y = cell[0] * resolution_m, cell[1] * resolution_m
+    max_x, max_y = min_x + resolution_m, min_y + resolution_m
+    closest_x = max(min_x, min(center_x_m, max_x))
+    closest_y = max(min_y, min(center_y_m, max_y))
+    return math.hypot(closest_x - center_x_m, closest_y - center_y_m) <= (
+        radius_m + 1e-12
+    )
 
 
 @dataclass
@@ -773,13 +788,13 @@ class RobotNode:
             cell
             for cell in self._lidar_dynamic_cells
             if all(
-                math.hypot(
-                    (cell[0] + 0.5) * self.local_state.local_map.resolution_m
-                    - peer_x_m,
-                    (cell[1] + 0.5) * self.local_state.local_map.resolution_m
-                    - peer_y_m,
+                not _cell_intersects_circle(
+                    cell,
+                    self.local_state.local_map.resolution_m,
+                    peer_x_m,
+                    peer_y_m,
+                    radius_m,
                 )
-                > radius_m + 1e-12
                 for peer_x_m, peer_y_m, radius_m in peer_hit_envelopes
             )
         }

@@ -561,19 +561,15 @@ class DStarLitePlanner:
                 math.floor(min(source_x, destination_x) - radius) - 1,
                 math.floor(max(source_x, destination_x) + radius) + 1,
             ):
-                state = self._states.get((gx, gy), UNKNOWN)
-                peer_forbidden = (gx, gy) in self._peer_forbidden_cells
-                if peer_forbidden and ignore_peer_forbidden:
-                    base_state = getattr(self._grid, "cell_without_peers", None)
-                    state = (
-                        UNKNOWN
-                        if base_state is None
-                        else base_state(gx, gy)
-                    )
-                    peer_forbidden = False
-                if state not in {OCCUPIED, FORBIDDEN} and not (
+                state = self._base_state((gx, gy))
+                peer_forbidden = (
+                    not ignore_peer_forbidden
+                    and (gx, gy) in self._peer_forbidden_cells
+                )
+                base_blocks = state in {OCCUPIED, FORBIDDEN} or (
                     require_observed and state != FREE
-                ):
+                )
+                if not base_blocks and not peer_forbidden:
                     continue
                 distance_squared = segment_aabb_distance_squared(
                     source_x,
@@ -585,15 +581,14 @@ class DStarLitePlanner:
                     gx + 1,
                     gy + 1,
                 )
-                blocked = (
-                    math.isclose(
-                        distance_squared,
-                        0.0,
-                        rel_tol=0.0,
-                        abs_tol=1e-12,
-                    )
-                    if peer_forbidden
-                    else is_strict_overlap(distance_squared, radius_squared)
+                peer_blocked = peer_forbidden and math.isclose(
+                    distance_squared,
+                    0.0,
+                    rel_tol=0.0,
+                    abs_tol=1e-12,
+                )
+                base_blocked = base_blocks and (
+                    is_strict_overlap(distance_squared, radius_squared)
                     or (
                         block_tangent
                         and math.isclose(
@@ -604,12 +599,13 @@ class DStarLitePlanner:
                         )
                     )
                 )
-                if blocked:
+                if peer_blocked or base_blocked:
+                    blocking_state = state if base_blocked else FORBIDDEN
                     if (
-                        (allow_forbidden_egress and state == FORBIDDEN)
+                        (allow_forbidden_egress and blocking_state == FORBIDDEN)
                         or (
                             allow_clearance_egress
-                            and state in {OCCUPIED, FORBIDDEN}
+                            and blocking_state in {OCCUPIED, FORBIDDEN}
                         )
                     ):
                         source_distance_squared = segment_aabb_distance_squared(
@@ -739,8 +735,7 @@ class DStarLitePlanner:
         centre_x, centre_y = cell[0] + 0.5, cell[1] + 0.5
         radius_squared = self._planning_radius_cells**2
         return any(
-            self._states.get((gx, gy), UNKNOWN) in {OCCUPIED, FORBIDDEN}
-            and (gx, gy) not in self._peer_forbidden_cells
+            self._base_state((gx, gy)) in {OCCUPIED, FORBIDDEN}
             and (
                 (gx, gy) == cell
                 or cell_overlaps_circle(
@@ -749,6 +744,17 @@ class DStarLitePlanner:
             )
             for gx in range(cell[0] - radius, cell[0] + radius + 1)
             for gy in range(cell[1] - radius, cell[1] + radius + 1)
+        )
+
+    def _base_state(self, cell: Cell) -> int:
+        cell_without_peers = getattr(self._grid, "cell_without_peers", None)
+        if cell_without_peers is not None:
+            return cell_without_peers(*cell)
+        state = self._states.get(cell, UNKNOWN)
+        return (
+            UNKNOWN
+            if cell in self._peer_forbidden_cells and state == FORBIDDEN
+            else state
         )
 
     def _neighbours(self, cell: Cell) -> tuple[Cell, ...]:

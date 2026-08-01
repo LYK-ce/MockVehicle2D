@@ -251,6 +251,31 @@ def test_peer_forbidden_cells_are_not_inflated_twice_and_move_cleanly() -> None:
     assert static._blocked((0, 0))
 
 
+def test_peer_overlay_does_not_hide_static_obstacle_inflation() -> None:
+    class PeerOverStaticGrid(ObservedGrid):
+        def snapshot(self):
+            return {
+                "cells": [{"gx": 0, "gy": 0, "state": FORBIDDEN}],
+                "peer_forbidden_cells": [{"gx": 0, "gy": 0}],
+            }
+
+        def cell_without_peers(self, gx, gy):
+            return OCCUPIED if (gx, gy) == (0, 0) else UNKNOWN
+
+    search = DStarLitePlanner(
+        PeerOverStaticGrid(ANCHOR, resolution_m=0.5),
+        vehicle_radius_m=0.5,
+        hard_clearance_m=AUTOMATIC_MINIMUM_CLEARANCE_M,
+        bounds_margin_m=2.0,
+    )
+    search.plan((-2, 0), (6, 0))
+
+    assert search._blocked((2, 0))
+    search.set_peer_forbidden_cells(())
+    search.observe_changes((MapCellUpdate(0, 0, OCCUPIED),))
+    assert search._blocked((2, 0))
+
+
 def test_peer_circle_rechecks_continuous_access_segments() -> None:
     class PeerGrid(ObservedGrid):
         def peer_exclusion_circles(self):
