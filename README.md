@@ -59,9 +59,9 @@ mockvehicle2d serve \
 # 完整真值地图上的 A* 离线调试工具，不属于自主运行链路
 mockvehicle2d pathfind --start-m 10,10 --goal-m 200,200
 
-# 一个隐藏物理世界中的四个独立逻辑车辆，端口为 19090～19093
+# 默认运行两车（19090～19091）；四车测试改用 examples/four_vehicle_scenario.json
 cargo build --bin map-sync-node
-mockvehicle2d fleet --scenario examples/four_vehicle_scenario.json
+mockvehicle2d fleet --scenario examples/two_vehicle_scenario.json
 ```
 
 依赖安装在仓库本地 `.venv/`。公开接口统一使用 SI 单位：米、秒、弧度、米/秒和
