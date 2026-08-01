@@ -750,12 +750,7 @@ class DStarLitePlanner:
         cell_without_peers = getattr(self._grid, "cell_without_peers", None)
         if cell_without_peers is not None:
             return cell_without_peers(*cell)
-        state = self._states.get(cell, UNKNOWN)
-        return (
-            UNKNOWN
-            if cell in self._peer_forbidden_cells and state == FORBIDDEN
-            else state
-        )
+        return self._states.get(cell, UNKNOWN)
 
     def _neighbours(self, cell: Cell) -> tuple[Cell, ...]:
         return tuple(

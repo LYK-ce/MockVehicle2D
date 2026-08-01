@@ -217,22 +217,12 @@ def test_peer_forbidden_cells_are_not_inflated_twice_and_move_cleanly() -> None:
         bounds_margin_m=2.0,
     )
     peer.set_peer_forbidden_cells(((2, 0),))
-    peer.plan(
-        (-2, 0),
-        (6, 0),
-        changed_cells=(MapCellUpdate(2, 0, FORBIDDEN),),
-    )
+    peer.plan((-2, 0), (6, 0))
 
     assert peer._blocked((2, 0))
     assert not peer._blocked((0, 0))
 
     peer.set_peer_forbidden_cells(((4, 0),))
-    peer.observe_changes(
-        (
-            MapCellUpdate(2, 0, UNKNOWN),
-            MapCellUpdate(4, 0, FORBIDDEN),
-        )
-    )
 
     assert not peer._blocked((2, 0))
     assert peer._blocked((4, 0))
@@ -249,6 +239,26 @@ def test_peer_forbidden_cells_are_not_inflated_twice_and_move_cleanly() -> None:
         changed_cells=(MapCellUpdate(2, 0, OCCUPIED),),
     )
     assert static._blocked((0, 0))
+
+
+def test_peer_overlay_never_hides_base_forbidden_inflation() -> None:
+    search = DStarLitePlanner(
+        ObservedGrid(ANCHOR, resolution_m=0.5),
+        vehicle_radius_m=0.5,
+        hard_clearance_m=AUTOMATIC_MINIMUM_CLEARANCE_M,
+        bounds_margin_m=2.0,
+    )
+    search.plan(
+        (-2, 0),
+        (6, 0),
+        changed_cells=(MapCellUpdate(0, 0, FORBIDDEN),),
+    )
+
+    search.set_peer_forbidden_cells(((0, 0),))
+    assert search._blocked((2, 0))
+
+    search.set_peer_forbidden_cells(((4, 0),))
+    assert search._blocked((2, 0))
 
 
 def test_peer_overlay_does_not_hide_static_obstacle_inflation() -> None:

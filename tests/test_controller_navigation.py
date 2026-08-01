@@ -272,6 +272,104 @@ class TestControllerNavigation(unittest.TestCase):
         self.assertEqual(navigation.goal_mode, "nearby_safe")
         self.assertEqual(navigation.reason, "nearby_safe_stop")
 
+    def test_terminal_updates_clear_pending_safe_stop_confirmation(self) -> None:
+        local_map = ObservedGrid(
+            AnchorSpec("terminal-anchor", 0.0, 0.0, 0.0),
+            resolution_m=1.0,
+        )
+        pose = PoseEstimate(
+            "terminal-anchor",
+            0.5,
+            0.5,
+            0.0,
+            (0.0, 0.0, 0.0),
+            "nominal",
+            0.0,
+            0,
+        )
+
+        def active_navigation():
+            navigation = RobotController().navigation
+            navigation.start(4.5, 0.5, local_map=local_map, pose=pose)
+            navigation._waiting_safe_stop_goal = navigation.goal
+            return navigation
+
+        cases = (
+            (
+                "missing planner",
+                SafetyAdvanceResult(),
+                lambda nav: setattr(nav, "_planner", None),
+            ),
+            ("collision", SafetyAdvanceResult(collided=True), lambda nav: None),
+            (
+                "unabsorbed safety stop",
+                SafetyAdvanceResult(stopped=True, reason="safety_scan_unhealthy"),
+                lambda nav: None,
+            ),
+        )
+        for name, advance, prepare in cases:
+            with self.subTest(name=name):
+                navigation = active_navigation()
+                prepare(navigation)
+                navigation.update(
+                    pose=pose,
+                    local_map=local_map,
+                    max_linear_mps=1.0,
+                    max_angular_rps=1.0,
+                    advance_result=advance,
+                )
+                self.assertEqual(navigation.status, "blocked")
+                self.assertIsNone(navigation._waiting_safe_stop_goal)
+
+                navigation.start(5.5, 0.5, local_map=local_map, pose=pose)
+                self.assertIsNone(navigation._waiting_safe_stop_goal)
+
+        navigation = active_navigation()
+        with patch.object(
+            navigation,
+            "_advance_planning",
+            side_effect=lambda *_args, **_kwargs: navigation._clear_pending_planning(),
+        ):
+            navigation.update(
+                pose=pose,
+                local_map=local_map,
+                max_linear_mps=1.0,
+                max_angular_rps=1.0,
+            )
+        self.assertEqual(navigation.status, "blocked")
+        self.assertEqual(navigation.reason, "no_path")
+        self.assertIsNone(navigation._waiting_safe_stop_goal)
+
+        navigation = active_navigation()
+        navigation._clear_pending_planning()
+        navigation._set_path([(0, 0), (1, 0)])
+        assert navigation._planner is not None
+        with (
+            patch.object(
+                navigation._planner,
+                "is_segment_passable",
+                return_value=False,
+            ),
+            patch.object(
+                navigation._planner,
+                "best_start_connection",
+                return_value=None,
+            ),
+        ):
+            navigation.update(
+                pose=pose,
+                local_map=local_map,
+                max_linear_mps=1.0,
+                max_angular_rps=1.0,
+                advance_result=SafetyAdvanceResult(
+                    stopped=True,
+                    reason="safety_obstacle",
+                ),
+            )
+        self.assertEqual(navigation.status, "blocked")
+        self.assertEqual(navigation.detail, "start_connection_unsafe")
+        self.assertIsNone(navigation._waiting_safe_stop_goal)
+
     def test_new_obstacle_exits_final_approach_and_replans(self) -> None:
         local_map = ObservedGrid(
             AnchorSpec("final-approach-anchor", 0.0, 0.0, 0.0),

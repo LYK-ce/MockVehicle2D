@@ -262,10 +262,7 @@ class GotoController:
 
         was_active = self.status == "active"
         if was_active and self._planner is None:
-            self.status = "blocked"
-            self.reason = "local_state_unavailable"
-            self.detail = None
-            self._clear_pending_planning()
+            self.block("local_state_unavailable")
             return 0.0, 0.0
         if was_active and self.block_for_localization_loss(pose):
             return 0.0, 0.0
@@ -278,11 +275,7 @@ class GotoController:
         if not was_active:
             return 0.0, 0.0
         if collided:
-            self._final_approach = False
-            self.status = "blocked"
-            self.reason = "collision"
-            self.detail = None
-            self._clear_pending_planning()
+            self.block("collision")
             return 0.0, 0.0
         if safety_stop is not None and not (
             self._planner is not None
@@ -297,11 +290,7 @@ class GotoController:
                 )
             )
         ):
-            self._final_approach = False
-            self.status = "blocked"
-            self.reason = safety_stop
-            self.detail = None
-            self._clear_pending_planning()
+            self.block(safety_stop)
             return 0.0, 0.0
 
         assert self.goal is not None
@@ -345,10 +334,7 @@ class GotoController:
         if self._planning_kind is not None or self.status != "active":
             return 0.0, 0.0
         if not self._path:
-            self._final_approach = False
-            self.status = "blocked"
-            self.reason = "no_path"
-            self._clear_pending_planning()
+            self._block_no_path(self.detail)
             return 0.0, 0.0
 
         if self._can_start_final_approach(pose, local_map):
@@ -410,12 +396,7 @@ class GotoController:
                     self._path[0],
                 )
                 if target_cell is None:
-                    self._final_approach = False
-                    self.status = "blocked"
-                    self.reason = "no_path"
-                    self.detail = "start_connection_unsafe"
-                    self._current_waypoint = None
-                    self._clear_pending_planning()
+                    self._block_no_path("start_connection_unsafe")
                     return 0.0, 0.0
                 target_x = (target_cell[0] + 0.5) * local_map.resolution_m
                 target_y = (target_cell[1] + 0.5) * local_map.resolution_m
@@ -825,15 +806,10 @@ class GotoController:
         self._current_waypoint = None
         self._clear_pending_planning()
 
-    def _block_no_path(self, detail: str) -> None:
-        self._final_approach = False
+    def _block_no_path(self, detail: str | None) -> None:
         self._set_path(None)
-        self.status = "blocked"
-        self.reason = "no_path"
-        self.detail = detail
         self._current_waypoint = None
-        self._waiting_safe_stop_goal = None
-        self._clear_pending_planning()
+        self.block("no_path", detail)
 
     def _clear_pending_planning(self) -> None:
         self._planning_kind = None
