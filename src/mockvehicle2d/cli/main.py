@@ -6,6 +6,8 @@ import math
 from pathlib import Path
 import random
 
+from mockvehicle2d.server import DEFAULT_REALTIME_FACTOR
+
 
 def _positive_float(value: str) -> float:
     number = float(value)
@@ -93,6 +95,7 @@ def _cmd_serve(args) -> None:
             odometry_translation_noise_stddev_m=args.odom_translation_noise_m,
             odometry_yaw_noise_stddev_rad=args.odom_yaw_noise_rad,
             odometry_seed=args.odom_seed,
+            realtime_factor=args.realtime_factor,
         )
     )
 
@@ -155,6 +158,7 @@ def _cmd_fleet(args) -> None:
             odometry_translation_noise_stddev_m=args.odom_translation_noise_m,
             odometry_yaw_noise_stddev_rad=args.odom_yaw_noise_rad,
             odometry_seed=args.odom_seed,
+            realtime_factor=args.realtime_factor,
         )
     )
 
@@ -226,6 +230,13 @@ def main() -> None:
         metavar="RAD",
     )
     serve.add_argument("--odom-seed", type=_integer, default=0, metavar="INTEGER")
+    serve.add_argument(
+        "--realtime-factor",
+        type=_positive_float,
+        default=DEFAULT_REALTIME_FACTOR,
+        metavar="FACTOR",
+        help="wall-clock acceleration (default: 3; use 1 for realtime)",
+    )
 
     fleet = subcommands.add_parser(
         "fleet",
@@ -275,6 +286,13 @@ def main() -> None:
         metavar="RAD",
     )
     fleet.add_argument("--odom-seed", type=_integer, default=0, metavar="INTEGER")
+    fleet.add_argument(
+        "--realtime-factor",
+        type=_positive_float,
+        default=DEFAULT_REALTIME_FACTOR,
+        metavar="FACTOR",
+        help="wall-clock acceleration (default: 3; use 1 for realtime)",
+    )
 
     pathfind = subcommands.add_parser(
         "pathfind",

@@ -14,7 +14,7 @@ import socket
 import stat
 import tempfile
 import time
-from typing import Iterable
+from typing import Callable, Iterable
 
 from mockvehicle2d.local_state import (
     FREE,
@@ -371,7 +371,15 @@ class PeerVehicleState:
 class MapSyncState:
     """Keeps local evidence, remote evidence and a derived read-only view separate."""
 
-    def __init__(self, session_id: str, vehicle_id: str, anchor: AnchorSpec, resolution_m: float) -> None:
+    def __init__(
+        self,
+        session_id: str,
+        vehicle_id: str,
+        anchor: AnchorSpec,
+        resolution_m: float,
+        *,
+        clock: Callable[[], float] | None = None,
+    ) -> None:
         if not session_id or not vehicle_id:
             raise ValueError("session_id and vehicle_id cannot be empty")
         if not math.isfinite(resolution_m) or resolution_m <= 0:
@@ -380,6 +388,7 @@ class MapSyncState:
         self.vehicle_id = vehicle_id
         self.anchor = anchor
         self.resolution_m = resolution_m
+        self._clock = time.monotonic if clock is None else clock
         self.local_peer_id: str | None = None
         self._expected_peers: dict[str, tuple[str, AnchorSpec]] = {}
         self._own_cells: dict[tuple[int, int], int] = {}
@@ -641,7 +650,7 @@ class MapSyncState:
         *,
         received_at_s: float | None = None,
     ) -> bool:
-        receipt = time.monotonic() if received_at_s is None else received_at_s
+        receipt = self._clock() if received_at_s is None else received_at_s
         if not math.isfinite(receipt):
             raise ValueError("peer state receipt time must be finite")
         try:
@@ -853,7 +862,7 @@ class MapSyncState:
         *,
         now_s: float | None = None,
     ) -> tuple[PeerVehicleState, ...]:
-        now = time.monotonic() if now_s is None else now_s
+        now = self._clock() if now_s is None else now_s
         if not math.isfinite(now):
             raise ValueError("peer state query time must be finite")
         expired = [
@@ -1435,11 +1444,16 @@ class P2PFleetSync:
         settings: P2PSettings,
         vehicles: tuple[P2PVehicleConfig, ...],
         states: dict[str, MapSyncState],
+        *,
+        realtime_factor: float = 1.0,
     ) -> None:
+        if not math.isfinite(realtime_factor) or realtime_factor <= 0:
+            raise ValueError("realtime factor must be finite and positive")
         self.session_id = session_id
         self.settings = settings
         self.vehicles = vehicles
         self.states = states
+        self.realtime_factor = realtime_factor
         self.runtime_dir = settings.runtime_dir.expanduser().resolve()
         self.sidecar_path = settings.sidecar_path.expanduser().resolve()
         self._bridges: dict[str, _NodeBridge] = {}
@@ -1457,8 +1471,16 @@ class P2PFleetSync:
         settings: P2PSettings,
         vehicles: tuple[P2PVehicleConfig, ...],
         states: dict[str, MapSyncState],
+        *,
+        realtime_factor: float = 1.0,
     ) -> "P2PFleetSync":
-        runtime = cls(session_id, settings, vehicles, states)
+        runtime = cls(
+            session_id,
+            settings,
+            vehicles,
+            states,
+            realtime_factor=realtime_factor,
+        )
         try:
             await runtime._start()
             return runtime
@@ -1710,7 +1732,7 @@ class P2PFleetSync:
                     )
 
     async def _flush_loop(self) -> None:
-        interval_s = self.settings.sync_interval_ms / 1000
+        interval_s = self.settings.sync_interval_ms / 1000 / self.realtime_factor
         while True:
             started = asyncio.get_running_loop().time()
             self.flush_once()

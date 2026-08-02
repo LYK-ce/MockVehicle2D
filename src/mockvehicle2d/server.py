@@ -44,6 +44,7 @@ from mockvehicle2d.vehicle import Vehicle
 HOST = "0.0.0.0"
 PORT = 19090
 DEFAULT_VEHICLE_ID = "mock_vehicle_01"
+DEFAULT_REALTIME_FACTOR = 3.0
 SPAWN_X = 10.0
 SPAWN_Y = 10.0
 MAP_RESOLUTION_M = 1.0
@@ -68,6 +69,9 @@ class VehicleRuntime:
     controller: RobotController
     safety: LocalSafetyRuntime
     local_state: AnchoredLocalState
+    realtime_factor: float = 1.0
+    _clock_origin: float = field(default=0.0, repr=False)
+    _timestamp_offset: float = field(default=0.0, repr=False)
     frame_sequence: int = 0
     controller_lease: asyncio.Lock = field(
         default_factory=asyncio.Lock,
@@ -79,6 +83,14 @@ class VehicleRuntime:
         repr=False,
         compare=False,
     )
+
+    def simulation_now(self, real_monotonic_now: float) -> float:
+        return self._clock_origin + (
+            real_monotonic_now - self._clock_origin
+        ) * self.realtime_factor
+
+    def timestamp_at(self, simulation_now: float) -> float:
+        return self._timestamp_offset + simulation_now
 
     def advance_to(self, monotonic_now: float) -> None:
         result = self.safety.advance(
@@ -164,7 +176,10 @@ class VehicleRuntime:
         command_timeout: float = 1.0,
         mission_capacity: int = 16,
         safety_healthy: bool = True,
+        realtime_factor: float = 1.0,
     ) -> "VehicleRuntime":
+        if not math.isfinite(realtime_factor) or realtime_factor <= 0:
+            raise ValueError("realtime factor must be finite and positive")
         voxels, grid = generate_map(radius=radius)
         vehicle = Vehicle(
             SPAWN_X,
@@ -190,6 +205,9 @@ class VehicleRuntime:
                 timestamp=started_at if timestamp is None else timestamp,
                 map_resolution_m=LOCAL_MAP_RESOLUTION_M,
             ),
+            realtime_factor,
+            started_at,
+            (started_at if timestamp is None else timestamp) - started_at,
         )
 
 
@@ -388,6 +406,7 @@ async def handler(
     radius: float = 0.5,
     command_timeout: float = 1.0,
     mission_capacity: int = 16,
+    realtime_factor: float = 1.0,
     _monotonic=time.monotonic,
     _wall_time=time.time,
     _safety_healthy: bool = True,
@@ -409,9 +428,12 @@ async def handler(
         command_timeout=command_timeout,
         mission_capacity=mission_capacity,
         safety_healthy=_safety_healthy,
+        realtime_factor=realtime_factor,
     )
     if runtime.controller_lease.locked():
-        timestamp = _wall_time()
+        timestamp = runtime.timestamp_at(
+            runtime.simulation_now(_monotonic())
+        )
         try:
             await _send_json(
                 websocket,
@@ -436,9 +458,13 @@ async def handler(
         ):
             runtime.local_state.set_localization_quality(
                 _localization_quality,
-                timestamp=_wall_time(),
+                timestamp=runtime.timestamp_at(
+                    runtime.simulation_now(_monotonic())
+                ),
             )
-        timestamp = _wall_time()
+        timestamp = runtime.timestamp_at(
+            runtime.simulation_now(_monotonic())
+        )
         await _send_json(
             websocket,
             {
@@ -448,6 +474,7 @@ async def handler(
                 "control_lease": "exclusive",
                 "mission_frame_id": "global_map",
                 "mission_types": list(SUPPORTED_MISSION_TYPES),
+                "realtime_factor": runtime.realtime_factor,
                 "birth_anchor": {
                     "anchor_id": runtime.local_state.anchor.anchor_id,
                     "x_m": runtime.local_state.anchor.global_x_m,
@@ -466,12 +493,12 @@ async def handler(
         )
         await _send_map_chunks(websocket, _encode_map_chunks(runtime.voxels, 256))
 
-        next_deadline = started_at
+        next_deadline = runtime.simulation_now(_monotonic())
         last_seq: int | None = None
         while True:
-            monotonic_now = _monotonic()
+            monotonic_now = runtime.simulation_now(_monotonic())
             if monotonic_now >= next_deadline:
-                timestamp = _wall_time()
+                timestamp = runtime.timestamp_at(monotonic_now)
                 frame = runtime.update(monotonic_now, timestamp)
                 pose, scan = telemetry_messages(runtime, frame)
                 await _send_json(websocket, pose)
@@ -485,7 +512,7 @@ async def handler(
                 runtime.frame_sequence += 1
                 next_deadline = _next_deadline(
                     next_deadline,
-                    _monotonic(),
+                    runtime.simulation_now(_monotonic()),
                     TMINI_SCAN_CONFIG.scan_time,
                 )
                 continue
@@ -493,12 +520,14 @@ async def handler(
             try:
                 raw = await asyncio.wait_for(
                     websocket.recv(),
-                    timeout=next_deadline - monotonic_now,
+                    timeout=(next_deadline - monotonic_now)
+                    / runtime.realtime_factor,
                 )
             except asyncio.TimeoutError:
                 continue
 
-            timestamp = _wall_time()
+            monotonic_now = runtime.simulation_now(_monotonic())
+            timestamp = runtime.timestamp_at(monotonic_now)
             try:
                 command = parse_command(
                     raw,
@@ -515,7 +544,7 @@ async def handler(
                 last_seq = command.seq
                 result = runtime.handle_command(
                     command,
-                    monotonic_now=_monotonic(),
+                    monotonic_now=monotonic_now,
                 )
                 await _send_json(
                     websocket,
@@ -533,7 +562,7 @@ async def handler(
                     timestamp,
                 )
             except ProtocolError as error:
-                runtime.fail_safe_stop(_monotonic())
+                runtime.fail_safe_stop(monotonic_now)
                 await _send_json(websocket, error_message(error, timestamp=timestamp))
                 event_cursor = await _send_pending_events(
                     websocket,
@@ -565,6 +594,7 @@ async def main(
     odometry_translation_noise_stddev_m: float = 0.0,
     odometry_yaw_noise_stddev_rad: float = 0.0,
     odometry_seed: int = 0,
+    realtime_factor: float = DEFAULT_REALTIME_FACTOR,
 ) -> None:
     from websockets.asyncio.server import serve
 
@@ -588,6 +618,7 @@ async def main(
         radius=radius,
         command_timeout=command_timeout,
         mission_capacity=mission_capacity,
+        realtime_factor=realtime_factor,
     )
     stop = asyncio.Event()
     shutting_down = False
@@ -613,6 +644,7 @@ async def main(
             radius=radius,
             command_timeout=command_timeout,
             mission_capacity=mission_capacity,
+            realtime_factor=realtime_factor,
             _runtime=runtime,
         )
 

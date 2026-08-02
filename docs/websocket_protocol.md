@@ -11,6 +11,7 @@
 | 控制权 | 每辆车同时只有一个独占连接 |
 | 单位 | m、s、rad、m/s、rad/s |
 | 任务坐标系 | `global_map` |
+| 默认时间倍率 | `3.0`（`--realtime-factor 1` 恢复实时） |
 
 多车模式保持同一个 v4 协议，每辆车使用独立 endpoint。示例四车场景监听
 `19090`～`19093`；一个 endpoint 的连接、命令序号和独占租约不会影响其他车辆。
@@ -259,7 +260,7 @@ Auto → Manual 暂停并保留任务。Manual → Auto 若有保留任务仍停
 和 `cancelled` 保留事件发生时的子目标进度。
 
 当前 simulator 为便于验证可靠性，保留本进程的全部任务事件；进程重启后 ledger 和
-序号都会清空。`timestamp_s` 是本次发送时间，重放时可能变化，事件身份只能使用
+序号都会清空。`timestamp_s` 是本次发送对应的模拟时间，重放时可能变化，事件身份只能使用
 `(event_epoch, event_seq)`。
 
 状态及触发：
@@ -301,6 +302,7 @@ Auto → Manual 暂停并保留任务。Manual → Auto 若有保留任务仍停
   "control_lease": "exclusive",
   "mission_frame_id": "global_map",
   "mission_types": ["goto", "patrol", "coverage"],
+  "realtime_factor": 3.0,
   "birth_anchor": {
     "anchor_id": "spawn_north_west",
     "x_m": 9.0,
@@ -338,7 +340,10 @@ Auto → Manual 暂停并保留任务。Manual → Auto 若有保留任务仍停
 }
 ```
 
-`map.source=simulator_ground_truth` 表示调试真值，不能作为自动规划输入。
+`realtime_factor` 表示一秒墙钟时间内推进的模拟秒数。倍率只改变墙钟节拍；所有消息的
+`timestamp_s` 共用同一模拟 epoch，物理量、控制/传感器周期、命令超时与 P2P 100 ms
+发布周期仍按模拟时间计算。`map.source=simulator_ground_truth` 表示调试真值，不能作为
+自动规划输入。
 
 ### 二进制地图 chunk
 

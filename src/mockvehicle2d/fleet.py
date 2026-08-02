@@ -56,6 +56,7 @@ from mockvehicle2d.safety import (
 )
 from mockvehicle2d.scan import LaserPoint, TMINI_SCAN_CONFIG, scan_grid, scan_message
 from mockvehicle2d.server import (
+    DEFAULT_REALTIME_FACTOR,
     HOST,
     LOCAL_MAP_RESOLUTION_M,
     MAP_RESOLUTION_M,
@@ -932,11 +933,13 @@ class FleetRuntime:
         world: SharedWorld,
         nodes: dict[str, RobotNode],
         wall_time_offset: float,
+        realtime_factor: float,
     ) -> None:
         self.scenario = scenario
         self.world = world
         self.nodes = nodes
         self._wall_time_offset = wall_time_offset
+        self.realtime_factor = realtime_factor
         self._sensor_epoch = world.now
         self._next_scan_index = {vehicle_id: 1 for vehicle_id in nodes}
         self.map_chunks = _encode_map_chunks(world.debug_voxels, world.debug_grid.width)
@@ -958,7 +961,10 @@ class FleetRuntime:
         odometry_config: OdometryConfig = OdometryConfig(),
         safety_healthy: bool = True,
         spawn_safety_margin_m: float = DEFAULT_SPAWN_SAFETY_MARGIN_M,
+        realtime_factor: float = 1.0,
     ) -> "FleetRuntime":
+        if not math.isfinite(realtime_factor) or realtime_factor <= 0:
+            raise ValueError("realtime factor must be finite and positive")
         if grid is None:
             generated_voxels, grid = generate_map(radius=radius)
             voxels = generated_voxels
@@ -1015,16 +1021,28 @@ class FleetRuntime:
                         spec.vehicle_id,
                         anchor,
                         local_state.local_map.resolution_m,
+                        clock=lambda world=world: world.now,
                     )
                 ),
             )
-        runtime = cls(scenario, world, nodes, timestamp - started_at)
+        runtime = cls(
+            scenario,
+            world,
+            nodes,
+            timestamp - started_at,
+            realtime_factor,
+        )
         runtime._sample_all(timestamp)
         return runtime
 
     @property
     def tick_s(self) -> float:
         return self.scenario.tick_s
+
+    def timestamp_at(self, simulation_now: float | None = None) -> float:
+        return self._wall_time_offset + (
+            self.world.now if simulation_now is None else simulation_now
+        )
 
     def handle_command(self, vehicle_id: str, command: Command) -> CommandResult:
         node = self.nodes[vehicle_id]
@@ -1069,7 +1087,10 @@ class FleetRuntime:
     async def run(self, stop: asyncio.Event) -> None:
         while not stop.is_set():
             try:
-                await asyncio.wait_for(stop.wait(), timeout=self.tick_s)
+                await asyncio.wait_for(
+                    stop.wait(),
+                    timeout=self.tick_s / self.realtime_factor,
+                )
             except asyncio.TimeoutError:
                 self.tick(time.time())
 
@@ -1212,7 +1233,7 @@ async def fleet_handler(websocket, *, fleet: FleetRuntime, vehicle_id: str) -> N
                 websocket,
                 {
                     "type": "error",
-                    "timestamp_s": time.time(),
+                    "timestamp_s": fleet.timestamp_at(),
                     "seq": None,
                     "code": "vehicle_busy",
                     "message": "another controller owns the vehicle lease",
@@ -1234,6 +1255,7 @@ async def fleet_handler(websocket, *, fleet: FleetRuntime, vehicle_id: str) -> N
                 "control_lease": "exclusive",
                 "mission_frame_id": "global_map",
                 "mission_types": list(SUPPORTED_MISSION_TYPES),
+                "realtime_factor": fleet.realtime_factor,
                 "birth_anchor": {
                     "anchor_id": node.spec.spawn_id,
                     "x_m": node.spec.anchor_pose.x_m,
@@ -1248,7 +1270,7 @@ async def fleet_handler(websocket, *, fleet: FleetRuntime, vehicle_id: str) -> N
             websocket,
             node.controller,
             0,
-            time.time(),
+            fleet.timestamp_at(),
         )
         await _send_map_chunks(websocket, fleet.map_chunks)
         pose, scan = fleet.telemetry_messages(vehicle_id)
@@ -1265,7 +1287,7 @@ async def fleet_handler(websocket, *, fleet: FleetRuntime, vehicle_id: str) -> N
                     websocket,
                     {
                         "type": "error",
-                        "timestamp_s": time.time(),
+                        "timestamp_s": fleet.timestamp_at(),
                         "seq": None,
                         "code": "telemetry_overflow",
                         "message": str(error),
@@ -1289,12 +1311,12 @@ async def fleet_handler(websocket, *, fleet: FleetRuntime, vehicle_id: str) -> N
             try:
                 raw = await asyncio.wait_for(
                     websocket.recv(),
-                    timeout=min(0.05, fleet.tick_s),
+                    timeout=min(0.05, fleet.tick_s) / fleet.realtime_factor,
                 )
             except asyncio.TimeoutError:
                 continue
 
-            timestamp = time.time()
+            timestamp = fleet.timestamp_at()
             try:
                 vehicle = fleet.world.vehicle(vehicle_id)
                 command = parse_command(
@@ -1483,6 +1505,7 @@ async def main(
     odometry_translation_noise_stddev_m: float = 0.0,
     odometry_yaw_noise_stddev_rad: float = 0.0,
     odometry_seed: int = 0,
+    realtime_factor: float = DEFAULT_REALTIME_FACTOR,
 ) -> None:
     from websockets.asyncio.server import serve
 
@@ -1495,6 +1518,7 @@ async def main(
         radius=radius,
         command_timeout=command_timeout,
         mission_capacity=mission_capacity,
+        realtime_factor=realtime_factor,
         odometry_config=OdometryConfig(
             odometry_translation_noise_stddev_m,
             odometry_yaw_noise_stddev_rad,
@@ -1541,6 +1565,7 @@ async def main(
                     for vehicle_id, node in fleet.nodes.items()
                     if node.map_sync is not None
                 },
+                realtime_factor=realtime_factor,
             )
             print(
                 f"libp2p map sync ready for {len(scenario.vehicles)} vehicle(s) "

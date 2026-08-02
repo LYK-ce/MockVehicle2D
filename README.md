@@ -46,6 +46,7 @@ mockvehicle2d serve --vehicle-id mock_vehicle_01
 # 改端口，并配置任务队列、车辆和出生锚点
 mockvehicle2d serve \
   --port 9090 \
+  --realtime-factor 3 \
   --mission-capacity 16 \
   --linear-speed-mps 0.5 \
   --angular-speed-rps 1.5708 \
@@ -65,7 +66,9 @@ mockvehicle2d fleet --scenario examples/two_vehicle_scenario.json
 ```
 
 依赖安装在仓库本地 `.venv/`。公开接口统一使用 SI 单位：米、秒、弧度、米/秒和
-弧度/秒。
+弧度/秒。`serve` 和 `fleet` 默认以 `--realtime-factor 3` 运行，即固定物理步长、传感器
+周期、控制阈值和 P2P 模拟时序不变，只把墙钟等待缩短为原来的三分之一；传入 `1`
+可恢复原来的实时速度。
 
 ## 多车共享世界
 

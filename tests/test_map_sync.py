@@ -47,7 +47,14 @@ def state(number: int) -> MapSyncState:
 class TestMapSyncState(unittest.TestCase):
     def test_peer_state_is_independent_ordered_and_expires_by_receipt_time(self) -> None:
         source = state(1)
-        receiver = state(2)
+        now = [20.0]
+        receiver = MapSyncState(
+            "session_1",
+            "vehicle_2",
+            anchor(2),
+            1.0,
+            clock=lambda: now[0],
+        )
         source.configure_network("peer_1", {"vehicle_2": ("peer_2", anchor(2))})
         receiver.configure_network("peer_2", {"vehicle_1": ("peer_1", anchor(1))})
         source.record_vehicle_state(
@@ -74,10 +81,10 @@ class TestMapSyncState(unittest.TestCase):
                 "peer_1",
                 "vehicle_1",
                 first,
-                received_at_s=20.0,
             )
         )
-        peer = receiver.peer_vehicle_states(now_s=20.0 + PEER_STATE_TTL_S)[0]
+        now[0] += PEER_STATE_TTL_S
+        peer = receiver.peer_vehicle_states()[0]
         self.assertEqual((peer.global_x_m, peer.global_y_m), (11.0, 7.0))
         self.assertEqual(peer.covariance, (0.04, 0.09, 0.01))
         self.assertFalse(
@@ -85,11 +92,11 @@ class TestMapSyncState(unittest.TestCase):
                 "peer_1",
                 "vehicle_1",
                 first,
-                received_at_s=20.1,
             )
         )
+        now[0] += 0.01
         self.assertEqual(
-            receiver.peer_vehicle_states(now_s=20.0 + PEER_STATE_TTL_S + 0.01),
+            receiver.peer_vehicle_states(),
             (),
         )
 
@@ -364,6 +371,43 @@ class TestP2PRuntimeOwnership(unittest.IsolatedAsyncioTestCase):
     def make_runtime(self, runtime_dir: Path) -> P2PFleetSync:
         settings = P2PSettings(Path("/bin/true"), runtime_dir)
         return P2PFleetSync("session_1", settings, (), {})
+
+    async def test_realtime_factor_keeps_flush_interval_in_simulation_time(
+        self,
+    ) -> None:
+        runtime = P2PFleetSync(
+            "session_1",
+            P2PSettings(Path("/bin/true"), Path("runtime")),
+            (),
+            {},
+            realtime_factor=3.0,
+        )
+        runtime.flush_once = Mock()
+        loop = Mock()
+        loop.time.side_effect = (10.0, 10.0)
+        sleep = AsyncMock(side_effect=asyncio.CancelledError)
+
+        with (
+            patch(
+                "mockvehicle2d.map_sync.asyncio.get_running_loop",
+                return_value=loop,
+            ),
+            patch("mockvehicle2d.map_sync.asyncio.sleep", new=sleep),
+            self.assertRaises(asyncio.CancelledError),
+        ):
+            await runtime._flush_loop()
+
+        runtime.flush_once.assert_called_once_with()
+        self.assertAlmostEqual(sleep.await_args.args[0], 0.1 / 3.0)
+        for factor in (0.0, -1.0, float("inf"), float("nan")):
+            with self.subTest(factor=factor), self.assertRaises(ValueError):
+                P2PFleetSync(
+                    "session_1",
+                    runtime.settings,
+                    (),
+                    {},
+                    realtime_factor=factor,
+                )
 
     async def test_runtime_directory_has_one_live_owner(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

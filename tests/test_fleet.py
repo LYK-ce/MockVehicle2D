@@ -72,6 +72,7 @@ def peer_fleet(
     *,
     grid: MapGrid | None = None,
     voxels: list[dict[str, object]] | None = None,
+    realtime_factor: float = 1.0,
 ) -> FleetRuntime:
     specs = tuple(
         FleetVehicleSpec(
@@ -92,6 +93,7 @@ def peer_fleet(
         ),
         grid=free_grid() if grid is None else grid,
         voxels=voxels,
+        realtime_factor=realtime_factor,
     )
     for vehicle_id, node in fleet.nodes.items():
         node.map_sync.configure_network(
@@ -199,6 +201,78 @@ class TestFleetScenario(unittest.TestCase):
 
 
 class TestFleetRuntime(unittest.TestCase):
+    def test_peer_state_ttl_uses_fleet_simulation_time(self) -> None:
+        fleet = peer_fleet(
+            AnchorPose(5.0, 5.0, 0.0),
+            AnchorPose(10.0, 10.0, 0.0),
+            realtime_factor=3.0,
+        )
+        relay_peer_states(fleet)
+        receiver = fleet.nodes["vehicle_2"].map_sync
+
+        for _ in range(3):
+            fleet.tick(fleet.timestamp_at(fleet.world.now + fleet.tick_s))
+        self.assertEqual(len(receiver.peer_vehicle_states()), 1)
+
+        fleet.tick(fleet.timestamp_at(fleet.world.now + fleet.tick_s))
+        self.assertEqual(receiver.peer_vehicle_states(), ())
+
+    def test_realtime_factor_changes_wall_pacing_not_simulation_ticks(self) -> None:
+        fleet_scenario = scenario(spec(1, 5.0, 5.0))
+        normal = FleetRuntime.create(
+            fleet_scenario,
+            grid=free_grid(),
+            timestamp=1_000.0,
+        )
+        fast = FleetRuntime.create(
+            fleet_scenario,
+            grid=free_grid(),
+            timestamp=1_000.0,
+            realtime_factor=3.0,
+        )
+        for fleet in (normal, fast):
+            fleet.handle_command(
+                "vehicle_1",
+                ManualCommand(1, ManualAction.DRIVE, 0.5, 0.0),
+            )
+            fleet.tick(fleet.timestamp_at(fleet.world.now + fleet.tick_s))
+            fleet.tick(fleet.timestamp_at(fleet.world.now + fleet.tick_s))
+
+        normal_vehicle = normal.world.vehicle("vehicle_1")
+        fast_vehicle = fast.world.vehicle("vehicle_1")
+        self.assertEqual(normal.world.now, fast.world.now)
+        self.assertEqual(normal_vehicle.linear_speed, fast_vehicle.linear_speed)
+        self.assertAlmostEqual(normal_vehicle.x, fast_vehicle.x)
+        self.assertAlmostEqual(normal_vehicle.y, fast_vehicle.y)
+        self.assertAlmostEqual(normal_vehicle.yaw, fast_vehicle.yaw)
+        self.assertEqual(
+            [frame.frame.timestamp for frame in normal.nodes["vehicle_1"]._frames],
+            [frame.frame.timestamp for frame in fast.nodes["vehicle_1"]._frames],
+        )
+
+        stop = asyncio.Event()
+        timeouts: list[float] = []
+
+        async def time_out(awaitable, *, timeout: float):
+            awaitable.close()
+            timeouts.append(timeout)
+            raise asyncio.TimeoutError
+
+        fast.tick = Mock(side_effect=lambda _: stop.set())
+        with patch("mockvehicle2d.fleet.asyncio.wait_for", side_effect=time_out):
+            asyncio.run(fast.run(stop))
+
+        self.assertEqual(fast.tick.call_count, 1)
+        self.assertAlmostEqual(timeouts[0], fleet_scenario.tick_s / 3.0)
+
+        for factor in (0.0, -1.0, math.inf, math.nan):
+            with self.subTest(factor=factor), self.assertRaises(ValueError):
+                FleetRuntime.create(
+                    fleet_scenario,
+                    grid=free_grid(),
+                    realtime_factor=factor,
+                )
+
     def test_missing_or_stale_tmini_scan_blocks_automatic_motion(self) -> None:
         for latest_scan_time in (
             None,
@@ -1194,6 +1268,7 @@ class TestFleetTelemetryWebSocket(unittest.IsolatedAsyncioTestCase):
             scenario(spec(1, 5.0, 5.0), tick_ms=1000),
             grid=free_grid(),
             command_timeout=20.0,
+            realtime_factor=3.0,
         )
 
         async def handler(websocket) -> None:
@@ -1216,6 +1291,7 @@ class TestFleetTelemetryWebSocket(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(
                     hello["mission_types"], ["goto", "patrol", "coverage"]
                 )
+                self.assertEqual(hello["realtime_factor"], 3.0)
                 await receive_scan(first, 0)
                 fleet.tick(1.0)
                 first_sequences = [

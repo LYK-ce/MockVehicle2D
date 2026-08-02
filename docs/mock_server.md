@@ -88,6 +88,10 @@ Server 以 Tmini 名义扫描周期（约 6 Hz）执行：
 命令到达时，Runtime 先把旧设定值安全推进到接收时刻，再执行命令。这样命令处理和遥测
 都不会倒退模拟时间。
 
+`--realtime-factor` 只缩放上述循环的墙钟等待，默认值为 `3`。线/角速度、100 ms fleet
+tick、Tmini 扫描周期、命令超时和安全阈值仍以模拟秒及 SI 单位计算；传入 `1` 可按实时
+速度运行。
+
 ## 手动控制
 
 手动控制直接给出 `linear_mps` 与 `angular_rps`，但仍经过安全门控。非零设定值只在
@@ -148,6 +152,7 @@ SafetyObservation
 mockvehicle2d serve \
   --port 19090 \
   --vehicle-id mock_vehicle_01 \
+  --realtime-factor 3 \
   --mission-capacity 16 \
   --linear-speed-mps 0.5 \
   --angular-speed-rps 1.5708 \
