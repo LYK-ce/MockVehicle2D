@@ -23,7 +23,11 @@ from mockvehicle2d.local_state import (
     UNKNOWN,
 )
 from mockvehicle2d.map_grid import MapGrid
-from mockvehicle2d.pathfinding.d_star_lite import DStarLitePlanner, _key_less
+from mockvehicle2d.pathfinding.d_star_lite import (
+    DStarLitePlanner,
+    _canonical_key,
+    _key_less,
+)
 from mockvehicle2d.safety import AUTOMATIC_MINIMUM_CLEARANCE_M
 
 
@@ -868,12 +872,49 @@ def test_local_change_expands_less_state_than_a_fresh_long_route() -> None:
     assert incremental_expansions < fresh.stats["expansions"]
 
 
-def test_near_equal_key_keeps_lexicographic_second_component_order() -> None:
-    lower_second = (57.154328932550705, 46.42640687119285)
-    higher_second = (57.154328932550684, 55.154328932550705)
+def test_canonical_key_uses_second_component_for_roundoff_equivalent_first() -> None:
+    lower_second = _canonical_key((57.154328932550705, 46.42640687119285))
+    higher_second = _canonical_key((57.154328932550684, 55.154328932550705))
 
-    assert lower_second > higher_second
+    assert lower_second[0] == higher_second[0]
     assert _key_less(lower_second, higher_second)
+
+
+def test_key_comparison_matches_heap_order_for_near_equal_components() -> None:
+    needed = _canonical_key((35.76345596729058, 25.020815280171306))
+    masked = _canonical_key((35.763455967290575, 32.26345596729058))
+    start = _canonical_key((35.76345596729058, 27.14213562373095))
+    queue = [needed, masked]
+    heapq.heapify(queue)
+
+    assert queue[0] == needed
+    assert _key_less(queue[0], start)
+
+
+def test_roundoff_equivalent_key_prioritizes_lower_cost_component() -> None:
+    raw_needed = (35.84924240491749, 25.0208152801713)
+    raw_start = (35.84924240491748, 27.142135623730937)
+    needed = _canonical_key(raw_needed)
+    start = _canonical_key(raw_start)
+
+    assert raw_needed > raw_start
+    assert needed[0] == start[0]
+    assert _key_less(needed, start)
+
+
+def test_one_ulp_vertex_inconsistency_remains_in_open_set() -> None:
+    search = planner()
+    start = (0, 0)
+    goal = (1, 0)
+    search._reset(start, goal)
+    search._g[goal] = 1.0
+    expected_rhs = search._cost(start, goal) + search._g[goal]
+    search._g[start] = math.nextafter(expected_rhs, math.inf)
+
+    search._update_vertex(start)
+
+    assert search._rhs[start] == expected_rhs
+    assert start in search._open_keys
 
 
 def test_long_start_movement_reuses_one_search_and_accumulates_key_modifier() -> None:

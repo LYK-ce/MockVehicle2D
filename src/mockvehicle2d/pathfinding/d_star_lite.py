@@ -27,6 +27,7 @@ Cell = tuple[int, int]
 Key = tuple[float, float]
 SQRT_2 = math.sqrt(2)
 EGRESS_PROBE_FRACTION = 1e-6
+KEY_DECIMAL_PLACES = 12
 MOVES = tuple(
     (dx, dy, SQRT_2 if dx and dy else 1.0)
     for dx in (-1, 0, 1)
@@ -454,7 +455,7 @@ class DStarLitePlanner:
         expansions = 0
         while (
             _key_less(self._top_key(), self._calculate_key(self._start))
-            or not math.isclose(self._rhs_value(self._start), self._g_value(self._start))
+            or self._rhs_value(self._start) != self._g_value(self._start)
         ):
             if expansions >= expansion_budget:
                 self._expansions += expansions
@@ -521,7 +522,7 @@ class DStarLitePlanner:
                 default=math.inf,
             )
         self._open_keys.pop(cell, None)
-        if not math.isclose(self._g_value(cell), self._rhs_value(cell)):
+        if self._g_value(cell) != self._rhs_value(cell):
             self._push(cell)
 
     def _cost(self, source: Cell, destination: Cell) -> float:
@@ -773,11 +774,13 @@ class DStarLitePlanner:
     def _calculate_key(self, cell: Cell) -> Key:
         assert self._start is not None
         value = min(self._g_value(cell), self._rhs_value(cell))
-        return (
-            value
-            + _octile(self._start, cell, self.resolution_m)
-            + self._key_modifier_cost,
-            value,
+        return _canonical_key(
+            (
+                value
+                + _octile(self._start, cell, self.resolution_m)
+                + self._key_modifier_cost,
+                value,
+            )
         )
 
     def _push(self, cell: Cell) -> None:
@@ -866,7 +869,11 @@ def _octile(first: Cell, second: Cell, resolution_m: float) -> float:
     return resolution_m * (max(dx, dy) + (SQRT_2 - 1) * min(dx, dy))
 
 
+def _canonical_key(key: Key) -> Key:
+    # Key costs are metres; picometre precision removes only float accumulation
+    # noise while giving heapq and D* Lite one shared total order.
+    return round(key[0], KEY_DECIMAL_PLACES), round(key[1], KEY_DECIMAL_PLACES)
+
+
 def _key_less(first: Key, second: Key) -> bool:
-    if not math.isclose(first[0], second[0]):
-        return first[0] < second[0]
-    return not math.isclose(first[1], second[1]) and first[1] < second[1]
+    return first < second
