@@ -430,16 +430,7 @@ class RobotController:
             safety=safety,
         )
         if self.navigation.status == "reached":
-            if self._advance_subgoal(vehicle):
-                self._start_or_resume(
-                    anchor,
-                    pose,
-                    local_map,
-                    vehicle.radius,
-                    emit_event=False,
-                )
-            else:
-                self._finish_reached(vehicle)
+            self._complete_subgoal(vehicle, anchor, pose, local_map)
             return
         if self.navigation.status == "blocked":
             self._finish_blocked(vehicle)
@@ -462,7 +453,7 @@ class RobotController:
         if decision.state == "stopped":
             vehicle.stop(now)
             if self.navigation.finish_nearby_safe_stop(pose, decision.reason):
-                self._finish_reached(vehicle)
+                self._complete_subgoal(vehicle, anchor, pose, local_map)
                 return
             edge_cell = (
                 self.navigation.unmapped_edge_evidence_cell(safety, pose, local_map)
@@ -758,6 +749,24 @@ class RobotController:
         self._subgoal_index += 1
         self._needs_start = True
         return True
+
+    def _complete_subgoal(
+        self,
+        vehicle: Vehicle,
+        anchor: AnchorSpec,
+        pose: PoseEstimate,
+        local_map: ObservedGrid,
+    ) -> None:
+        if self._advance_subgoal(vehicle):
+            self._start_or_resume(
+                anchor,
+                pose,
+                local_map,
+                vehicle.radius,
+                emit_event=False,
+            )
+        else:
+            self._finish_reached(vehicle)
 
     def _finish_reached(self, vehicle: Vehicle) -> None:
         assert self.active_mission is not None

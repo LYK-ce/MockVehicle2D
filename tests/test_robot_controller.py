@@ -598,6 +598,32 @@ def case_automatic_safety_stop_finishes_nearby_or_blocks() -> None:
             assert harness.controller.navigation.reason == "safety_obstacle"
 
 
+def case_nearby_safe_stop_advances_high_level_subgoals() -> None:
+    class StoppedSafety(LocalSafetyRuntime):
+        def evaluate(self, *args, **kwargs) -> SafetyDecision:
+            return SafetyDecision(0.0, 0.0, "stopped", "safety_obstacle")
+
+    harness = Harness(capacity=1)
+    harness.safety = StoppedSafety()
+    harness.mode(1, ModeAction.SWITCH_TO_AUTO)
+    harness.auto(
+        2,
+        AutoAction.PUSH,
+        (patrol("nearby-route", ((11.5, 10.0), (11.0, 10.0)), seq=2),),
+    )
+    harness.events()
+
+    harness.tick(0.0, advance=SafetyAdvanceResult())
+    assert harness.controller.auto_state is AutoState.ACTIVE
+    assert harness.controller.snapshot()["active_mission"]["subgoal_index"] == 1
+    assert [event.status for event in harness.events()] == ["active"]
+
+    harness.tick(0.1, advance=SafetyAdvanceResult())
+    assert harness.controller.auto_state is AutoState.IDLE
+    assert harness.controller.active_mission is None
+    assert [event.status for event in harness.events()] == ["reached"]
+
+
 def case_unabsorbed_edge_stop_is_deferred_only_once() -> None:
     class RepeatedEdgeSafety(LocalSafetyRuntime):
         def __init__(self) -> None:
@@ -735,6 +761,9 @@ class TestRobotController(unittest.TestCase):
     test_safety_gate = staticmethod(case_manual_and_auto_are_both_gated_by_safety)
     test_auto_safety_stop_terminal_state = staticmethod(
         case_automatic_safety_stop_finishes_nearby_or_blocks
+    )
+    test_nearby_safe_stop_advances_subgoals = staticmethod(
+        case_nearby_safe_stop_advances_high_level_subgoals
     )
     test_unabsorbed_edge_stop_is_bounded = staticmethod(
         case_unabsorbed_edge_stop_is_deferred_only_once
