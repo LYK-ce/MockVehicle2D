@@ -797,21 +797,28 @@ class TestP2PRuntimeOwnership(unittest.IsolatedAsyncioTestCase):
             await contender.close()
 
     async def test_stubborn_flush_is_bounded_and_keeps_runtime_lease(self) -> None:
+        started = asyncio.Event()
         release = asyncio.Event()
         cancelled = asyncio.Event()
 
         async def stubborn_flush() -> None:
+            started.set()
             try:
                 await asyncio.Event().wait()
             except asyncio.CancelledError:
                 cancelled.set()
-                await release.wait()
+                while not release.is_set():
+                    try:
+                        await release.wait()
+                    except asyncio.CancelledError:
+                        pass
 
         with tempfile.TemporaryDirectory() as temporary:
             runtime_dir = Path(temporary)
             runtime = self.make_runtime(runtime_dir)
             runtime._acquire_runtime_lease()
             runtime._flush_task = asyncio.create_task(stubborn_flush())
+            await asyncio.wait_for(started.wait(), timeout=0.2)
 
             with patch("mockvehicle2d.map_sync.PROCESS_STOP_TIMEOUT_S", 0.05):
                 close_task = asyncio.create_task(runtime.close())
@@ -1110,23 +1117,24 @@ class TestP2PRuntimeOwnership(unittest.IsolatedAsyncioTestCase):
             await bridge.start_server()
             _reader, writer = await asyncio.open_unix_connection(path)
             await self._wait_until(lambda: bridge._writer is not None)
-            bridge.process = await asyncio.create_subprocess_exec(
+            process = await asyncio.create_subprocess_exec(
                 sys.executable,
                 "-c",
                 "import time; time.sleep(0.1)",
             )
+            bridge.process = process
             close_task = asyncio.create_task(bridge.close())
-            await asyncio.sleep(0.01)
+            await self._wait_until(lambda: bridge._close_task is not None)
             close_task.cancel()
             try:
                 with self.assertRaises(asyncio.CancelledError):
                     await close_task
-                self.assertIsNotNone(bridge.process.returncode)
+                self.assertIsNotNone(process.returncode)
                 self.assertFalse(path.exists())
             finally:
-                if bridge.process.returncode is None:
-                    bridge.process.kill()
-                    await bridge.process.wait()
+                if process.returncode is None:
+                    process.kill()
+                    await process.wait()
                 await bridge.close()
                 writer.close()
                 await writer.wait_closed()

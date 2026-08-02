@@ -241,6 +241,23 @@ def test_peer_forbidden_cells_are_not_inflated_twice_and_move_cleanly() -> None:
     assert static._blocked((0, 0))
 
 
+def test_peer_forbidden_changes_repair_an_existing_search() -> None:
+    search = planner(bounds_margin_m=2.0)
+    original = search.plan((0, 0), (6, 0))
+    resets = search.stats["resets"]
+
+    search.set_peer_forbidden_cells(((1, 0),))
+    detour = search.plan((0, 0), (6, 0))
+    search.set_peer_forbidden_cells(())
+    restored = search.plan((0, 0), (6, 0))
+
+    assert original is not None and detour is not None
+    assert (1, 0) not in detour
+    assert geometric_cost(detour) > geometric_cost(original)
+    assert restored == original
+    assert search.stats["resets"] == resets
+
+
 def test_peer_overlay_never_hides_base_forbidden_inflation() -> None:
     search = DStarLitePlanner(
         ObservedGrid(ANCHOR, resolution_m=0.5),

@@ -153,7 +153,18 @@ class DStarLitePlanner:
             for cell in updated
         ):
             raise ValueError("peer forbidden cells must be integer pairs")
+        changed = self._peer_forbidden_cells ^ updated
         self._peer_forbidden_cells = updated
+        if changed and self._bounds is not None:
+            affected = {
+                neighbour
+                for cell in changed
+                for neighbour in self._neighbours(cell)
+            }
+            affected.update(cell for cell in changed if self._inside(cell))
+            for cell in sorted(affected):
+                self._update_vertex(cell)
+            self._incremental_updates += len(affected)
 
     def validate_plan_request(self, start: Cell, goal: Cell) -> None:
         """Reject a request that cannot fit inside this planner's hard bounds."""

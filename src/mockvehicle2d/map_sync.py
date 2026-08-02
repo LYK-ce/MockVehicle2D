@@ -1224,6 +1224,10 @@ class _NodeBridge:
             try:
                 writer.close()
                 await writer.wait_closed()
+            except ConnectionError:
+                self._writers.discard(writer)
+                if self._writer is writer:
+                    self._writer = None
             except BaseException:
                 # Keep ownership until a later close confirms the writer stopped.
                 pass
@@ -1334,6 +1338,11 @@ class _NodeBridge:
         for owned_writer in writers:
             try:
                 owned_writer.close()
+            except ConnectionError:
+                self._writers.discard(owned_writer)
+                if self._writer is owned_writer:
+                    self._writer = None
+                continue
             except BaseException as error:
                 pending_cleanup = True
                 errors.append(error)
@@ -1342,7 +1351,7 @@ class _NodeBridge:
                 owned_writer.wait_closed,
                 "map-sync writer wait did not stop",
             )
-            if not closed:
+            if not closed and not isinstance(error, ConnectionError):
                 pending_cleanup = True
                 assert error is not None
                 errors.append(error)
