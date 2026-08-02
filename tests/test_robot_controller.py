@@ -13,12 +13,15 @@ from mockvehicle2d.controller import (
     AutoAction,
     AutoCommand,
     AutoState,
+    CoverageMission,
     GotoMission,
     ManualAction,
     ManualCommand,
+    Mission,
     ModeAction,
     ModeCommand,
     OpMode,
+    PatrolMission,
     RobotController,
 )
 from mockvehicle2d.local_state import (
@@ -74,7 +77,7 @@ class Harness:
         self,
         seq: int,
         action: AutoAction,
-        missions: tuple[GotoMission, ...] = (),
+        missions: tuple[Mission, ...] = (),
     ):
         return self.controller.handle(
             AutoCommand(seq, action, missions),
@@ -142,6 +145,16 @@ def mission(
     seq: int = 1,
 ) -> GotoMission:
     return GotoMission(mission_id, "global_map", x_m, y_m, seq)
+
+
+def patrol(
+    mission_id: str,
+    waypoints: tuple[tuple[float, float], ...],
+    *,
+    cycles: int = 1,
+    seq: int = 1,
+) -> PatrolMission:
+    return PatrolMission(mission_id, "global_map", waypoints, cycles, seq)
 
 
 def case_defaults_to_manual_with_no_hidden_task_authority() -> None:
@@ -283,6 +296,148 @@ def case_mission_ids_remain_idempotent_for_the_process_lifetime() -> None:
     )
     assert not conflict.accepted
     assert conflict.reason == "mission_id_conflict"
+
+
+def case_high_level_missions_keep_parent_capacity_and_full_fingerprints() -> None:
+    harness = Harness(capacity=1)
+    harness.mode(1, ModeAction.SWITCH_TO_AUTO)
+    original = patrol(
+        "route",
+        ((10.0, 10.0), (11.0, 10.0)),
+        cycles=512,
+        seq=2,
+    )
+    assert len(original.subgoals) == 1024
+    assert harness.auto(2, AutoAction.PUSH, (original,)).accepted
+    assert harness.controller.snapshot()["mission_queue"]["size"] == 1
+    harness.events()
+
+    retry = patrol(
+        "route",
+        ((10.0, 10.0), (11.0, 10.0)),
+        cycles=512,
+        seq=3,
+    )
+    assert harness.auto(3, AutoAction.PUSH, (retry,)).accepted
+    assert harness.events() == ()
+
+    changed = patrol(
+        "route",
+        ((10.0, 10.0), (11.0, 10.0)),
+        cycles=511,
+        seq=4,
+    )
+    conflict = harness.auto(4, AutoAction.PUSH, (changed,))
+    assert not conflict.accepted
+    assert conflict.reason == "mission_id_conflict"
+
+    other_type = CoverageMission(
+        "route",
+        "global_map",
+        10.0,
+        10.0,
+        12.0,
+        11.0,
+        1.0,
+        5,
+    )
+    conflict = harness.auto(5, AutoAction.PUSH, (other_type,))
+    assert not conflict.accepted
+    assert conflict.reason == "mission_id_conflict"
+
+    full = harness.auto(6, AutoAction.PUSH, (mission("another", 10.0),))
+    assert not full.accepted
+    assert full.reason == "mission_queue_full"
+
+
+def case_patrol_progress_survives_pause_takeover_resume_and_cancel() -> None:
+    harness = Harness(capacity=1)
+    harness.mode(1, ModeAction.SWITCH_TO_AUTO)
+    route = patrol(
+        "patrol-progress",
+        ((10.0, 10.0), (10.0, 10.0)),
+        cycles=2,
+        seq=2,
+    )
+    harness.auto(2, AutoAction.PUSH, (route,))
+    queued = harness.events()[0].as_dict(0.0)
+    assert queued["mission_type"] == "patrol"
+    assert queued["subgoal_index"] == 0
+    assert queued["subgoal_count"] == 4
+
+    harness.tick(0.0)
+    snapshot = harness.controller.snapshot()["active_mission"]
+    assert snapshot["subgoal_index"] == 1
+    assert snapshot["subgoal_count"] == 4
+    assert snapshot["current_goal"] == {
+        "frame_id": "global_map",
+        "x_m": 10.0,
+        "y_m": 10.0,
+    }
+    assert not any(event.status == "reached" for event in harness.events())
+
+    harness.auto(3, AutoAction.PAUSE)
+    assert harness.events()[-1].subgoal_index == 1
+    harness.mode(4, ModeAction.SWITCH_TO_MANUAL)
+    harness.mode(5, ModeAction.SWITCH_TO_AUTO)
+    harness.auto(6, AutoAction.RESUME)
+    harness.tick(0.1)
+    assert harness.controller.snapshot()["active_mission"]["subgoal_index"] == 2
+
+    harness.auto(7, AutoAction.CANCEL_ALL)
+    cancelled = harness.events()[-1]
+    assert cancelled.status == "cancelled"
+    assert cancelled.subgoal_index == 2
+    assert harness.controller.snapshot()["active_mission"] is None
+
+
+def case_patrol_emits_one_parent_reached_and_does_not_skip_when_blocked() -> None:
+    complete = Harness(capacity=1)
+    complete.mode(1, ModeAction.SWITCH_TO_AUTO)
+    complete.auto(
+        2,
+        AutoAction.PUSH,
+        (patrol("one-parent", ((10.0, 10.0), (10.0, 10.0)), seq=2),),
+    )
+    complete.events()
+    complete.tick(0.0)
+    complete.tick(0.1)
+    events = complete.events()
+    assert {event.mission.mission_id for event in events} == {"one-parent"}
+    assert [event.status for event in events] == ["active", "reached"]
+    reached = next(event for event in events if event.status == "reached")
+    assert reached.subgoal_index == 1
+    assert reached.as_dict(0.1)["subgoal_count"] == 2
+    assert complete.controller.auto_state is AutoState.IDLE
+
+    blocked = Harness(capacity=2)
+    blocked.mode(1, ModeAction.SWITCH_TO_AUTO)
+    blocked.auto(
+        2,
+        AutoAction.PUSH,
+        (
+            patrol("blocked-parent", ((10.0, 10.0), (14.0, 10.0)), seq=2),
+            mission("waiting", 18.0, seq=2),
+        ),
+    )
+    blocked.tick(0.0)
+    lost = PoseEstimate(
+        blocked.anchor.anchor_id,
+        0.0,
+        0.0,
+        0.0,
+        (0.0, 0.0, 0.0),
+        "lost",
+        0.1,
+        1,
+    )
+    blocked.tick(0.1, pose=lost)
+    assert blocked.controller.auto_state is AutoState.BLOCKED
+    assert blocked.controller.active_mission.mission_id == "blocked-parent"
+    assert blocked.controller.snapshot()["active_mission"]["subgoal_index"] == 1
+    assert blocked.controller.snapshot()["mission_queue"]["mission_ids"] == [
+        "waiting"
+    ]
 
 
 def case_pause_without_outstanding_missions_stays_idle() -> None:
@@ -556,6 +711,15 @@ class TestRobotController(unittest.TestCase):
     )
     test_process_lifetime_idempotency = staticmethod(
         case_mission_ids_remain_idempotent_for_the_process_lifetime
+    )
+    test_high_level_capacity_and_idempotency = staticmethod(
+        case_high_level_missions_keep_parent_capacity_and_full_fingerprints
+    )
+    test_high_level_pause_resume_cancel = staticmethod(
+        case_patrol_progress_survives_pause_takeover_resume_and_cancel
+    )
+    test_high_level_parent_events_and_blocking = staticmethod(
+        case_patrol_emits_one_parent_reached_and_does_not_skip_when_blocked
     )
     test_pause_while_idle = staticmethod(
         case_pause_without_outstanding_missions_stays_idle

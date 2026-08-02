@@ -109,25 +109,51 @@ Auto → Manual 暂停并保留任务。Manual → Auto 若有保留任务仍停
       "y_m": 30.0
     },
     {
-      "mission_id": "goto-002",
-      "type": "goto",
+      "mission_id": "patrol-001",
+      "type": "patrol",
       "frame_id": "global_map",
-      "x_m": 24.0,
-      "y_m": 35.0
+      "waypoints": [
+        {"x_m": 24.0, "y_m": 35.0},
+        {"x_m": 28.0, "y_m": 35.0}
+      ],
+      "cycles": 2
+    },
+    {
+      "mission_id": "coverage-001",
+      "type": "coverage",
+      "frame_id": "global_map",
+      "area": {
+        "min_x_m": 10.0,
+        "min_y_m": 10.0,
+        "max_x_m": 20.0,
+        "max_y_m": 15.0
+      },
+      "lane_spacing_m": 1.0
     }
   ]
 }
 ```
 
-仅在 `auto` 模式有效。当前只支持 `goto`。`mission_id` 为 1–64 个 ASCII 字母、
-数字、点、下划线、冒号或连字符。坐标必须有限且绝对值不超过 `1,000,000 m`。
+仅在 `auto` 模式有效。支持：
+
+- `goto`：单个 `x_m/y_m` 目标；
+- `patrol`：按 `waypoints` 顺序执行正整数次 `cycles`；
+- `coverage`：覆盖有效矩形 `area`。从 `(min_x_m,min_y_m)` 开始，沿矩形长边往返，
+  相邻横道间距为正数 `lane_spacing_m`；短边不能整除间距时仍包含末端边界。
+
+三类任务都使用 `global_map`。`mission_id` 为 1–64 个 ASCII 字母、数字、点、
+下划线、冒号或连字符。所有坐标必须有限且绝对值不超过 `1,000,000 m`。
+`patrol` 航点不能为空，`coverage` 的每个 minimum 必须小于对应 maximum。一个父任务
+最多生成 1024 个子目标；在生成路线前检查该上限，因此极小间距不会分配无界内存。
+高层任务通过现有 `goto` 导航逐个执行子目标，不创建独立子任务。
 
 一次 push 是原子的：
 
 - batch 不能为空、不能超过任务队列配置，且 batch 内 ID 必须唯一；
-- 待执行队列空间不足时整个 batch 拒绝；
-- 已知 `mission_id` 携带相同 `frame_id/x_m/y_m` 时视为幂等重试，不重复入队；
-- 已知 `mission_id` 携带不同目标时返回 `mission_id_conflict`。
+- 待执行队列空间不足时整个 batch 拒绝，高层任务按一个父任务计数；
+- 任一任务或生成路线无效时整个命令在进入控制器前拒绝，不会部分入队；
+- 已知 `mission_id` 携带完全相同的类型和任务定义时视为幂等重试，不重复入队；
+- 已知 `mission_id` 携带不同类型或定义时返回 `mission_id_conflict`。
 
 客户端重试时必须使用新的、更大的命令 `seq`，但沿用原 `mission_id`。
 幂等记录在 Server 进程生命周期内不会静默淘汰；进程重启后内存记录清空，不提供
@@ -200,8 +226,11 @@ Auto → Manual 暂停并保留任务。Manual → Auto 若有保留任务仍停
   "event_seq": 42,
   "timestamp_s": 1717800000.3,
   "mission_id": "goto-001",
+  "mission_type": "goto",
   "submitted_seq": 5,
   "status": "blocked",
+  "subgoal_index": 0,
+  "subgoal_count": 1,
   "goal": {
     "frame_id": "global_map",
     "x_m": 20.0,
@@ -223,6 +252,11 @@ Auto → Manual 暂停并保留任务。Manual → Auto 若有保留任务仍停
 递增顺序发送尚未发送的事件。重连会从 ledger 起点自动重放，因此传输语义是
 **at-least-once**：跨连接可能重复，但不会改变事件身份或乱序。客户端必须按
 `(event_epoch, event_seq)` 去重；epoch 变化时清除旧的 sequence 游标。
+
+`subgoal_index` 从 0 开始；`goal` 是该事件对应的当前子目标。中间目标不会使用新的
+`mission_id`，也不会单独发布任务事件；连续进度由 `pose.controller.active_mission`
+提供。只有最后一个子目标完成才发布父任务 `reached`；`active`、`paused`、`blocked`
+和 `cancelled` 保留事件发生时的子目标进度。
 
 当前 simulator 为便于验证可靠性，保留本进程的全部任务事件；进程重启后 ledger 和
 序号都会清空。`timestamp_s` 是本次发送时间，重放时可能变化，事件身份只能使用
@@ -266,6 +300,7 @@ Auto → Manual 暂停并保留任务。Manual → Auto 若有保留任务仍停
   "vehicle_id": "mock_vehicle_01",
   "control_lease": "exclusive",
   "mission_frame_id": "global_map",
+  "mission_types": ["goto", "patrol", "coverage"],
   "birth_anchor": {
     "anchor_id": "spawn_north_west",
     "x_m": 9.0,
@@ -347,7 +382,14 @@ cell 状态：`0` 可通行、`1` 墙、`2` 无地面/落差。客户端用
       "frame_id": "global_map",
       "x_m": 20.0,
       "y_m": 30.0,
-      "submitted_seq": 5
+      "submitted_seq": 5,
+      "subgoal_index": 0,
+      "subgoal_count": 1,
+      "current_goal": {
+        "frame_id": "global_map",
+        "x_m": 20.0,
+        "y_m": 30.0
+      }
     },
     "mission_queue": {
       "size": 1,

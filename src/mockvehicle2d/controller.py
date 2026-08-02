@@ -3,11 +3,11 @@
 from __future__ import annotations
 
 from collections import deque
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import Enum
 import math
 import re
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, ClassVar
 import uuid
 
 from mockvehicle2d.navigation import GotoController
@@ -27,6 +27,9 @@ if TYPE_CHECKING:
 
 MISSION_ID_PATTERN = re.compile(r"[A-Za-z0-9._:-]{1,64}")
 MISSION_FRAME = "global_map"
+MAX_MISSION_SUBGOALS = 1024
+SUPPORTED_MISSION_TYPES = ("goto", "patrol", "coverage")
+Goal = tuple[float, float]
 
 
 class OpMode(str, Enum):
@@ -61,6 +64,7 @@ class AutoAction(str, Enum):
 
 @dataclass(frozen=True)
 class GotoMission:
+    mission_type: ClassVar[str] = "goto"
     mission_id: str
     frame_id: str
     x_m: float
@@ -68,37 +72,195 @@ class GotoMission:
     submitted_seq: int
 
     def __post_init__(self) -> None:
-        if not MISSION_ID_PATTERN.fullmatch(self.mission_id):
-            raise ValueError("invalid mission_id")
-        if self.frame_id != MISSION_FRAME:
-            raise ValueError(f"frame_id must be {MISSION_FRAME}")
-        if (
-            isinstance(self.x_m, bool)
-            or isinstance(self.y_m, bool)
-            or not math.isfinite(self.x_m)
-            or not math.isfinite(self.y_m)
-        ):
-            raise ValueError("mission coordinates must be finite")
-        if (
-            isinstance(self.submitted_seq, bool)
-            or not isinstance(self.submitted_seq, int)
-            or not 0 <= self.submitted_seq <= 2**64 - 1
-        ):
-            raise ValueError("submitted_seq must be an unsigned 64-bit integer")
+        _validate_mission_header(self.mission_id, self.frame_id, self.submitted_seq)
+        _validate_goal((self.x_m, self.y_m))
 
     @property
-    def fingerprint(self) -> tuple[str, float, float]:
-        return self.frame_id, self.x_m, self.y_m
+    def fingerprint(self) -> tuple[object, ...]:
+        return self.mission_type, self.frame_id, self.x_m, self.y_m
+
+    @property
+    def subgoals(self) -> tuple[Goal, ...]:
+        return ((self.x_m, self.y_m),)
 
     def as_dict(self) -> dict[str, object]:
         return {
             "mission_id": self.mission_id,
-            "type": "goto",
+            "type": self.mission_type,
             "frame_id": self.frame_id,
             "x_m": self.x_m,
             "y_m": self.y_m,
             "submitted_seq": self.submitted_seq,
         }
+
+
+@dataclass(frozen=True)
+class PatrolMission:
+    mission_type: ClassVar[str] = "patrol"
+    mission_id: str
+    frame_id: str
+    waypoints: tuple[Goal, ...]
+    cycles: int
+    submitted_seq: int
+    _subgoals: tuple[Goal, ...] = field(init=False, repr=False, compare=False)
+
+    def __post_init__(self) -> None:
+        _validate_mission_header(self.mission_id, self.frame_id, self.submitted_seq)
+        if not self.waypoints:
+            raise ValueError("waypoints must not be empty")
+        for waypoint in self.waypoints:
+            _validate_goal(waypoint)
+        if (
+            isinstance(self.cycles, bool)
+            or not isinstance(self.cycles, int)
+            or self.cycles <= 0
+        ):
+            raise ValueError("cycles must be a positive integer")
+        if self.cycles > MAX_MISSION_SUBGOALS // len(self.waypoints):
+            raise ValueError(
+                f"mission must generate at most {MAX_MISSION_SUBGOALS} subgoals"
+            )
+        object.__setattr__(self, "_subgoals", self.waypoints * self.cycles)
+
+    @property
+    def fingerprint(self) -> tuple[object, ...]:
+        return self.mission_type, self.frame_id, self.waypoints, self.cycles
+
+    @property
+    def subgoals(self) -> tuple[Goal, ...]:
+        return self._subgoals
+
+    def as_dict(self) -> dict[str, object]:
+        return {
+            "mission_id": self.mission_id,
+            "type": self.mission_type,
+            "frame_id": self.frame_id,
+            "waypoints": [
+                {"x_m": x_m, "y_m": y_m} for x_m, y_m in self.waypoints
+            ],
+            "cycles": self.cycles,
+            "submitted_seq": self.submitted_seq,
+        }
+
+
+@dataclass(frozen=True)
+class CoverageMission:
+    mission_type: ClassVar[str] = "coverage"
+    mission_id: str
+    frame_id: str
+    min_x_m: float
+    min_y_m: float
+    max_x_m: float
+    max_y_m: float
+    lane_spacing_m: float
+    submitted_seq: int
+    _subgoals: tuple[Goal, ...] = field(init=False, repr=False, compare=False)
+
+    def __post_init__(self) -> None:
+        _validate_mission_header(self.mission_id, self.frame_id, self.submitted_seq)
+        for goal in (
+            (self.min_x_m, self.min_y_m),
+            (self.max_x_m, self.max_y_m),
+        ):
+            _validate_goal(goal)
+        if self.min_x_m >= self.max_x_m or self.min_y_m >= self.max_y_m:
+            raise ValueError("coverage area minimums must be below maximums")
+        if (
+            isinstance(self.lane_spacing_m, bool)
+            or not isinstance(self.lane_spacing_m, (int, float))
+            or not math.isfinite(self.lane_spacing_m)
+            or self.lane_spacing_m <= 0
+        ):
+            raise ValueError("lane_spacing_m must be finite and positive")
+        object.__setattr__(self, "_subgoals", self._coverage_subgoals())
+
+    @property
+    def fingerprint(self) -> tuple[object, ...]:
+        return (
+            self.mission_type,
+            self.frame_id,
+            self.min_x_m,
+            self.min_y_m,
+            self.max_x_m,
+            self.max_y_m,
+            self.lane_spacing_m,
+        )
+
+    @property
+    def subgoals(self) -> tuple[Goal, ...]:
+        return self._subgoals
+
+    def as_dict(self) -> dict[str, object]:
+        return {
+            "mission_id": self.mission_id,
+            "type": self.mission_type,
+            "frame_id": self.frame_id,
+            "area": {
+                "min_x_m": self.min_x_m,
+                "min_y_m": self.min_y_m,
+                "max_x_m": self.max_x_m,
+                "max_y_m": self.max_y_m,
+            },
+            "lane_spacing_m": self.lane_spacing_m,
+            "submitted_seq": self.submitted_seq,
+        }
+
+    def _coverage_subgoals(self) -> tuple[Goal, ...]:
+        width = self.max_x_m - self.min_x_m
+        height = self.max_y_m - self.min_y_m
+        along_x = width >= height
+        short_span = height if along_x else width
+        ratio = short_span / self.lane_spacing_m
+        max_segments = MAX_MISSION_SUBGOALS // 2 - 1
+        if not math.isfinite(ratio) or ratio > max_segments:
+            raise ValueError(
+                f"mission must generate at most {MAX_MISSION_SUBGOALS} subgoals"
+            )
+        segments = max(1, math.ceil(ratio))
+        goals: list[Goal] = []
+        for index in range(segments + 1):
+            lane = (
+                (self.max_y_m if along_x else self.max_x_m)
+                if index == segments
+                else (self.min_y_m if along_x else self.min_x_m)
+                + index * self.lane_spacing_m
+            )
+            if along_x:
+                endpoints = ((self.min_x_m, lane), (self.max_x_m, lane))
+            else:
+                endpoints = ((lane, self.min_y_m), (lane, self.max_y_m))
+            goals.extend(endpoints if index % 2 == 0 else reversed(endpoints))
+        return tuple(goals)
+
+
+Mission = GotoMission | PatrolMission | CoverageMission
+
+
+def _validate_mission_header(
+    mission_id: object,
+    frame_id: object,
+    submitted_seq: object,
+) -> None:
+    if not isinstance(mission_id, str) or not MISSION_ID_PATTERN.fullmatch(mission_id):
+        raise ValueError("invalid mission_id")
+    if frame_id != MISSION_FRAME:
+        raise ValueError(f"frame_id must be {MISSION_FRAME}")
+    if (
+        isinstance(submitted_seq, bool)
+        or not isinstance(submitted_seq, int)
+        or not 0 <= submitted_seq <= 2**64 - 1
+    ):
+        raise ValueError("submitted_seq must be an unsigned 64-bit integer")
+
+
+def _validate_goal(goal: object) -> None:
+    if not isinstance(goal, tuple) or len(goal) != 2 or any(
+        isinstance(value, bool)
+        or not isinstance(value, (int, float))
+        or not math.isfinite(value)
+        for value in goal
+    ):
+        raise ValueError("mission coordinates must be finite")
 
 
 @dataclass(frozen=True)
@@ -119,7 +281,7 @@ class ManualCommand:
 class AutoCommand:
     seq: int
     action: AutoAction
-    missions: tuple[GotoMission, ...] = ()
+    missions: tuple[Mission, ...] = ()
 
 
 Command = ModeCommand | ManualCommand | AutoCommand
@@ -129,25 +291,30 @@ Command = ModeCommand | ManualCommand | AutoCommand
 class ControllerEvent:
     event_seq: int
     event_epoch: str
-    mission: GotoMission
+    mission: Mission
+    subgoal_index: int
     status: str
     reason: str | None = None
     detail: str | None = None
     navigation: dict[str, object] | None = None
 
     def as_dict(self, timestamp: float) -> dict[str, object]:
+        goal_x_m, goal_y_m = self.mission.subgoals[self.subgoal_index]
         message: dict[str, object] = {
             "type": "mission_update",
             "event_seq": self.event_seq,
             "event_epoch": self.event_epoch,
             "timestamp_s": timestamp,
             "mission_id": self.mission.mission_id,
+            "mission_type": self.mission.mission_type,
             "submitted_seq": self.mission.submitted_seq,
             "status": self.status,
+            "subgoal_index": self.subgoal_index,
+            "subgoal_count": len(self.mission.subgoals),
             "goal": {
                 "frame_id": self.mission.frame_id,
-                "x_m": self.mission.x_m,
-                "y_m": self.mission.y_m,
+                "x_m": goal_x_m,
+                "y_m": goal_y_m,
             },
         }
         if self.reason is not None:
@@ -182,16 +349,17 @@ class RobotController:
         self.auto_state = AutoState.IDLE
         self.navigation = navigation or GotoController()
         self.mission_capacity = mission_capacity
-        self.active_mission: GotoMission | None = None
-        self._pending: deque[GotoMission] = deque()
+        self.active_mission: Mission | None = None
+        self._pending: deque[Mission] = deque()
         # ponytail: process-lifetime ledgers fit the simulator; add persistence and
         # explicit retention only when long-running deployment volume requires it.
-        self._mission_history: dict[str, tuple[str, float, float]] = {}
+        self._mission_history: dict[str, tuple[object, ...]] = {}
         self._events: list[ControllerEvent] = []
         self.event_epoch = uuid.uuid4().hex
         self._manual_setpoint: tuple[float, float] | None = None
         self._manual_deadline: float | None = None
         self._needs_start = False
+        self._subgoal_index = 0
         self._deferred_edge_cell: tuple[int, int] | None = None
 
     @property
@@ -262,7 +430,16 @@ class RobotController:
             safety=safety,
         )
         if self.navigation.status == "reached":
-            self._finish_reached(vehicle)
+            if self._advance_subgoal(vehicle):
+                self._start_or_resume(
+                    anchor,
+                    pose,
+                    local_map,
+                    vehicle.radius,
+                    emit_event=False,
+                )
+            else:
+                self._finish_reached(vehicle)
             return
         if self.navigation.status == "blocked":
             self._finish_blocked(vehicle)
@@ -341,7 +518,9 @@ class RobotController:
             "mode": self.mode.value,
             "auto_state": self.auto_state.value,
             "active_mission": (
-                None if self.active_mission is None else self.active_mission.as_dict()
+                None
+                if self.active_mission is None
+                else self._active_mission_snapshot()
             ),
             "mission_queue": {
                 "size": len(self._pending),
@@ -464,7 +643,7 @@ class RobotController:
         self._cancel_all("cancelled")
         return CommandResult(True)
 
-    def _push(self, missions: tuple[GotoMission, ...]) -> CommandResult:
+    def _push(self, missions: tuple[Mission, ...]) -> CommandResult:
         if not missions:
             return CommandResult(False, "empty_mission_batch")
         ids = [mission.mission_id for mission in missions]
@@ -531,6 +710,8 @@ class RobotController:
         pose: PoseEstimate,
         local_map: ObservedGrid,
         vehicle_radius_m: float,
+        *,
+        emit_event: bool = True,
     ) -> None:
         self._needs_start = False
         self._deferred_edge_cell = None
@@ -539,15 +720,17 @@ class RobotController:
                 self.auto_state = AutoState.IDLE
                 return
             self.active_mission = self._pending.popleft()
+            self._subgoal_index = 0
         mission = self.active_mission
+        goal_x_m, goal_y_m = mission.subgoals[self._subgoal_index]
         local_x_m, local_y_m, _ = anchor.global_to_anchor(
-            mission.x_m, mission.y_m
+            goal_x_m, goal_y_m
         )
         try:
             self.navigation.start(
                 local_x_m,
                 local_y_m,
-                reported_goal=(mission.x_m, mission.y_m),
+                reported_goal=(goal_x_m, goal_y_m),
                 local_map=local_map,
                 pose=pose,
                 vehicle_radius_m=vehicle_radius_m,
@@ -560,11 +743,21 @@ class RobotController:
             self.navigation.block("localization_lost")
             self._finish_blocked_without_vehicle()
             return
-        self._emit(
-            mission,
-            "active",
-            navigation=self.navigation.snapshot(),
-        )
+        if emit_event:
+            self._emit(
+                mission,
+                "active",
+                navigation=self.navigation.snapshot(),
+            )
+
+    def _advance_subgoal(self, vehicle: Vehicle) -> bool:
+        assert self.active_mission is not None
+        if self._subgoal_index + 1 >= len(self.active_mission.subgoals):
+            return False
+        vehicle.stop()
+        self._subgoal_index += 1
+        self._needs_start = True
+        return True
 
     def _finish_reached(self, vehicle: Vehicle) -> None:
         assert self.active_mission is not None
@@ -578,6 +771,7 @@ class RobotController:
             self.navigation.snapshot(),
         )
         self.active_mission = None
+        self._subgoal_index = 0
         self._needs_start = bool(self._pending)
         self.auto_state = (
             AutoState.ACTIVE if self._needs_start else AutoState.IDLE
@@ -625,13 +819,14 @@ class RobotController:
         for mission in missions:
             self._emit(mission, "cancelled", reason)
         self.active_mission = None
+        self._subgoal_index = 0
         self._pending.clear()
         self.auto_state = AutoState.IDLE
         self._needs_start = False
 
     def _emit(
         self,
-        mission: GotoMission,
+        mission: Mission,
         status: str,
         reason: str | None = None,
         detail: str | None = None,
@@ -642,9 +837,25 @@ class RobotController:
                 self.latest_event_seq + 1,
                 self.event_epoch,
                 mission,
+                self._subgoal_index if mission is self.active_mission else 0,
                 status,
                 reason,
                 detail,
                 navigation,
             )
         )
+
+    def _active_mission_snapshot(self) -> dict[str, object]:
+        assert self.active_mission is not None
+        mission = self.active_mission
+        goal_x_m, goal_y_m = mission.subgoals[self._subgoal_index]
+        return {
+            **mission.as_dict(),
+            "subgoal_index": self._subgoal_index,
+            "subgoal_count": len(mission.subgoals),
+            "current_goal": {
+                "frame_id": mission.frame_id,
+                "x_m": goal_x_m,
+                "y_m": goal_y_m,
+            },
+        }

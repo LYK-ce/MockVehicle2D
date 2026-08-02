@@ -1212,6 +1212,10 @@ class TestFleetTelemetryWebSocket(unittest.IsolatedAsyncioTestCase):
         port = server.sockets[0].getsockname()[1]
         try:
             async with connect(f"ws://127.0.0.1:{port}") as first:
+                hello = json.loads(await first.recv())
+                self.assertEqual(
+                    hello["mission_types"], ["goto", "patrol", "coverage"]
+                )
                 await receive_scan(first, 0)
                 fleet.tick(1.0)
                 first_sequences = [

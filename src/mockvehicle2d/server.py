@@ -13,7 +13,12 @@ import signal
 import struct
 import time
 
-from mockvehicle2d.controller import Command, CommandResult, RobotController
+from mockvehicle2d.controller import (
+    SUPPORTED_MISSION_TYPES,
+    Command,
+    CommandResult,
+    RobotController,
+)
 from mockvehicle2d.local_state import (
     AnchorSpec,
     AnchoredLocalState,
@@ -442,6 +447,7 @@ async def handler(
                 "vehicle_id": vehicle_id,
                 "control_lease": "exclusive",
                 "mission_frame_id": "global_map",
+                "mission_types": list(SUPPORTED_MISSION_TYPES),
                 "birth_anchor": {
                     "anchor_id": runtime.local_state.anchor.anchor_id,
                     "x_m": runtime.local_state.anchor.global_x_m,

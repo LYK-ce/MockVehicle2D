@@ -10,11 +10,16 @@ from mockvehicle2d.controller import (
     AutoCommand,
     Command,
     CommandResult,
+    CoverageMission,
     GotoMission,
+    MAX_MISSION_SUBGOALS,
     ManualAction,
     ManualCommand,
+    Mission,
     ModeAction,
     ModeCommand,
+    PatrolMission,
+    SUPPORTED_MISSION_TYPES,
 )
 
 
@@ -174,13 +179,40 @@ def _parse_auto(
     return AutoCommand(seq, action, missions)
 
 
-def _parse_mission(payload: object, seq: int) -> GotoMission:
+def _parse_mission(payload: object, seq: int) -> Mission:
     if not isinstance(payload, dict):
         raise ProtocolError("invalid_mission", "each mission must be an object", seq)
-    fields = {"mission_id", "type", "frame_id", "x_m", "y_m"}
+    if "type" not in payload:
+        raise ProtocolError(
+            "invalid_fields",
+            "mission has missing or unexpected fields",
+            seq,
+        )
+    mission_type = payload["type"]
+    if mission_type not in SUPPORTED_MISSION_TYPES:
+        raise ProtocolError(
+            "invalid_mission_type",
+            "mission type must be one of: goto, patrol, coverage",
+            seq,
+        )
+    fields = {
+        "goto": {"mission_id", "type", "frame_id", "x_m", "y_m"},
+        "patrol": {
+            "mission_id",
+            "type",
+            "frame_id",
+            "waypoints",
+            "cycles",
+        },
+        "coverage": {
+            "mission_id",
+            "type",
+            "frame_id",
+            "area",
+            "lane_spacing_m",
+        },
+    }[mission_type]
     _require_fields(payload, fields, seq, subject="mission")
-    if payload["type"] != "goto":
-        raise ProtocolError("invalid_mission_type", "mission type must be goto", seq)
     mission_id = payload["mission_id"]
     frame_id = payload["frame_id"]
     if not isinstance(mission_id, str) or not isinstance(frame_id, str):
@@ -189,18 +221,76 @@ def _parse_mission(payload: object, seq: int) -> GotoMission:
             "mission_id and frame_id must be strings",
             seq,
         )
-    x_m = _finite_number(payload["x_m"], "x_m", seq)
-    y_m = _finite_number(payload["y_m"], "y_m", seq)
-    if abs(x_m) > MAX_ABS_COORDINATE_M or abs(y_m) > MAX_ABS_COORDINATE_M:
+    try:
+        if mission_type == "goto":
+            return GotoMission(
+                mission_id,
+                frame_id,
+                _coordinate(payload["x_m"], "x_m", seq),
+                _coordinate(payload["y_m"], "y_m", seq),
+                seq,
+            )
+        if mission_type == "patrol":
+            waypoints = payload["waypoints"]
+            if not isinstance(waypoints, list) or not waypoints:
+                raise ValueError("waypoints must be a non-empty JSON array")
+            if len(waypoints) > MAX_MISSION_SUBGOALS:
+                raise ValueError(
+                    f"mission must generate at most {MAX_MISSION_SUBGOALS} subgoals"
+                )
+            parsed_waypoints = []
+            for waypoint in waypoints:
+                if not isinstance(waypoint, dict):
+                    raise ValueError("each waypoint must be an object")
+                _require_fields(waypoint, {"x_m", "y_m"}, seq, subject="waypoint")
+                parsed_waypoints.append(
+                    (
+                        _coordinate(waypoint["x_m"], "waypoint.x_m", seq),
+                        _coordinate(waypoint["y_m"], "waypoint.y_m", seq),
+                    )
+                )
+            return PatrolMission(
+                mission_id,
+                frame_id,
+                tuple(parsed_waypoints),
+                payload["cycles"],
+                seq,
+            )
+
+        area = payload["area"]
+        if not isinstance(area, dict):
+            raise ValueError("area must be an object")
+        _require_fields(
+            area,
+            {"min_x_m", "min_y_m", "max_x_m", "max_y_m"},
+            seq,
+            subject="area",
+        )
+        return CoverageMission(
+            mission_id,
+            frame_id,
+            _coordinate(area["min_x_m"], "area.min_x_m", seq),
+            _coordinate(area["min_y_m"], "area.min_y_m", seq),
+            _coordinate(area["max_x_m"], "area.max_x_m", seq),
+            _coordinate(area["max_y_m"], "area.max_y_m", seq),
+            _finite_number(payload["lane_spacing_m"], "lane_spacing_m", seq),
+            seq,
+        )
+    except ProtocolError:
+        raise
+    except ValueError as error:
+        raise ProtocolError("invalid_mission", str(error), seq) from error
+
+
+def _coordinate(value: object, field: str, seq: int) -> float:
+    coordinate = _finite_number(value, field, seq)
+    if abs(coordinate) > MAX_ABS_COORDINATE_M:
         raise ProtocolError(
             "goal_out_of_range",
             f"goal coordinates must be within ±{MAX_ABS_COORDINATE_M:g} m",
             seq,
         )
-    try:
-        return GotoMission(mission_id, frame_id, x_m, y_m, seq)
-    except ValueError as error:
-        raise ProtocolError("invalid_mission", str(error), seq) from error
+    return coordinate
 
 
 def _decode_message(raw: object) -> dict[str, object]:
