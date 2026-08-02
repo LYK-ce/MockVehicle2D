@@ -336,13 +336,13 @@ class TestControllerProtocol(unittest.TestCase):
                 "mission_id": "coverage-large",
                 "type": "coverage",
                 "frame_id": "global_map",
-                    "area": {
-                        "min_x_m": 0,
-                        "min_y_m": 0,
-                        "max_x_m": 1,
-                        "max_y_m": 1,
-                    },
-                    "lane_spacing_m": 1e-300,
+                "area": {
+                    "min_x_m": 0,
+                    "min_y_m": 0,
+                    "max_x_m": 1,
+                    "max_y_m": 1,
+                },
+                "lane_spacing_m": 1e-300,
             },
         ]
         valid = {
