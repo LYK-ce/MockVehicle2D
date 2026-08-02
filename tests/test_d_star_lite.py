@@ -872,12 +872,80 @@ def test_local_change_expands_less_state_than_a_fresh_long_route() -> None:
     assert incremental_expansions < fresh.stats["expansions"]
 
 
-def test_canonical_key_uses_second_component_for_roundoff_equivalent_first() -> None:
-    lower_second = _canonical_key((57.154328932550705, 46.42640687119285))
-    higher_second = _canonical_key((57.154328932550684, 55.154328932550705))
+def test_public_replan_survives_roundoff_key_order_after_start_move_and_map_change() -> None:
+    # Minimized from the deterministic seed-42 Patrol failure.
+    occupied = {
+        (-6, 10), (-5, 10), (-5, 11), (-4, -15), (-3, -16), (-3, -15),
+        (-2, 18), (-1, 18), (-1, 19), (0, -13), (1, -14), (1, -13),
+        (2, -17), (2, 20), (3, -18), (3, -17), (3, 20), (3, 21),
+        (6, -18), (6, -17), (7, -18), (7, -17), (10, -11), (11, -12),
+        (11, -11), (12, -13), (12, -10), (12, -9), (13, -13), (13, -10),
+        (13, -9), (14, -13), (14, -5), (14, 2), (14, 3), (15, -14),
+        (15, -13), (15, -6), (15, -5), (15, 2), (15, 3), (16, -17),
+        (17, -18), (17, -17), (18, -16), (18, -15), (18, 0), (18, 1),
+        (19, -16), (19, -15), (19, 0), (19, 1), (20, -14), (20, -13),
+        (21, -13), (22, 18), (22, 19), (22, 30), (23, 18), (23, 19),
+        (23, 30), (23, 31), (24, 2), (24, 3), (24, 16), (24, 17),
+        (25, 2), (25, 3), (25, 16), (25, 17), (26, 22), (27, 22),
+        (27, 23), (30, -14), (30, -13), (31, -13), (32, 32), (33, 32),
+        (34, -20), (34, -19), (34, -16), (34, -15), (34, 32), (35, -20),
+        (35, -19), (35, -15), (35, 32), (35, 33), (36, -8), (36, -7),
+        (36, 2), (36, 3), (36, 22), (36, 23), (37, -7), (37, 2),
+        (37, 3), (37, 22), (37, 23), (38, -4), (38, -3), (38, 8),
+        (38, 9), (38, 10), (38, 11), (38, 26), (38, 27), (38, 32),
+        (38, 33), (39, 8), (39, 9), (39, 10), (39, 11), (39, 26),
+        (39, 27), (39, 32), (39, 33), (42, -16), (42, -15), (42, 10),
+        (42, 11), (43, -15), (43, 10), (44, 34),
+    }
+    forbidden = {(29, 4), (29, 5), (32, 4)}
+    assert len(occupied) == 124
 
-    assert lower_second[0] == higher_second[0]
-    assert _key_less(lower_second, higher_second)
+    class Seed42Window:
+        resolution_m = 0.5
+
+        @staticmethod
+        def snapshot() -> dict[str, object]:
+            return {
+                "cells": [
+                    MapCellUpdate(
+                        gx,
+                        gy,
+                        FORBIDDEN
+                        if (gx, gy) in forbidden
+                        else OCCUPIED
+                        if (gx, gy) in occupied
+                        else FREE,
+                    ).as_dict()
+                    for gx in range(-6, 45)
+                    for gy in range(-27, 35)
+                ]
+            }
+
+    search = DStarLitePlanner(
+        Seed42Window(),
+        vehicle_radius_m=0.5,
+        hard_clearance_m=AUTOMATIC_MINIMUM_CLEARANCE_M,
+        bounds_margin_m=12.0,
+    )
+    assert search.plan(
+        (18, -3),
+        (20, 10),
+        start_position_m=(9.074923599443348, -1.0596174985969213),
+    ) is not None
+
+    path = search.plan(
+        (24, -16),
+        (20, 10),
+        changed_cells=(
+            MapCellUpdate(2, -24, FREE),
+            MapCellUpdate(20, -22, FORBIDDEN),
+        ),
+        start_position_m=(12.000413957435718, -7.955252274183886),
+    )
+
+    assert path is not None
+    assert path[0] == (24, -16)
+    assert path[-1] == (20, 10)
 
 
 def test_key_comparison_matches_heap_order_for_near_equal_components() -> None:
@@ -889,32 +957,6 @@ def test_key_comparison_matches_heap_order_for_near_equal_components() -> None:
 
     assert queue[0] == needed
     assert _key_less(queue[0], start)
-
-
-def test_roundoff_equivalent_key_prioritizes_lower_cost_component() -> None:
-    raw_needed = (35.84924240491749, 25.0208152801713)
-    raw_start = (35.84924240491748, 27.142135623730937)
-    needed = _canonical_key(raw_needed)
-    start = _canonical_key(raw_start)
-
-    assert raw_needed > raw_start
-    assert needed[0] == start[0]
-    assert _key_less(needed, start)
-
-
-def test_one_ulp_vertex_inconsistency_remains_in_open_set() -> None:
-    search = planner()
-    start = (0, 0)
-    goal = (1, 0)
-    search._reset(start, goal)
-    search._g[goal] = 1.0
-    expected_rhs = search._cost(start, goal) + search._g[goal]
-    search._g[start] = math.nextafter(expected_rhs, math.inf)
-
-    search._update_vertex(start)
-
-    assert search._rhs[start] == expected_rhs
-    assert start in search._open_keys
 
 
 def test_long_start_movement_reuses_one_search_and_accumulates_key_modifier() -> None:
