@@ -140,7 +140,9 @@ Unix domain socket 交换有界 JSONL 消息，控制 tick 不等待该 socket�
 
 {"type":"mode","seq":5,"action":"switch_to_auto"}
 {"type":"auto","seq":6,"action":"push","missions":[
-  {"mission_id":"goto-001","type":"goto","frame_id":"global_map","x_m":20.0,"y_m":30.0}
+  {"mission_id":"goto-001","type":"goto","frame_id":"global_map","x_m":20.0,"y_m":30.0},
+  {"mission_id":"patrol-001","type":"patrol","frame_id":"global_map","waypoints":[{"x_m":20.0,"y_m":30.0},{"x_m":24.0,"y_m":30.0}],"cycles":2},
+  {"mission_id":"coverage-001","type":"coverage","frame_id":"global_map","area":{"min_x_m":20.0,"min_y_m":20.0,"max_x_m":30.0,"max_y_m":25.0},"lane_spacing_m":1.0}
 ]}
 {"type":"auto","seq":7,"action":"pause"}
 {"type":"auto","seq":8,"action":"resume"}
@@ -159,14 +161,19 @@ Unix domain socket 交换有界 JSONL 消息，控制 tick 不等待该 socket�
   `resume`。
 - `pause` 保留活动任务和队列；没有活动或排队任务时保持 `Idle`；`cancel_all`
   才会清空任务。
+- `patrol` 按给定航点执行有限轮次；`coverage` 从矩形左下角开始，沿长边生成蛇形
+  路线。二者都复用现有 `goto` 导航，每个父任务最多生成 1024 个子目标且只占一个
+  队列位置。
 - Auto 已在执行时重复 `resume` 是无副作用操作，不会停车或重启规划。
-- `mission_id` 在 Server 进程生命周期内是永久幂等键。相同 ID 和相同目标的重试不会
-  重复入队；相同 ID 携带不同目标会被拒绝。进程重启后该内存状态会清空。
+- `mission_id` 在 Server 进程生命周期内是永久幂等键。相同 ID 和完全相同任务定义的
+  重试不会重复入队；相同 ID 携带不同定义会被拒绝。进程重启后该内存状态会清空。
 - 控制连接断开时车辆立即停车，自动任务暂停而不是丢弃；重连后可显式恢复。
 - 非法输入触发故障停车；活动自动任务进入暂停状态。
 
 每条合法命令先收到 `command_ack`。自动任务另外通过 `mission_update` 报告
 `queued`、`active`、`paused`、`reached`、`blocked` 和 `cancelled`。
+高层任务的事件和控制器快照携带当前子目标及 0-based `subgoal_index/subgoal_count`；
+中间子目标不会产生独立任务或 `reached`，父任务只在最后一个子目标完成时到达。
 每个任务事件携带 `event_epoch` 和进程内严格递增的 `event_seq`。Server 保留本进程
 产生的全部任务事件，连接建立后按顺序自动重放；断线重连可能再次收到已经处理过的
 事件，客户端应按 `(event_epoch, event_seq)` 幂等去重。命令 ack 只确认命令是否受理，

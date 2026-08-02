@@ -99,13 +99,16 @@ Server 以 Tmini 名义扫描周期（约 6 Hz）执行：
 
 ## 自动控制
 
-Auto `push` 只写入任务队列。控制帧启动当前 `goto`，将 `global_map` 目标通过出生锚点
-转换为 `anchor_map` 目标，再由有限视野 D* Lite 规划。`GotoController` 返回期望速度，
-不直接控制车辆。到达、阻断、暂停和取消都通过 `mission_update` 明确发布。
+Auto `push` 只写入父任务队列。`goto` 直接提供一个目标；`patrol` 和矩形 `coverage`
+确定性生成最多 1024 个子目标，并按序复用同一个 `GotoController`。控制帧将当前
+`global_map` 子目标通过出生锚点转换为 `anchor_map`，再由有限视野 D* Lite 规划。
+`GotoController` 返回期望速度，不直接控制车辆。中间子目标不成为独立任务，父任务的
+到达、阻断、暂停和取消通过 `mission_update` 明确发布。
 
-同一 `mission_id` 和同一目标可用新的 `seq` 安全重试；不会生成第二个任务。相同 ID
-对应不同目标会返回 `mission_id_conflict`。该记录在 Server 进程生命周期内永久保留，
-不会因任务数量增加而静默淘汰；进程重启会清空，因为模拟器当前不提供持久化。
+同一 `mission_id` 和完全相同任务定义可用新的 `seq` 安全重试；不会生成第二个任务。
+相同 ID 对应不同类型、航点、轮次、区域或间距会返回 `mission_id_conflict`。该记录在
+Server 进程生命周期内永久保留，不会因任务数量增加而静默淘汰；进程重启会清空，
+因为模拟器当前不提供持久化。
 Auto 已为 Active 时重复 `resume` 也是幂等操作，不会重启 D* 搜索。
 
 ## 连接与故障语义

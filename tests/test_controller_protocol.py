@@ -14,11 +14,13 @@ sys.path.insert(0, str(REPO_ROOT / "src"))
 from mockvehicle2d.controller import (
     AutoAction,
     AutoCommand,
+    CoverageMission,
     GotoMission,
     ManualAction,
     ManualCommand,
     ModeAction,
     ModeCommand,
+    PatrolMission,
 )
 from mockvehicle2d.local_state import AnchorSpec, OdometryConfig
 from mockvehicle2d.protocol import ProtocolError, parse_command
@@ -218,6 +220,206 @@ class TestControllerProtocol(unittest.TestCase):
         self.assertEqual(command.missions[0].mission_id, "goto-1")
         self.assertEqual(command.missions[0].submitted_seq, 5)
 
+    def test_parses_patrol_and_deterministic_coverage_routes(self) -> None:
+        command = parse(
+            json.dumps(
+                {
+                    "type": "auto",
+                    "seq": 6,
+                    "action": "push",
+                    "missions": [
+                        {
+                            "mission_id": "patrol-1",
+                            "type": "patrol",
+                            "frame_id": "global_map",
+                            "waypoints": [
+                                {"x_m": 1, "y_m": 2},
+                                {"x_m": 3, "y_m": 4},
+                            ],
+                            "cycles": 2,
+                        },
+                        {
+                            "mission_id": "coverage-1",
+                            "type": "coverage",
+                            "frame_id": "global_map",
+                            "area": {
+                                "min_x_m": 0,
+                                "min_y_m": 0,
+                                "max_x_m": 4,
+                                "max_y_m": 2,
+                            },
+                            "lane_spacing_m": 1.5,
+                        },
+                    ],
+                }
+            )
+        )
+
+        patrol, coverage = command.missions
+        self.assertIsInstance(patrol, PatrolMission)
+        self.assertEqual(
+            patrol.subgoals,
+            ((1.0, 2.0), (3.0, 4.0), (1.0, 2.0), (3.0, 4.0)),
+        )
+        self.assertIsInstance(coverage, CoverageMission)
+        self.assertEqual(
+            coverage.subgoals,
+            (
+                (0.0, 0.0),
+                (4.0, 0.0),
+                (4.0, 1.5),
+                (0.0, 1.5),
+                (0.0, 2.0),
+                (4.0, 2.0),
+            ),
+        )
+
+        vertical = parse(
+            '{"type":"auto","seq":7,"action":"push","missions":['
+            '{"mission_id":"coverage-2","type":"coverage",'
+            '"frame_id":"global_map","area":{"min_x_m":0,"min_y_m":0,'
+            '"max_x_m":2,"max_y_m":4},"lane_spacing_m":3}]}'
+        ).missions[0]
+        self.assertEqual(
+            vertical.subgoals,
+            ((0.0, 0.0), (0.0, 4.0), (2.0, 4.0), (2.0, 0.0)),
+        )
+
+    def test_rejects_invalid_or_oversized_high_level_missions_atomically(self) -> None:
+        invalid_missions = [
+            {
+                "mission_id": "patrol-empty",
+                "type": "patrol",
+                "frame_id": "global_map",
+                "waypoints": [],
+                "cycles": 1,
+            },
+            {
+                "mission_id": "patrol-cycles",
+                "type": "patrol",
+                "frame_id": "global_map",
+                "waypoints": [{"x_m": 0, "y_m": 0}],
+                "cycles": True,
+            },
+            {
+                "mission_id": "patrol-large",
+                "type": "patrol",
+                "frame_id": "global_map",
+                "waypoints": [{"x_m": 0, "y_m": 0}, {"x_m": 1, "y_m": 1}],
+                "cycles": 513,
+            },
+            {
+                "mission_id": "coverage-area",
+                "type": "coverage",
+                "frame_id": "global_map",
+                "area": {
+                    "min_x_m": 1,
+                    "min_y_m": 0,
+                    "max_x_m": 1,
+                    "max_y_m": 2,
+                },
+                "lane_spacing_m": 1,
+            },
+            {
+                "mission_id": "coverage-spacing",
+                "type": "coverage",
+                "frame_id": "global_map",
+                "area": {
+                    "min_x_m": 0,
+                    "min_y_m": 0,
+                    "max_x_m": 1,
+                    "max_y_m": 1,
+                },
+                "lane_spacing_m": 0,
+            },
+            {
+                "mission_id": "coverage-large",
+                "type": "coverage",
+                "frame_id": "global_map",
+                "area": {
+                    "min_x_m": 0,
+                    "min_y_m": 0,
+                    "max_x_m": 1,
+                    "max_y_m": 1,
+                },
+                "lane_spacing_m": 1e-300,
+            },
+        ]
+        valid = {
+            "mission_id": "still-not-queued",
+            "type": "goto",
+            "frame_id": "global_map",
+            "x_m": 1,
+            "y_m": 2,
+        }
+        for invalid in invalid_missions:
+            raw = json.dumps(
+                {
+                    "type": "auto",
+                    "seq": 8,
+                    "action": "push",
+                    "missions": [valid, invalid],
+                }
+            )
+            with self.subTest(mission_id=invalid["mission_id"]), self.assertRaises(
+                ProtocolError
+            ) as caught:
+                parse(raw)
+            self.assertEqual(caught.exception.code, "invalid_mission")
+
+        strict_cases = [
+            (
+                {
+                    "mission_id": "waypoint-extra",
+                    "type": "patrol",
+                    "frame_id": "global_map",
+                    "waypoints": [{"x_m": 0, "y_m": 0, "z_m": 0}],
+                    "cycles": 1,
+                },
+                "invalid_fields",
+            ),
+            (
+                {
+                    "mission_id": "area-extra",
+                    "type": "coverage",
+                    "frame_id": "global_map",
+                    "area": {
+                        "min_x_m": 0,
+                        "min_y_m": 0,
+                        "max_x_m": 1,
+                        "max_y_m": 1,
+                        "yaw_rad": 0,
+                    },
+                    "lane_spacing_m": 1,
+                },
+                "invalid_fields",
+            ),
+            (
+                {
+                    "mission_id": "far-waypoint",
+                    "type": "patrol",
+                    "frame_id": "global_map",
+                    "waypoints": [{"x_m": 1_000_001, "y_m": 0}],
+                    "cycles": 1,
+                },
+                "goal_out_of_range",
+            ),
+        ]
+        for invalid, code in strict_cases:
+            raw = json.dumps(
+                {
+                    "type": "auto",
+                    "seq": 9,
+                    "action": "push",
+                    "missions": [invalid],
+                }
+            )
+            with self.subTest(mission_id=invalid["mission_id"]), self.assertRaises(
+                ProtocolError
+            ) as caught:
+                parse(raw)
+            self.assertEqual(caught.exception.code, code)
+
     def test_rejects_legacy_ambiguous_or_unsafe_messages(self) -> None:
         cases = [
             ('{"type":"goto","seq":1,"x_m":1,"y_m":2}', "invalid_type"),
@@ -252,7 +454,7 @@ class TestControllerProtocol(unittest.TestCase):
             ),
             (
                 '{"type":"auto","seq":1,"action":"push","missions":['
-                '{"mission_id":"m","type":"patrol","frame_id":"global_map",'
+                '{"mission_id":"m","type":"orbit","frame_id":"global_map",'
                 '"x_m":1,"y_m":2}]}',
                 "invalid_mission_type",
             ),
@@ -325,6 +527,7 @@ class TestControllerProtocol(unittest.TestCase):
             ["hello", "pose", "scan", "command_ack"],
         )
         self.assertEqual(hello["protocol_version"], 4)
+        self.assertEqual(hello["mission_types"], ["goto", "patrol", "coverage"])
         self.assertEqual(hello["controller"]["mode"], "manual")
         event_info = hello["controller"]["mission_events"]
         self.assertEqual(event_info["latest_event_seq"], 0)

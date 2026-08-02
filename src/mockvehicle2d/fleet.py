@@ -18,7 +18,12 @@ from mockvehicle2d.collision import (
     is_swept_circle_passable,
     swept_trajectories_overlap,
 )
-from mockvehicle2d.controller import Command, CommandResult, RobotController
+from mockvehicle2d.controller import (
+    SUPPORTED_MISSION_TYPES,
+    Command,
+    CommandResult,
+    RobotController,
+)
 from mockvehicle2d.local_state import (
     FORBIDDEN,
     OCCUPIED,
@@ -1228,6 +1233,7 @@ async def fleet_handler(websocket, *, fleet: FleetRuntime, vehicle_id: str) -> N
                 "vehicle_id": vehicle_id,
                 "control_lease": "exclusive",
                 "mission_frame_id": "global_map",
+                "mission_types": list(SUPPORTED_MISSION_TYPES),
                 "birth_anchor": {
                     "anchor_id": node.spec.spawn_id,
                     "x_m": node.spec.anchor_pose.x_m,
