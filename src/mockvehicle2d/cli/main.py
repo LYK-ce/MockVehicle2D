@@ -235,7 +235,10 @@ def main() -> None:
         type=_positive_float,
         default=DEFAULT_REALTIME_FACTOR,
         metavar="FACTOR",
-        help="wall-clock acceleration (default: 3; use 1 for realtime)",
+        help=(
+            f"wall-clock acceleration (default: {DEFAULT_REALTIME_FACTOR:g}; "
+            "use 1 for realtime)"
+        ),
     )
 
     fleet = subcommands.add_parser(
@@ -291,7 +294,10 @@ def main() -> None:
         type=_positive_float,
         default=DEFAULT_REALTIME_FACTOR,
         metavar="FACTOR",
-        help="wall-clock acceleration (default: 3; use 1 for realtime)",
+        help=(
+            f"wall-clock acceleration (default: {DEFAULT_REALTIME_FACTOR:g}; "
+            "use 1 for realtime)"
+        ),
     )
 
     pathfind = subcommands.add_parser(

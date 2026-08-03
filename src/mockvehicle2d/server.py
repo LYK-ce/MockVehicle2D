@@ -44,7 +44,7 @@ from mockvehicle2d.vehicle import Vehicle
 HOST = "0.0.0.0"
 PORT = 19090
 DEFAULT_VEHICLE_ID = "mock_vehicle_01"
-DEFAULT_REALTIME_FACTOR = 3.0
+DEFAULT_REALTIME_FACTOR = 5.0
 SPAWN_X = 10.0
 SPAWN_Y = 10.0
 MAP_RESOLUTION_M = 1.0

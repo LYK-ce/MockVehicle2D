@@ -16,7 +16,7 @@ cli = importlib.import_module("mockvehicle2d.cli.main")
 
 
 class TestRealtimeFactorCli(unittest.TestCase):
-    def test_serve_and_fleet_default_to_three_times_realtime(self) -> None:
+    def test_serve_and_fleet_default_to_five_times_realtime(self) -> None:
         from mockvehicle2d import fleet, server
 
         cases = (
@@ -32,7 +32,7 @@ class TestRealtimeFactorCli(unittest.TestCase):
             ):
                 cli.main()
 
-            self.assertEqual(target.call_args.kwargs["realtime_factor"], 3.0)
+            self.assertEqual(target.call_args.kwargs["realtime_factor"], 5.0)
             run.assert_called_once_with(None)
 
     def test_realtime_factor_accepts_one_and_rejects_nonpositive_or_nonfinite(

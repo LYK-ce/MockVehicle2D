@@ -11,7 +11,7 @@
 | 控制权 | 每辆车同时只有一个独占连接 |
 | 单位 | m、s、rad、m/s、rad/s |
 | 任务坐标系 | `global_map` |
-| 默认时间倍率 | `3.0`（`--realtime-factor 1` 恢复实时） |
+| 默认时间倍率 | `5.0`（`--realtime-factor 1` 恢复实时） |
 
 多车模式保持同一个 v4 协议，每辆车使用独立 endpoint。示例四车场景监听
 `19090`～`19093`；一个 endpoint 的连接、命令序号和独占租约不会影响其他车辆。
@@ -302,7 +302,7 @@ Auto → Manual 暂停并保留任务。Manual → Auto 若有保留任务仍停
   "control_lease": "exclusive",
   "mission_frame_id": "global_map",
   "mission_types": ["goto", "patrol", "coverage"],
-  "realtime_factor": 3.0,
+  "realtime_factor": 5.0,
   "birth_anchor": {
     "anchor_id": "spawn_north_west",
     "x_m": 9.0,
