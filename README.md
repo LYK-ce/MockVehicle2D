@@ -63,12 +63,35 @@ mockvehicle2d pathfind --start-m 10,10 --goal-m 200,200
 # 默认运行两车（19090～19091）；四车测试改用 examples/four_vehicle_scenario.json
 cargo build --bin map-sync-node
 mockvehicle2d fleet --scenario examples/two_vehicle_scenario.json
+
+# 不启动 Godot、WebSocket 或墙钟等待，按固定模拟 tick 执行一次实验
+mockvehicle2d episode \
+  --scenario examples/single_vehicle_episode.json \
+  --max-simulation-s 30 \
+  --goto mock_vehicle_01,11,10
 ```
 
 依赖安装在仓库本地 `.venv/`。公开接口统一使用 SI 单位：米、秒、弧度、米/秒和
 弧度/秒。`serve` 和 `fleet` 默认以 `--realtime-factor 5` 运行，即固定物理步长、传感器
 周期、控制阈值和 P2P 模拟时序不变，只把墙钟等待缩短为原来的五分之一；传入 `1`
 可恢复原来的实时速度。
+
+## Headless Episode Runner
+
+`episode` 复用 `FleetRuntime`、`RobotController` 和现有 Mission 语义，在调用线程中直接
+推进固定模拟 tick。它不读取墙钟、不打开 WebSocket，也不受 `serve/fleet` 的
+`realtime_factor` 影响。CLI 至少需要一个 `--goto VEHICLE_ID,X_M,Y_M`；可重复该参数为
+一辆或多辆车依次入队。达到全部已提交任务后提前成功结束，任务阻断或达到
+`--max-simulation-s` 时失败结束。
+
+标准输出是单行 canonical JSON，包含场景 ID、odometry seed、tick 数、模拟时长、终止
+原因，以及每辆车的仿真真值终态、按 tick 采样的路径长度、碰撞/阻断/安全终态和任务
+状态。真值只由评估层读取，不会进入自主控制链。Python 调用入口为
+`mockvehicle2d.episode.run_episode`，可直接传入现有 `GotoMission`、`PatrolMission` 或
+`CoverageMission`。
+
+初版 Runner 明确拒绝启用 P2P 的场景，因为真实 localhost libp2p 调度不属于确定性模拟
+时钟；确定性通信环境完成后再接入。Runner 当前也不包含定时事件或通信故障注入。
 
 ## 多车共享世界
 
@@ -205,6 +228,7 @@ odometry，并将 Tmini 扫描累计到车辆自己的
 ```text
 src/mockvehicle2d/
 ├── controller.py          # 模式、队列、任务生命周期和唯一控制权
+├── episode.py             # 固定 tick 的 headless 实验执行与结果
 ├── protocol.py            # WebSocket v4 严格 JSON 边界
 ├── server.py              # 独占连接、帧调度和遥测
 ├── fleet.py               # 1～4 车场景、共享物理世界和独立 endpoint

@@ -1,0 +1,12 @@
+{
+  "scenario_id": "single_vehicle_episode",
+  "tick_ms": 100,
+  "vehicles": [
+    {
+      "vehicle_id": "mock_vehicle_01",
+      "operator_port": 19090,
+      "spawn_id": "spawn_01",
+      "anchor_pose": {"x_m": 10.0, "y_m": 10.0, "yaw_rad": 0.0}
+    }
+  ]
+}

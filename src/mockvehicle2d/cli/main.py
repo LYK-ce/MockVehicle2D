@@ -76,6 +76,15 @@ def _coords_m(value: str) -> tuple[float, float]:
     return coordinates
 
 
+def _episode_goto(value: str) -> tuple[str, float, float]:
+    parts = value.split(",")
+    if len(parts) != 3:
+        raise argparse.ArgumentTypeError("goto must be VEHICLE_ID,X_M,Y_M")
+    vehicle_id = _vehicle_id(parts[0])
+    x_m, y_m = _coords_m(",".join(parts[1:]))
+    return vehicle_id, x_m, y_m
+
+
 def _cmd_serve(args) -> None:
     from mockvehicle2d.server import main as server_main
 
@@ -161,6 +170,32 @@ def _cmd_fleet(args) -> None:
             realtime_factor=args.realtime_factor,
         )
     )
+
+
+def _cmd_episode(args) -> None:
+    from mockvehicle2d.controller import GotoMission
+    from mockvehicle2d.episode import run_episode
+    from mockvehicle2d.fleet import FleetScenario
+    from mockvehicle2d.local_state import OdometryConfig
+
+    missions: dict[str, list[GotoMission]] = {}
+    for index, (vehicle_id, x_m, y_m) in enumerate(args.goto, 1):
+        missions.setdefault(vehicle_id, []).append(
+            GotoMission(
+                f"episode-goto-{index:04d}",
+                "global_map",
+                x_m,
+                y_m,
+                index,
+            )
+        )
+    result = run_episode(
+        FleetScenario.load(args.scenario),
+        missions,
+        max_simulation_s=args.max_simulation_s,
+        odometry_config=OdometryConfig(seed=args.odom_seed),
+    )
+    print(result.to_json())
 
 
 def main() -> None:
@@ -300,6 +335,26 @@ def main() -> None:
         ),
     )
 
+    episode = subcommands.add_parser(
+        "episode",
+        help="Run initial Goto missions headlessly on the fixed simulation clock",
+    )
+    episode.add_argument("--scenario", type=Path, required=True, metavar="JSON")
+    episode.add_argument(
+        "--max-simulation-s",
+        type=_positive_float,
+        required=True,
+        metavar="S",
+    )
+    episode.add_argument(
+        "--goto",
+        type=_episode_goto,
+        action="append",
+        required=True,
+        metavar="VEHICLE_ID,X_M,Y_M",
+    )
+    episode.add_argument("--odom-seed", type=_integer, default=0, metavar="INTEGER")
+
     pathfind = subcommands.add_parser(
         "pathfind",
         help="Run the full-truth A* debug tool",
@@ -328,6 +383,7 @@ def main() -> None:
     commands = {
         "serve": _cmd_serve,
         "fleet": _cmd_fleet,
+        "episode": _cmd_episode,
         "pathfind": _cmd_pathfind,
     }
     commands[args.command](args)
