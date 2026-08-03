@@ -22,7 +22,8 @@ from mockvehicle2d.local_state import OdometryConfig
 from mockvehicle2d.map_grid import MapGrid
 
 
-RESULT_SCHEMA_VERSION = 1
+RESULT_SCHEMA_VERSION = 2
+MIN_PROGRESS_TRANSLATION_M = 0.001
 _MISSION_TYPES = (GotoMission, PatrolMission, CoverageMission)
 
 
@@ -34,6 +35,7 @@ class EpisodeResult:
     simulation_duration_s: float
     success: bool
     termination_reason: str
+    minimum_inter_vehicle_clearance_m: float | None
     vehicles: tuple[dict[str, object], ...]
 
     def as_dict(self) -> dict[str, object]:
@@ -48,6 +50,7 @@ class EpisodeResult:
             "simulation_duration_s": self.simulation_duration_s,
             "success": self.success,
             "termination_reason": self.termination_reason,
+            "minimum_inter_vehicle_clearance_m": self.minimum_inter_vehicle_clearance_m,
             "vehicles": list(self.vehicles),
         }
 
@@ -147,7 +150,14 @@ def run_episode(
             raise ValueError(f"cannot start missions for {vehicle_id}: {reason}")
 
     previous_poses = fleet.world.truth_snapshot()
+    radii = {
+        vehicle_id: fleet.world.vehicle(vehicle_id).radius
+        for vehicle_id in previous_poses
+    }
     path_lengths = {vehicle_id: 0.0 for vehicle_id in previous_poses}
+    no_progress_ticks = {vehicle_id: 0 for vehicle_id in previous_poses}
+    longest_no_progress_ticks = {vehicle_id: 0 for vehicle_id in previous_poses}
+    minimum_clearance = _minimum_inter_vehicle_clearance(previous_poses, radii)
     collisions = {vehicle_id: False for vehicle_id in previous_poses}
     safety_stops = {vehicle_id: False for vehicle_id in previous_poses}
     tick_count = 0
@@ -169,9 +179,18 @@ def run_episode(
         current_poses = fleet.world.truth_snapshot()
         for vehicle_id, pose in current_poses.items():
             previous = previous_poses[vehicle_id]
-            path_lengths[vehicle_id] += math.hypot(
+            translation_m = math.hypot(
                 pose[0] - previous[0],
                 pose[1] - previous[1],
+            )
+            path_lengths[vehicle_id] += translation_m
+            (
+                no_progress_ticks[vehicle_id],
+                longest_no_progress_ticks[vehicle_id],
+            ) = _update_no_progress(
+                no_progress_ticks[vehicle_id],
+                longest_no_progress_ticks[vehicle_id],
+                translation_m,
             )
             vehicle = fleet.world.vehicle(vehicle_id)
             node = fleet.nodes[vehicle_id]
@@ -180,6 +199,10 @@ def run_episode(
                 "stopped",
                 "fault",
             }
+        current_clearance = _minimum_inter_vehicle_clearance(current_poses, radii)
+        if current_clearance is not None:
+            assert minimum_clearance is not None
+            minimum_clearance = min(minimum_clearance, current_clearance)
         previous_poses = current_poses
 
     statuses = _mission_statuses(fleet, missions)
@@ -205,6 +228,9 @@ def run_episode(
                     "yaw_rad": _stable_float(vehicle.yaw),
                 },
                 "path_length_m": _stable_float(path_lengths[vehicle_id]),
+                "longest_no_progress_duration_s": _stable_float(
+                    longest_no_progress_ticks[vehicle_id] * fleet.tick_s
+                ),
                 "collision_occurred": collisions[vehicle_id],
                 "blocked": node.controller.auto_state.value == "blocked",
                 "blocked_reason": blocked_reason,
@@ -231,6 +257,7 @@ def run_episode(
         _stable_float(tick_count * fleet.tick_s),
         termination_reason == "completed",
         termination_reason,
+        None if minimum_clearance is None else _stable_float(minimum_clearance),
         tuple(vehicle_results),
     )
 
@@ -254,3 +281,30 @@ def _mission_statuses(
 
 def _stable_float(value: float) -> float:
     return round(float(value), 12)
+
+
+def _minimum_inter_vehicle_clearance(
+    poses: Mapping[str, tuple[float, float, float]],
+    radii: Mapping[str, float],
+) -> float | None:
+    vehicle_ids = sorted(poses)
+    if len(vehicle_ids) < 2:
+        return None
+    return min(
+        math.dist(poses[first][:2], poses[second][:2])
+        - radii[first]
+        - radii[second]
+        for index, first in enumerate(vehicle_ids)
+        for second in vehicle_ids[index + 1 :]
+    )
+
+
+def _update_no_progress(
+    current_ticks: int,
+    longest_ticks: int,
+    translation_m: float,
+) -> tuple[int, int]:
+    if translation_m >= MIN_PROGRESS_TRANSLATION_M:
+        return 0, longest_ticks
+    current_ticks += 1
+    return current_ticks, max(longest_ticks, current_ticks)

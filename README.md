@@ -69,6 +69,13 @@ mockvehicle2d episode \
   --scenario examples/single_vehicle_episode.json \
   --max-simulation-s 30 \
   --goto mock_vehicle_01,11,10
+
+# P2P-disabled 双车交叉基准；当前基线可确定性完成
+mockvehicle2d episode \
+  --scenario examples/two_vehicle_crossing_episode.json \
+  --max-simulation-s 30 \
+  --goto mock_vehicle_01,11,11 \
+  --goto mock_vehicle_02,9,11
 ```
 
 依赖安装在仓库本地 `.venv/`。公开接口统一使用 SI 单位：米、秒、弧度、米/秒和
@@ -84,9 +91,14 @@ mockvehicle2d episode \
 一辆或多辆车依次入队。达到全部已提交任务后提前成功结束，任务阻断或达到
 `--max-simulation-s` 时失败结束。
 
-标准输出是单行 canonical JSON，包含场景 ID、odometry seed、tick 数、模拟时长、终止
-原因，以及每辆车的仿真真值终态、按 tick 采样的路径长度、碰撞/阻断/安全终态和任务
-状态。真值只由评估层读取，不会进入自主控制链。Python 调用入口为
+标准输出是 schema version 2 的单行 canonical JSON，包含场景 ID、odometry seed、tick 数、
+模拟时长、终止原因，以及每辆车的仿真真值终态、按 tick 采样的路径长度、碰撞/阻断/
+安全终态和任务状态。顶层 `minimum_inter_vehicle_clearance_m` 从 `t=0` 开始，取所有固定
+tick、所有无序车辆对的最小圆形 footprint 边缘间距（中心距减去两车半径）；单车时为
+`null`，负值表示 footprint 已重叠。每车 `longest_no_progress_duration_s` 是连续固定 tick
+内真值中心每 tick 平移小于 1 mm 的最长模拟时长，原地转向和等待计入，恢复至少 1 mm
+平移后重新计数，episode 结束时尚未恢复的尾段也计入。真值只由评估层读取，不会进入
+自主控制链。Python 调用入口为
 `mockvehicle2d.episode.run_episode`，可直接传入现有 `GotoMission`、`PatrolMission` 或
 `CoverageMission`。
 
