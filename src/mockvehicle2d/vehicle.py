@@ -67,6 +67,32 @@ def _integrate_velocity(
     return _ramp_velocity(current, target, rate, elapsed)
 
 
+def _velocity_breakpoints(
+    current: float,
+    target: float,
+    acceleration: float,
+    deceleration: float,
+    elapsed: float,
+) -> tuple[float, ...]:
+    """Return interior times where a velocity ramp changes sign or slope."""
+    if current == target:
+        return ()
+    if current * target < 0:
+        zero_at = abs(current) / deceleration
+        candidates = (zero_at, zero_at + abs(target) / acceleration)
+    else:
+        rate = acceleration if abs(target) > abs(current) else deceleration
+        candidates = (abs(target - current) / rate,)
+    return tuple(
+        breakpoint
+        for breakpoint in candidates
+        if breakpoint > 0.0
+        and not math.isclose(breakpoint, 0.0, rel_tol=1e-12, abs_tol=1e-12)
+        and breakpoint < elapsed
+        and not math.isclose(breakpoint, elapsed, rel_tol=1e-12, abs_tol=1e-12)
+    )
+
+
 class Vehicle:
     """A circular differential-drive vehicle in the simulator's screen coordinates."""
 
@@ -261,51 +287,104 @@ class Vehicle:
             self.angular_acceleration_rps2,
             elapsed,
         )
-        max_linear = max(abs(self._linear_mps), abs(ending_linear))
-        max_angular = max(abs(self._angular_rps), abs(ending_angular))
-        max_step = max(0.01, min(0.25, self.radius / 2))
-        steps = max(
-            1,
-            math.ceil(max_linear * elapsed / max_step),
-            math.ceil(max_angular * elapsed / (math.pi / 18)),
+        raw_breakpoints = (
+            *_velocity_breakpoints(
+                self._linear_mps,
+                target_linear,
+                self.linear_acceleration_mps2,
+                self.linear_deceleration_mps2,
+                elapsed,
+            ),
+            *_velocity_breakpoints(
+                self._angular_rps,
+                target_angular,
+                self.angular_acceleration_rps2,
+                self.angular_acceleration_rps2,
+                elapsed,
+            ),
         )
+        breakpoints: list[float] = []
+        for breakpoint in sorted(raw_breakpoints):
+            if not breakpoints or not math.isclose(
+                breakpoint,
+                breakpoints[-1],
+                rel_tol=1e-12,
+                abs_tol=1e-12,
+            ):
+                breakpoints.append(breakpoint)
+        breakpoints.append(elapsed)
+
+        max_step = max(0.01, min(0.25, self.radius / 2))
         previous_distance = 0.0
         previous_rotation = 0.0
-        for step in range(1, steps + 1):
-            if step == steps:
-                timestamp = ended_at
-                current_distance = distance
-                current_rotation = rotation
-            else:
-                interval_elapsed = elapsed * step / steps
-                timestamp = started_at + interval_elapsed
-                _, current_distance = _integrate_velocity(
-                    self._linear_mps,
-                    target_linear,
-                    self.linear_acceleration_mps2,
-                    self.linear_deceleration_mps2,
-                    interval_elapsed,
+        phase_started = 0.0
+        phase_linear = self._linear_mps
+        phase_angular = self._angular_rps
+        for phase_ended in breakpoints:
+            phase_duration = phase_ended - phase_started
+            phase_ending_linear, _ = _integrate_velocity(
+                self._linear_mps,
+                target_linear,
+                self.linear_acceleration_mps2,
+                self.linear_deceleration_mps2,
+                phase_ended,
+            )
+            phase_ending_angular, _ = _integrate_velocity(
+                self._angular_rps,
+                target_angular,
+                self.angular_acceleration_rps2,
+                self.angular_acceleration_rps2,
+                phase_ended,
+            )
+            max_linear = max(abs(phase_linear), abs(phase_ending_linear))
+            max_angular = max(abs(phase_angular), abs(phase_ending_angular))
+            steps = max(
+                1,
+                math.ceil(max_linear * phase_duration / max_step),
+                math.ceil(max_angular * phase_duration / (math.pi / 18)),
+            )
+            for step in range(1, steps + 1):
+                interval_elapsed = (
+                    phase_ended
+                    if step == steps
+                    else phase_started + phase_duration * step / steps
                 )
-                _, current_rotation = _integrate_velocity(
-                    self._angular_rps,
-                    target_angular,
-                    self.angular_acceleration_rps2,
-                    self.angular_acceleration_rps2,
-                    interval_elapsed,
-                )
-            if (max_linear or max_angular) and not self._move(
-                grid,
-                current_distance - previous_distance,
-                current_rotation - previous_rotation,
-                timestamp=timestamp,
-                trajectory=trajectory,
-            ):
-                self.collision = True
-                self.force_stop()
-                self._last_update = ended_at
-                return False
-            previous_distance = current_distance
-            previous_rotation = current_rotation
+                if interval_elapsed == elapsed:
+                    timestamp = ended_at
+                    current_distance = distance
+                    current_rotation = rotation
+                else:
+                    timestamp = started_at + interval_elapsed
+                    _, current_distance = _integrate_velocity(
+                        self._linear_mps,
+                        target_linear,
+                        self.linear_acceleration_mps2,
+                        self.linear_deceleration_mps2,
+                        interval_elapsed,
+                    )
+                    _, current_rotation = _integrate_velocity(
+                        self._angular_rps,
+                        target_angular,
+                        self.angular_acceleration_rps2,
+                        self.angular_acceleration_rps2,
+                        interval_elapsed,
+                    )
+                if (max_linear or max_angular) and not self._move(
+                    grid,
+                    current_distance - previous_distance,
+                    current_rotation - previous_rotation,
+                    timestamp=timestamp,
+                    trajectory=trajectory,
+                ):
+                    self.collision = True
+                    self.force_stop()
+                    self._last_update = ended_at
+                    return False
+                previous_distance = current_distance
+                previous_rotation = current_rotation
+            phase_started = phase_ended
+            phase_linear = phase_ending_linear
+            phase_angular = phase_ending_angular
         self._linear_mps = ending_linear
         self._angular_rps = ending_angular
         self._last_update = ended_at
@@ -323,7 +402,7 @@ class Vehicle:
         if distance == 0:
             self.yaw = math.atan2(math.sin(self.yaw + rotation), math.cos(self.yaw + rotation))
             self.collision = False
-            if trajectory is not None:
+            if trajectory is not None and timestamp > trajectory[-1][0]:
                 trajectory.append((timestamp, self.x, self.y, self.yaw))
             return True
 
@@ -331,12 +410,12 @@ class Vehicle:
         x = self.x + distance * math.cos(mid_yaw)
         y = self.y + distance * math.sin(mid_yaw)
         if not is_swept_circle_passable(grid, self.x, self.y, x, y, self.radius):
-            if trajectory is not None:
+            if trajectory is not None and timestamp > trajectory[-1][0]:
                 trajectory.append((timestamp, self.x, self.y, self.yaw))
             return False
         self.x, self.y = x, y
         self.yaw = math.atan2(math.sin(self.yaw + rotation), math.cos(self.yaw + rotation))
-        if trajectory is not None:
+        if trajectory is not None and timestamp > trajectory[-1][0]:
             trajectory.append((timestamp, self.x, self.y, self.yaw))
         self.collision = False
         return True

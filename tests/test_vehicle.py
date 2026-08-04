@@ -156,6 +156,113 @@ def test_reversal_with_zero_net_distance_retains_the_physical_path() -> None:
     assert moving.body_velocities()[0] == pytest.approx(-0.5)
 
 
+def test_low_speed_reversal_detects_wall_crossed_between_matching_endpoints() -> None:
+    grid = MapGrid.from_wall_set(20, 20, {(3, 5)})
+    moving = Vehicle(
+        2.492,
+        5.5,
+        linear_acceleration_mps2=1.0,
+        linear_deceleration_mps2=1.0,
+        radius=0.5,
+        command_timeout=5.0,
+        now=0.0,
+    )
+    moving.install_drive(0.1, 0.0, 0.0)
+    moving.advance(grid, 0.1)
+    assert moving.x == pytest.approx(2.497)
+    moving.install_drive(-0.1, 0.0, 0.1)
+
+    collided = moving.advance(grid, 0.3)
+
+    assert collided
+    assert moving.collision
+
+
+def test_low_speed_angular_reversal_retains_the_physical_orientation_path() -> None:
+    grid = MapGrid.from_wall_set(20, 20, set())
+    rotating = vehicle(
+        angular_acceleration_rps2=1.0,
+        command_timeout=5.0,
+    )
+    rotating.install_drive(0.0, 0.1, 0.0)
+    rotating.advance(grid, 0.1)
+    start_yaw = rotating.yaw
+    rotating.install_drive(0.0, -0.1, 0.1)
+    trajectory = []
+
+    rotating.advance(grid, 0.3, trajectory=trajectory)
+
+    assert rotating.yaw == pytest.approx(start_yaw)
+    assert max(point[3] for point in trajectory) == pytest.approx(start_yaw + 0.005)
+    assert rotating.body_velocities() == pytest.approx((0.0, -0.1))
+
+
+def test_linear_and_angular_breakpoints_share_one_strict_timeline() -> None:
+    grid = MapGrid.from_wall_set(20, 20, set())
+    coarse = vehicle(
+        linear_speed=1.0,
+        angular_speed=1.0,
+        linear_acceleration_mps2=1.0,
+        linear_deceleration_mps2=1.0,
+        angular_acceleration_rps2=1.0,
+        command_timeout=5.0,
+    )
+    coarse.install_drive(0.1, 0.2, 0.0)
+    coarse.advance(grid, 0.2)
+    coarse.install_drive(-0.1, -0.2, 0.2)
+    trajectory = []
+
+    coarse.advance(grid, 0.6, trajectory=trajectory)
+
+    reference = vehicle(
+        linear_speed=1.0,
+        angular_speed=1.0,
+        linear_acceleration_mps2=1.0,
+        linear_deceleration_mps2=1.0,
+        angular_acceleration_rps2=1.0,
+        command_timeout=5.0,
+    )
+    reference.install_drive(0.1, 0.2, 0.0)
+    reference.advance(grid, 0.2)
+    reference.install_drive(-0.1, -0.2, 0.2)
+    for step in range(201, 601):
+        reference.advance(grid, step / 1000)
+
+    assert [point[0] for point in trajectory] == pytest.approx(
+        [0.2, 0.3, 0.4, 0.6]
+    )
+    assert all(
+        current[0] < following[0]
+        for current, following in zip(trajectory, trajectory[1:])
+    )
+    assert trajectory[-1][0] == 0.6
+    assert (coarse.x, coarse.y, coarse.yaw) == pytest.approx(
+        (reference.x, reference.y, reference.yaw),
+        abs=1e-4,
+    )
+
+
+def test_nearly_equal_motion_breakpoints_do_not_duplicate_timestamps() -> None:
+    grid = MapGrid.from_wall_set(20, 20, set())
+    moving = vehicle(
+        linear_speed=1.0,
+        angular_speed=1.0,
+        linear_acceleration_mps2=1.0,
+        angular_acceleration_rps2=1.0,
+        command_timeout=5.0,
+    )
+    moving.install_drive(0.1, 0.1000000000005, 0.0)
+    trajectory = []
+
+    moving.advance(grid, 0.2, trajectory=trajectory)
+
+    assert [point[0] for point in trajectory] == pytest.approx([0.0, 0.1, 0.2])
+    assert all(
+        current[0] < following[0]
+        for current, following in zip(trajectory, trajectory[1:])
+    )
+
+
 def test_angular_velocity_uses_the_configured_ramp() -> None:
     grid = MapGrid.from_wall_set(20, 20, set())
     rotating = vehicle(

@@ -1169,6 +1169,39 @@ class TestFleetRuntime(unittest.TestCase):
             {"vehicle_1": True, "vehicle_2": True},
         )
 
+    def test_low_speed_reversal_collision_matches_fine_time_steps(self) -> None:
+        def stopped(tick_s: float) -> dict[str, bool]:
+            fleet = FleetRuntime.create(
+                scenario(
+                    spec(1, 2.492, 5.0),
+                    spec(2, 2.511, 5.0),
+                    tick_ms=round(tick_s * 1000),
+                ),
+                grid=free_grid(),
+                radius=0.005,
+                linear_speed=0.1,
+                linear_acceleration_mps2=1.0,
+                linear_deceleration_mps2=1.0,
+                command_timeout=5.0,
+                spawn_safety_margin_m=0.0,
+            )
+            fleet.world.vehicle("vehicle_1").install_drive(0.1, 0.0, 0.0)
+            fleet.world.advance_to(0.1)
+            fleet.world.vehicle("vehicle_1").install_drive(-0.1, 0.0, 0.1)
+            results = {vehicle_id: False for vehicle_id in fleet.nodes}
+            now = 0.1
+            while now < 0.3:
+                now = min(0.3, now + tick_s)
+                for vehicle_id, result in fleet.world.advance_to(now).items():
+                    results[vehicle_id] |= result.stopped
+            return results
+
+        self.assertEqual(stopped(0.2), stopped(0.01))
+        self.assertEqual(
+            stopped(0.2),
+            {"vehicle_1": True, "vehicle_2": True},
+        )
+
     def test_reversal_safety_observes_the_executed_direction(self) -> None:
         grid = free_grid()
         fleet = FleetRuntime.create(
