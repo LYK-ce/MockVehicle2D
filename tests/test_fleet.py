@@ -1107,6 +1107,68 @@ class TestFleetRuntime(unittest.TestCase):
             )
         )
 
+    def test_accelerating_trajectories_use_physical_time_for_arbitration(self) -> None:
+        fleet = FleetRuntime.create(
+            scenario(
+                spec(1, 4.7, 5.0),
+                spec(2, 5.0, 4.775, math.pi / 2),
+                tick_ms=1000,
+            ),
+            grid=free_grid(),
+            radius=0.01,
+            linear_speed=1.0,
+            linear_acceleration_mps2=1.0,
+            command_timeout=2.0,
+            spawn_safety_margin_m=0.0,
+        )
+        first = fleet.world.vehicle("vehicle_1")
+        second = fleet.world.vehicle("vehicle_2")
+        first.install_drive(1.0, 0.0, 0.0)
+        second.install_drive(0.5, 0.0, 0.0)
+
+        results = fleet.world.advance_to(1.0)
+
+        self.assertTrue(all(not result.stopped for result in results.values()))
+        poses = fleet.world.truth_snapshot()
+        self.assertEqual(poses["vehicle_1"], (5.2, 5.0, 0.0))
+        self.assertAlmostEqual(poses["vehicle_2"][0], 5.0)
+        self.assertAlmostEqual(poses["vehicle_2"][1], 5.15)
+        self.assertAlmostEqual(poses["vehicle_2"][2], math.pi / 2)
+
+    def test_coarse_accelerating_collision_matches_fine_time_steps(self) -> None:
+        def collided(tick_s: float) -> dict[str, bool]:
+            fleet = FleetRuntime.create(
+                scenario(
+                    spec(1, 4.71875, 5.0),
+                    spec(2, 5.0, 4.75, math.pi / 2),
+                    tick_ms=round(tick_s * 1000),
+                ),
+                grid=free_grid(),
+                radius=0.01,
+                linear_speed=1.0,
+                linear_acceleration_mps2=1.0,
+                command_timeout=2.0,
+                spawn_safety_margin_m=0.0,
+            )
+            fleet.world.vehicle("vehicle_1").install_drive(1.0, 0.0, 0.0)
+            fleet.world.vehicle("vehicle_2").install_drive(0.5, 0.0, 0.0)
+            stopped = {vehicle_id: False for vehicle_id in fleet.nodes}
+            now = 0.0
+            while now < 1.0:
+                now = min(1.0, now + tick_s)
+                for vehicle_id, result in fleet.world.advance_to(now).items():
+                    stopped[vehicle_id] |= result.stopped
+            return stopped
+
+        self.assertEqual(
+            collided(1.0),
+            collided(0.01),
+        )
+        self.assertEqual(
+            collided(1.0),
+            {"vehicle_1": True, "vehicle_2": True},
+        )
+
     def test_reversal_safety_observes_the_executed_direction(self) -> None:
         grid = free_grid()
         fleet = FleetRuntime.create(

@@ -261,18 +261,51 @@ class Vehicle:
             self.angular_acceleration_rps2,
             elapsed,
         )
-        if (distance or rotation) and not self._move(
-            grid,
-            distance,
-            rotation,
-            started_at=started_at,
-            ended_at=ended_at,
-            trajectory=trajectory,
-        ):
-            self.collision = True
-            self.force_stop()
-            self._last_update = ended_at
-            return False
+        max_linear = max(abs(self._linear_mps), abs(ending_linear))
+        max_angular = max(abs(self._angular_rps), abs(ending_angular))
+        max_step = max(0.01, min(0.25, self.radius / 2))
+        steps = max(
+            1,
+            math.ceil(max_linear * elapsed / max_step),
+            math.ceil(max_angular * elapsed / (math.pi / 18)),
+        )
+        previous_distance = 0.0
+        previous_rotation = 0.0
+        for step in range(1, steps + 1):
+            if step == steps:
+                timestamp = ended_at
+                current_distance = distance
+                current_rotation = rotation
+            else:
+                interval_elapsed = elapsed * step / steps
+                timestamp = started_at + interval_elapsed
+                _, current_distance = _integrate_velocity(
+                    self._linear_mps,
+                    target_linear,
+                    self.linear_acceleration_mps2,
+                    self.linear_deceleration_mps2,
+                    interval_elapsed,
+                )
+                _, current_rotation = _integrate_velocity(
+                    self._angular_rps,
+                    target_angular,
+                    self.angular_acceleration_rps2,
+                    self.angular_acceleration_rps2,
+                    interval_elapsed,
+                )
+            if (max_linear or max_angular) and not self._move(
+                grid,
+                current_distance - previous_distance,
+                current_rotation - previous_rotation,
+                timestamp=timestamp,
+                trajectory=trajectory,
+            ):
+                self.collision = True
+                self.force_stop()
+                self._last_update = ended_at
+                return False
+            previous_distance = current_distance
+            previous_rotation = current_rotation
         self._linear_mps = ending_linear
         self._angular_rps = ending_angular
         self._last_update = ended_at
@@ -284,46 +317,26 @@ class Vehicle:
         distance: float,
         rotation: float,
         *,
-        started_at: float,
-        ended_at: float,
+        timestamp: float,
         trajectory: list[TimedPose] | None,
     ) -> bool:
         if distance == 0:
             self.yaw = math.atan2(math.sin(self.yaw + rotation), math.cos(self.yaw + rotation))
             self.collision = False
-            if trajectory is not None and ended_at > trajectory[-1][0]:
-                trajectory.append((ended_at, self.x, self.y, self.yaw))
+            if trajectory is not None:
+                trajectory.append((timestamp, self.x, self.y, self.yaw))
             return True
 
-        # Short chords retain a nearby last-safe pose while approximating an arc.
-        max_step = max(0.01, min(0.25, self.radius / 2))
-        steps = max(
-            1,
-            math.ceil(abs(distance) / max_step),
-            math.ceil(abs(rotation) / (math.pi / 18)),
-        )
-        step_distance = distance / steps
-        step_rotation = rotation / steps
-        for step in range(steps):
-            mid_yaw = self.yaw + step_rotation / 2
-            x = self.x + step_distance * math.cos(mid_yaw)
-            y = self.y + step_distance * math.sin(mid_yaw)
-            if step_distance and not is_swept_circle_passable(grid, self.x, self.y, x, y, self.radius):
-                if trajectory is not None:
-                    timestamp = started_at + (ended_at - started_at) * (step + 1) / steps
-                    if timestamp > trajectory[-1][0]:
-                        trajectory.append((timestamp, self.x, self.y, self.yaw))
-                return False
-            self.x, self.y = x, y
-            self.yaw = math.atan2(math.sin(self.yaw + step_rotation), math.cos(self.yaw + step_rotation))
+        mid_yaw = self.yaw + rotation / 2
+        x = self.x + distance * math.cos(mid_yaw)
+        y = self.y + distance * math.sin(mid_yaw)
+        if not is_swept_circle_passable(grid, self.x, self.y, x, y, self.radius):
             if trajectory is not None:
-                timestamp = (
-                    ended_at
-                    if step + 1 == steps
-                    else started_at + (ended_at - started_at) * (step + 1) / steps
-                )
-                trajectory.append(
-                    (timestamp, self.x, self.y, self.yaw)
-                )
+                trajectory.append((timestamp, self.x, self.y, self.yaw))
+            return False
+        self.x, self.y = x, y
+        self.yaw = math.atan2(math.sin(self.yaw + rotation), math.cos(self.yaw + rotation))
+        if trajectory is not None:
+            trajectory.append((timestamp, self.x, self.y, self.yaw))
         self.collision = False
         return True

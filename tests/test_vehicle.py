@@ -140,6 +140,22 @@ def test_reversal_brakes_through_zero_before_accelerating_backwards() -> None:
     assert moving.body_velocities()[0] == pytest.approx(-0.25)
 
 
+def test_reversal_with_zero_net_distance_retains_the_physical_path() -> None:
+    grid = MapGrid.from_wall_set(20, 20, set())
+    moving = vehicle(command_timeout=5.0)
+    moving.install_drive(0.5, 0.0, 0.0)
+    moving.advance(grid, 0.5)
+    start_x = moving.x
+    moving.install_drive(-0.5, 0.0, 0.5)
+    trajectory = []
+
+    moving.advance(grid, 1.5, trajectory=trajectory)
+
+    assert moving.x == pytest.approx(start_x)
+    assert max(point[1] for point in trajectory) == pytest.approx(start_x + 0.125)
+    assert moving.body_velocities()[0] == pytest.approx(-0.5)
+
+
 def test_angular_velocity_uses_the_configured_ramp() -> None:
     grid = MapGrid.from_wall_set(20, 20, set())
     rotating = vehicle(
@@ -174,6 +190,49 @@ def test_straight_ramp_and_stopping_distance_are_tick_size_stable() -> None:
     for position, velocities in results:
         assert position == pytest.approx(5.25)
         assert velocities == (0.0, 0.0)
+
+
+def test_accelerating_arc_timestamps_and_geometry_match_fine_time_steps() -> None:
+    grid = MapGrid.from_wall_set(20, 20, set())
+    coarse = vehicle(
+        linear_speed=1.0,
+        angular_speed=1.0,
+        linear_acceleration_mps2=1.0,
+        angular_acceleration_rps2=4.0,
+        command_timeout=2.0,
+    )
+    coarse.install_drive(1.0, 1.0, 0.0)
+    trajectory = []
+    coarse.advance(grid, 1.0, trajectory=trajectory)
+
+    reference = vehicle(
+        linear_speed=1.0,
+        angular_speed=1.0,
+        linear_acceleration_mps2=1.0,
+        angular_acceleration_rps2=4.0,
+        command_timeout=2.0,
+    )
+    reference.install_drive(1.0, 1.0, 0.0)
+    for step in range(1, 1001):
+        reference.advance(grid, step / 1000)
+
+    assert trajectory[0] == (0.0, 5.0, 5.0, 0.0)
+    assert trajectory[-1] == (1.0, coarse.x, coarse.y, coarse.yaw)
+    assert all(
+        current[0] < following[0]
+        for current, following in zip(trajectory, trajectory[1:])
+    )
+    for current, following in zip(trajectory, trajectory[1:]):
+        assert math.dist(current[1:3], following[1:3]) <= 0.25 + 1e-12
+        yaw_step = math.atan2(
+            math.sin(following[3] - current[3]),
+            math.cos(following[3] - current[3]),
+        )
+        assert abs(yaw_step) <= math.pi / 18 + 1e-12
+    assert (coarse.x, coarse.y, coarse.yaw) == pytest.approx(
+        (reference.x, reference.y, reference.yaw),
+        abs=2e-3,
+    )
 
 
 def test_safety_reduced_velocity_cannot_reverse_or_exceed_active_setpoint() -> None:
