@@ -27,6 +27,7 @@ from mockvehicle2d.fleet import (
 )
 from mockvehicle2d.local_state import (
     OCCUPIED,
+    AnchorSpec,
     LocalMapDelta,
     OdometryConfig,
     PoseEstimate,
@@ -38,7 +39,8 @@ from mockvehicle2d.safety import (
     AUTOMATIC_MINIMUM_CLEARANCE_M,
     HARD_STOP_CLEARANCE_M,
 )
-from mockvehicle2d.server import generate_map
+from mockvehicle2d.server import VehicleRuntime, generate_map
+from mockvehicle2d.vehicle import Vehicle
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -1105,6 +1107,92 @@ class TestFleetRuntime(unittest.TestCase):
             )
         )
 
+    def test_reversal_safety_observes_the_executed_direction(self) -> None:
+        grid = free_grid()
+        fleet = FleetRuntime.create(
+            scenario(
+                spec(1, 2.4, 5.0),
+                spec(2, 20.0, 5.0),
+            ),
+            grid=grid,
+            linear_speed=1.0,
+            linear_deceleration_mps2=1.0,
+            command_timeout=10.0,
+        )
+        fleet.handle_command(
+            "vehicle_1",
+            ManualCommand(1, ManualAction.DRIVE, 1.0, 0.0),
+        )
+        for tick in range(10):
+            fleet.tick((tick + 1) * fleet.tick_s)
+        grid.set_cell(4, 5, WALL)
+
+        fleet.handle_command(
+            "vehicle_1",
+            ManualCommand(2, ManualAction.DRIVE, -1.0, 0.0),
+        )
+        fleet.tick(1.1)
+
+        observation = fleet.nodes["vehicle_1"].safety.observation
+        self.assertIsNotNone(observation.obstacle_clearance_m)
+        self.assertGreater(
+            fleet.world.vehicle("vehicle_1").body_velocities()[0],
+            0.0,
+        )
+
+    def test_serve_and_fleet_use_the_same_safety_preparation(self) -> None:
+        grid = free_grid()
+        served = VehicleRuntime.create(
+            started_at=0.0,
+            anchor=AnchorSpec("serve", 2.4, 5.0, 0.0),
+            odometry_config=OdometryConfig(),
+            linear_speed=1.0,
+            linear_deceleration_mps2=1.0,
+            command_timeout=10.0,
+        )
+        served.grid = grid
+        served.vehicle = Vehicle(
+            2.4,
+            5.0,
+            linear_speed=1.0,
+            linear_deceleration_mps2=1.0,
+            command_timeout=10.0,
+            now=0.0,
+        )
+        fleet = FleetRuntime.create(
+            scenario(spec(1, 2.4, 5.0), spec(2, 20.0, 5.0)),
+            grid=grid,
+            linear_speed=1.0,
+            linear_deceleration_mps2=1.0,
+            command_timeout=10.0,
+        )
+        fleet_vehicle = fleet.world.vehicle("vehicle_1")
+        for vehicle in (served.vehicle, fleet_vehicle):
+            vehicle.install_drive(1.0, 0.0, 0.0)
+        served.vehicle.advance(grid, 1.0)
+        fleet.world.advance_to(1.0)
+        fleet_vehicle = fleet.world.vehicle("vehicle_1")
+        grid.set_cell(4, 5, WALL)
+
+        served.advance_to(1.1)
+        fleet._advance_world(1.1)
+        fleet_vehicle = fleet.world.vehicle("vehicle_1")
+
+        self.assertEqual(
+            (
+                served.vehicle.x,
+                served.vehicle.body_velocities(),
+                served.vehicle.target_velocities(),
+                served.safety.decision,
+            ),
+            (
+                fleet_vehicle.x,
+                fleet_vehicle.body_velocities(),
+                fleet_vehicle.target_velocities(),
+                fleet.nodes["vehicle_1"].safety.decision,
+            ),
+        )
+
     def test_curved_motion_cannot_pass_through_another_vehicle(self) -> None:
         for tick_ms in (100, 1000):
             with self.subTest(tick_ms=tick_ms):
@@ -1296,7 +1384,7 @@ class TestFleetRuntime(unittest.TestCase):
         self.assertAlmostEqual(frames[1].truth_pose[0], 5.0 + 1 / 18)
         self.assertAlmostEqual(frames[-1].truth_pose[0], 5.25)
 
-    def test_coarse_tick_frames_change_state_only_after_a_mid_tick_collision(self) -> None:
+    def test_coarse_tick_frames_show_bounded_stop_before_a_wall(self) -> None:
         grid = free_grid()
         grid.set_cell(6, 5, WALL)
         fleet = FleetRuntime.create(
@@ -1323,10 +1411,13 @@ class TestFleetRuntime(unittest.TestCase):
         self.assertTrue(
             all(not frame.runtime_state["collision"] for frame in frames[:stopped_at])
         )
-        self.assertTrue(frames[stopped_at].runtime_state["collision"])
-        self.assertEqual(
-            len({frame.truth_pose for frame in frames[stopped_at:]}),
-            1,
+        self.assertTrue(
+            all(not frame.runtime_state["collision"] for frame in frames)
+        )
+        self.assertEqual(frames[-1].runtime_state["linear_mps"], 0.0)
+        self.assertLessEqual(
+            frames[-1].truth_pose[0] + 0.5,
+            6.0 - HARD_STOP_CLEARANCE_M,
         )
 
 
@@ -1492,12 +1583,7 @@ class TestFleetTelemetryWebSocket(unittest.IsolatedAsyncioTestCase):
                         "vehicle_1",
                         ManualCommand(2, ManualAction.STOP),
                     )
-                    node.safety.decision = type(node.safety.decision)(
-                        0.0,
-                        0.0,
-                        "fault",
-                        "injected_after_first_tick",
-                    )
+                    node.safety.healthy = False
                     fleet.tick(-123.0)
                     node.map_sync.published_deltas = 99
 
@@ -1520,7 +1606,7 @@ class TestFleetTelemetryWebSocket(unittest.IsolatedAsyncioTestCase):
                     )
                     self.assertEqual(
                         [pose["safety"]["reason"] for pose in poses],
-                        [None] * 6 + ["injected_after_first_tick"] * 6,
+                        [None] * 6 + ["safety_sensor_fault"] * 6,
                     )
                     self.assertEqual(
                         [pose["p2p_map_sync"]["published_deltas"] for pose in poses],

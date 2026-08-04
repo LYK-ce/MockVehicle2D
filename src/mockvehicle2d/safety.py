@@ -64,6 +64,14 @@ class SafetyAdvanceResult:
     reason: str | None = None
 
 
+@dataclass(frozen=True)
+class SafetyAdvancePlan:
+    until: float
+    limited_velocities: tuple[float, float] | None = None
+    stop_after: bool = False
+    result: SafetyAdvanceResult = SafetyAdvanceResult()
+
+
 def nearest_obstacle_clearance(
     points: Iterable[LaserPoint],
     desired_linear_mps: float,
@@ -148,12 +156,27 @@ class SafetyGovernor:
         desired_angular_rps: float,
         observation: SafetyObservation,
         automatic: bool,
+        *,
+        minimum_clearance_m: float = HARD_STOP_CLEARANCE_M,
     ) -> SafetyDecision:
         values = (desired_linear_mps, desired_angular_rps)
         if any(isinstance(value, bool) or not isinstance(value, (int, float)) for value in values):
             raise ValueError("desired velocities must be numbers")
-        if not all(math.isfinite(value) for value in values) or type(automatic) is not bool:
-            raise ValueError("desired velocities must be finite and automatic must be a bool")
+        if isinstance(minimum_clearance_m, bool) or not isinstance(
+            minimum_clearance_m,
+            (int, float),
+        ):
+            raise ValueError("minimum clearance must be a number")
+        if (
+            not all(math.isfinite(value) for value in values)
+            or type(automatic) is not bool
+            or not math.isfinite(minimum_clearance_m)
+            or minimum_clearance_m < HARD_STOP_CLEARANCE_M
+        ):
+            raise ValueError(
+                "velocities and minimum clearance must be finite; "
+                "automatic must be a bool"
+            )
 
         linear_mps = float(desired_linear_mps)
         angular_rps = float(desired_angular_rps)
@@ -175,8 +198,12 @@ class SafetyGovernor:
             return SafetyDecision(linear_mps, angular_rps, "clear", None)
 
         clearance, reason = nearest
-        if clearance < HARD_STOP_CLEARANCE_M or (
-            automatic and clearance <= AUTOMATIC_MINIMUM_CLEARANCE_M
+        stopping_clearance = max(
+            minimum_clearance_m,
+            AUTOMATIC_MINIMUM_CLEARANCE_M if automatic else HARD_STOP_CLEARANCE_M,
+        )
+        if clearance < stopping_clearance or (
+            automatic and clearance <= stopping_clearance
         ):
             return SafetyDecision(0.0, angular_rps, "stopped", reason)
         if automatic and linear_mps and clearance < SLOW_ZONE_CLEARANCE_M:
@@ -240,9 +267,152 @@ class LocalSafetyRuntime:
             healthy=self.healthy and scan_healthy,
         )
         self.decision = self._governor.limit(
-            desired_linear_mps, desired_angular_rps, self.observation, automatic
+            desired_linear_mps,
+            desired_angular_rps,
+            self.observation,
+            automatic,
         )
         return self.decision
+
+    def prepare_advance(
+        self,
+        vehicle: Vehicle,
+        grid: MapGrid,
+        now: float,
+        *,
+        automatic: bool,
+    ) -> SafetyAdvancePlan:
+        """Prepare one bounded safety step without advancing physics."""
+        if not math.isfinite(now) or now < vehicle.last_update:
+            raise ValueError("monotonic time must be finite and cannot move backwards")
+        if now == vehicle.last_update:
+            return SafetyAdvancePlan(now)
+
+        executed_linear, executed_angular = vehicle.body_velocities()
+        target_linear, target_angular = vehicle.target_velocities()
+        linear_mps = executed_linear or target_linear
+        angular_rps = executed_angular or target_angular
+        if linear_mps == 0:
+            if angular_rps:
+                decision = self.evaluate(
+                    vehicle,
+                    grid,
+                    0.0,
+                    angular_rps,
+                    automatic=automatic,
+                )
+                if decision.state == "fault":
+                    vehicle.stop()
+                    return SafetyAdvancePlan(
+                        now,
+                        result=SafetyAdvanceResult(
+                            stopped=True,
+                            reason=decision.reason,
+                        ),
+                    )
+            return SafetyAdvancePlan(now)
+
+        requested_linear = (
+            target_linear if executed_linear * target_linear >= 0 else 0.0
+        )
+        requested_angular = (
+            target_angular if executed_angular * target_angular >= 0 else 0.0
+        )
+        translation_rate = max(abs(linear_mps), abs(requested_linear))
+        rotation_rate = max(abs(angular_rps), abs(requested_angular))
+        step_time = min(
+            now - vehicle.last_update,
+            MAX_TRANSLATION_STEP_M / translation_rate,
+            (
+                MAX_ROTATION_STEP_RAD / rotation_rate
+                if rotation_rate
+                else math.inf
+            ),
+        )
+        if step_time <= 0:
+            self.decision = SafetyDecision(
+                0.0,
+                requested_angular,
+                "fault",
+                "safety_sensor_fault",
+            )
+            vehicle.stop()
+            return SafetyAdvancePlan(
+                now,
+                result=SafetyAdvanceResult(
+                    stopped=True,
+                    reason="safety_sensor_fault",
+                ),
+            )
+
+        speed = abs(executed_linear)
+        requested_speed = abs(requested_linear)
+        rate = (
+            vehicle.linear_acceleration_mps2
+            if requested_speed > speed
+            else vehicle.linear_deceleration_mps2
+        )
+        speed_after_step = (
+            min(requested_speed, speed + rate * step_time)
+            if requested_speed > speed
+            else max(requested_speed, speed - rate * step_time)
+        )
+        step_distance = max(speed, speed_after_step) * step_time
+        minimum_clearance = (
+            HARD_STOP_CLEARANCE_M
+            + step_distance
+            + speed_after_step**2 / (2 * vehicle.linear_deceleration_mps2)
+        )
+        policy_linear_mps = (
+            math.copysign(vehicle.linear_speed, linear_mps)
+            if automatic
+            else requested_linear or linear_mps
+        )
+        decision = self.evaluate(
+            vehicle,
+            grid,
+            policy_linear_mps,
+            requested_angular or angular_rps,
+            automatic=automatic,
+        )
+        if decision.state not in ("fault", "stopped"):
+            decision = self._governor.limit(
+                policy_linear_mps,
+                requested_angular or angular_rps,
+                self.observation,
+                automatic,
+                minimum_clearance_m=minimum_clearance,
+            )
+            self.decision = decision
+        if decision.state == "fault":
+            vehicle.stop()
+            return SafetyAdvancePlan(
+                now,
+                result=SafetyAdvanceResult(
+                    stopped=True,
+                    reason=decision.reason,
+                ),
+            )
+        if decision.state == "stopped":
+            return SafetyAdvancePlan(
+                vehicle.last_update + step_time,
+                (0.0, decision.angular_rps),
+                True,
+                SafetyAdvanceResult(stopped=True, reason=decision.reason),
+            )
+
+        effective_linear = math.copysign(
+            min(abs(requested_linear), abs(decision.linear_mps)),
+            requested_linear,
+        )
+        effective_angular = math.copysign(
+            min(abs(requested_angular), abs(decision.angular_rps)),
+            requested_angular,
+        )
+        return SafetyAdvancePlan(
+            vehicle.last_update + step_time,
+            (effective_linear, effective_angular),
+        )
 
     def advance(
         self,
@@ -253,138 +423,50 @@ class LocalSafetyRuntime:
         automatic: bool,
     ) -> SafetyAdvanceResult:
         """Advance held motion in fresh, clearance-bounded safety steps."""
-        if now < vehicle.last_update:
-            raise ValueError("monotonic time moved backwards")
+        if not math.isfinite(now) or now < vehicle.last_update:
+            raise ValueError("monotonic time must be finite and cannot move backwards")
 
-        deadline = vehicle.command_deadline
-        motion_until = min(now, deadline) if deadline is not None else now
+        result = SafetyAdvanceResult()
         steps = 0
-        while vehicle.last_update < motion_until:
-            executed_linear, executed_angular = vehicle.body_velocities()
-            target_linear, target_angular = vehicle.target_velocities()
-            if vehicle.command == "stop":
+        while vehicle.last_update < now:
+            if steps >= MAX_SAFETY_ADVANCE_STEPS:
+                self.decision = SafetyDecision(
+                    0.0,
+                    0.0,
+                    "fault",
+                    "safety_sensor_fault",
+                )
+                vehicle.stop()
                 collided = vehicle.advance(grid, now)
-                return SafetyAdvanceResult(collided=collided)
-            linear_mps = executed_linear or target_linear
-            angular_rps = executed_angular or target_angular
-            if linear_mps == 0:
-                if angular_rps:
-                    decision = self.evaluate(vehicle, grid, 0.0, angular_rps, automatic=automatic)
-                    if decision.state == "fault":
-                        vehicle.stop()
-                        vehicle.advance(grid, now)
-                        return SafetyAdvanceResult(stopped=True, reason=decision.reason)
-                collided = vehicle.advance(grid, now)
-                return SafetyAdvanceResult(collided=collided)
-
-            requested_linear = (
-                target_linear
-                if executed_linear * target_linear >= 0
-                else 0.0
-            )
-            requested_angular = (
-                target_angular
-                if executed_angular * target_angular >= 0
-                else 0.0
-            )
-            policy_linear_mps = (
-                math.copysign(vehicle.linear_speed, linear_mps)
-                if automatic
-                else requested_linear or linear_mps
-            )
-            decision = self.evaluate(
+                return SafetyAdvanceResult(
+                    collided=result.collided or collided,
+                    stopped=True,
+                    reason=result.reason or "safety_sensor_fault",
+                )
+            steps += 1
+            plan = self.prepare_advance(
                 vehicle,
                 grid,
-                policy_linear_mps,
-                requested_angular or angular_rps,
+                now,
                 automatic=automatic,
             )
-            if decision.state == "fault":
-                vehicle.stop()
-                vehicle.advance(grid, now)
-                return SafetyAdvanceResult(stopped=True, reason=decision.reason)
-            if decision.state == "stopped":
-                vehicle.advance(
-                    grid,
-                    now,
-                    limited_velocities=(0.0, decision.angular_rps),
-                )
-                vehicle.stop()
-                return SafetyAdvanceResult(stopped=True, reason=decision.reason)
-            effective_linear = math.copysign(
-                min(abs(requested_linear), abs(decision.linear_mps)),
-                requested_linear,
-            )
-            effective_angular = math.copysign(
-                min(abs(requested_angular), abs(decision.angular_rps)),
-                requested_angular,
-            )
-
-            nearest = min(
-                (
-                    (clearance, reason)
-                    for clearance, reason in (
-                        (self.observation.obstacle_clearance_m, "safety_obstacle"),
-                        (self.observation.edge_clearance_m, "safety_edge"),
-                    )
-                    if clearance is not None
-                ),
-                default=None,
-            )
-            step_distance = MAX_TRANSLATION_STEP_M
-            if nearest is not None:
-                clearance, reason = nearest
-                step_distance = min(step_distance, max(0.0, clearance - HARD_STOP_CLEARANCE_M))
-                if step_distance <= 1e-12:
-                    self.decision = SafetyDecision(0.0, angular_rps, "stopped", reason)
-                    vehicle.advance(
-                        grid,
-                        now,
-                        limited_velocities=(0.0, angular_rps),
-                    )
-                    vehicle.stop()
-                    return SafetyAdvanceResult(stopped=True, reason=reason)
-
-            step_time = min(
-                motion_until - vehicle.last_update,
-                step_distance
-                / max(abs(executed_linear), abs(effective_linear)),
-                MAX_ROTATION_STEP_RAD
-                / max(abs(executed_angular), abs(effective_angular))
-                if executed_angular or effective_angular
-                else math.inf,
-            )
-            next_update = vehicle.last_update + step_time
-            too_many_rotations = (
-                steps == 0
-                and abs(angular_rps) * (motion_until - vehicle.last_update)
-                > MAX_ROTATION_STEP_RAD * MAX_SAFETY_ADVANCE_STEPS
-            )
-            if (
-                too_many_rotations
-                or steps >= MAX_SAFETY_ADVANCE_STEPS
-                or next_update <= vehicle.last_update
-            ):
-                self.decision = SafetyDecision(
-                    0.0, effective_angular, "fault", "safety_sensor_fault"
-                )
-                vehicle.stop()
-                vehicle.advance(grid, now)
-                return SafetyAdvanceResult(stopped=True, reason="safety_sensor_fault")
-            steps += 1
             collided = vehicle.advance(
                 grid,
-                next_update,
-                limited_velocities=(effective_linear, effective_angular),
+                plan.until,
+                limited_velocities=plan.limited_velocities,
+            )
+            if plan.stop_after:
+                vehicle.stop()
+            result = SafetyAdvanceResult(
+                collided=result.collided or collided,
+                stopped=result.stopped or plan.result.stopped,
+                reason=result.reason or plan.result.reason,
             )
             if collided:
-                vehicle.advance(grid, now)
-                return SafetyAdvanceResult(collided=True)
-
-        if vehicle.last_update < now:
-            collided = vehicle.advance(grid, now)
-            return SafetyAdvanceResult(collided=collided)
-        return SafetyAdvanceResult()
+                if vehicle.last_update < now:
+                    vehicle.advance(grid, now)
+                return result
+        return result
 
     def snapshot(self) -> dict[str, object]:
         return {

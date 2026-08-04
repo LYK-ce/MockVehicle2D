@@ -445,9 +445,17 @@ class SharedWorld:
 
         return sensed
 
-    def advance_to(self, target_time: float) -> dict[str, SafetyAdvanceResult]:
+    def advance_to(
+        self,
+        target_time: float,
+        *,
+        limited_velocities: dict[str, tuple[float, float] | None] | None = None,
+    ) -> dict[str, SafetyAdvanceResult]:
         if not math.isfinite(target_time) or target_time < self.now:
             raise ValueError("world time must be finite and monotonic")
+        limits = {} if limited_velocities is None else limited_velocities
+        if not set(limits) <= set(self._vehicles):
+            raise ValueError("limited velocities contain an unknown vehicle")
         starts = {
             vehicle_id: (vehicle.x, vehicle.y)
             for vehicle_id, vehicle in self._vehicles.items()
@@ -461,6 +469,7 @@ class SharedWorld:
             collided = candidate.advance(
                 self._grid,
                 target_time,
+                limited_velocities=limits.get(vehicle_id),
                 trajectory=trajectory,
             )
             candidates[vehicle_id] = candidate
@@ -1192,7 +1201,54 @@ class FleetRuntime:
             )
 
     def _advance_world(self, target_time: float) -> None:
-        results = self.world.advance_to(target_time)
+        results = {
+            vehicle_id: SafetyAdvanceResult()
+            for vehicle_id in self.nodes
+        }
+        while self.world.now < target_time:
+            plans = {
+                vehicle_id: self.nodes[vehicle_id].safety.prepare_advance(
+                    self.world.vehicle(vehicle_id),
+                    self.world.sensor_grid(vehicle_id),
+                    target_time,
+                    automatic=self.nodes[
+                        vehicle_id
+                    ].controller.is_automatic_motion_active,
+                )
+                for vehicle_id in sorted(self.nodes)
+            }
+            next_time = min(plan.until for plan in plans.values())
+            if next_time <= self.world.now:
+                raise RuntimeError("safety advance did not move simulation time")
+            advanced = self.world.advance_to(
+                next_time,
+                limited_velocities={
+                    vehicle_id: plan.limited_velocities
+                    for vehicle_id, plan in plans.items()
+                },
+            )
+            for vehicle_id, plan in plans.items():
+                if plan.stop_after:
+                    self.world.vehicle(vehicle_id).stop()
+                previous = results[vehicle_id]
+                current = advanced[vehicle_id]
+                results[vehicle_id] = SafetyAdvanceResult(
+                    collided=(
+                        previous.collided
+                        or plan.result.collided
+                        or current.collided
+                    ),
+                    stopped=(
+                        previous.stopped
+                        or plan.result.stopped
+                        or current.stopped
+                    ),
+                    reason=(
+                        previous.reason
+                        or plan.result.reason
+                        or current.reason
+                    ),
+                )
         for vehicle_id, result in results.items():
             self.nodes[vehicle_id].record_advance(result)
 

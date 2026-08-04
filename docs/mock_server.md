@@ -79,6 +79,10 @@ AutoState
 命令仍表示 target，不改变 v4 JSON schema。realtime factor 只缩短墙钟等待，不参与该
 动力学计算。
 
+每个安全物理小步的停车净空至少包含固定 `0.25 m` 余量、当前小步位移上界和按配置线
+减速度计算的 `v²/(2a)` 制动距离。正反向切换或 target 已归零但车辆仍在制动时，风险
+感知继续使用 executed velocity 的实际运动方向；`serve` 与 `fleet` 复用同一准备逻辑。
+
 ## 一帧的执行顺序
 
 Server 以 Tmini 名义扫描周期（约 6 Hz）执行：

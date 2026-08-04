@@ -167,7 +167,7 @@ class TestEpisodeRunner(unittest.TestCase):
         result = results[0]
         self.assertFalse(result.success)
         self.assertEqual(result.termination_reason, "blocked")
-        self.assertEqual(result.tick_count, 136)
+        self.assertEqual(result.tick_count, 124)
         clearance = result.minimum_inter_vehicle_clearance_m
         self.assertIsNotNone(clearance)
         assert clearance is not None

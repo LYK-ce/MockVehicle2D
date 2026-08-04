@@ -241,11 +241,11 @@ def _merge_advance(
     previous: SafetyAdvanceResult,
     current: SafetyAdvanceResult,
 ) -> SafetyAdvanceResult:
-    if previous.collided or current.collided:
-        return SafetyAdvanceResult(collided=True)
-    if previous.stopped:
-        return previous
-    return current
+    return SafetyAdvanceResult(
+        collided=previous.collided or current.collided,
+        stopped=previous.stopped or current.stopped,
+        reason=previous.reason or current.reason,
+    )
 
 
 def _encode_map_chunks(
