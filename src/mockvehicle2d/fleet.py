@@ -56,6 +56,7 @@ from mockvehicle2d.safety import (
 )
 from mockvehicle2d.scan import LaserPoint, TMINI_SCAN_CONFIG, scan_grid, scan_message
 from mockvehicle2d.server import (
+    DEFAULT_REALTIME_FACTOR,
     HOST,
     LOCAL_MAP_RESOLUTION_M,
     MAP_RESOLUTION_M,
@@ -67,7 +68,13 @@ from mockvehicle2d.server import (
     generate_map,
     validate_vehicle_id,
 )
-from mockvehicle2d.vehicle import TimedPose, Vehicle
+from mockvehicle2d.vehicle import (
+    DEFAULT_ANGULAR_ACCELERATION_RPS2,
+    DEFAULT_LINEAR_ACCELERATION_MPS2,
+    DEFAULT_LINEAR_DECELERATION_MPS2,
+    TimedPose,
+    Vehicle,
+)
 
 
 MAX_VEHICLES = 4
@@ -302,6 +309,9 @@ class SharedWorld:
         radius: float,
         linear_speed: float,
         angular_speed: float,
+        linear_acceleration_mps2: float,
+        linear_deceleration_mps2: float,
+        angular_acceleration_rps2: float,
         command_timeout: float,
         started_at: float,
         spawn_safety_margin_m: float = DEFAULT_SPAWN_SAFETY_MARGIN_M,
@@ -310,14 +320,25 @@ class SharedWorld:
             radius,
             linear_speed,
             angular_speed,
+            linear_acceleration_mps2,
+            linear_deceleration_mps2,
+            angular_acceleration_rps2,
             command_timeout,
             started_at,
             spawn_safety_margin_m,
         )
         if not all(math.isfinite(value) for value in parameters):
             raise ValueError("world parameters must be finite")
-        if min(radius, linear_speed, angular_speed, command_timeout) <= 0:
-            raise ValueError("vehicle radius, speeds, and timeout must be positive")
+        if min(
+            radius,
+            linear_speed,
+            angular_speed,
+            linear_acceleration_mps2,
+            linear_deceleration_mps2,
+            angular_acceleration_rps2,
+            command_timeout,
+        ) <= 0:
+            raise ValueError("vehicle motion limits, radius, and timeout must be positive")
         if spawn_safety_margin_m < 0:
             raise ValueError("spawn safety margin cannot be negative")
         if not 1 <= len(specs) <= MAX_VEHICLES:
@@ -365,6 +386,9 @@ class SharedWorld:
                 spec.anchor_pose.yaw_rad,
                 linear_speed=linear_speed,
                 angular_speed=angular_speed,
+                linear_acceleration_mps2=linear_acceleration_mps2,
+                linear_deceleration_mps2=linear_deceleration_mps2,
+                angular_acceleration_rps2=angular_acceleration_rps2,
                 radius=radius,
                 command_timeout=command_timeout,
                 now=started_at,
@@ -421,9 +445,17 @@ class SharedWorld:
 
         return sensed
 
-    def advance_to(self, target_time: float) -> dict[str, SafetyAdvanceResult]:
+    def advance_to(
+        self,
+        target_time: float,
+        *,
+        limited_velocities: dict[str, tuple[float, float] | None] | None = None,
+    ) -> dict[str, SafetyAdvanceResult]:
         if not math.isfinite(target_time) or target_time < self.now:
             raise ValueError("world time must be finite and monotonic")
+        limits = {} if limited_velocities is None else limited_velocities
+        if not set(limits) <= set(self._vehicles):
+            raise ValueError("limited velocities contain an unknown vehicle")
         starts = {
             vehicle_id: (vehicle.x, vehicle.y)
             for vehicle_id, vehicle in self._vehicles.items()
@@ -437,6 +469,7 @@ class SharedWorld:
             collided = candidate.advance(
                 self._grid,
                 target_time,
+                limited_velocities=limits.get(vehicle_id),
                 trajectory=trajectory,
             )
             candidates[vehicle_id] = candidate
@@ -486,7 +519,7 @@ class SharedWorld:
 
         for vehicle_id in blocked:
             stopped = copy.copy(self._vehicles[vehicle_id])
-            stopped.stop(target_time)
+            stopped.force_stop(target_time)
             stopped.collision = False
             candidates[vehicle_id] = stopped
             trajectories[vehicle_id] = stationary[vehicle_id]
@@ -932,11 +965,13 @@ class FleetRuntime:
         world: SharedWorld,
         nodes: dict[str, RobotNode],
         wall_time_offset: float,
+        realtime_factor: float,
     ) -> None:
         self.scenario = scenario
         self.world = world
         self.nodes = nodes
         self._wall_time_offset = wall_time_offset
+        self.realtime_factor = realtime_factor
         self._sensor_epoch = world.now
         self._next_scan_index = {vehicle_id: 1 for vehicle_id in nodes}
         self.map_chunks = _encode_map_chunks(world.debug_voxels, world.debug_grid.width)
@@ -952,13 +987,19 @@ class FleetRuntime:
         voxels: list[dict[str, object]] | None = None,
         linear_speed: float = 0.5,
         angular_speed: float = math.pi / 2,
+        linear_acceleration_mps2: float = DEFAULT_LINEAR_ACCELERATION_MPS2,
+        linear_deceleration_mps2: float = DEFAULT_LINEAR_DECELERATION_MPS2,
+        angular_acceleration_rps2: float = DEFAULT_ANGULAR_ACCELERATION_RPS2,
         radius: float = 0.5,
         command_timeout: float = 1.0,
         mission_capacity: int = 16,
         odometry_config: OdometryConfig = OdometryConfig(),
         safety_healthy: bool = True,
         spawn_safety_margin_m: float = DEFAULT_SPAWN_SAFETY_MARGIN_M,
+        realtime_factor: float = 1.0,
     ) -> "FleetRuntime":
+        if not math.isfinite(realtime_factor) or realtime_factor <= 0:
+            raise ValueError("realtime factor must be finite and positive")
         if grid is None:
             generated_voxels, grid = generate_map(radius=radius)
             voxels = generated_voxels
@@ -982,6 +1023,9 @@ class FleetRuntime:
             radius=radius,
             linear_speed=linear_speed,
             angular_speed=angular_speed,
+            linear_acceleration_mps2=linear_acceleration_mps2,
+            linear_deceleration_mps2=linear_deceleration_mps2,
+            angular_acceleration_rps2=angular_acceleration_rps2,
             command_timeout=command_timeout,
             started_at=started_at,
             spawn_safety_margin_m=spawn_safety_margin_m,
@@ -1015,16 +1059,28 @@ class FleetRuntime:
                         spec.vehicle_id,
                         anchor,
                         local_state.local_map.resolution_m,
+                        clock=lambda world=world: world.now,
                     )
                 ),
             )
-        runtime = cls(scenario, world, nodes, timestamp - started_at)
+        runtime = cls(
+            scenario,
+            world,
+            nodes,
+            timestamp - started_at,
+            realtime_factor,
+        )
         runtime._sample_all(timestamp)
         return runtime
 
     @property
     def tick_s(self) -> float:
         return self.scenario.tick_s
+
+    def timestamp_at(self, simulation_now: float | None = None) -> float:
+        return self._wall_time_offset + (
+            self.world.now if simulation_now is None else simulation_now
+        )
 
     def handle_command(self, vehicle_id: str, command: Command) -> CommandResult:
         node = self.nodes[vehicle_id]
@@ -1069,7 +1125,10 @@ class FleetRuntime:
     async def run(self, stop: asyncio.Event) -> None:
         while not stop.is_set():
             try:
-                await asyncio.wait_for(stop.wait(), timeout=self.tick_s)
+                await asyncio.wait_for(
+                    stop.wait(),
+                    timeout=self.tick_s / self.realtime_factor,
+                )
             except asyncio.TimeoutError:
                 self.tick(time.time())
 
@@ -1142,7 +1201,54 @@ class FleetRuntime:
             )
 
     def _advance_world(self, target_time: float) -> None:
-        results = self.world.advance_to(target_time)
+        results = {
+            vehicle_id: SafetyAdvanceResult()
+            for vehicle_id in self.nodes
+        }
+        while self.world.now < target_time:
+            plans = {
+                vehicle_id: self.nodes[vehicle_id].safety.prepare_advance(
+                    self.world.vehicle(vehicle_id),
+                    self.world.sensor_grid(vehicle_id),
+                    target_time,
+                    automatic=self.nodes[
+                        vehicle_id
+                    ].controller.is_automatic_motion_active,
+                )
+                for vehicle_id in sorted(self.nodes)
+            }
+            next_time = min(plan.until for plan in plans.values())
+            if next_time <= self.world.now:
+                raise RuntimeError("safety advance did not move simulation time")
+            advanced = self.world.advance_to(
+                next_time,
+                limited_velocities={
+                    vehicle_id: plan.limited_velocities
+                    for vehicle_id, plan in plans.items()
+                },
+            )
+            for vehicle_id, plan in plans.items():
+                if plan.stop_after:
+                    self.world.vehicle(vehicle_id).stop()
+                previous = results[vehicle_id]
+                current = advanced[vehicle_id]
+                results[vehicle_id] = SafetyAdvanceResult(
+                    collided=(
+                        previous.collided
+                        or plan.result.collided
+                        or current.collided
+                    ),
+                    stopped=(
+                        previous.stopped
+                        or plan.result.stopped
+                        or current.stopped
+                    ),
+                    reason=(
+                        previous.reason
+                        or plan.result.reason
+                        or current.reason
+                    ),
+                )
         for vehicle_id, result in results.items():
             self.nodes[vehicle_id].record_advance(result)
 
@@ -1212,7 +1318,7 @@ async def fleet_handler(websocket, *, fleet: FleetRuntime, vehicle_id: str) -> N
                 websocket,
                 {
                     "type": "error",
-                    "timestamp_s": time.time(),
+                    "timestamp_s": fleet.timestamp_at(),
                     "seq": None,
                     "code": "vehicle_busy",
                     "message": "another controller owns the vehicle lease",
@@ -1234,6 +1340,7 @@ async def fleet_handler(websocket, *, fleet: FleetRuntime, vehicle_id: str) -> N
                 "control_lease": "exclusive",
                 "mission_frame_id": "global_map",
                 "mission_types": list(SUPPORTED_MISSION_TYPES),
+                "realtime_factor": fleet.realtime_factor,
                 "birth_anchor": {
                     "anchor_id": node.spec.spawn_id,
                     "x_m": node.spec.anchor_pose.x_m,
@@ -1248,7 +1355,7 @@ async def fleet_handler(websocket, *, fleet: FleetRuntime, vehicle_id: str) -> N
             websocket,
             node.controller,
             0,
-            time.time(),
+            fleet.timestamp_at(),
         )
         await _send_map_chunks(websocket, fleet.map_chunks)
         pose, scan = fleet.telemetry_messages(vehicle_id)
@@ -1265,7 +1372,7 @@ async def fleet_handler(websocket, *, fleet: FleetRuntime, vehicle_id: str) -> N
                     websocket,
                     {
                         "type": "error",
-                        "timestamp_s": time.time(),
+                        "timestamp_s": fleet.timestamp_at(),
                         "seq": None,
                         "code": "telemetry_overflow",
                         "message": str(error),
@@ -1289,12 +1396,12 @@ async def fleet_handler(websocket, *, fleet: FleetRuntime, vehicle_id: str) -> N
             try:
                 raw = await asyncio.wait_for(
                     websocket.recv(),
-                    timeout=min(0.05, fleet.tick_s),
+                    timeout=min(0.05, fleet.tick_s) / fleet.realtime_factor,
                 )
             except asyncio.TimeoutError:
                 continue
 
-            timestamp = time.time()
+            timestamp = fleet.timestamp_at()
             try:
                 vehicle = fleet.world.vehicle(vehicle_id)
                 command = parse_command(
@@ -1477,12 +1584,16 @@ async def main(
     *,
     linear_speed: float = 0.5,
     angular_speed: float = math.pi / 2,
+    linear_acceleration_mps2: float = DEFAULT_LINEAR_ACCELERATION_MPS2,
+    linear_deceleration_mps2: float = DEFAULT_LINEAR_DECELERATION_MPS2,
+    angular_acceleration_rps2: float = DEFAULT_ANGULAR_ACCELERATION_RPS2,
     radius: float = 0.5,
     command_timeout: float = 1.0,
     mission_capacity: int = 16,
     odometry_translation_noise_stddev_m: float = 0.0,
     odometry_yaw_noise_stddev_rad: float = 0.0,
     odometry_seed: int = 0,
+    realtime_factor: float = DEFAULT_REALTIME_FACTOR,
 ) -> None:
     from websockets.asyncio.server import serve
 
@@ -1492,9 +1603,13 @@ async def main(
         timestamp=time.time(),
         linear_speed=linear_speed,
         angular_speed=angular_speed,
+        linear_acceleration_mps2=linear_acceleration_mps2,
+        linear_deceleration_mps2=linear_deceleration_mps2,
+        angular_acceleration_rps2=angular_acceleration_rps2,
         radius=radius,
         command_timeout=command_timeout,
         mission_capacity=mission_capacity,
+        realtime_factor=realtime_factor,
         odometry_config=OdometryConfig(
             odometry_translation_noise_stddev_m,
             odometry_yaw_noise_stddev_rad,
@@ -1541,6 +1656,7 @@ async def main(
                     for vehicle_id, node in fleet.nodes.items()
                     if node.map_sync is not None
                 },
+                realtime_factor=realtime_factor,
             )
             print(
                 f"libp2p map sync ready for {len(scenario.vehicles)} vehicle(s) "

@@ -6,6 +6,13 @@ import math
 from pathlib import Path
 import random
 
+from mockvehicle2d.server import DEFAULT_REALTIME_FACTOR
+from mockvehicle2d.vehicle import (
+    DEFAULT_ANGULAR_ACCELERATION_RPS2,
+    DEFAULT_LINEAR_ACCELERATION_MPS2,
+    DEFAULT_LINEAR_DECELERATION_MPS2,
+)
+
 
 def _positive_float(value: str) -> float:
     number = float(value)
@@ -74,6 +81,15 @@ def _coords_m(value: str) -> tuple[float, float]:
     return coordinates
 
 
+def _episode_goto(value: str) -> tuple[str, float, float]:
+    parts = value.split(",")
+    if len(parts) != 3:
+        raise argparse.ArgumentTypeError("goto must be VEHICLE_ID,X_M,Y_M")
+    vehicle_id = _vehicle_id(parts[0])
+    x_m, y_m = _coords_m(",".join(parts[1:]))
+    return vehicle_id, x_m, y_m
+
+
 def _cmd_serve(args) -> None:
     from mockvehicle2d.server import main as server_main
 
@@ -83,6 +99,9 @@ def _cmd_serve(args) -> None:
             vehicle_id=args.vehicle_id,
             linear_speed=args.linear_speed_mps,
             angular_speed=args.angular_speed_rps,
+            linear_acceleration_mps2=args.linear_acceleration_mps2,
+            linear_deceleration_mps2=args.linear_deceleration_mps2,
+            angular_acceleration_rps2=args.angular_acceleration_rps2,
             radius=args.vehicle_radius_m,
             command_timeout=args.command_timeout_s,
             mission_capacity=args.mission_capacity,
@@ -93,6 +112,7 @@ def _cmd_serve(args) -> None:
             odometry_translation_noise_stddev_m=args.odom_translation_noise_m,
             odometry_yaw_noise_stddev_rad=args.odom_yaw_noise_rad,
             odometry_seed=args.odom_seed,
+            realtime_factor=args.realtime_factor,
         )
     )
 
@@ -149,14 +169,51 @@ def _cmd_fleet(args) -> None:
             args.scenario,
             linear_speed=args.linear_speed_mps,
             angular_speed=args.angular_speed_rps,
+            linear_acceleration_mps2=args.linear_acceleration_mps2,
+            linear_deceleration_mps2=args.linear_deceleration_mps2,
+            angular_acceleration_rps2=args.angular_acceleration_rps2,
             radius=args.vehicle_radius_m,
             command_timeout=args.command_timeout_s,
             mission_capacity=args.mission_capacity,
             odometry_translation_noise_stddev_m=args.odom_translation_noise_m,
             odometry_yaw_noise_stddev_rad=args.odom_yaw_noise_rad,
             odometry_seed=args.odom_seed,
+            realtime_factor=args.realtime_factor,
         )
     )
+
+
+def _cmd_episode(args) -> None:
+    from mockvehicle2d.controller import GotoMission
+    from mockvehicle2d.episode import run_episode
+    from mockvehicle2d.fleet import FleetScenario
+    from mockvehicle2d.local_state import OdometryConfig
+
+    missions: dict[str, list[GotoMission]] = {}
+    for index, (vehicle_id, x_m, y_m) in enumerate(args.goto, 1):
+        missions.setdefault(vehicle_id, []).append(
+            GotoMission(
+                f"episode-goto-{index:04d}",
+                "global_map",
+                x_m,
+                y_m,
+                index,
+            )
+        )
+    result = run_episode(
+        FleetScenario.load(args.scenario),
+        missions,
+        max_simulation_s=args.max_simulation_s,
+        linear_speed=args.linear_speed_mps,
+        angular_speed=args.angular_speed_rps,
+        linear_acceleration_mps2=args.linear_acceleration_mps2,
+        linear_deceleration_mps2=args.linear_deceleration_mps2,
+        angular_acceleration_rps2=args.angular_acceleration_rps2,
+        radius=args.vehicle_radius_m,
+        command_timeout=args.command_timeout_s,
+        odometry_config=OdometryConfig(seed=args.odom_seed),
+    )
+    print(result.to_json())
 
 
 def main() -> None:
@@ -185,6 +242,24 @@ def main() -> None:
         type=_positive_float,
         default=math.pi / 2,
         metavar="RPS",
+    )
+    serve.add_argument(
+        "--linear-acceleration-mps2",
+        type=_positive_float,
+        default=DEFAULT_LINEAR_ACCELERATION_MPS2,
+        metavar="MPS2",
+    )
+    serve.add_argument(
+        "--linear-deceleration-mps2",
+        type=_positive_float,
+        default=DEFAULT_LINEAR_DECELERATION_MPS2,
+        metavar="MPS2",
+    )
+    serve.add_argument(
+        "--angular-acceleration-rps2",
+        type=_positive_float,
+        default=DEFAULT_ANGULAR_ACCELERATION_RPS2,
+        metavar="RPS2",
     )
     serve.add_argument(
         "--vehicle-radius-m",
@@ -226,6 +301,16 @@ def main() -> None:
         metavar="RAD",
     )
     serve.add_argument("--odom-seed", type=_integer, default=0, metavar="INTEGER")
+    serve.add_argument(
+        "--realtime-factor",
+        type=_positive_float,
+        default=DEFAULT_REALTIME_FACTOR,
+        metavar="FACTOR",
+        help=(
+            f"wall-clock acceleration (default: {DEFAULT_REALTIME_FACTOR:g}; "
+            "use 1 for realtime)"
+        ),
+    )
 
     fleet = subcommands.add_parser(
         "fleet",
@@ -243,6 +328,24 @@ def main() -> None:
         type=_positive_float,
         default=math.pi / 2,
         metavar="RPS",
+    )
+    fleet.add_argument(
+        "--linear-acceleration-mps2",
+        type=_positive_float,
+        default=DEFAULT_LINEAR_ACCELERATION_MPS2,
+        metavar="MPS2",
+    )
+    fleet.add_argument(
+        "--linear-deceleration-mps2",
+        type=_positive_float,
+        default=DEFAULT_LINEAR_DECELERATION_MPS2,
+        metavar="MPS2",
+    )
+    fleet.add_argument(
+        "--angular-acceleration-rps2",
+        type=_positive_float,
+        default=DEFAULT_ANGULAR_ACCELERATION_RPS2,
+        metavar="RPS2",
     )
     fleet.add_argument(
         "--vehicle-radius-m",
@@ -275,6 +378,78 @@ def main() -> None:
         metavar="RAD",
     )
     fleet.add_argument("--odom-seed", type=_integer, default=0, metavar="INTEGER")
+    fleet.add_argument(
+        "--realtime-factor",
+        type=_positive_float,
+        default=DEFAULT_REALTIME_FACTOR,
+        metavar="FACTOR",
+        help=(
+            f"wall-clock acceleration (default: {DEFAULT_REALTIME_FACTOR:g}; "
+            "use 1 for realtime)"
+        ),
+    )
+
+    episode = subcommands.add_parser(
+        "episode",
+        help="Run initial Goto missions headlessly on the fixed simulation clock",
+    )
+    episode.add_argument("--scenario", type=Path, required=True, metavar="JSON")
+    episode.add_argument(
+        "--max-simulation-s",
+        type=_positive_float,
+        required=True,
+        metavar="S",
+    )
+    episode.add_argument(
+        "--goto",
+        type=_episode_goto,
+        action="append",
+        required=True,
+        metavar="VEHICLE_ID,X_M,Y_M",
+    )
+    episode.add_argument(
+        "--linear-speed-mps",
+        type=_positive_float,
+        default=0.5,
+        metavar="MPS",
+    )
+    episode.add_argument(
+        "--angular-speed-rps",
+        type=_positive_float,
+        default=math.pi / 2,
+        metavar="RPS",
+    )
+    episode.add_argument(
+        "--linear-acceleration-mps2",
+        type=_positive_float,
+        default=DEFAULT_LINEAR_ACCELERATION_MPS2,
+        metavar="MPS2",
+    )
+    episode.add_argument(
+        "--linear-deceleration-mps2",
+        type=_positive_float,
+        default=DEFAULT_LINEAR_DECELERATION_MPS2,
+        metavar="MPS2",
+    )
+    episode.add_argument(
+        "--angular-acceleration-rps2",
+        type=_positive_float,
+        default=DEFAULT_ANGULAR_ACCELERATION_RPS2,
+        metavar="RPS2",
+    )
+    episode.add_argument(
+        "--vehicle-radius-m",
+        type=_positive_float,
+        default=0.5,
+        metavar="M",
+    )
+    episode.add_argument(
+        "--command-timeout-s",
+        type=_positive_float,
+        default=1.0,
+        metavar="S",
+    )
+    episode.add_argument("--odom-seed", type=_integer, default=0, metavar="INTEGER")
 
     pathfind = subcommands.add_parser(
         "pathfind",
@@ -304,6 +479,7 @@ def main() -> None:
     commands = {
         "serve": _cmd_serve,
         "fleet": _cmd_fleet,
+        "episode": _cmd_episode,
         "pathfind": _cmd_pathfind,
     }
     commands[args.command](args)

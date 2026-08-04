@@ -1,0 +1,18 @@
+{
+  "scenario_id": "two_vehicle_crossing_episode",
+  "tick_ms": 100,
+  "vehicles": [
+    {
+      "vehicle_id": "mock_vehicle_01",
+      "operator_port": 19090,
+      "spawn_id": "spawn_south_west",
+      "anchor_pose": {"x_m": 9.0, "y_m": 9.0, "yaw_rad": 0.7853981633974483}
+    },
+    {
+      "vehicle_id": "mock_vehicle_02",
+      "operator_port": 19091,
+      "spawn_id": "spawn_south_east",
+      "anchor_pose": {"x_m": 11.0, "y_m": 9.0, "yaw_rad": 2.356194490192345}
+    }
+  ]
+}

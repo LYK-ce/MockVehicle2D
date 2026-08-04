@@ -46,9 +46,13 @@ mockvehicle2d serve --vehicle-id mock_vehicle_01
 # 改端口，并配置任务队列、车辆和出生锚点
 mockvehicle2d serve \
   --port 9090 \
+  --realtime-factor 5 \
   --mission-capacity 16 \
   --linear-speed-mps 0.5 \
   --angular-speed-rps 1.5708 \
+  --linear-acceleration-mps2 1.0 \
+  --linear-deceleration-mps2 1.0 \
+  --angular-acceleration-rps2 3.1416 \
   --vehicle-radius-m 0.5 \
   --command-timeout-s 1.0 \
   --anchor-id car_01_anchor \
@@ -62,10 +66,55 @@ mockvehicle2d pathfind --start-m 10,10 --goal-m 200,200
 # 默认运行两车（19090～19091）；四车测试改用 examples/four_vehicle_scenario.json
 cargo build --bin map-sync-node
 mockvehicle2d fleet --scenario examples/two_vehicle_scenario.json
+
+# 不启动 Godot、WebSocket 或墙钟等待，按固定模拟 tick 执行一次实验
+mockvehicle2d episode \
+  --scenario examples/single_vehicle_episode.json \
+  --max-simulation-s 30 \
+  --goto mock_vehicle_01,11,10
+
+# P2P-disabled 双车交叉基准；当前有界动力学基线可确定性复现 no_path 阻断
+mockvehicle2d episode \
+  --scenario examples/two_vehicle_crossing_episode.json \
+  --max-simulation-s 30 \
+  --goto mock_vehicle_01,11,11 \
+  --goto mock_vehicle_02,9,11
 ```
 
-依赖安装在仓库本地 `.venv/`。公开接口统一使用 SI 单位：米、秒、弧度、米/秒和
-弧度/秒。
+依赖安装在仓库本地 `.venv/`。公开接口统一使用 SI 单位：米、秒、弧度、米/秒、
+弧度/秒、米/秒²和弧度/秒²。车辆区分控制器请求的 target velocity 与实际 executed
+velocity；默认线加速、线减速和角加速上限分别为 `1 m/s²`、`1 m/s²` 和 `π rad/s²`。
+普通 stop、watchdog 和 safety stop 将 target 置零并按上限制动，正反向切换先减到零；
+静态碰撞和多车同时仲裁拒绝候选轨迹时才立即钳制实际速度，以保持不穿透。
+
+`serve` 和 `fleet` 默认以 `--realtime-factor 5` 运行，即固定物理步长、传感器
+周期、控制阈值和 P2P 模拟时序不变，只把墙钟等待缩短为原来的五分之一；传入 `1`
+可恢复原来的实时速度。
+
+## Headless Episode Runner
+
+`episode` 复用 `FleetRuntime`、`RobotController` 和现有 Mission 语义，在调用线程中直接
+推进固定模拟 tick。它不读取墙钟、不打开 WebSocket，也不受 `serve/fleet` 的
+`realtime_factor` 影响。CLI 至少需要一个 `--goto VEHICLE_ID,X_M,Y_M`；可重复该参数为
+一辆或多辆车依次入队。任务达到全部完成或任一阻断后，Runner 继续按固定 tick 记录
+有界制动尾段，直到相关车辆的 target 和 executed velocity 都归零；制动仍受
+`--max-simulation-s` 限制。达到全部已提交任务并完成制动后成功结束，任务阻断或达到
+时限时失败结束。`episode` 与 `serve`/`fleet` 使用相同的速度、加减速、半径和 watchdog
+CLI 参数。
+
+标准输出是 schema version 2 的单行 canonical JSON，包含场景 ID、odometry seed、tick 数、
+模拟时长、终止原因，以及每辆车的仿真真值终态、按 tick 采样的路径长度、碰撞/阻断/
+安全终态和任务状态。顶层 `minimum_inter_vehicle_clearance_m` 从 `t=0` 开始，取所有固定
+tick、所有无序车辆对的最小圆形 footprint 边缘间距（中心距减去两车半径）；单车时为
+`null`，负值表示 footprint 已重叠。每车 `longest_no_progress_duration_s` 是连续固定 tick
+内真值中心每 tick 平移小于 1 mm 的最长模拟时长，原地转向和等待计入，恢复至少 1 mm
+平移后重新计数，episode 结束时尚未恢复的尾段也计入。真值只由评估层读取，不会进入
+自主控制链。Python 调用入口为
+`mockvehicle2d.episode.run_episode`，可直接传入现有 `GotoMission`、`PatrolMission` 或
+`CoverageMission`。
+
+初版 Runner 明确拒绝启用 P2P 的场景，因为真实 localhost libp2p 调度不属于确定性模拟
+时钟；确定性通信环境完成后再接入。Runner 当前也不包含定时事件或通信故障注入。
 
 ## 多车共享世界
 
@@ -151,8 +200,8 @@ Unix domain socket 交换有界 JSONL 消息，控制 tick 不等待该 socket�
 
 模式语义：
 
-- 模式切换先停车；重复切到当前模式是无副作用的幂等操作。
-- `mode/stop_motion` 在 Manual、Auto 或模式切换竞态中都立即停车；Auto 任务暂停并
+- 模式切换先请求制动；重复切到当前模式是无副作用的幂等操作。
+- `mode/stop_motion` 在 Manual、Auto 或模式切换竞态中都请求有界制动；Auto 任务暂停并
   保留，重复调用不产生重复事件。
 - 手动命令只在 `manual` 模式有效，自动命令只在 `auto` 模式有效。
 - 手动 `drive` 是有租约的连续速度设定值；客户端需在
@@ -167,7 +216,7 @@ Unix domain socket 交换有界 JSONL 消息，控制 tick 不等待该 socket�
 - Auto 已在执行时重复 `resume` 是无副作用操作，不会停车或重启规划。
 - `mission_id` 在 Server 进程生命周期内是永久幂等键。相同 ID 和完全相同任务定义的
   重试不会重复入队；相同 ID 携带不同定义会被拒绝。进程重启后该内存状态会清空。
-- 控制连接断开时车辆立即停车，自动任务暂停而不是丢弃；重连后可显式恢复。
+- 控制连接断开时车辆请求有界制动，自动任务暂停而不是丢弃；重连后可显式恢复。
 - 非法输入触发故障停车；活动自动任务进入暂停状态。
 
 每条合法命令先收到 `command_ack`。自动任务另外通过 `mission_update` 报告
@@ -202,6 +251,7 @@ odometry，并将 Tmini 扫描累计到车辆自己的
 ```text
 src/mockvehicle2d/
 ├── controller.py          # 模式、队列、任务生命周期和唯一控制权
+├── episode.py             # 固定 tick 的 headless 实验执行与结果
 ├── protocol.py            # WebSocket v4 严格 JSON 边界
 ├── server.py              # 独占连接、帧调度和遥测
 ├── fleet.py               # 1～4 车场景、共享物理世界和独立 endpoint

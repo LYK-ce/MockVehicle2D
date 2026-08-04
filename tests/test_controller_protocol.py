@@ -190,6 +190,38 @@ class TestControllerProtocol(unittest.TestCase):
 
         self.assertEqual(runtime.local_state.local_map.resolution_m, 0.5)
 
+    def test_realtime_factor_scales_time_without_changing_one_simulation_step(
+        self,
+    ) -> None:
+        def runtime(factor: float) -> VehicleRuntime:
+            return VehicleRuntime.create(
+                started_at=10.0,
+                timestamp=1_000.0,
+                anchor=AnchorSpec("factor-test", 10.0, 10.0, 0.0),
+                odometry_config=OdometryConfig(),
+                realtime_factor=factor,
+            )
+
+        normal = runtime(1.0)
+        fast = runtime(3.0)
+        command = ManualCommand(1, ManualAction.DRIVE, 0.5, 0.0)
+        normal.handle_command(command, monotonic_now=10.1)
+        fast_now = fast.simulation_now(10.0 + 0.1 / 3.0)
+        fast.handle_command(command, monotonic_now=fast_now)
+        normal.update(10.2, normal.timestamp_at(10.2))
+        fast.update(fast_now + 0.1, fast.timestamp_at(fast_now + 0.1))
+
+        self.assertAlmostEqual(fast_now, 10.1)
+        self.assertAlmostEqual(fast.timestamp_at(fast_now), 1_000.1)
+        self.assertEqual(fast.vehicle.linear_speed, normal.vehicle.linear_speed)
+        self.assertAlmostEqual(fast.vehicle.x, normal.vehicle.x)
+        self.assertAlmostEqual(fast.vehicle.y, normal.vehicle.y)
+        self.assertAlmostEqual(fast.vehicle.yaw, normal.vehicle.yaw)
+
+        for factor in (0.0, -1.0, math.inf, math.nan):
+            with self.subTest(factor=factor), self.assertRaises(ValueError):
+                runtime(factor)
+
     def test_parses_only_the_three_command_families(self) -> None:
         self.assertEqual(
             parse('{"type":"mode","seq":1,"action":"switch_to_auto"}'),
@@ -504,6 +536,7 @@ class TestControllerProtocol(unittest.TestCase):
         asyncio.run(
             handler(
                 socket,
+                realtime_factor=3.0,
                 _monotonic=clock.monotonic,
                 _wall_time=clock.monotonic,
             )
@@ -527,6 +560,7 @@ class TestControllerProtocol(unittest.TestCase):
             ["hello", "pose", "scan", "command_ack"],
         )
         self.assertEqual(hello["protocol_version"], 4)
+        self.assertEqual(hello["realtime_factor"], 3.0)
         self.assertEqual(hello["mission_types"], ["goto", "patrol", "coverage"])
         self.assertEqual(hello["controller"]["mode"], "manual")
         event_info = hello["controller"]["mission_events"]
@@ -538,6 +572,7 @@ class TestControllerProtocol(unittest.TestCase):
             (scan["seq"], scan["timestamp_s"]),
         )
         self.assertTrue(ack["accepted"])
+        self.assertEqual(ack["timestamp_s"], pose["timestamp_s"])
         self.assertEqual(ack["controller"]["mode"], "auto")
 
     def test_handler_rejects_old_goto_and_fails_safe(self) -> None:
@@ -600,7 +635,7 @@ class TestControllerProtocol(unittest.TestCase):
             )
             error = socket.messages[-1]
             self.assertEqual(error["code"], "vehicle_busy")
-            self.assertEqual(error["timestamp_s"], 20.0)
+            self.assertEqual(error["timestamp_s"], 10.0)
             self.assertEqual(runtime.controller.snapshot(), before)
             self.assertTrue(runtime.controller_lease.locked())
             runtime.controller_lease.release()

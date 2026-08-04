@@ -536,14 +536,16 @@ def case_manual_setpoint_refreshes_watchdog_then_expires_without_resume() -> Non
     harness = Harness(command_timeout=0.5)
     result = harness.manual(1, ManualAction.DRIVE, 0.2, 0.1)
     assert result.accepted
-    assert harness.vehicle.body_velocities() == (0.2, 0.1)
+    assert harness.vehicle.target_velocities() == (0.2, 0.1)
+    assert harness.vehicle.body_velocities() == (0.0, 0.0)
 
     harness.tick(0.25)
     assert harness.vehicle.body_velocities() == (0.2, 0.1)
     assert math.isclose(harness.vehicle.command_deadline, 0.75)
 
     harness.tick(0.5)
-    assert harness.vehicle.body_velocities() == (0.0, 0.0)
+    assert harness.vehicle.target_velocities() == (0.0, 0.0)
+    assert harness.vehicle.body_velocities() == (0.2, 0.1)
     harness.tick(1.0)
     assert harness.vehicle.body_velocities() == (0.0, 0.0)
 
@@ -570,7 +572,8 @@ def case_manual_and_auto_are_both_gated_by_safety() -> None:
     manual_turn.vehicle.x = 10.3
     limited = manual_turn.manual(4, ManualAction.DRIVE, 0.5, -0.3)
     assert limited.accepted
-    assert manual_turn.vehicle.body_velocities() == (0.0, -0.3)
+    assert manual_turn.vehicle.target_velocities() == (0.0, -0.3)
+    assert manual_turn.vehicle.body_velocities() == (0.0, 0.0)
 
 
 def case_automatic_safety_stop_finishes_nearby_or_blocks() -> None:
@@ -668,11 +671,15 @@ def case_disconnect_pauses_auto_and_stops_manual() -> None:
 def case_stop_motion_is_global_task_preserving_and_idempotent() -> None:
     harness = Harness(capacity=3)
     harness.manual(1, ManualAction.DRIVE, 0.2, 0.1)
+    harness.tick(0.25)
 
     assert harness.mode(2, ModeAction.STOP_MOTION).accepted
     assert harness.controller.mode is OpMode.MANUAL
-    assert harness.vehicle.body_velocities() == (0.0, 0.0)
+    assert harness.vehicle.target_velocities() == (0.0, 0.0)
+    assert harness.vehicle.body_velocities() == (0.2, 0.1)
     assert not harness.controller.snapshot()["manual_setpoint_active"]
+    harness.tick(0.5)
+    assert harness.vehicle.body_velocities() == (0.0, 0.0)
     assert harness.mode(3, ModeAction.STOP_MOTION).accepted
     assert harness.events() == ()
 
@@ -682,7 +689,7 @@ def case_stop_motion_is_global_task_preserving_and_idempotent() -> None:
         AutoAction.PUSH,
         (mission("active", 14.0), mission("queued", 18.0)),
     )
-    harness.tick(0.0)
+    harness.tick(0.5)
     harness.events()
 
     assert harness.mode(6, ModeAction.STOP_MOTION).accepted

@@ -9,8 +9,9 @@
 | 命令格式 | UTF-8 JSON 文本对象 |
 | 协议版本 | `4` |
 | 控制权 | 每辆车同时只有一个独占连接 |
-| 单位 | m、s、rad、m/s、rad/s |
+| 单位 | m、s、rad、m/s、rad/s、m/s²、rad/s² |
 | 任务坐标系 | `global_map` |
+| 默认时间倍率 | `5.0`（`--realtime-factor 1` 恢复实时） |
 
 多车模式保持同一个 v4 协议，每辆车使用独立 endpoint。示例四车场景监听
 `19090`～`19093`；一个 endpoint 的连接、命令序号和独占租约不会影响其他车辆。
@@ -46,9 +47,9 @@ Client ◄──── mission_update ───── Vehicle  （有状态变�
 }
 ```
 
-断开会立即停车并释放租约。odometry、本地地图、活动任务和待执行队列保留；有未完成
-任务时自动状态变为 `paused`。重连后由 `hello.controller` 恢复当前状态，随后 Server
-按 `event_seq` 重放本进程保留的全部任务事件，再显式 `resume`。
+断开会立即请求有界制动并释放租约。odometry、本地地图、活动任务和待执行队列保留；
+有未完成任务时自动状态变为 `paused`。重连后由 `hello.controller` 恢复当前状态，
+随后 Server 按 `event_seq` 重放本进程保留的全部任务事件，再显式 `resume`。
 
 ## 下行命令
 
@@ -60,14 +61,14 @@ Client ◄──── mission_update ───── Vehicle  （有状态变�
 {"type":"mode","seq":3,"action":"stop_motion"}
 ```
 
-模式命令不受当前模式限制。实际切换先停车；重复切到当前模式是幂等操作。
+模式命令不受当前模式限制。实际切换先请求有界制动；重复切到当前模式是幂等操作。
 Auto → Manual 暂停并保留任务。Manual → Auto 若有保留任务仍停在 `paused`，需要
 `auto/resume`。
 
 `stop_motion` 是模式无关的安全停车入口：
 
-- 在 Manual 中立即停车并清除手动速度租约，模式仍为 Manual；
-- 在 Auto 中立即停车，活动任务和队列保留，状态变为 `paused`；
+- 在 Manual 中立即请求有界制动并清除手动速度租约，模式仍为 Manual；
+- 在 Auto 中立即请求有界制动，活动任务和队列保留，状态变为 `paused`；
 - 在 Auto Idle 中保持 Idle；
 - 重复调用不重复发布 paused 事件。
 
@@ -259,7 +260,7 @@ Auto → Manual 暂停并保留任务。Manual → Auto 若有保留任务仍停
 和 `cancelled` 保留事件发生时的子目标进度。
 
 当前 simulator 为便于验证可靠性，保留本进程的全部任务事件；进程重启后 ledger 和
-序号都会清空。`timestamp_s` 是本次发送时间，重放时可能变化，事件身份只能使用
+序号都会清空。`timestamp_s` 是本次发送对应的模拟时间，重放时可能变化，事件身份只能使用
 `(event_epoch, event_seq)`。
 
 状态及触发：
@@ -301,6 +302,7 @@ Auto → Manual 暂停并保留任务。Manual → Auto 若有保留任务仍停
   "control_lease": "exclusive",
   "mission_frame_id": "global_map",
   "mission_types": ["goto", "patrol", "coverage"],
+  "realtime_factor": 5.0,
   "birth_anchor": {
     "anchor_id": "spawn_north_west",
     "x_m": 9.0,
@@ -338,7 +340,10 @@ Auto → Manual 暂停并保留任务。Manual → Auto 若有保留任务仍停
 }
 ```
 
-`map.source=simulator_ground_truth` 表示调试真值，不能作为自动规划输入。
+`realtime_factor` 表示一秒墙钟时间内推进的模拟秒数。倍率只改变墙钟节拍；所有消息的
+`timestamp_s` 共用同一模拟 epoch，物理量、控制/传感器周期、命令超时与 P2P 100 ms
+发布周期仍按模拟时间计算。`map.source=simulator_ground_truth` 表示调试真值，不能作为
+自动规划输入。
 
 ### 二进制地图 chunk
 
@@ -500,7 +505,7 @@ Forbidden 证据。
 }
 ```
 
-协议错误会先触发故障停车；若自动任务存在，会额外收到 `paused` 事件，原因为
+协议错误会先触发故障制动；若自动任务存在，会额外收到 `paused` 事件，原因为
 `invalid_command`。常见 code：
 
 ```text

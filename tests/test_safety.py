@@ -215,6 +215,9 @@ class SafetyGovernorTest(unittest.TestCase):
         self.assertEqual(result.reason, "safety_obstacle")
         self.assertEqual(vehicle.x, 2.3)
         self.assertGreater(vehicle.yaw, 0.0)
+        self.assertEqual(vehicle.target_velocities(), (0.0, 0.0))
+        self.assertGreater(vehicle.body_velocities()[1], 0.0)
+        LocalSafetyRuntime().advance(vehicle, grid, 0.2, automatic=True)
         self.assertEqual(vehicle.body_velocities(), (0.0, 0.0))
 
     def test_exact_hard_clearance_preserves_allowed_rotation(self) -> None:
@@ -233,7 +236,195 @@ class SafetyGovernorTest(unittest.TestCase):
         self.assertEqual(result.reason, "safety_obstacle")
         self.assertEqual(vehicle.x, 2.25)
         self.assertGreater(vehicle.yaw, 0.0)
+        self.assertEqual(vehicle.target_velocities(), (0.0, 0.0))
+        self.assertGreater(vehicle.body_velocities()[1], 0.0)
+
+    def test_stop_with_residual_speed_keeps_zero_target_until_braked(self) -> None:
+        grid = MapGrid.from_wall_set(8, 8, set())
+        vehicle = Vehicle(2.0, 4.0, command_timeout=5.0, now=0.0)
+        safety = LocalSafetyRuntime()
+        vehicle.install_drive(0.5, 0.0, 0.0)
+        safety.advance(vehicle, grid, 0.5, automatic=False)
+        self.assertEqual(vehicle.body_velocities(), (0.5, 0.0))
+
+        stopped_at = vehicle.x
+        vehicle.stop()
+        safety.advance(vehicle, grid, 1.0, automatic=False)
+
+        self.assertEqual(vehicle.target_velocities(), (0.0, 0.0))
         self.assertEqual(vehicle.body_velocities(), (0.0, 0.0))
+        self.assertAlmostEqual(vehicle.x - stopped_at, 0.125)
+
+    def test_safety_stop_uses_bounded_braking_without_reaching_the_wall(self) -> None:
+        free = MapGrid.from_wall_set(12, 8, set())
+        blocked = MapGrid.from_wall_set(12, 8, {(3, y) for y in range(8)})
+        vehicle = Vehicle(2.0, 4.0, command_timeout=5.0, now=0.0)
+        safety = LocalSafetyRuntime()
+        vehicle.install_drive(0.5, 0.0, 0.0)
+        safety.advance(vehicle, free, 0.5, automatic=False)
+
+        result = safety.advance(vehicle, blocked, 2.0, automatic=False)
+
+        self.assertTrue(result.stopped)
+        self.assertFalse(result.collided)
+        self.assertEqual(vehicle.target_velocities(), (0.0, 0.0))
+        self.assertEqual(vehicle.body_velocities(), (0.0, 0.0))
+        self.assertLess(vehicle.x + vehicle.radius, 3.0)
+
+    def test_high_speed_uses_dynamic_braking_clearance_before_the_wall(self) -> None:
+        grid = MapGrid.from_wall_set(10, 8, {(5, y) for y in range(8)})
+        vehicle = Vehicle(
+            2.0,
+            4.0,
+            linear_speed=1.0,
+            linear_deceleration_mps2=1.0,
+            command_timeout=5.0,
+            now=0.0,
+        )
+        safety = LocalSafetyRuntime()
+        vehicle.install_drive(1.0, 0.0, 0.0)
+
+        result = safety.advance(vehicle, grid, 4.0, automatic=False)
+
+        self.assertTrue(result.stopped)
+        self.assertFalse(result.collided)
+        self.assertFalse(vehicle.collision)
+        self.assertEqual(vehicle.body_velocities(), (0.0, 0.0))
+        self.assertLessEqual(
+            vehicle.x + vehicle.radius,
+            5.0 - HARD_STOP_CLEARANCE_M,
+        )
+
+    def test_high_speed_uses_dynamic_braking_clearance_before_an_edge(self) -> None:
+        grid = MapGrid.from_wall_set(8, 8, set())
+        vehicle = Vehicle(
+            2.0,
+            4.0,
+            math.pi,
+            linear_speed=1.0,
+            linear_deceleration_mps2=1.0,
+            command_timeout=5.0,
+            now=0.0,
+        )
+        safety = LocalSafetyRuntime()
+        vehicle.install_drive(1.0, 0.0, 0.0)
+
+        result = safety.advance(vehicle, grid, 4.0, automatic=False)
+
+        self.assertTrue(result.stopped)
+        self.assertFalse(result.collided)
+        self.assertFalse(vehicle.collision)
+        self.assertEqual(vehicle.body_velocities(), (0.0, 0.0))
+        self.assertGreaterEqual(
+            vehicle.x - vehicle.radius,
+            HARD_STOP_CLEARANCE_M,
+        )
+
+    def test_fault_propagates_collision_during_bounded_braking(self) -> None:
+        free = MapGrid.from_wall_set(8, 8, set())
+        blocked = MapGrid.from_wall_set(8, 8, {(4, y) for y in range(8)})
+        vehicle = Vehicle(
+            2.7,
+            4.0,
+            linear_speed=1.0,
+            linear_deceleration_mps2=1.0,
+            command_timeout=5.0,
+            now=0.0,
+        )
+        vehicle.install_drive(1.0, 0.0, 0.0)
+        vehicle.advance(free, 1.0)
+
+        result = LocalSafetyRuntime(healthy=False).advance(
+            vehicle,
+            blocked,
+            2.0,
+            automatic=False,
+        )
+
+        self.assertTrue(result.stopped)
+        self.assertTrue(result.collided)
+        self.assertTrue(vehicle.collision)
+
+    def test_safety_stop_propagates_collision_during_bounded_braking(self) -> None:
+        free = MapGrid.from_wall_set(8, 8, set())
+        blocked = MapGrid.from_wall_set(8, 8, {(4, y) for y in range(8)})
+        vehicle = Vehicle(
+            2.7,
+            4.0,
+            linear_speed=1.0,
+            linear_deceleration_mps2=1.0,
+            command_timeout=5.0,
+            now=0.0,
+        )
+        vehicle.install_drive(1.0, 0.0, 0.0)
+        vehicle.advance(free, 1.0)
+
+        result = LocalSafetyRuntime().advance(
+            vehicle,
+            blocked,
+            2.0,
+            automatic=False,
+        )
+
+        self.assertTrue(result.stopped)
+        self.assertTrue(result.collided)
+        self.assertTrue(vehicle.collision)
+
+    def test_zero_target_residual_collision_is_reported(self) -> None:
+        free = MapGrid.from_wall_set(8, 8, set())
+        blocked = MapGrid.from_wall_set(8, 8, {(4, y) for y in range(8)})
+        vehicle = Vehicle(
+            2.7,
+            4.0,
+            linear_speed=1.0,
+            linear_deceleration_mps2=1.0,
+            command_timeout=5.0,
+            now=0.0,
+        )
+        vehicle.install_drive(1.0, 0.0, 0.0)
+        vehicle.advance(free, 1.0)
+        vehicle.stop()
+
+        result = LocalSafetyRuntime().advance(
+            vehicle,
+            blocked,
+            2.0,
+            automatic=False,
+        )
+
+        self.assertEqual(vehicle.target_velocities(), (0.0, 0.0))
+        self.assertTrue(result.collided)
+        self.assertTrue(vehicle.collision)
+
+    def test_reversal_retains_target_after_braking_through_zero(self) -> None:
+        grid = MapGrid.from_wall_set(20, 20, set())
+        vehicle = Vehicle(5.0, 5.0, command_timeout=5.0, now=0.0)
+        safety = LocalSafetyRuntime()
+        vehicle.install_drive(0.5, 0.0, 0.0)
+        safety.advance(vehicle, grid, 0.5, automatic=False)
+        vehicle.install_drive(-0.5, 0.0, 0.5)
+
+        safety.advance(vehicle, grid, 2.0, automatic=False)
+
+        self.assertEqual(vehicle.target_velocities(), (-0.5, 0.0))
+        self.assertLess(vehicle.body_velocities()[0], 0.0)
+
+    def test_limited_safety_step_does_not_replace_the_requested_target(self) -> None:
+        grid = MapGrid.from_wall_set(10, 8, {(5, y) for y in range(8)})
+        vehicle = Vehicle(3.75, 4.0, command_timeout=5.0, now=0.0)
+        safety = LocalSafetyRuntime()
+        vehicle.install_drive(0.5, 0.0, 0.0)
+
+        plan = safety.prepare_advance(vehicle, grid, 0.1, automatic=True)
+        self.assertIsNotNone(plan.limited_velocities)
+        self.assertLess(plan.limited_velocities[0], 0.5)
+        vehicle.advance(
+            grid,
+            plan.until,
+            limited_velocities=plan.limited_velocities,
+        )
+
+        self.assertEqual(vehicle.target_velocities(), (0.5, 0.0))
 
 
 def main() -> int:

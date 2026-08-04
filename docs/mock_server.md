@@ -35,10 +35,11 @@ RobotController
 | `navigation.py` | 根据局部状态生成自动期望速度 | 直接修改车辆 |
 | `safety.py` | 手动/自动安全门控、故障停车、安全推进 | 任务队列 |
 | `server.py` | 独占连接、帧调度、遥测和事件发送 | 自主决策 |
-| `vehicle.py` | 运动学、执行器设定值、看门狗 | 任务和协议 |
+| `vehicle.py` | 有界加减速、运动学、执行器设定值、看门狗 | 任务和协议 |
 
-安全运行时和碰撞检查可以直接停车，因为它们是控制器之外的独立故障保护；除此之外，
-业务路径不得绕过 `RobotController` 安装运动设定值。
+普通安全停车与看门狗同样只请求有界制动。静态碰撞和多车同时仲裁可以立即钳制实际
+速度，因为它们必须拒绝已判定不安全的物理候选轨迹；除此之外，业务路径不得绕过
+`RobotController` 安装运动设定值。
 
 ## 状态模型
 
@@ -64,13 +65,23 @@ AutoState
 |------|------|
 | Manual → Auto（无任务） | `Auto/Idle` |
 | Manual → Auto（有保留任务） | `Auto/Paused`，需 `resume` |
-| Auto → Manual | 先停车，活动任务转为 paused，队列保留 |
+| Auto → Manual | 先请求制动，活动任务转为 paused，队列保留 |
 | 重复切换到当前模式 | 幂等，无额外停车和事件 |
-| 任意模式 → `stop_motion` | 立即停车并清除手动租约；Auto 任务暂停保留 |
-| 控制连接断开 | 停车；自动任务暂停；释放独占连接 |
-| 非法协议输入 | 停车；自动任务暂停，原因 `invalid_command` |
+| 任意模式 → `stop_motion` | 请求有界制动并清除手动租约；Auto 任务暂停保留 |
+| 控制连接断开 | 请求有界制动；自动任务暂停；释放独占连接 |
+| 非法协议输入 | 请求有界制动；自动任务暂停，原因 `invalid_command` |
 
 在 `Auto/Idle` 且没有活动或排队任务时，`pause` 保持 Idle，不产生虚假的预暂停状态。
+
+`Vehicle` 分开保存 target 和 executed linear/angular velocity。每次物理推进用配置的
+`1 m/s²` 线加速、`1 m/s²` 线减速和 `π rad/s²` 角加速上限逼近 target；反向命令先制动
+到零再向相反方向加速。遥测速度和 P2P 车辆状态报告 executed velocity，WebSocket 速度
+命令仍表示 target，不改变 v4 JSON schema。realtime factor 只缩短墙钟等待，不参与该
+动力学计算。
+
+每个安全物理小步的停车净空至少包含固定 `0.25 m` 余量、当前小步位移上界和按配置线
+减速度计算的 `v²/(2a)` 制动距离。正反向切换或 target 已归零但车辆仍在制动时，风险
+感知继续使用 executed velocity 的实际运动方向；`serve` 与 `fleet` 复用同一准备逻辑。
 
 ## 一帧的执行顺序
 
@@ -87,6 +98,10 @@ Server 以 Tmini 名义扫描周期（约 6 Hz）执行：
 
 命令到达时，Runtime 先把旧设定值安全推进到接收时刻，再执行命令。这样命令处理和遥测
 都不会倒退模拟时间。
+
+`--realtime-factor` 只缩放上述循环的墙钟等待，默认值为 `5`。线/角速度、100 ms fleet
+tick、Tmini 扫描周期、命令超时和安全阈值仍以模拟秒及 SI 单位计算；传入 `1` 可按实时
+速度运行。
 
 ## 手动控制
 
@@ -148,9 +163,13 @@ SafetyObservation
 mockvehicle2d serve \
   --port 19090 \
   --vehicle-id mock_vehicle_01 \
+  --realtime-factor 5 \
   --mission-capacity 16 \
   --linear-speed-mps 0.5 \
   --angular-speed-rps 1.5708 \
+  --linear-acceleration-mps2 1.0 \
+  --linear-deceleration-mps2 1.0 \
+  --angular-acceleration-rps2 3.1416 \
   --vehicle-radius-m 0.5 \
   --command-timeout-s 1.0
 ```
