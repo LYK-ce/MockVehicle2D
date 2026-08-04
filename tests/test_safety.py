@@ -215,6 +215,9 @@ class SafetyGovernorTest(unittest.TestCase):
         self.assertEqual(result.reason, "safety_obstacle")
         self.assertEqual(vehicle.x, 2.3)
         self.assertGreater(vehicle.yaw, 0.0)
+        self.assertEqual(vehicle.target_velocities(), (0.0, 0.0))
+        self.assertGreater(vehicle.body_velocities()[1], 0.0)
+        LocalSafetyRuntime().advance(vehicle, grid, 0.2, automatic=True)
         self.assertEqual(vehicle.body_velocities(), (0.0, 0.0))
 
     def test_exact_hard_clearance_preserves_allowed_rotation(self) -> None:
@@ -233,7 +236,40 @@ class SafetyGovernorTest(unittest.TestCase):
         self.assertEqual(result.reason, "safety_obstacle")
         self.assertEqual(vehicle.x, 2.25)
         self.assertGreater(vehicle.yaw, 0.0)
+        self.assertEqual(vehicle.target_velocities(), (0.0, 0.0))
+        self.assertGreater(vehicle.body_velocities()[1], 0.0)
+
+    def test_stop_with_residual_speed_keeps_zero_target_until_braked(self) -> None:
+        grid = MapGrid.from_wall_set(8, 8, set())
+        vehicle = Vehicle(2.0, 4.0, command_timeout=5.0, now=0.0)
+        safety = LocalSafetyRuntime()
+        vehicle.install_drive(0.5, 0.0, 0.0)
+        safety.advance(vehicle, grid, 0.5, automatic=False)
+        self.assertEqual(vehicle.body_velocities(), (0.5, 0.0))
+
+        stopped_at = vehicle.x
+        vehicle.stop()
+        safety.advance(vehicle, grid, 1.0, automatic=False)
+
+        self.assertEqual(vehicle.target_velocities(), (0.0, 0.0))
         self.assertEqual(vehicle.body_velocities(), (0.0, 0.0))
+        self.assertAlmostEqual(vehicle.x - stopped_at, 0.125)
+
+    def test_safety_stop_uses_bounded_braking_without_reaching_the_wall(self) -> None:
+        free = MapGrid.from_wall_set(12, 8, set())
+        blocked = MapGrid.from_wall_set(12, 8, {(3, y) for y in range(8)})
+        vehicle = Vehicle(2.0, 4.0, command_timeout=5.0, now=0.0)
+        safety = LocalSafetyRuntime()
+        vehicle.install_drive(0.5, 0.0, 0.0)
+        safety.advance(vehicle, free, 0.5, automatic=False)
+
+        result = safety.advance(vehicle, blocked, 2.0, automatic=False)
+
+        self.assertTrue(result.stopped)
+        self.assertFalse(result.collided)
+        self.assertEqual(vehicle.target_velocities(), (0.0, 0.0))
+        self.assertEqual(vehicle.body_velocities(), (0.0, 0.0))
+        self.assertLess(vehicle.x + vehicle.radius, 3.0)
 
 
 def main() -> int:

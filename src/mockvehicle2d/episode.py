@@ -20,6 +20,11 @@ from mockvehicle2d.controller import (
 from mockvehicle2d.fleet import FleetRuntime, FleetScenario
 from mockvehicle2d.local_state import OdometryConfig
 from mockvehicle2d.map_grid import MapGrid
+from mockvehicle2d.vehicle import (
+    DEFAULT_ANGULAR_ACCELERATION_RPS2,
+    DEFAULT_LINEAR_ACCELERATION_MPS2,
+    DEFAULT_LINEAR_DECELERATION_MPS2,
+)
 
 
 RESULT_SCHEMA_VERSION = 2
@@ -72,6 +77,9 @@ def run_episode(
     voxels: list[dict[str, object]] | None = None,
     linear_speed: float = 0.5,
     angular_speed: float = math.pi / 2,
+    linear_acceleration_mps2: float = DEFAULT_LINEAR_ACCELERATION_MPS2,
+    linear_deceleration_mps2: float = DEFAULT_LINEAR_DECELERATION_MPS2,
+    angular_acceleration_rps2: float = DEFAULT_ANGULAR_ACCELERATION_RPS2,
     radius: float = 0.5,
     command_timeout: float = 1.0,
     mission_capacity: int = 16,
@@ -128,6 +136,9 @@ def run_episode(
         voxels=voxels,
         linear_speed=linear_speed,
         angular_speed=angular_speed,
+        linear_acceleration_mps2=linear_acceleration_mps2,
+        linear_deceleration_mps2=linear_deceleration_mps2,
+        angular_acceleration_rps2=angular_acceleration_rps2,
         radius=radius,
         command_timeout=command_timeout,
         mission_capacity=mission_capacity,
@@ -161,17 +172,41 @@ def run_episode(
     collisions = {vehicle_id: False for vehicle_id in previous_poses}
     safety_stops = {vehicle_id: False for vehicle_id in previous_poses}
     tick_count = 0
-    termination_reason = "timeout"
+    termination_reason: str | None = None
+    terminal_statuses: dict[tuple[str, str], str] | None = None
 
     while True:
         statuses = _mission_statuses(fleet, missions)
-        if all(status == "reached" for status in statuses.values()):
+        if termination_reason is None and all(
+            status == "reached" for status in statuses.values()
+        ):
             termination_reason = "completed"
-            break
-        if any(status == "blocked" for status in statuses.values()):
+            terminal_statuses = statuses
+        elif termination_reason is None and any(
+            status == "blocked" for status in statuses.values()
+        ):
             termination_reason = "blocked"
+            terminal_statuses = statuses
+            for vehicle_id in sorted(missions):
+                if (
+                    missions[vehicle_id]
+                    and fleet.nodes[vehicle_id].controller.auto_state.value == "active"
+                ):
+                    fleet.handle_command(
+                        vehicle_id,
+                        ModeCommand(3, ModeAction.STOP_MOTION),
+                    )
+        if termination_reason is not None and _vehicles_stopped(
+            fleet,
+            tuple(
+                vehicle_id
+                for vehicle_id, vehicle_missions in missions.items()
+                if vehicle_missions
+            ),
+        ):
             break
         if (tick_count + 1) * fleet.tick_s > max_simulation_s + 1e-12:
+            termination_reason = "timeout"
             break
 
         fleet.tick(fleet.timestamp_at(fleet.world.now + fleet.tick_s))
@@ -205,7 +240,8 @@ def run_episode(
             minimum_clearance = min(minimum_clearance, current_clearance)
         previous_poses = current_poses
 
-    statuses = _mission_statuses(fleet, missions)
+    assert termination_reason is not None
+    statuses = terminal_statuses or _mission_statuses(fleet, missions)
     vehicle_results = []
     for vehicle_id in sorted(fleet.nodes):
         node = fleet.nodes[vehicle_id]
@@ -277,6 +313,17 @@ def _mission_statuses(
             if key in statuses:
                 statuses[key] = event.status
     return statuses
+
+
+def _vehicles_stopped(
+    fleet: FleetRuntime,
+    vehicle_ids: Sequence[str],
+) -> bool:
+    return all(
+        fleet.world.vehicle(vehicle_id).target_velocities() == (0.0, 0.0)
+        and fleet.world.vehicle(vehicle_id).body_velocities() == (0.0, 0.0)
+        for vehicle_id in vehicle_ids
+    )
 
 
 def _stable_float(value: float) -> float:

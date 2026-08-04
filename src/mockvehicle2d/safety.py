@@ -260,7 +260,13 @@ class LocalSafetyRuntime:
         motion_until = min(now, deadline) if deadline is not None else now
         steps = 0
         while vehicle.last_update < motion_until:
-            linear_mps, angular_rps = vehicle.body_velocities()
+            executed_linear, executed_angular = vehicle.body_velocities()
+            target_linear, target_angular = vehicle.target_velocities()
+            if vehicle.command == "stop":
+                collided = vehicle.advance(grid, now)
+                return SafetyAdvanceResult(collided=collided)
+            linear_mps = executed_linear or target_linear
+            angular_rps = executed_angular or target_angular
             if linear_mps == 0:
                 if angular_rps:
                     decision = self.evaluate(vehicle, grid, 0.0, angular_rps, automatic=automatic)
@@ -271,13 +277,27 @@ class LocalSafetyRuntime:
                 collided = vehicle.advance(grid, now)
                 return SafetyAdvanceResult(collided=collided)
 
+            requested_linear = (
+                target_linear
+                if executed_linear * target_linear >= 0
+                else 0.0
+            )
+            requested_angular = (
+                target_angular
+                if executed_angular * target_angular >= 0
+                else 0.0
+            )
             policy_linear_mps = (
                 math.copysign(vehicle.linear_speed, linear_mps)
                 if automatic
-                else linear_mps
+                else requested_linear or linear_mps
             )
             decision = self.evaluate(
-                vehicle, grid, policy_linear_mps, angular_rps, automatic=automatic
+                vehicle,
+                grid,
+                policy_linear_mps,
+                requested_angular or angular_rps,
+                automatic=automatic,
             )
             if decision.state == "fault":
                 vehicle.stop()
@@ -292,10 +312,13 @@ class LocalSafetyRuntime:
                 vehicle.stop()
                 return SafetyAdvanceResult(stopped=True, reason=decision.reason)
             effective_linear = math.copysign(
-                min(abs(linear_mps), abs(decision.linear_mps)),
-                linear_mps,
+                min(abs(requested_linear), abs(decision.linear_mps)),
+                requested_linear,
             )
-            effective_angular = decision.angular_rps
+            effective_angular = math.copysign(
+                min(abs(requested_angular), abs(decision.angular_rps)),
+                requested_angular,
+            )
 
             nearest = min(
                 (
@@ -324,9 +347,11 @@ class LocalSafetyRuntime:
 
             step_time = min(
                 motion_until - vehicle.last_update,
-                step_distance / abs(effective_linear),
-                MAX_ROTATION_STEP_RAD / abs(effective_angular)
-                if effective_angular
+                step_distance
+                / max(abs(executed_linear), abs(effective_linear)),
+                MAX_ROTATION_STEP_RAD
+                / max(abs(executed_angular), abs(effective_angular))
+                if executed_angular or effective_angular
                 else math.inf,
             )
             next_update = vehicle.last_update + step_time

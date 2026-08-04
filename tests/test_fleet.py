@@ -542,6 +542,30 @@ class TestFleetRuntime(unittest.TestCase):
                 }
             )
 
+        self.assertTrue(
+            all(
+                fleet.world.vehicle(vehicle_id).target_velocities() == (0.0, 0.0)
+                for vehicle_id in fleet.nodes
+            )
+        )
+        for drain_tick in range(10):
+            if all(
+                fleet.world.vehicle(vehicle_id).body_velocities() == (0.0, 0.0)
+                for vehicle_id in fleet.nodes
+            ):
+                break
+            fleet.tick((tick + drain_tick + 2) * fleet.tick_s)
+            first = fleet.world.vehicle("vehicle_1")
+            second = fleet.world.vehicle("vehicle_2")
+            minimum_separation = min(
+                minimum_separation,
+                math.hypot(first.x - second.x, first.y - second.y),
+            )
+            self.assertFalse(first.collision)
+            self.assertFalse(second.collision)
+        else:
+            self.fail("terminal fleet did not finish braking")
+
         front = fleet.world.vehicle("vehicle_1")
         trailing = fleet.world.vehicle("vehicle_2")
         self.assertLessEqual(math.dist((front.x, front.y), goal), 0.11)
@@ -627,6 +651,24 @@ class TestFleetRuntime(unittest.TestCase):
                 break
         else:
             self.fail(fleet.nodes[follower_id].controller.snapshot())
+
+        self.assertEqual(
+            fleet.world.vehicle(follower_id).target_velocities(),
+            (0.0, 0.0),
+        )
+        for drain_tick in range(10):
+            if fleet.world.vehicle(follower_id).body_velocities() == (0.0, 0.0):
+                break
+            relay_peer_states(fleet)
+            fleet.tick((tick + drain_tick + 2) * fleet.tick_s)
+            follower = fleet.world.vehicle(follower_id)
+            leader = fleet.world.vehicle(leader_id)
+            minimum_separation = min(
+                minimum_separation,
+                math.dist((follower.x, follower.y), (leader.x, leader.y)),
+            )
+        else:
+            self.fail("nearby safe stop did not finish braking")
 
         follower = fleet.world.vehicle(follower_id)
         leader = fleet.world.vehicle(leader_id)
@@ -1013,6 +1055,7 @@ class TestFleetRuntime(unittest.TestCase):
             )
 
         fleet.tick(1.0)
+        fleet.tick(2.0)
         poses = fleet.world.truth_snapshot()
         distance_squared = (
             (poses["vehicle_1"][0] - poses["vehicle_2"][0]) ** 2
@@ -1033,6 +1076,33 @@ class TestFleetRuntime(unittest.TestCase):
         self.assertEqual(
             fleet.world.vehicle("vehicle_2").body_velocities(),
             (0.0, 0.0),
+        )
+
+        reversed_fleet = FleetRuntime.create(
+            scenario(
+                spec(2, 13.0, 10.0, math.pi),
+                spec(1, 10.0, 10.0),
+                tick_ms=1000,
+            ),
+            grid=free_grid(),
+            linear_speed=5.0,
+            command_timeout=10.0,
+        )
+        for vehicle_id in reversed_fleet.nodes:
+            reversed_fleet.handle_command(
+                vehicle_id,
+                ManualCommand(1, ManualAction.DRIVE, 5.0, 0.0),
+            )
+        reversed_fleet.tick(1.0)
+        reversed_fleet.tick(2.0)
+
+        self.assertEqual(reversed_fleet.world.truth_snapshot(), poses)
+        self.assertTrue(
+            all(
+                reversed_fleet.world.vehicle(vehicle_id).body_velocities()
+                == (0.0, 0.0)
+                for vehicle_id in reversed_fleet.nodes
+            )
         )
 
     def test_curved_motion_cannot_pass_through_another_vehicle(self) -> None:
@@ -1160,8 +1230,8 @@ class TestFleetRuntime(unittest.TestCase):
         self.assertNotEqual(sampled_poses[0], sampled_poses[-1])
         self.assertLess(sampled_poses[0][0], sampled_poses[-1][0])
         self.assertLess(sampled_poses[0][1], sampled_poses[-1][1])
-        self.assertAlmostEqual(sampled_poses[0][2], math.pi / 12, places=2)
-        self.assertAlmostEqual(sampled_poses[-1][2], math.pi / 2, places=9)
+        self.assertAlmostEqual(sampled_poses[0][2], math.pi / 72, places=9)
+        self.assertAlmostEqual(sampled_poses[-1][2], 3 * math.pi / 8, places=9)
 
     def test_dynamic_vehicle_is_raycast_at_the_same_sensor_time(self) -> None:
         fleet = FleetRuntime.create(
@@ -1211,10 +1281,11 @@ class TestFleetRuntime(unittest.TestCase):
             [frame.runtime_state["actuator_command"] for frame in frames],
             ["drive", "drive", "stop", "stop", "stop", "stop"],
         )
-        self.assertEqual(
+        for actual, expected in zip(
             [frame.runtime_state["linear_mps"] for frame in frames],
-            [1.0, 1.0, 0.0, 0.0, 0.0, 0.0],
-        )
+            (1 / 6, 1 / 3, 1 / 2, 1 / 3, 1 / 6, 0.0),
+        ):
+            self.assertAlmostEqual(actual, expected)
         self.assertEqual(
             [
                 frame.runtime_state["controller"]["manual_setpoint_active"]
@@ -1222,14 +1293,14 @@ class TestFleetRuntime(unittest.TestCase):
             ],
             [True, True, False, False, False, False],
         )
-        self.assertAlmostEqual(frames[1].truth_pose[0], 5.0 + 1 / 3)
-        self.assertAlmostEqual(frames[-1].truth_pose[0], 5.5)
+        self.assertAlmostEqual(frames[1].truth_pose[0], 5.0 + 1 / 18)
+        self.assertAlmostEqual(frames[-1].truth_pose[0], 5.25)
 
     def test_coarse_tick_frames_change_state_only_after_a_mid_tick_collision(self) -> None:
         grid = free_grid()
         grid.set_cell(6, 5, WALL)
         fleet = FleetRuntime.create(
-            scenario(spec(1, 5.0, 5.0), tick_ms=1000),
+            scenario(spec(1, 5.2, 5.0), tick_ms=1000),
             grid=grid,
             linear_speed=1.0,
             command_timeout=10.0,
@@ -1459,10 +1530,25 @@ class TestFleetTelemetryWebSocket(unittest.IsolatedAsyncioTestCase):
                         [pose["localization"]["scan_match"]["revision"] for pose in poses],
                         list(range(2, 14)),
                     )
-                    for pose in poses[:6]:
-                        self.assertAlmostEqual(pose["vx_mps"], 0.5)
-                    for pose in poses[6:]:
-                        self.assertEqual((pose["vx_mps"], pose["vy_mps"]), (0.0, 0.0))
+                    for pose, expected_vx in zip(
+                        poses,
+                        (
+                            1 / 6,
+                            1 / 3,
+                            1 / 2,
+                            1 / 2,
+                            1 / 2,
+                            1 / 2,
+                            1 / 3,
+                            1 / 6,
+                            0.0,
+                            0.0,
+                            0.0,
+                            0.0,
+                        ),
+                    ):
+                        self.assertAlmostEqual(pose["vx_mps"], expected_vx)
+                        self.assertEqual(pose["vy_mps"], 0.0)
             finally:
                 server.close()
                 await server.wait_closed()

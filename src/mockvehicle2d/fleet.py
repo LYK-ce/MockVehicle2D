@@ -68,7 +68,13 @@ from mockvehicle2d.server import (
     generate_map,
     validate_vehicle_id,
 )
-from mockvehicle2d.vehicle import TimedPose, Vehicle
+from mockvehicle2d.vehicle import (
+    DEFAULT_ANGULAR_ACCELERATION_RPS2,
+    DEFAULT_LINEAR_ACCELERATION_MPS2,
+    DEFAULT_LINEAR_DECELERATION_MPS2,
+    TimedPose,
+    Vehicle,
+)
 
 
 MAX_VEHICLES = 4
@@ -303,6 +309,9 @@ class SharedWorld:
         radius: float,
         linear_speed: float,
         angular_speed: float,
+        linear_acceleration_mps2: float,
+        linear_deceleration_mps2: float,
+        angular_acceleration_rps2: float,
         command_timeout: float,
         started_at: float,
         spawn_safety_margin_m: float = DEFAULT_SPAWN_SAFETY_MARGIN_M,
@@ -311,14 +320,25 @@ class SharedWorld:
             radius,
             linear_speed,
             angular_speed,
+            linear_acceleration_mps2,
+            linear_deceleration_mps2,
+            angular_acceleration_rps2,
             command_timeout,
             started_at,
             spawn_safety_margin_m,
         )
         if not all(math.isfinite(value) for value in parameters):
             raise ValueError("world parameters must be finite")
-        if min(radius, linear_speed, angular_speed, command_timeout) <= 0:
-            raise ValueError("vehicle radius, speeds, and timeout must be positive")
+        if min(
+            radius,
+            linear_speed,
+            angular_speed,
+            linear_acceleration_mps2,
+            linear_deceleration_mps2,
+            angular_acceleration_rps2,
+            command_timeout,
+        ) <= 0:
+            raise ValueError("vehicle motion limits, radius, and timeout must be positive")
         if spawn_safety_margin_m < 0:
             raise ValueError("spawn safety margin cannot be negative")
         if not 1 <= len(specs) <= MAX_VEHICLES:
@@ -366,6 +386,9 @@ class SharedWorld:
                 spec.anchor_pose.yaw_rad,
                 linear_speed=linear_speed,
                 angular_speed=angular_speed,
+                linear_acceleration_mps2=linear_acceleration_mps2,
+                linear_deceleration_mps2=linear_deceleration_mps2,
+                angular_acceleration_rps2=angular_acceleration_rps2,
                 radius=radius,
                 command_timeout=command_timeout,
                 now=started_at,
@@ -487,7 +510,7 @@ class SharedWorld:
 
         for vehicle_id in blocked:
             stopped = copy.copy(self._vehicles[vehicle_id])
-            stopped.stop(target_time)
+            stopped.force_stop(target_time)
             stopped.collision = False
             candidates[vehicle_id] = stopped
             trajectories[vehicle_id] = stationary[vehicle_id]
@@ -955,6 +978,9 @@ class FleetRuntime:
         voxels: list[dict[str, object]] | None = None,
         linear_speed: float = 0.5,
         angular_speed: float = math.pi / 2,
+        linear_acceleration_mps2: float = DEFAULT_LINEAR_ACCELERATION_MPS2,
+        linear_deceleration_mps2: float = DEFAULT_LINEAR_DECELERATION_MPS2,
+        angular_acceleration_rps2: float = DEFAULT_ANGULAR_ACCELERATION_RPS2,
         radius: float = 0.5,
         command_timeout: float = 1.0,
         mission_capacity: int = 16,
@@ -988,6 +1014,9 @@ class FleetRuntime:
             radius=radius,
             linear_speed=linear_speed,
             angular_speed=angular_speed,
+            linear_acceleration_mps2=linear_acceleration_mps2,
+            linear_deceleration_mps2=linear_deceleration_mps2,
+            angular_acceleration_rps2=angular_acceleration_rps2,
             command_timeout=command_timeout,
             started_at=started_at,
             spawn_safety_margin_m=spawn_safety_margin_m,
@@ -1499,6 +1528,9 @@ async def main(
     *,
     linear_speed: float = 0.5,
     angular_speed: float = math.pi / 2,
+    linear_acceleration_mps2: float = DEFAULT_LINEAR_ACCELERATION_MPS2,
+    linear_deceleration_mps2: float = DEFAULT_LINEAR_DECELERATION_MPS2,
+    angular_acceleration_rps2: float = DEFAULT_ANGULAR_ACCELERATION_RPS2,
     radius: float = 0.5,
     command_timeout: float = 1.0,
     mission_capacity: int = 16,
@@ -1515,6 +1547,9 @@ async def main(
         timestamp=time.time(),
         linear_speed=linear_speed,
         angular_speed=angular_speed,
+        linear_acceleration_mps2=linear_acceleration_mps2,
+        linear_deceleration_mps2=linear_deceleration_mps2,
+        angular_acceleration_rps2=angular_acceleration_rps2,
         radius=radius,
         command_timeout=command_timeout,
         mission_capacity=mission_capacity,

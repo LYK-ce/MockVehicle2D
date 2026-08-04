@@ -120,37 +120,122 @@ class TestEpisodeRunner(unittest.TestCase):
         self.assertEqual((current, longest), (3, 3))
 
     def test_two_vehicle_crossing_example_reports_interaction_metrics(self) -> None:
+        from mockvehicle2d import episode as episode_module
+
         crossing = FleetScenario.load(
             REPO_ROOT / "examples" / "two_vehicle_crossing_episode.json"
         )
-        result = run_episode(
-            crossing,
-            {
-                "mock_vehicle_01": (
-                    GotoMission("goto-1", "global_map", 11.0, 11.0, 2),
-                ),
-                "mock_vehicle_02": (
-                    GotoMission("goto-2", "global_map", 9.0, 11.0, 2),
-                ),
-            },
-            max_simulation_s=30.0,
-            grid=MapGrid.from_wall_set(24, 24, set()),
-        )
+        missions = {
+            "mock_vehicle_01": (
+                GotoMission("goto-1", "global_map", 11.0, 11.0, 2),
+            ),
+            "mock_vehicle_02": (
+                GotoMission("goto-2", "global_map", 9.0, 11.0, 2),
+            ),
+        }
+        observed_stopping = []
+        real_stopped = episode_module._vehicles_stopped
 
-        self.assertTrue(result.success)
-        self.assertEqual(result.termination_reason, "completed")
+        def record_stopping_state(fleet, vehicle_ids):
+            observed_stopping.append(
+                tuple(
+                    (
+                        fleet.world.vehicle(vehicle_id).target_velocities(),
+                        fleet.world.vehicle(vehicle_id).body_velocities(),
+                    )
+                    for vehicle_id in vehicle_ids
+                )
+            )
+            return real_stopped(fleet, vehicle_ids)
+
+        with patch(
+            "mockvehicle2d.episode._vehicles_stopped",
+            side_effect=record_stopping_state,
+        ):
+            results = [
+                run_episode(
+                    crossing,
+                    missions,
+                    max_simulation_s=30.0,
+                    grid=MapGrid.from_wall_set(24, 24, set()),
+                    realtime_factor=factor,
+                )
+                for factor in (1.0, 5.0)
+            ]
+
+        self.assertEqual(results[0].to_json(), results[1].to_json())
+        result = results[0]
+        self.assertFalse(result.success)
+        self.assertEqual(result.termination_reason, "blocked")
+        self.assertEqual(result.tick_count, 136)
         clearance = result.minimum_inter_vehicle_clearance_m
         self.assertIsNotNone(clearance)
         assert clearance is not None
         self.assertGreaterEqual(clearance, 0.0)
         self.assertLess(clearance, 1.0)
         self.assertEqual(len(result.vehicles), 2)
+        self.assertEqual(
+            [vehicle["blocked_reason"] for vehicle in result.vehicles],
+            ["no_path", None],
+        )
+        self.assertTrue(
+            any(
+                target == (0.0, 0.0) and executed != (0.0, 0.0)
+                for state in observed_stopping
+                for target, executed in state
+            )
+        )
+        self.assertTrue(
+            all(
+                target == executed == (0.0, 0.0)
+                for target, executed in observed_stopping[-1]
+            )
+        )
         for vehicle in result.vehicles:
             self.assertGreater(vehicle["longest_no_progress_duration_s"], 0.0)
             self.assertLessEqual(
                 vehicle["longest_no_progress_duration_s"],
                 result.simulation_duration_s,
             )
+
+    def test_completed_episode_drains_residual_motion_before_returning(self) -> None:
+        from mockvehicle2d import episode as episode_module
+
+        observed = []
+        real_stopped = episode_module._vehicles_stopped
+
+        def record_stopping_state(fleet, vehicle_ids):
+            observed.append(
+                tuple(
+                    (
+                        fleet.world.vehicle(vehicle_id).target_velocities(),
+                        fleet.world.vehicle(vehicle_id).body_velocities(),
+                    )
+                    for vehicle_id in vehicle_ids
+                )
+            )
+            return real_stopped(fleet, vehicle_ids)
+
+        with patch(
+            "mockvehicle2d.episode._vehicles_stopped",
+            side_effect=record_stopping_state,
+        ):
+            result = run_episode(
+                scenario(),
+                {"vehicle_1": (mission(5.6),)},
+                max_simulation_s=10.0,
+                grid=MapGrid.from_wall_set(20, 20, set()),
+            )
+
+        self.assertTrue(result.success)
+        self.assertTrue(
+            any(target == (0.0, 0.0) and executed != (0.0, 0.0)
+                for state in observed for target, executed in state)
+        )
+        self.assertTrue(
+            all(target == executed == (0.0, 0.0)
+                for target, executed in observed[-1])
+        )
 
     def test_timeout_uses_simulation_time(self) -> None:
         result = run_episode(
@@ -190,6 +275,12 @@ class TestEpisodeRunner(unittest.TestCase):
             "10",
             "--goto",
             "mock_vehicle_01,11,10",
+            "--linear-acceleration-mps2",
+            "2",
+            "--linear-deceleration-mps2",
+            "3",
+            "--angular-acceleration-rps2",
+            "4",
         ]
         with (
             patch.object(sys, "argv", arguments),
@@ -201,6 +292,9 @@ class TestEpisodeRunner(unittest.TestCase):
         submitted = run.call_args.args[1]["mock_vehicle_01"][0]
         self.assertEqual(submitted.mission_id, "episode-goto-0001")
         self.assertEqual((submitted.x_m, submitted.y_m), (11.0, 10.0))
+        self.assertEqual(run.call_args.kwargs["linear_acceleration_mps2"], 2.0)
+        self.assertEqual(run.call_args.kwargs["linear_deceleration_mps2"], 3.0)
+        self.assertEqual(run.call_args.kwargs["angular_acceleration_rps2"], 4.0)
         output.assert_called_once_with('{"success":true}')
 
 

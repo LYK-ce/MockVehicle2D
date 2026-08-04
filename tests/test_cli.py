@@ -18,6 +18,11 @@ cli = importlib.import_module("mockvehicle2d.cli.main")
 class TestRealtimeFactorCli(unittest.TestCase):
     def test_serve_and_fleet_default_to_five_times_realtime(self) -> None:
         from mockvehicle2d import fleet, server
+        from mockvehicle2d.vehicle import (
+            DEFAULT_ANGULAR_ACCELERATION_RPS2,
+            DEFAULT_LINEAR_ACCELERATION_MPS2,
+            DEFAULT_LINEAR_DECELERATION_MPS2,
+        )
 
         cases = (
             ("serve", server, ("serve",)),
@@ -33,6 +38,18 @@ class TestRealtimeFactorCli(unittest.TestCase):
                 cli.main()
 
             self.assertEqual(target.call_args.kwargs["realtime_factor"], 5.0)
+            self.assertEqual(
+                target.call_args.kwargs["linear_acceleration_mps2"],
+                DEFAULT_LINEAR_ACCELERATION_MPS2,
+            )
+            self.assertEqual(
+                target.call_args.kwargs["linear_deceleration_mps2"],
+                DEFAULT_LINEAR_DECELERATION_MPS2,
+            )
+            self.assertEqual(
+                target.call_args.kwargs["angular_acceleration_rps2"],
+                DEFAULT_ANGULAR_ACCELERATION_RPS2,
+            )
             run.assert_called_once_with(None)
 
     def test_realtime_factor_accepts_one_and_rejects_nonpositive_or_nonfinite(

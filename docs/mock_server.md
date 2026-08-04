@@ -35,10 +35,11 @@ RobotController
 | `navigation.py` | 根据局部状态生成自动期望速度 | 直接修改车辆 |
 | `safety.py` | 手动/自动安全门控、故障停车、安全推进 | 任务队列 |
 | `server.py` | 独占连接、帧调度、遥测和事件发送 | 自主决策 |
-| `vehicle.py` | 运动学、执行器设定值、看门狗 | 任务和协议 |
+| `vehicle.py` | 有界加减速、运动学、执行器设定值、看门狗 | 任务和协议 |
 
-安全运行时和碰撞检查可以直接停车，因为它们是控制器之外的独立故障保护；除此之外，
-业务路径不得绕过 `RobotController` 安装运动设定值。
+普通安全停车与看门狗同样只请求有界制动。静态碰撞和多车同时仲裁可以立即钳制实际
+速度，因为它们必须拒绝已判定不安全的物理候选轨迹；除此之外，业务路径不得绕过
+`RobotController` 安装运动设定值。
 
 ## 状态模型
 
@@ -64,13 +65,19 @@ AutoState
 |------|------|
 | Manual → Auto（无任务） | `Auto/Idle` |
 | Manual → Auto（有保留任务） | `Auto/Paused`，需 `resume` |
-| Auto → Manual | 先停车，活动任务转为 paused，队列保留 |
+| Auto → Manual | 先请求制动，活动任务转为 paused，队列保留 |
 | 重复切换到当前模式 | 幂等，无额外停车和事件 |
-| 任意模式 → `stop_motion` | 立即停车并清除手动租约；Auto 任务暂停保留 |
-| 控制连接断开 | 停车；自动任务暂停；释放独占连接 |
-| 非法协议输入 | 停车；自动任务暂停，原因 `invalid_command` |
+| 任意模式 → `stop_motion` | 请求有界制动并清除手动租约；Auto 任务暂停保留 |
+| 控制连接断开 | 请求有界制动；自动任务暂停；释放独占连接 |
+| 非法协议输入 | 请求有界制动；自动任务暂停，原因 `invalid_command` |
 
 在 `Auto/Idle` 且没有活动或排队任务时，`pause` 保持 Idle，不产生虚假的预暂停状态。
+
+`Vehicle` 分开保存 target 和 executed linear/angular velocity。每次物理推进用配置的
+`1 m/s²` 线加速、`1 m/s²` 线减速和 `π rad/s²` 角加速上限逼近 target；反向命令先制动
+到零再向相反方向加速。遥测速度和 P2P 车辆状态报告 executed velocity，WebSocket 速度
+命令仍表示 target，不改变 v4 JSON schema。realtime factor 只缩短墙钟等待，不参与该
+动力学计算。
 
 ## 一帧的执行顺序
 
@@ -156,6 +163,9 @@ mockvehicle2d serve \
   --mission-capacity 16 \
   --linear-speed-mps 0.5 \
   --angular-speed-rps 1.5708 \
+  --linear-acceleration-mps2 1.0 \
+  --linear-deceleration-mps2 1.0 \
+  --angular-acceleration-rps2 3.1416 \
   --vehicle-radius-m 0.5 \
   --command-timeout-s 1.0
 ```

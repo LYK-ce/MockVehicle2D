@@ -645,7 +645,7 @@ class TestControllerNavigation(unittest.TestCase):
             advance_result=SafetyAdvanceResult(),
             now=0.0,
         )
-        linear_mps, _ = vehicle.body_velocities()
+        linear_mps, _ = vehicle.target_velocities()
         self.assertGreater(linear_mps, 0.0)
         self.assertLessEqual(linear_mps, vehicle.linear_speed * 0.4)
         self.assertEqual(controller.navigation.status, "active")
@@ -753,6 +753,9 @@ class TestControllerNavigation(unittest.TestCase):
             runtime.controller.navigation.detail,
             "nearby_safe_goal_unavailable",
         )
+        self.assertEqual(runtime.vehicle.target_velocities(), (0.0, 0.0))
+        stopped_at = runtime.vehicle.last_update + 1.0
+        runtime.update(stopped_at, stopped_at)
         self.assertEqual(runtime.vehicle.body_velocities(), (0.0, 0.0))
 
     def test_planning_work_is_sliced_and_out_of_range_search_terminates(self) -> None:
@@ -813,12 +816,12 @@ class TestControllerNavigation(unittest.TestCase):
                 ]
                 expansion_counts.append(current - previous)
                 previous = current
-                if vehicle.body_velocities() != (0.0, 0.0):
+                if vehicle.target_velocities() != (0.0, 0.0):
                     break
         self.assertTrue(expansion_counts)
         self.assertLessEqual(max(expansion_counts), 1)
         self.assertGreater(
-            vehicle.body_velocities()[0],
+            vehicle.target_velocities()[0],
             0.0,
             controller.snapshot(),
         )
@@ -934,7 +937,7 @@ class TestControllerNavigation(unittest.TestCase):
             advance_result=SafetyAdvanceResult(),
             now=0.0,
         )
-        self.assertNotEqual(vehicle.body_velocities(), (0.0, 0.0))
+        self.assertNotEqual(vehicle.target_velocities(), (0.0, 0.0))
 
         controller.tick(
             vehicle=vehicle,

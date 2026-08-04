@@ -50,6 +50,9 @@ mockvehicle2d serve \
   --mission-capacity 16 \
   --linear-speed-mps 0.5 \
   --angular-speed-rps 1.5708 \
+  --linear-acceleration-mps2 1.0 \
+  --linear-deceleration-mps2 1.0 \
+  --angular-acceleration-rps2 3.1416 \
   --vehicle-radius-m 0.5 \
   --command-timeout-s 1.0 \
   --anchor-id car_01_anchor \
@@ -70,7 +73,7 @@ mockvehicle2d episode \
   --max-simulation-s 30 \
   --goto mock_vehicle_01,11,10
 
-# P2P-disabled 双车交叉基准；当前基线可确定性完成
+# P2P-disabled 双车交叉基准；当前有界动力学基线可确定性复现 no_path 阻断
 mockvehicle2d episode \
   --scenario examples/two_vehicle_crossing_episode.json \
   --max-simulation-s 30 \
@@ -78,8 +81,13 @@ mockvehicle2d episode \
   --goto mock_vehicle_02,9,11
 ```
 
-依赖安装在仓库本地 `.venv/`。公开接口统一使用 SI 单位：米、秒、弧度、米/秒和
-弧度/秒。`serve` 和 `fleet` 默认以 `--realtime-factor 5` 运行，即固定物理步长、传感器
+依赖安装在仓库本地 `.venv/`。公开接口统一使用 SI 单位：米、秒、弧度、米/秒、
+弧度/秒、米/秒²和弧度/秒²。车辆区分控制器请求的 target velocity 与实际 executed
+velocity；默认线加速、线减速和角加速上限分别为 `1 m/s²`、`1 m/s²` 和 `π rad/s²`。
+普通 stop、watchdog 和 safety stop 将 target 置零并按上限制动，正反向切换先减到零；
+静态碰撞和多车同时仲裁拒绝候选轨迹时才立即钳制实际速度，以保持不穿透。
+
+`serve` 和 `fleet` 默认以 `--realtime-factor 5` 运行，即固定物理步长、传感器
 周期、控制阈值和 P2P 模拟时序不变，只把墙钟等待缩短为原来的五分之一；传入 `1`
 可恢复原来的实时速度。
 
@@ -88,8 +96,11 @@ mockvehicle2d episode \
 `episode` 复用 `FleetRuntime`、`RobotController` 和现有 Mission 语义，在调用线程中直接
 推进固定模拟 tick。它不读取墙钟、不打开 WebSocket，也不受 `serve/fleet` 的
 `realtime_factor` 影响。CLI 至少需要一个 `--goto VEHICLE_ID,X_M,Y_M`；可重复该参数为
-一辆或多辆车依次入队。达到全部已提交任务后提前成功结束，任务阻断或达到
-`--max-simulation-s` 时失败结束。
+一辆或多辆车依次入队。任务达到全部完成或任一阻断后，Runner 继续按固定 tick 记录
+有界制动尾段，直到相关车辆的 target 和 executed velocity 都归零；制动仍受
+`--max-simulation-s` 限制。达到全部已提交任务并完成制动后成功结束，任务阻断或达到
+时限时失败结束。`episode` 与 `serve`/`fleet` 使用相同的速度、加减速、半径和 watchdog
+CLI 参数。
 
 标准输出是 schema version 2 的单行 canonical JSON，包含场景 ID、odometry seed、tick 数、
 模拟时长、终止原因，以及每辆车的仿真真值终态、按 tick 采样的路径长度、碰撞/阻断/
@@ -189,8 +200,8 @@ Unix domain socket 交换有界 JSONL 消息，控制 tick 不等待该 socket�
 
 模式语义：
 
-- 模式切换先停车；重复切到当前模式是无副作用的幂等操作。
-- `mode/stop_motion` 在 Manual、Auto 或模式切换竞态中都立即停车；Auto 任务暂停并
+- 模式切换先请求制动；重复切到当前模式是无副作用的幂等操作。
+- `mode/stop_motion` 在 Manual、Auto 或模式切换竞态中都请求有界制动；Auto 任务暂停并
   保留，重复调用不产生重复事件。
 - 手动命令只在 `manual` 模式有效，自动命令只在 `auto` 模式有效。
 - 手动 `drive` 是有租约的连续速度设定值；客户端需在
@@ -205,7 +216,7 @@ Unix domain socket 交换有界 JSONL 消息，控制 tick 不等待该 socket�
 - Auto 已在执行时重复 `resume` 是无副作用操作，不会停车或重启规划。
 - `mission_id` 在 Server 进程生命周期内是永久幂等键。相同 ID 和完全相同任务定义的
   重试不会重复入队；相同 ID 携带不同定义会被拒绝。进程重启后该内存状态会清空。
-- 控制连接断开时车辆立即停车，自动任务暂停而不是丢弃；重连后可显式恢复。
+- 控制连接断开时车辆请求有界制动，自动任务暂停而不是丢弃；重连后可显式恢复。
 - 非法输入触发故障停车；活动自动任务进入暂停状态。
 
 每条合法命令先收到 `command_ack`。自动任务另外通过 `mission_update` 报告
