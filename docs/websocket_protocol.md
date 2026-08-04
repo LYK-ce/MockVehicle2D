@@ -9,7 +9,7 @@
 | 命令格式 | UTF-8 JSON 文本对象 |
 | 协议版本 | `4` |
 | 控制权 | 每辆车同时只有一个独占连接 |
-| 单位 | m、s、rad、m/s、rad/s |
+| 单位 | m、s、rad、m/s、rad/s、m/s²、rad/s² |
 | 任务坐标系 | `global_map` |
 | 默认时间倍率 | `5.0`（`--realtime-factor 1` 恢复实时） |
 
@@ -47,9 +47,9 @@ Client ◄──── mission_update ───── Vehicle  （有状态变�
 }
 ```
 
-断开会立即停车并释放租约。odometry、本地地图、活动任务和待执行队列保留；有未完成
-任务时自动状态变为 `paused`。重连后由 `hello.controller` 恢复当前状态，随后 Server
-按 `event_seq` 重放本进程保留的全部任务事件，再显式 `resume`。
+断开会立即请求有界制动并释放租约。odometry、本地地图、活动任务和待执行队列保留；
+有未完成任务时自动状态变为 `paused`。重连后由 `hello.controller` 恢复当前状态，
+随后 Server 按 `event_seq` 重放本进程保留的全部任务事件，再显式 `resume`。
 
 ## 下行命令
 
@@ -61,14 +61,14 @@ Client ◄──── mission_update ───── Vehicle  （有状态变�
 {"type":"mode","seq":3,"action":"stop_motion"}
 ```
 
-模式命令不受当前模式限制。实际切换先停车；重复切到当前模式是幂等操作。
+模式命令不受当前模式限制。实际切换先请求有界制动；重复切到当前模式是幂等操作。
 Auto → Manual 暂停并保留任务。Manual → Auto 若有保留任务仍停在 `paused`，需要
 `auto/resume`。
 
 `stop_motion` 是模式无关的安全停车入口：
 
-- 在 Manual 中立即停车并清除手动速度租约，模式仍为 Manual；
-- 在 Auto 中立即停车，活动任务和队列保留，状态变为 `paused`；
+- 在 Manual 中立即请求有界制动并清除手动速度租约，模式仍为 Manual；
+- 在 Auto 中立即请求有界制动，活动任务和队列保留，状态变为 `paused`；
 - 在 Auto Idle 中保持 Idle；
 - 重复调用不重复发布 paused 事件。
 
@@ -505,7 +505,7 @@ Forbidden 证据。
 }
 ```
 
-协议错误会先触发故障停车；若自动任务存在，会额外收到 `paused` 事件，原因为
+协议错误会先触发故障制动；若自动任务存在，会额外收到 `paused` 事件，原因为
 `invalid_command`。常见 code：
 
 ```text
