@@ -67,6 +67,11 @@ class GotoController:
         self._candidate_inspections = 0
         self._skip_goal_connected_candidates = False
         self._waiting_safe_stop_goal: tuple[float, float] | None = None
+        self._waiting_for_peer_replan = False
+
+    @property
+    def motion_target(self) -> tuple[float, float] | None:
+        return self._current_waypoint
 
     def start(
         self,
@@ -104,6 +109,7 @@ class GotoController:
         self._candidate_inspections = 0
         self._skip_goal_connected_candidates = False
         self._waiting_safe_stop_goal = None
+        self._waiting_for_peer_replan = False
         self._planner = DStarLitePlanner(
             local_map,
             vehicle_radius_m=vehicle_radius_m,
@@ -121,6 +127,7 @@ class GotoController:
             self.reason = reason
             self.detail = None
             self._waiting_safe_stop_goal = None
+            self._waiting_for_peer_replan = False
             self._clear_pending_planning()
 
     def block(self, reason: str, detail: str | None = None) -> None:
@@ -129,6 +136,7 @@ class GotoController:
         self.reason = reason
         self.detail = detail
         self._waiting_safe_stop_goal = None
+        self._waiting_for_peer_replan = False
         self._clear_pending_planning()
 
     def block_for_localization_loss(self, pose: PoseEstimate) -> bool:
@@ -301,6 +309,14 @@ class GotoController:
                 map_delta.peer_forbidden_cells
             )
         changes = () if map_delta is None else map_delta.changed_cells
+        if self._waiting_for_peer_replan:
+            if map_delta is None:
+                return 0.0, 0.0
+            self._waiting_for_peer_replan = False
+            self.goal = self.requested_goal
+            self.goal_mode = "exact"
+            self._goal_access_cell = None
+            self._planning_kind = "goal"
         if self._final_approach:
             if changes:
                 self._planner.observe_changes(changes)
@@ -480,6 +496,7 @@ class GotoController:
                     failure = "goal_blocked"
             else:
                 failure = self._planner_failure()
+            if progress.status != "ready":
                 if failure in {"start_blocked", "expansion_limit"}:
                     self._block_no_path(failure)
                     return
@@ -804,12 +821,25 @@ class GotoController:
         self.reason = None
         self.detail = None
         self._current_waypoint = None
+        self._waiting_for_peer_replan = False
         self._clear_pending_planning()
 
     def _block_no_path(self, detail: str | None) -> None:
+        if self._planner is not None and self._planner.has_peer_exclusions:
+            self._wait_for_peer_replan(detail)
+            return
         self._set_path(None)
         self._current_waypoint = None
         self.block("no_path", detail)
+
+    def _wait_for_peer_replan(self, detail: str | None) -> None:
+        self._set_path(None)
+        self.status = "active"
+        self.reason = None
+        self.detail = detail
+        self._current_waypoint = None
+        self._waiting_for_peer_replan = True
+        self._clear_pending_planning()
 
     def _clear_pending_planning(self) -> None:
         self._planning_kind = None

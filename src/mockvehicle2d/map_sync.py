@@ -379,6 +379,7 @@ class MapSyncState:
         resolution_m: float,
         *,
         clock: Callable[[], float] | None = None,
+        state_generation: int | None = None,
     ) -> None:
         if not session_id or not vehicle_id:
             raise ValueError("session_id and vehicle_id cannot be empty")
@@ -401,7 +402,13 @@ class MapSyncState:
         # Per-source boot generation. A stable vehicle identity requires a
         # non-regressing wall clock; rollback is rejected instead of replacing
         # a newer peer state.
-        self._state_generation = time.time_ns()
+        self._state_generation = (
+            time.time_ns()
+            if state_generation is None
+            else _positive_integer(state_generation, "state_generation")
+        )
+        if self._state_generation > (1 << 64) - 1:
+            raise ValueError("state_generation exceeds unsigned 64-bit range")
         self._state_sequence = 0
         self._state_inflight: PeerVehicleState | None = None
         self._local_vehicle_state: PeerVehicleState | None = None

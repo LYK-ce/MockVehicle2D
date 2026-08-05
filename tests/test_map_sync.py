@@ -45,6 +45,32 @@ def state(number: int) -> MapSyncState:
 
 
 class TestMapSyncState(unittest.TestCase):
+    def test_peer_state_generation_can_be_fixed_for_deterministic_transport(self) -> None:
+        source = MapSyncState(
+            "session_1",
+            "vehicle_1",
+            anchor(1),
+            1.0,
+            state_generation=7,
+        )
+        source.record_vehicle_state(
+            PoseEstimate(
+                anchor(1).anchor_id,
+                0.0,
+                0.0,
+                0.0,
+                (0.0, 0.0, 0.0),
+                "nominal",
+                0.0,
+                1,
+            ),
+            radius_m=0.5,
+            linear_mps=0.0,
+            omega_rps=0.0,
+        )
+
+        self.assertEqual(source.prepare_peer_state()["state_generation"], 7)
+
     def test_peer_state_is_independent_ordered_and_expires_by_receipt_time(self) -> None:
         source = state(1)
         now = [20.0]

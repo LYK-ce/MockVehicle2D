@@ -802,6 +802,8 @@ class RobotNode:
                 self.latest_frame.scan_points if scan_fresh else ()
             ),
             safety_scan_healthy=scan_fresh,
+            vehicle_id=self.spec.vehicle_id,
+            peer_states=peer_states,
         )
         self._pending_map_delta = None
         self._pending_advance = SafetyAdvanceResult()
@@ -997,9 +999,12 @@ class FleetRuntime:
         safety_healthy: bool = True,
         spawn_safety_margin_m: float = DEFAULT_SPAWN_SAFETY_MARGIN_M,
         realtime_factor: float = 1.0,
+        in_process_peer_states: bool = False,
     ) -> "FleetRuntime":
         if not math.isfinite(realtime_factor) or realtime_factor <= 0:
             raise ValueError("realtime factor must be finite and positive")
+        if type(in_process_peer_states) is not bool:
+            raise ValueError("in_process_peer_states must be boolean")
         if grid is None:
             generated_voxels, grid = generate_map(radius=radius)
             voxels = generated_voxels
@@ -1031,6 +1036,16 @@ class FleetRuntime:
             spawn_safety_margin_m=spawn_safety_margin_m,
         )
         nodes = {}
+        state_generations = (
+            {
+                vehicle_id: index
+                for index, vehicle_id in enumerate(
+                    sorted(spec.vehicle_id for spec in scenario.vehicles), 1
+                )
+            }
+            if in_process_peer_states
+            else {}
+        )
         for spec in scenario.vehicles:
             pose = spec.anchor_pose
             anchor = AnchorSpec(spec.spawn_id, pose.x_m, pose.y_m, pose.yaw_rad)
@@ -1053,13 +1068,14 @@ class FleetRuntime:
                 local_state,
                 (
                     None
-                    if scenario.p2p is None
+                    if scenario.p2p is None and not in_process_peer_states
                     else MapSyncState(
                         scenario.scenario_id,
                         spec.vehicle_id,
                         anchor,
                         local_state.local_map.resolution_m,
                         clock=lambda world=world: world.now,
+                        state_generation=state_generations.get(spec.vehicle_id),
                     )
                 ),
             )

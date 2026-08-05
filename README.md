@@ -73,7 +73,7 @@ mockvehicle2d episode \
   --max-simulation-s 30 \
   --goto mock_vehicle_01,11,10
 
-# P2P-disabled 双车交叉基准；当前有界动力学基线可确定性复现 no_path 阻断
+# P2P-disabled 双车交叉基准；固定优先级让行后两车均可确定性完成
 mockvehicle2d episode \
   --scenario examples/two_vehicle_crossing_episode.json \
   --max-simulation-s 30 \
@@ -101,6 +101,13 @@ velocity；默认线加速、线减速和角加速上限分别为 `1 m/s²`、`1
 `--max-simulation-s` 限制。达到全部已提交任务并完成制动后成功结束，任务阻断或达到
 时限时失败结束。`episode` 与 `serve`/`fleet` 使用相同的速度、加减速、半径和 watchdog
 CLI 参数。
+
+多车 Episode 不启动 localhost libp2p，而是把现有 peer-state v1 payload 经过 JSON
+序列化、协议校验和 anchor 变换后，以固定 1 tick 延迟在进程内传递；序列、接收时间和
+`0.35 s` 过期规则与实时 P2P 路径一致。启用了真实 `p2p` 配置的场景仍被拒绝，因为
+libp2p 墙钟调度和 map delta 传播不属于确定性 Episode。两车短时轨迹冲突使用稳定的
+`vehicle_id` 字典序决定通行权；低优先级车辆有界制动并保持任务 active，连续确认冲突
+解除后自动恢复。让行期间 peer state 缺失或过期时保持停车，LocalSafety 仍是最终裁决。
 
 标准输出是 schema version 2 的单行 canonical JSON，包含场景 ID、odometry seed、tick 数、
 模拟时长、终止原因，以及每辆车的仿真真值终态、按 tick 采样的路径长度、碰撞/阻断/

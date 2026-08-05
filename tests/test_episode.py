@@ -6,15 +6,29 @@ import sys
 import unittest
 from unittest.mock import patch
 
-from mockvehicle2d.controller import GotoMission
+from mockvehicle2d.controller import (
+    AutoAction,
+    AutoCommand,
+    GotoMission,
+    ModeAction,
+    ModeCommand,
+    PatrolMission,
+)
 from mockvehicle2d.episode import (
     MIN_PROGRESS_TRANSLATION_M,
+    _DeterministicPeerStateExchange,
     _update_no_progress,
     run_episode,
 )
-from mockvehicle2d.fleet import AnchorPose, FleetScenario, FleetVehicleSpec
+from mockvehicle2d.fleet import (
+    AnchorPose,
+    FleetRuntime,
+    FleetScenario,
+    FleetVehicleSpec,
+)
 from mockvehicle2d.map_grid import MapGrid
 from mockvehicle2d.map_sync import P2PSettings
+from mockvehicle2d.safety import AUTOMATIC_MINIMUM_CLEARANCE_M
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -165,18 +179,20 @@ class TestEpisodeRunner(unittest.TestCase):
 
         self.assertEqual(results[0].to_json(), results[1].to_json())
         result = results[0]
-        self.assertFalse(result.success)
-        self.assertEqual(result.termination_reason, "blocked")
-        self.assertEqual(result.tick_count, 124)
+        self.assertTrue(result.success)
+        self.assertEqual(result.termination_reason, "completed")
         clearance = result.minimum_inter_vehicle_clearance_m
         self.assertIsNotNone(clearance)
         assert clearance is not None
-        self.assertGreaterEqual(clearance, 0.0)
-        self.assertLess(clearance, 1.0)
+        self.assertGreaterEqual(clearance, AUTOMATIC_MINIMUM_CLEARANCE_M)
         self.assertEqual(len(result.vehicles), 2)
         self.assertEqual(
             [vehicle["blocked_reason"] for vehicle in result.vehicles],
-            ["no_path", None],
+            [None, None],
+        )
+        self.assertEqual(
+            [vehicle["missions"][0]["status"] for vehicle in result.vehicles],
+            ["reached", "reached"],
         )
         self.assertTrue(
             any(
@@ -236,6 +252,133 @@ class TestEpisodeRunner(unittest.TestCase):
             all(target == executed == (0.0, 0.0)
                 for target, executed in observed[-1])
         )
+
+    def test_crossing_coordination_is_stable_across_tick_sizes(self) -> None:
+        crossing = FleetScenario.load(
+            REPO_ROOT / "examples" / "two_vehicle_crossing_episode.json"
+        )
+        missions = {
+            "mock_vehicle_01": (
+                GotoMission("goto-1", "global_map", 11.0, 11.0, 2),
+            ),
+            "mock_vehicle_02": (
+                GotoMission("goto-2", "global_map", 9.0, 11.0, 2),
+            ),
+        }
+
+        for tick_ms in (50, 250):
+            with self.subTest(tick_ms=tick_ms):
+                result = run_episode(
+                    FleetScenario(
+                        f"crossing_{tick_ms}",
+                        crossing.vehicles,
+                        tick_ms,
+                    ),
+                    missions,
+                    max_simulation_s=30.0,
+                    grid=MapGrid.from_wall_set(24, 24, set()),
+                )
+                self.assertTrue(result.success, result.as_dict())
+                self.assertFalse(
+                    any(vehicle["collision_occurred"] for vehicle in result.vehicles)
+                )
+                self.assertGreaterEqual(
+                    result.minimum_inter_vehicle_clearance_m,
+                    AUTOMATIC_MINIMUM_CLEARANCE_M,
+                )
+
+    def test_coordination_is_shared_by_patrol_missions(self) -> None:
+        crossing = FleetScenario.load(
+            REPO_ROOT / "examples" / "two_vehicle_crossing_episode.json"
+        )
+        result = run_episode(
+            crossing,
+            {
+                "mock_vehicle_01": (
+                    GotoMission("goto-1", "global_map", 11.0, 11.0, 2),
+                ),
+                "mock_vehicle_02": (
+                    PatrolMission(
+                        "patrol-2",
+                        "global_map",
+                        ((9.0, 11.0), (9.0, 10.5)),
+                        1,
+                        2,
+                    ),
+                ),
+            },
+            max_simulation_s=40.0,
+            grid=MapGrid.from_wall_set(24, 24, set()),
+        )
+
+        self.assertTrue(result.success)
+        self.assertEqual(result.vehicles[1]["missions"][0]["type"], "patrol")
+        self.assertEqual(result.vehicles[1]["missions"][0]["status"], "reached")
+        self.assertGreaterEqual(
+            result.minimum_inter_vehicle_clearance_m,
+            AUTOMATIC_MINIMUM_CLEARANCE_M,
+        )
+
+    def test_peer_state_expiry_keeps_an_active_yielder_stopped(self) -> None:
+        crossing = FleetScenario.load(
+            REPO_ROOT / "examples" / "two_vehicle_crossing_episode.json"
+        )
+        fleet = FleetRuntime.create(
+            crossing,
+            grid=MapGrid.from_wall_set(24, 24, set()),
+            in_process_peer_states=True,
+        )
+        exchange = _DeterministicPeerStateExchange(fleet)
+        for index, (vehicle_id, goal) in enumerate(
+            (
+                ("mock_vehicle_01", (11.0, 11.0)),
+                ("mock_vehicle_02", (9.0, 11.0)),
+            ),
+            1,
+        ):
+            self.assertTrue(
+                fleet.handle_command(
+                    vehicle_id,
+                    ModeCommand(1, ModeAction.SWITCH_TO_AUTO),
+                ).accepted
+            )
+            self.assertTrue(
+                fleet.handle_command(
+                    vehicle_id,
+                    AutoCommand(
+                        2,
+                        AutoAction.PUSH,
+                        (GotoMission(f"goto-{index}", "global_map", *goal, 2),),
+                    ),
+                ).accepted
+            )
+
+        for _ in range(80):
+            fleet.tick(fleet.timestamp_at(fleet.world.now + fleet.tick_s))
+            exchange.advance()
+            if fleet.nodes["mock_vehicle_02"].controller.is_yielding:
+                break
+        else:
+            self.fail("lower-priority vehicle never yielded")
+
+        for _ in range(6):
+            fleet.tick(fleet.timestamp_at(fleet.world.now + fleet.tick_s))
+
+        node = fleet.nodes["mock_vehicle_02"]
+        self.assertEqual(node.map_sync.peer_vehicle_states(), ())
+        self.assertTrue(node.controller.is_yielding)
+        self.assertEqual(node.controller.auto_state.value, "active")
+        self.assertEqual(
+            fleet.world.vehicle("mock_vehicle_02").target_velocities(),
+            (0.0, 0.0),
+        )
+        self.assertTrue(
+            fleet.handle_command(
+                "mock_vehicle_02",
+                ModeCommand(3, ModeAction.SWITCH_TO_MANUAL),
+            ).accepted
+        )
+        self.assertFalse(node.controller.is_yielding)
 
     def test_timeout_uses_simulation_time(self) -> None:
         result = run_episode(

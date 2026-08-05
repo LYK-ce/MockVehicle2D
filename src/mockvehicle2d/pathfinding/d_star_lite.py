@@ -121,6 +121,10 @@ class DStarLitePlanner:
             "key_modifier_cost": self._key_modifier_cost,
         }
 
+    @property
+    def has_peer_exclusions(self) -> bool:
+        return bool(self._peer_forbidden_cells)
+
     def planning_budget_allows(self, start: Cell, goal: Cell) -> bool:
         self._validate_cell(start, "start")
         self._validate_cell(goal, "goal")
