@@ -73,7 +73,7 @@ mockvehicle2d episode \
   --max-simulation-s 30 \
   --goto mock_vehicle_01,11,10
 
-# P2P-disabled 双车交叉基准；固定优先级让行后两车均可确定性完成
+# 无 localhost libp2p 的双车交叉基准；进程内 peer-state relay 驱动确定性让行
 mockvehicle2d episode \
   --scenario examples/two_vehicle_crossing_episode.json \
   --max-simulation-s 30 \
@@ -120,8 +120,8 @@ tick、所有无序车辆对的最小圆形 footprint 边缘间距（中心距�
 `mockvehicle2d.episode.run_episode`，可直接传入现有 `GotoMission`、`PatrolMission` 或
 `CoverageMission`。
 
-初版 Runner 明确拒绝启用 P2P 的场景，因为真实 localhost libp2p 调度不属于确定性模拟
-时钟；确定性通信环境完成后再接入。Runner 当前也不包含定时事件或通信故障注入。
+Runner 明确拒绝启用真实 P2P 的场景，因为 localhost libp2p 调度和 map delta 传播不属于
+确定性模拟时钟；当前只提供上述进程内 peer-state relay，不包含定时事件或通信故障注入。
 
 ## 多车共享世界
 
@@ -155,8 +155,9 @@ sidecar；默认无顶层 `p2p` 的场景不启动任何网络进程。每辆车
 自己 `ObservedGrid` 新产生的 dirty cells；没有变化时不发消息，发送和接收都不会等待
 其他节点。身份密钥保存在配置的 `runtime_dir`，进程重启后 PeerId 保持稳定。
 
-每车严格维护 OwnMap、按来源划分的 PeerEvidence 和只读 CollaborativeView。远端证据
-不会进入 OwnMap、不会重新发布，也暂不改变 D* Lite 或本地安全决策。P2P 健康度、
+每车严格维护 OwnMap、按来源划分的 PeerEvidence 和只读 CollaborativeView。远端地图证据
+不会进入 OwnMap、不会重新发布，也暂不改变 D* Lite 或本地安全决策；peer vehicle state
+只作为瞬态 footprint exclusion 和让行输入。P2P 健康度、
 本地/远端 delta 计数和协同视图摘要通过每车 `pose.p2p_map_sync` 遥测提供。当前仅实现
 在线增量和重复/过期拒绝；离线缺包与后加入节点的 tile 快照恢复留到下一里程碑。
 
