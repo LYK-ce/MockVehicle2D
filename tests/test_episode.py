@@ -15,6 +15,7 @@ from mockvehicle2d.controller import (
     PatrolMission,
 )
 from mockvehicle2d.episode import (
+    EpisodeResult,
     MIN_PROGRESS_TRANSLATION_M,
     _DeterministicPeerStateExchange,
     _update_no_progress,
@@ -32,6 +33,12 @@ from mockvehicle2d.safety import AUTOMATIC_MINIMUM_CLEARANCE_M
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
+FOUR_VEHICLE_CROSSING_GOALS = (
+    ("mock_vehicle_01", (15.0, 10.0)),
+    ("mock_vehicle_02", (5.0, 10.0)),
+    ("mock_vehicle_03", (10.0, 15.0)),
+    ("mock_vehicle_04", (10.0, 5.0)),
+)
 
 
 def scenario(*, p2p: P2PSettings | None = None) -> FleetScenario:
@@ -53,6 +60,25 @@ def scenario(*, p2p: P2PSettings | None = None) -> FleetScenario:
 
 def mission(x_m: float) -> GotoMission:
     return GotoMission("goto-1", "global_map", x_m, 5.0, 2)
+
+
+def run_four_vehicle_crossing(scenario: FleetScenario) -> EpisodeResult:
+    return run_episode(
+        scenario,
+        {
+            vehicle_id: (
+                GotoMission(
+                    f"goto-{vehicle_id[-2:]}",
+                    "global_map",
+                    *goal,
+                    2,
+                ),
+            )
+            for vehicle_id, goal in FOUR_VEHICLE_CROSSING_GOALS
+        },
+        max_simulation_s=90.0,
+        grid=MapGrid.from_wall_set(20, 20, set()),
+    )
 
 
 class TestEpisodeRunner(unittest.TestCase):
@@ -213,6 +239,69 @@ class TestEpisodeRunner(unittest.TestCase):
                 vehicle["longest_no_progress_duration_s"],
                 result.simulation_duration_s,
             )
+
+    def test_four_vehicle_crossing_is_deterministic_and_order_independent(self) -> None:
+        crossing = FleetScenario.load(
+            REPO_ROOT / "tests" / "fixtures" / "four_vehicle_crossing_episode.json"
+        )
+        reordered = FleetScenario(
+            crossing.scenario_id,
+            tuple(reversed(crossing.vehicles)),
+            crossing.tick_ms,
+        )
+        results = (
+            run_four_vehicle_crossing(crossing),
+            run_four_vehicle_crossing(crossing),
+            run_four_vehicle_crossing(reordered),
+        )
+
+        self.assertEqual(len({result.to_json() for result in results}), 1)
+        for result in results:
+            self.assertTrue(result.success, result.as_dict())
+            self.assertEqual(result.termination_reason, "completed")
+            self.assertGreaterEqual(
+                result.minimum_inter_vehicle_clearance_m,
+                AUTOMATIC_MINIMUM_CLEARANCE_M,
+            )
+            self.assertEqual(len(result.vehicles), 4)
+            self.assertTrue(
+                all(
+                    not vehicle["collision_occurred"]
+                    and not vehicle["blocked"]
+                    and vehicle["blocked_reason"] is None
+                    and vehicle["missions"][0]["status"] == "reached"
+                    for vehicle in result.vehicles
+                )
+            )
+
+    def test_four_vehicle_crossing_is_stable_across_tick_sizes(self) -> None:
+        crossing = FleetScenario.load(
+            REPO_ROOT / "tests" / "fixtures" / "four_vehicle_crossing_episode.json"
+        )
+
+        for tick_ms in (50, 250):
+            with self.subTest(tick_ms=tick_ms):
+                result = run_four_vehicle_crossing(
+                    FleetScenario(
+                        crossing.scenario_id,
+                        crossing.vehicles,
+                        tick_ms,
+                    )
+                )
+                self.assertTrue(result.success, result.as_dict())
+                self.assertEqual(result.termination_reason, "completed")
+                self.assertGreaterEqual(
+                    result.minimum_inter_vehicle_clearance_m,
+                    AUTOMATIC_MINIMUM_CLEARANCE_M,
+                )
+                self.assertTrue(
+                    all(
+                        not vehicle["collision_occurred"]
+                        and not vehicle["blocked"]
+                        and vehicle["missions"][0]["status"] == "reached"
+                        for vehicle in result.vehicles
+                    )
+                )
 
     def test_completed_episode_drains_residual_motion_before_returning(self) -> None:
         from mockvehicle2d import episode as episode_module

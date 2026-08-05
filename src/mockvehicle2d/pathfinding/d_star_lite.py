@@ -117,6 +117,7 @@ class DStarLitePlanner:
         ] | None = None
         self._peer_route_frontier: deque[Cell] = deque()
         self._peer_route_visited: set[Cell] = set()
+        self._path_extraction_recovery: tuple[Cell, Cell] | None = None
         self.last_failure: str | None = None
         self.last_failure_caused_by_peer = False
 
@@ -380,6 +381,7 @@ class DStarLitePlanner:
                     return PlanProgress("pending")
                 self.last_failure = "search_exhausted"
                 self.last_failure_caused_by_peer = caused_by_peer
+                self._path_extraction_recovery = None
                 self._planning_pending = False
                 return PlanProgress("unreachable")
 
@@ -421,6 +423,7 @@ class DStarLitePlanner:
                 not self._blocked(start, ignore_peer_forbidden=True)
                 or self._has_start_egress(ignore_peer_forbidden=True)
             )
+            self._path_extraction_recovery = None
             self._planning_pending = False
             return PlanProgress("unreachable")
         if self._blocked(goal):
@@ -428,12 +431,14 @@ class DStarLitePlanner:
             self.last_failure_caused_by_peer = (
                 not self._blocked(goal, ignore_peer_forbidden=True)
             )
+            self._path_extraction_recovery = None
             self._planning_pending = False
             return PlanProgress("unreachable")
         expansion_limit = self._cell_count() * 20
         remaining_expansions = expansion_limit - self._planning_expansions
         if remaining_expansions <= 0:
             self.last_failure = "expansion_limit"
+            self._path_extraction_recovery = None
             self._planning_pending = False
             return PlanProgress("unreachable")
         before = self._expansions
@@ -444,6 +449,7 @@ class DStarLitePlanner:
         if not complete:
             if self._planning_expansions >= expansion_limit:
                 self.last_failure = "expansion_limit"
+                self._path_extraction_recovery = None
                 self._planning_pending = False
                 return PlanProgress("unreachable")
             self._planning_pending = True
@@ -451,11 +457,23 @@ class DStarLitePlanner:
         self._planning_pending = False
         path = self._extract_path()
         if path is None:
+            # ponytail: one reset repairs stale incremental state; a repeated
+            # extraction failure for the same endpoints remains terminal.
+            if (
+                not math.isinf(self._g_value(start))
+                and self._path_extraction_recovery != (start, goal)
+            ):
+                self._path_extraction_recovery = start, goal
+                self._reset(start, goal)
+                self._planning_expansions = 0
+                self._planning_pending = True
+                return PlanProgress("pending")
             self.last_failure = (
                 "search_exhausted"
                 if math.isinf(self._g_value(start))
                 else "path_extraction"
             )
+            self._path_extraction_recovery = None
             if (
                 self.last_failure == "search_exhausted"
                 and self._peer_forbidden_cells
@@ -470,6 +488,7 @@ class DStarLitePlanner:
                     return PlanProgress("pending")
                 self.last_failure_caused_by_peer = caused_by_peer
             return PlanProgress("unreachable")
+        self._path_extraction_recovery = None
         return PlanProgress("ready", path)
 
     def _reset(self, start: Cell, goal: Cell) -> None:

@@ -79,6 +79,10 @@ mockvehicle2d episode \
   --max-simulation-s 30 \
   --goto mock_vehicle_01,11,11 \
   --goto mock_vehicle_02,9,11
+
+# 四车从东、西、南、北穿过同一中心的空场确定性协同基准
+python -m pytest -p no:cacheprovider -q tests/test_episode.py \
+  -k four_vehicle_crossing
 ```
 
 依赖安装在仓库本地 `.venv/`。公开接口统一使用 SI 单位：米、秒、弧度、米/秒、
