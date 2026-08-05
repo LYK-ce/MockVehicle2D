@@ -110,6 +110,7 @@ class DStarLitePlanner:
         self._planning_pending = False
         self._planning_expansions = 0
         self.last_failure: str | None = None
+        self.last_failure_caused_by_peer = False
 
     @property
     def stats(self) -> dict[str, float | int]:
@@ -120,10 +121,6 @@ class DStarLitePlanner:
             "resets": self._resets,
             "key_modifier_cost": self._key_modifier_cost,
         }
-
-    @property
-    def has_peer_exclusions(self) -> bool:
-        return bool(self._peer_forbidden_cells)
 
     def planning_budget_allows(self, start: Cell, goal: Cell) -> bool:
         self._validate_cell(start, "start")
@@ -189,6 +186,7 @@ class DStarLitePlanner:
         *,
         extra_clearance_m: float = 0.0,
         require_observed: bool = False,
+        _ignore_peer_exclusions: bool = False,
     ) -> bool:
         if (
             not isinstance(source_m, tuple)
@@ -203,7 +201,11 @@ class DStarLitePlanner:
             or not isinstance(value, (int, float))
             or not math.isfinite(value)
             for value in values
-        ) or extra_clearance_m < 0 or type(require_observed) is not bool:
+        ) or (
+            extra_clearance_m < 0
+            or type(require_observed) is not bool
+            or type(_ignore_peer_exclusions) is not bool
+        ):
             raise ValueError(
                 "segment endpoints and clearance must be finite; "
                 "clearance cannot be negative and require_observed must be boolean"
@@ -223,15 +225,28 @@ class DStarLitePlanner:
             block_tangent=extra_clearance_m > 0,
             require_observed=require_observed,
             ignore_peer_forbidden=True,
-        ) and not self._peer_circle_segment_blocked(source_m, destination_m)
+        ) and (
+            _ignore_peer_exclusions
+            or not self._peer_circle_segment_blocked(source_m, destination_m)
+        )
 
     def best_start_connection(
         self,
         source_m: tuple[float, float],
         current: Cell,
+        *,
+        _ignore_peer_exclusions: bool = False,
     ) -> Cell | None:
         self._validate_cell(current, "current")
         if self._goal is None or not self._inside(current):
+            return None
+        if (
+            _ignore_peer_exclusions
+            and not self.route_exists_without_peer_exclusions(
+                current,
+                self._goal,
+            )
+        ):
             return None
         candidates = (current, *self._neighbours(current))
         source = (
@@ -240,7 +255,13 @@ class DStarLitePlanner:
         )
         choices = []
         for candidate in candidates:
-            if self._blocked(candidate) or math.isinf(self._g_value(candidate)):
+            if self._blocked(
+                candidate,
+                ignore_peer_forbidden=_ignore_peer_exclusions,
+            ) or (
+                not _ignore_peer_exclusions
+                and math.isinf(self._g_value(candidate))
+            ):
                 continue
             destination = candidate[0] + 0.5, candidate[1] + 0.5
             if self._segment_blocked(
@@ -248,6 +269,7 @@ class DStarLitePlanner:
                 destination,
                 allow_forbidden_egress=True,
                 allow_clearance_egress=self._start_position_cells is not None,
+                ignore_peer_forbidden=_ignore_peer_exclusions,
             ):
                 continue
             connector = (
@@ -264,7 +286,12 @@ class DStarLitePlanner:
             )
             choices.append(
                 (
-                    connector + self._g_value(candidate),
+                    connector
+                    + (
+                        _octile(candidate, self._goal, self.resolution_m)
+                        if _ignore_peer_exclusions
+                        else self._g_value(candidate)
+                    ),
                     _octile(candidate, self._goal, self.resolution_m),
                     candidate,
                 )
@@ -340,6 +367,7 @@ class DStarLitePlanner:
         else:
             start_position_cells = None
         self.last_failure = None
+        self.last_failure_caused_by_peer = False
         previous_start_position = self._start_position_cells
         self._start_position_cells = start_position_cells
 
@@ -379,10 +407,16 @@ class DStarLitePlanner:
                 self._update_vertex(start)
         if self._blocked(start) and not self._has_start_egress():
             self.last_failure = "start_blocked"
+            self.last_failure_caused_by_peer = (
+                self.route_exists_without_peer_exclusions(start, goal)
+            )
             self._planning_pending = False
             return PlanProgress("unreachable")
         if self._blocked(goal):
             self.last_failure = "goal_blocked"
+            self.last_failure_caused_by_peer = (
+                self.route_exists_without_peer_exclusions(start, goal)
+            )
             self._planning_pending = False
             return PlanProgress("unreachable")
         expansion_limit = self._cell_count() * 20
@@ -411,6 +445,10 @@ class DStarLitePlanner:
                 if math.isinf(self._g_value(start))
                 else "path_extraction"
             )
+            if self.last_failure == "search_exhausted":
+                self.last_failure_caused_by_peer = (
+                    self.route_exists_without_peer_exclusions(start, goal)
+                )
             return PlanProgress("unreachable")
         return PlanProgress("ready", path)
 
@@ -529,20 +567,40 @@ class DStarLitePlanner:
         if self._g_value(cell) != self._rhs_value(cell):
             self._push(cell)
 
-    def _cost(self, source: Cell, destination: Cell) -> float:
-        if self._blocked(source):
-            return self._start_connection_cost(source, destination)
-        if self._blocked(destination):
+    def _cost(
+        self,
+        source: Cell,
+        destination: Cell,
+        *,
+        ignore_peer_forbidden: bool = False,
+    ) -> float:
+        if self._blocked(source, ignore_peer_forbidden=ignore_peer_forbidden):
+            return self._start_connection_cost(
+                source,
+                destination,
+                ignore_peer_forbidden=ignore_peer_forbidden,
+            )
+        if self._blocked(
+            destination,
+            ignore_peer_forbidden=ignore_peer_forbidden,
+        ):
             return math.inf
         dx, dy = destination[0] - source[0], destination[1] - source[1]
         if dx and dy and (
-            self._blocked((source[0] + dx, source[1]))
-            or self._blocked((source[0], source[1] + dy))
+            self._blocked(
+                (source[0] + dx, source[1]),
+                ignore_peer_forbidden=ignore_peer_forbidden,
+            )
+            or self._blocked(
+                (source[0], source[1] + dy),
+                ignore_peer_forbidden=ignore_peer_forbidden,
+            )
         ):
             return math.inf
         if self._segment_blocked(
             (source[0] + 0.5, source[1] + 0.5),
             (destination[0] + 0.5, destination[1] + 0.5),
+            ignore_peer_forbidden=ignore_peer_forbidden,
         ):
             return math.inf
         step = self.resolution_m * (SQRT_2 if dx and dy else 1.0)
@@ -711,22 +769,77 @@ class DStarLitePlanner:
             for center_x, center_y, radius_m in circles()
         )
 
-    def _has_start_egress(self) -> bool:
+    def _has_start_egress(
+        self,
+        *,
+        ignore_peer_forbidden: bool = False,
+    ) -> bool:
         assert self._start is not None
         return any(
-            math.isfinite(self._start_connection_cost(self._start, neighbour))
+            math.isfinite(
+                self._start_connection_cost(
+                    self._start,
+                    neighbour,
+                    ignore_peer_forbidden=ignore_peer_forbidden,
+                )
+            )
             for neighbour in self._neighbours(self._start)
         )
+
+    def route_exists_without_peer_exclusions(
+        self,
+        start: Cell,
+        goal: Cell,
+    ) -> bool:
+        """Return counterfactual route evidence; never authorize motion."""
+        self._validate_cell(start, "start")
+        self._validate_cell(goal, "goal")
+        if (
+            self._bounds is None
+            or not self._inside(start)
+            or not self._inside(goal)
+        ):
+            return False
+        if self._blocked(
+            start,
+            ignore_peer_forbidden=True,
+        ) and not self._has_start_egress(ignore_peer_forbidden=True):
+            return False
+        if self._blocked(goal, ignore_peer_forbidden=True):
+            return False
+        frontier = [start]
+        visited = {start}
+        while frontier:
+            current = frontier.pop()
+            if current == goal:
+                return True
+            for neighbour in self._neighbours(current):
+                if neighbour in visited or math.isinf(
+                    self._cost(
+                        current,
+                        neighbour,
+                        ignore_peer_forbidden=True,
+                    )
+                ):
+                    continue
+                visited.add(neighbour)
+                frontier.append(neighbour)
+        return False
 
     def _start_connection_cost(
         self,
         source: Cell,
         destination: Cell,
+        *,
+        ignore_peer_forbidden: bool = False,
     ) -> float:
         if (
             source != self._start
             or self._start_position_cells is None
-            or self._blocked(destination)
+            or self._blocked(
+                destination,
+                ignore_peer_forbidden=ignore_peer_forbidden,
+            )
         ):
             return math.inf
         target = destination[0] + 0.5, destination[1] + 0.5
@@ -734,6 +847,7 @@ class DStarLitePlanner:
             self._start_position_cells,
             target,
             allow_clearance_egress=True,
+            ignore_peer_forbidden=ignore_peer_forbidden,
         ):
             return math.inf
         distance_m = (
@@ -742,10 +856,15 @@ class DStarLitePlanner:
         state = self._states.get(destination, UNKNOWN)
         return distance_m * (1.0 if state == FREE else self.unknown_cost)
 
-    def _blocked(self, cell: Cell) -> bool:
+    def _blocked(
+        self,
+        cell: Cell,
+        *,
+        ignore_peer_forbidden: bool = False,
+    ) -> bool:
         if not self._inside(cell):
             return True
-        if cell in self._peer_forbidden_cells:
+        if not ignore_peer_forbidden and cell in self._peer_forbidden_cells:
             return True
         radius = self._inflation_cells
         centre_x, centre_y = cell[0] + 0.5, cell[1] + 0.5

@@ -78,7 +78,8 @@ Free；选中后保持稳定，并在每帧证据更新后重新验证。
 置为 `blocked` 且不跳过队列；条件恢复后可 `resume` 重试，或用 `cancel_all` 清空。
 
 已验证身份且未过期的 peer vehicle state 作为瞬态 footprint exclusion 单独进入规划，
-不会写入 `ObservedGrid`。如果当前无路由 peer exclusion 引起，任务保持 `active`，等待
+不会写入 `ObservedGrid`。只有同一规划请求在忽略 peer exclusion 后存在可行路径，才把
+当前无路归因为瞬态 peer 阻塞并保持 `active`；静态起点、目标或路径阻塞仍终止任务。
 peer 位置变化后增量重试；匿名 LiDAR 动态回波仍按保守的有限视野障碍处理。规划给出的
 期望速度进入 LocalSafety 前还会做 4 秒最近接近预测：发生冲突时，`vehicle_id` 字典序
 较大的车辆让行并有界制动，连续 3 个控制 tick 确认冲突解除后恢复。让行期间 peer state

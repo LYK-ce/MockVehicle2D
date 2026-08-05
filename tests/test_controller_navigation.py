@@ -481,6 +481,43 @@ class TestControllerNavigation(unittest.TestCase):
         )
         self.assertEqual(runtime.controller.navigation.reason, "no_path")
 
+    def test_unrelated_peer_does_not_hide_a_static_blocked_start(self) -> None:
+        local_map = ObservedGrid(
+            AnchorSpec("blocked-start-anchor", 0.0, 0.0, 0.0),
+            resolution_m=1.0,
+        )
+        pose = PoseEstimate(
+            "blocked-start-anchor",
+            0.5,
+            0.5,
+            0.0,
+            (0.0, 0.0, 0.0),
+            "nominal",
+            0.0,
+            0,
+        )
+        navigation = RobotController().navigation
+        navigation.start(4.5, 0.5, local_map=local_map, pose=pose)
+
+        navigation.update(
+            pose=pose,
+            local_map=local_map,
+            max_linear_mps=1.0,
+            max_angular_rps=1.0,
+            map_delta=LocalMapDelta(
+                tuple(
+                    MapCellUpdate(gx, gy, OCCUPIED)
+                    for gx in range(-1, 2)
+                    for gy in range(-1, 2)
+                ),
+                ((12, 12),),
+            ),
+        )
+
+        self.assertEqual(navigation.status, "blocked")
+        self.assertEqual(navigation.reason, "no_path")
+        self.assertEqual(navigation.detail, "start_blocked")
+
     def test_multi_obstacle_layout_terminates_without_active_stop_loop(self) -> None:
         walls = {
             (5, 2),

@@ -717,6 +717,36 @@ def test_no_route_returns_none() -> None:
     assert search.last_failure == "search_exhausted"
 
 
+@pytest.mark.parametrize(
+    ("peer_cell", "static_cell", "failure", "caused_by_peer"),
+    (
+        ((0, 0), None, "start_blocked", True),
+        ((4, 0), None, "goal_blocked", True),
+        ((2, 0), None, "search_exhausted", True),
+        ((3, 0), (0, 0), "start_blocked", False),
+        ((3, 0), (4, 0), "goal_blocked", False),
+        ((3, 0), (2, 0), "search_exhausted", False),
+    ),
+)
+def test_peer_failure_evidence_requires_a_peer_caused_failure(
+    peer_cell: tuple[int, int],
+    static_cell: tuple[int, int] | None,
+    failure: str,
+    caused_by_peer: bool,
+) -> None:
+    search = planner(bounds_margin_m=0.0)
+    search.set_peer_forbidden_cells((peer_cell,))
+    changes = (
+        ()
+        if static_cell is None
+        else (MapCellUpdate(*static_cell, OCCUPIED),)
+    )
+
+    assert search.plan((0, 0), (4, 0), changed_cells=changes) is None
+    assert search.last_failure == failure
+    assert search.last_failure_caused_by_peer is caused_by_peer
+
+
 @pytest.mark.parametrize("blocked", [(0, 0), (4, 0)])
 def test_occupied_start_or_goal_returns_none(blocked: tuple[int, int]) -> None:
     search = planner()
