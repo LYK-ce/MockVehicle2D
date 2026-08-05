@@ -625,6 +625,8 @@ class GotoController:
                 goal_cell,
                 require_observed=False,
             )
+            if progress.status == "pending":
+                return
             if not requested_safe or progress.status == "unreachable":
                 candidate_without_peers = self._candidate_is_safe(
                     point,
@@ -632,15 +634,10 @@ class GotoController:
                     require_observed=False,
                     _ignore_peer_exclusions=True,
                 )
-                route_without_peers = (
-                    progress.status == "ready"
-                    or self._planner.route_exists_without_peer_exclusions(
-                        self._pose_cell(pose, local_map),
-                        goal_cell,
-                    )
-                )
                 current_failure_is_peer = (
-                    not requested_safe and candidate_without_peers
+                    progress.status == "ready"
+                    and not requested_safe
+                    and candidate_without_peers
                 ) or (
                     progress.status == "unreachable"
                     and self._planner.last_failure_caused_by_peer
@@ -648,12 +645,9 @@ class GotoController:
                 self._safe_search_peer_blocked |= (
                     current_failure_is_peer
                     and candidate_without_peers
-                    and route_without_peers
                 )
                 self._pending_candidate = None
                 continue
-            if progress.status == "pending":
-                return
             assert progress.path is not None
             if self._planner.best_start_connection(
                 (pose.x_m, pose.y_m),

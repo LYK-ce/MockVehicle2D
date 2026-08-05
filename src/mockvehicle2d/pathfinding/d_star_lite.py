@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections import deque
 from dataclasses import dataclass
 import heapq
 import math
@@ -109,6 +110,13 @@ class DStarLitePlanner:
         self._resets = 0
         self._planning_pending = False
         self._planning_expansions = 0
+        self._peer_route_probe: tuple[
+            Cell,
+            Cell,
+            tuple[float, float] | None,
+        ] | None = None
+        self._peer_route_frontier: deque[Cell] = deque()
+        self._peer_route_visited: set[Cell] = set()
         self.last_failure: str | None = None
         self.last_failure_caused_by_peer = False
 
@@ -157,6 +165,8 @@ class DStarLitePlanner:
             raise ValueError("peer forbidden cells must be integer pairs")
         changed = self._peer_forbidden_cells ^ updated
         self._peer_forbidden_cells = updated
+        if changed:
+            self._cancel_peer_route_probe()
         if changed and self._bounds is not None:
             affected = {
                 neighbour
@@ -240,14 +250,6 @@ class DStarLitePlanner:
         self._validate_cell(current, "current")
         if self._goal is None or not self._inside(current):
             return None
-        if (
-            _ignore_peer_exclusions
-            and not self.route_exists_without_peer_exclusions(
-                current,
-                self._goal,
-            )
-        ):
-            return None
         candidates = (current, *self._neighbours(current))
         source = (
             source_m[0] / self.resolution_m,
@@ -258,10 +260,7 @@ class DStarLitePlanner:
             if self._blocked(
                 candidate,
                 ignore_peer_forbidden=_ignore_peer_exclusions,
-            ) or (
-                not _ignore_peer_exclusions
-                and math.isinf(self._g_value(candidate))
-            ):
+            ) or math.isinf(self._g_value(candidate)):
                 continue
             destination = candidate[0] + 0.5, candidate[1] + 0.5
             if self._segment_blocked(
@@ -286,12 +285,7 @@ class DStarLitePlanner:
             )
             choices.append(
                 (
-                    connector
-                    + (
-                        _octile(candidate, self._goal, self.resolution_m)
-                        if _ignore_peer_exclusions
-                        else self._g_value(candidate)
-                    ),
+                    connector + self._g_value(candidate),
                     _octile(candidate, self._goal, self.resolution_m),
                     candidate,
                 )
@@ -373,6 +367,22 @@ class DStarLitePlanner:
 
         changes = self._record_changes(changed_cells)
 
+        probe_request = (start, goal, start_position_cells)
+        if self._peer_route_probe is not None:
+            if self._peer_route_probe != probe_request:
+                self._cancel_peer_route_probe()
+            else:
+                caused_by_peer = self._advance_peer_route_probe(
+                    expansion_budget
+                )
+                if caused_by_peer is None:
+                    self._planning_pending = True
+                    return PlanProgress("pending")
+                self.last_failure = "search_exhausted"
+                self.last_failure_caused_by_peer = caused_by_peer
+                self._planning_pending = False
+                return PlanProgress("unreachable")
+
         new_planning_session = (
             not self._planning_pending or self._goal != goal
         )
@@ -408,14 +418,15 @@ class DStarLitePlanner:
         if self._blocked(start) and not self._has_start_egress():
             self.last_failure = "start_blocked"
             self.last_failure_caused_by_peer = (
-                self.route_exists_without_peer_exclusions(start, goal)
+                not self._blocked(start, ignore_peer_forbidden=True)
+                or self._has_start_egress(ignore_peer_forbidden=True)
             )
             self._planning_pending = False
             return PlanProgress("unreachable")
         if self._blocked(goal):
             self.last_failure = "goal_blocked"
             self.last_failure_caused_by_peer = (
-                self.route_exists_without_peer_exclusions(start, goal)
+                not self._blocked(goal, ignore_peer_forbidden=True)
             )
             self._planning_pending = False
             return PlanProgress("unreachable")
@@ -445,14 +456,24 @@ class DStarLitePlanner:
                 if math.isinf(self._g_value(start))
                 else "path_extraction"
             )
-            if self.last_failure == "search_exhausted":
-                self.last_failure_caused_by_peer = (
-                    self.route_exists_without_peer_exclusions(start, goal)
+            if (
+                self.last_failure == "search_exhausted"
+                and self._peer_forbidden_cells
+            ):
+                self._begin_peer_route_probe(start, goal)
+                caused_by_peer = self._advance_peer_route_probe(
+                    max(0, expansion_budget - (self._expansions - before))
                 )
+                if caused_by_peer is None:
+                    self.last_failure = None
+                    self._planning_pending = True
+                    return PlanProgress("pending")
+                self.last_failure_caused_by_peer = caused_by_peer
             return PlanProgress("unreachable")
         return PlanProgress("ready", path)
 
     def _reset(self, start: Cell, goal: Cell) -> None:
+        self._cancel_peer_route_probe()
         bounds = self._planning_bounds(start, goal)
         self._bounds = bounds
         self._start = self._last_start = start
@@ -484,6 +505,8 @@ class DStarLitePlanner:
         changed_cells: Iterable[MapCellUpdate],
     ) -> tuple[MapCellUpdate, ...]:
         changes = tuple(changed_cells)
+        if changes:
+            self._cancel_peer_route_probe()
         for change in changes:
             self._validate_update(change)
             if change.state == UNKNOWN:
@@ -786,35 +809,33 @@ class DStarLitePlanner:
             for neighbour in self._neighbours(self._start)
         )
 
-    def route_exists_without_peer_exclusions(
+    def _begin_peer_route_probe(self, start: Cell, goal: Cell) -> None:
+        self._peer_route_probe = start, goal, self._start_position_cells
+        self._peer_route_frontier = deque((start,))
+        self._peer_route_visited = {start}
+
+    def _advance_peer_route_probe(
         self,
-        start: Cell,
-        goal: Cell,
-    ) -> bool:
-        """Return counterfactual route evidence; never authorize motion."""
-        self._validate_cell(start, "start")
-        self._validate_cell(goal, "goal")
+        expansion_budget: int,
+    ) -> bool | None:
+        assert self._peer_route_probe is not None
+        start, goal, _ = self._peer_route_probe
         if (
-            self._bounds is None
-            or not self._inside(start)
-            or not self._inside(goal)
-        ):
+            self._blocked(start, ignore_peer_forbidden=True)
+            and not self._has_start_egress(ignore_peer_forbidden=True)
+        ) or self._blocked(goal, ignore_peer_forbidden=True):
+            self._cancel_peer_route_probe()
             return False
-        if self._blocked(
-            start,
-            ignore_peer_forbidden=True,
-        ) and not self._has_start_egress(ignore_peer_forbidden=True):
-            return False
-        if self._blocked(goal, ignore_peer_forbidden=True):
-            return False
-        frontier = [start]
-        visited = {start}
-        while frontier:
-            current = frontier.pop()
+        expansions = 0
+        while self._peer_route_frontier and expansions < expansion_budget:
+            current = self._peer_route_frontier.popleft()
+            expansions += 1
             if current == goal:
+                self._expansions += expansions
+                self._cancel_peer_route_probe()
                 return True
             for neighbour in self._neighbours(current):
-                if neighbour in visited or math.isinf(
+                if neighbour in self._peer_route_visited or math.isinf(
                     self._cost(
                         current,
                         neighbour,
@@ -822,9 +843,18 @@ class DStarLitePlanner:
                     )
                 ):
                     continue
-                visited.add(neighbour)
-                frontier.append(neighbour)
+                self._peer_route_visited.add(neighbour)
+                self._peer_route_frontier.append(neighbour)
+        self._expansions += expansions
+        if self._peer_route_frontier:
+            return None
+        self._cancel_peer_route_probe()
         return False
+
+    def _cancel_peer_route_probe(self) -> None:
+        self._peer_route_probe = None
+        self._peer_route_frontier.clear()
+        self._peer_route_visited.clear()
 
     def _start_connection_cost(
         self,

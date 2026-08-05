@@ -31,6 +31,7 @@ from mockvehicle2d.local_state import (
     PoseEstimate,
 )
 from mockvehicle2d.map_grid import MapGrid
+from mockvehicle2d.pathfinding.d_star_lite import PlanProgress
 from mockvehicle2d.safety import (
     LocalSafetyRuntime,
     SafetyAdvanceResult,
@@ -88,6 +89,69 @@ def start_missions(runtime: VehicleRuntime, *missions: GotoMission) -> None:
 
 
 class TestControllerNavigation(unittest.TestCase):
+    def test_safe_candidate_planner_failures_do_not_become_peer_waits(self) -> None:
+        local_map = ObservedGrid(
+            AnchorSpec("candidate-failure-anchor", 0.0, 0.0, 0.0),
+            resolution_m=1.0,
+        )
+        pose = PoseEstimate(
+            "candidate-failure-anchor",
+            0.5,
+            0.5,
+            0.0,
+            (0.0, 0.0, 0.0),
+            "nominal",
+            0.0,
+            0,
+        )
+        for failure in ("expansion_limit", "path_extraction"):
+            with self.subTest(failure=failure):
+                navigation = RobotController().navigation
+                navigation.start(4.5, 0.5, local_map=local_map, pose=pose)
+                candidate = ((3.5, 0.5), (3, 0))
+                assert navigation._planner is not None
+                navigation._planner.plan((0, 0), candidate[1])
+                navigation._begin_safe_goal_search(
+                    pose,
+                    local_map,
+                    skip_goal_connected=False,
+                    peer_blocked=False,
+                )
+                navigation._safe_candidates = [candidate]
+                navigation._safe_candidate_index = 1
+                navigation._pending_candidate = candidate
+
+                def fail_plan(*args, **kwargs):
+                    navigation._planner.last_failure = failure
+                    navigation._planner.last_failure_caused_by_peer = False
+                    return PlanProgress("unreachable")
+
+                with (
+                    patch.object(
+                        navigation._planner,
+                        "advance_plan",
+                        side_effect=fail_plan,
+                    ),
+                    patch.object(
+                        navigation,
+                        "_candidate_is_safe",
+                        side_effect=lambda *args, **kwargs: kwargs.get(
+                            "_ignore_peer_exclusions",
+                            False,
+                        ),
+                    ),
+                ):
+                    navigation._advance_safe_candidate(
+                        pose,
+                        local_map,
+                        (),
+                        256,
+                    )
+
+                self.assertEqual(navigation.status, "blocked")
+                self.assertEqual(navigation.reason, "no_path")
+                self.assertFalse(navigation._waiting_for_peer_replan)
+
     def test_nearby_safe_candidates_prefer_the_current_side(self) -> None:
         local_map = ObservedGrid(
             AnchorSpec("candidate-anchor", 0.0, 0.0, 0.0),
