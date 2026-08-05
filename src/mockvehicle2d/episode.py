@@ -29,6 +29,7 @@ from mockvehicle2d.vehicle import (
 
 RESULT_SCHEMA_VERSION = 2
 MIN_PROGRESS_TRANSLATION_M = 0.001
+PEER_STATE_DELAY_TICKS = 1
 _MISSION_TYPES = (GotoMission, PatrolMission, CoverageMission)
 
 
@@ -66,6 +67,84 @@ class EpisodeResult:
             separators=(",", ":"),
             sort_keys=True,
         )
+
+
+class _DeterministicPeerStateExchange:
+    """Relay validated peer-state JSON after a fixed simulation-tick delay."""
+
+    def __init__(self, fleet: FleetRuntime) -> None:
+        self._fleet = fleet
+        self._tick = 0
+        self._pending: list[tuple[int, str, str]] = []
+        vehicle_ids = tuple(sorted(fleet.nodes))
+        peer_ids = {
+            vehicle_id: f"episode-peer-{index}"
+            for index, vehicle_id in enumerate(vehicle_ids, 1)
+        }
+        for vehicle_id in vehicle_ids:
+            state = fleet.nodes[vehicle_id].map_sync
+            assert state is not None
+            state.configure_network(
+                peer_ids[vehicle_id],
+                {
+                    other_id: (
+                        peer_ids[other_id],
+                        fleet.nodes[other_id].local_state.anchor,
+                    )
+                    for other_id in vehicle_ids
+                    if other_id != vehicle_id
+                },
+            )
+            state.set_health(
+                ready=True,
+                connected_vehicle_ids=(
+                    other_id for other_id in vehicle_ids if other_id != vehicle_id
+                ),
+            )
+        self._publish()
+
+    def advance(self) -> None:
+        self._tick += 1
+        due = [item for item in self._pending if item[0] <= self._tick]
+        self._pending = [item for item in self._pending if item[0] > self._tick]
+        for _, source_id, encoded in due:
+            source_peer_id = self._fleet.nodes[source_id].map_sync.local_peer_id
+            assert source_peer_id is not None
+            for receiver_id in sorted(self._fleet.nodes):
+                if receiver_id == source_id:
+                    continue
+                receiver = self._fleet.nodes[receiver_id].map_sync
+                assert receiver is not None
+                receiver.receive_transport(
+                    source_peer_id,
+                    source_id,
+                    json.loads(encoded),
+                )
+        self._publish()
+
+    def _publish(self) -> None:
+        if len(self._fleet.nodes) < 2:
+            return
+        for source_id in sorted(self._fleet.nodes):
+            state = self._fleet.nodes[source_id].map_sync
+            assert state is not None
+            payload = state.prepare_peer_state()
+            if payload is None:
+                continue
+            encoded = json.dumps(
+                payload,
+                allow_nan=False,
+                separators=(",", ":"),
+                sort_keys=True,
+            )
+            self._pending.append(
+                (self._tick + PEER_STATE_DELAY_TICKS, source_id, encoded)
+            )
+            state.publish_transport_result(
+                str(payload["protocol"]),
+                int(payload["sequence"]),
+                True,
+            )
 
 
 def run_episode(
@@ -144,6 +223,12 @@ def run_episode(
         mission_capacity=mission_capacity,
         odometry_config=odometry_config,
         realtime_factor=realtime_factor,
+        in_process_peer_states=len(scenario.vehicles) > 1,
+    )
+    peer_exchange = (
+        None
+        if len(scenario.vehicles) < 2
+        else _DeterministicPeerStateExchange(fleet)
     )
     for vehicle_id in sorted(missions):
         if not missions[vehicle_id]:
@@ -211,6 +296,8 @@ def run_episode(
 
         fleet.tick(fleet.timestamp_at(fleet.world.now + fleet.tick_s))
         tick_count += 1
+        if peer_exchange is not None:
+            peer_exchange.advance()
         current_poses = fleet.world.truth_snapshot()
         for vehicle_id, pose in current_poses.items():
             previous = previous_poses[vehicle_id]

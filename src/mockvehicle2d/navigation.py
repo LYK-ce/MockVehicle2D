@@ -67,6 +67,12 @@ class GotoController:
         self._candidate_inspections = 0
         self._skip_goal_connected_candidates = False
         self._waiting_safe_stop_goal: tuple[float, float] | None = None
+        self._waiting_for_peer_replan = False
+        self._safe_search_peer_blocked = False
+
+    @property
+    def motion_target(self) -> tuple[float, float] | None:
+        return self._current_waypoint
 
     def start(
         self,
@@ -104,6 +110,8 @@ class GotoController:
         self._candidate_inspections = 0
         self._skip_goal_connected_candidates = False
         self._waiting_safe_stop_goal = None
+        self._waiting_for_peer_replan = False
+        self._safe_search_peer_blocked = False
         self._planner = DStarLitePlanner(
             local_map,
             vehicle_radius_m=vehicle_radius_m,
@@ -121,6 +129,7 @@ class GotoController:
             self.reason = reason
             self.detail = None
             self._waiting_safe_stop_goal = None
+            self._waiting_for_peer_replan = False
             self._clear_pending_planning()
 
     def block(self, reason: str, detail: str | None = None) -> None:
@@ -129,6 +138,7 @@ class GotoController:
         self.reason = reason
         self.detail = detail
         self._waiting_safe_stop_goal = None
+        self._waiting_for_peer_replan = False
         self._clear_pending_planning()
 
     def block_for_localization_loss(self, pose: PoseEstimate) -> bool:
@@ -301,16 +311,30 @@ class GotoController:
                 map_delta.peer_forbidden_cells
             )
         changes = () if map_delta is None else map_delta.changed_cells
+        if self._waiting_for_peer_replan:
+            if map_delta is None:
+                return 0.0, 0.0
+            self._waiting_for_peer_replan = False
+            self.goal = self.requested_goal
+            self.goal_mode = "exact"
+            self._goal_access_cell = None
+            self._planning_kind = "goal"
+            self._safe_search_peer_blocked = False
         if self._final_approach:
             if changes:
                 self._planner.observe_changes(changes)
                 self._planning_map_changed = True
             if not self._final_approach_segment_is_safe(pose):
+                peer_blocked = self._final_approach_segment_is_safe(
+                    pose,
+                    _ignore_peer_exclusions=True,
+                )
                 self._final_approach = False
                 self._begin_safe_goal_search(
                     pose,
                     local_map,
                     skip_goal_connected=False,
+                    peer_blocked=peer_blocked,
                 )
                 return 0.0, 0.0
             changes = ()
@@ -323,6 +347,7 @@ class GotoController:
                 self._planning_kind = "goal"
                 self._planning_previous_path = list(self._path)
                 self._current_waypoint = None
+                self._safe_search_peer_blocked = False
         self._planning_map_changed |= bool(changes)
         if self._planning_kind is not None:
             self._advance_planning(
@@ -360,7 +385,15 @@ class GotoController:
                     self._waiting_safe_stop_goal = self.goal
                     return 0.0, 0.0
                 else:
-                    self._block_no_path("nearby_safe_goal_unconfirmed")
+                    self._block_no_path(
+                        "nearby_safe_goal_unconfirmed",
+                        peer_blocked=self._candidate_is_safe(
+                            self.goal,
+                            self._goal_cell(local_map),
+                            require_observed=True,
+                            _ignore_peer_exclusions=True,
+                        ),
+                    )
                     return 0.0, 0.0
             self._final_approach = False
             self.status = "reached"
@@ -396,7 +429,15 @@ class GotoController:
                     self._path[0],
                 )
                 if target_cell is None:
-                    self._block_no_path("start_connection_unsafe")
+                    self._block_no_path(
+                        "start_connection_unsafe",
+                        peer_blocked=self._planner.best_start_connection(
+                            (x_m, y_m),
+                            self._path[0],
+                            _ignore_peer_exclusions=True,
+                        )
+                        is not None,
+                    )
                     return 0.0, 0.0
                 target_x = (target_cell[0] + 0.5) * local_map.resolution_m
                 target_y = (target_cell[1] + 0.5) * local_map.resolution_m
@@ -439,6 +480,7 @@ class GotoController:
         remaining = expansion_budget
         changes = changed_cells
         if self._planning_kind == "goal":
+            peer_blocked = False
             before = self._planner.stats["expansions"]
             progress = self._planner.advance_plan(
                 self._pose_cell(pose, local_map),
@@ -459,6 +501,9 @@ class GotoController:
                     if failure is None:
                         self._complete_planning()
                         return
+                    peer_blocked = (
+                        self._execution_goal_failure_caused_by_peer()
+                    )
                 elif self._safe_execution_goal_remains_safe(
                     pose,
                     local_map,
@@ -478,10 +523,21 @@ class GotoController:
                     return
                 else:
                     failure = "goal_blocked"
+                    peer_blocked = self._safe_execution_goal_remains_safe(
+                        pose,
+                        local_map,
+                        require_observed=False,
+                        _ignore_peer_exclusions=True,
+                    )
             else:
                 failure = self._planner_failure()
+                peer_blocked = self._planner.last_failure_caused_by_peer
+            if progress.status != "ready":
                 if failure in {"start_blocked", "expansion_limit"}:
-                    self._block_no_path(failure)
+                    self._block_no_path(
+                        failure,
+                        peer_blocked=peer_blocked,
+                    )
                     return
             if self._nearby_detail is None:
                 self._nearby_detail = failure
@@ -489,6 +545,7 @@ class GotoController:
                 pose,
                 local_map,
                 skip_goal_connected=failure == "goal_unreachable",
+                peer_blocked=peer_blocked,
             )
         if self._planning_kind == "candidate":
             self._advance_safe_candidate(
@@ -504,6 +561,7 @@ class GotoController:
         local_map: ObservedGrid,
         *,
         skip_goal_connected: bool,
+        peer_blocked: bool,
     ) -> None:
         self._final_approach = False
         self._planning_kind = "candidate"
@@ -515,6 +573,7 @@ class GotoController:
         self._pending_candidate = None
         self._current_waypoint = None
         self._waiting_safe_stop_goal = None
+        self._safe_search_peer_blocked = peer_blocked
 
     def _advance_safe_candidate(
         self,
@@ -539,7 +598,10 @@ class GotoController:
                 self._pending_candidate = candidate
                 if candidate is None:
                     if self._safe_candidate_index == len(self._safe_candidates):
-                        self._block_no_path("nearby_safe_goal_unavailable")
+                        self._block_no_path(
+                            "nearby_safe_goal_unavailable",
+                            peer_blocked=self._safe_search_peer_blocked,
+                        )
                     return
                 if self.goal != self._pending_candidate[0]:
                     self._waiting_safe_stop_goal = None
@@ -563,16 +625,49 @@ class GotoController:
                 goal_cell,
                 require_observed=False,
             )
-            if not requested_safe or progress.status == "unreachable":
-                self._pending_candidate = None
-                continue
             if progress.status == "pending":
                 return
+            if (
+                progress.status == "unreachable"
+                and self._planner.last_failure
+                in {"expansion_limit", "path_extraction"}
+            ):
+                self._block_no_path(self._planner.last_failure)
+                return
+            if not requested_safe or progress.status == "unreachable":
+                candidate_without_peers = self._candidate_is_safe(
+                    point,
+                    goal_cell,
+                    require_observed=False,
+                    _ignore_peer_exclusions=True,
+                )
+                current_failure_is_peer = (
+                    progress.status == "ready"
+                    and not requested_safe
+                    and candidate_without_peers
+                ) or (
+                    progress.status == "unreachable"
+                    and self._planner.last_failure_caused_by_peer
+                )
+                self._safe_search_peer_blocked |= (
+                    current_failure_is_peer
+                    and candidate_without_peers
+                )
+                self._pending_candidate = None
+                continue
             assert progress.path is not None
             if self._planner.best_start_connection(
                 (pose.x_m, pose.y_m),
                 progress.path[0],
             ) is None:
+                self._safe_search_peer_blocked |= (
+                    self._planner.best_start_connection(
+                        (pose.x_m, pose.y_m),
+                        progress.path[0],
+                        _ignore_peer_exclusions=True,
+                    )
+                    is not None
+                )
                 self._pending_candidate = None
                 continue
             confirmed = self._candidate_is_safe(
@@ -623,10 +718,20 @@ class GotoController:
                 )
             ):
                 continue
-            if allow_stale_geometry or self._candidate_is_safe(
+            candidate_is_safe = self._candidate_is_safe(
                 point,
                 goal_cell,
                 require_observed=False,
+            )
+            if (
+                allow_stale_geometry
+                or candidate_is_safe
+                or self._candidate_is_safe(
+                    point,
+                    goal_cell,
+                    require_observed=False,
+                    _ignore_peer_exclusions=True,
+                )
             ):
                 return candidate, inspected
         if self._candidate_inspections >= MAX_CANDIDATE_INSPECTIONS_PER_MISSION:
@@ -705,6 +810,7 @@ class GotoController:
         goal_cell: tuple[int, int],
         *,
         require_observed: bool,
+        _ignore_peer_exclusions: bool = False,
     ) -> bool:
         assert self._planner is not None
         cell_center = (
@@ -716,11 +822,13 @@ class GotoController:
             point,
             extra_clearance_m=AUTOMATIC_MINIMUM_CLEARANCE_M,
             require_observed=require_observed,
+            _ignore_peer_exclusions=_ignore_peer_exclusions,
         ) and self._planner.is_segment_passable(
             cell_center,
             point,
             extra_clearance_m=AUTOMATIC_MINIMUM_CLEARANCE_M,
             require_observed=require_observed,
+            _ignore_peer_exclusions=_ignore_peer_exclusions,
         )
 
     def _safe_execution_goal_remains_safe(
@@ -729,6 +837,7 @@ class GotoController:
         local_map: ObservedGrid,
         *,
         require_observed: bool,
+        _ignore_peer_exclusions: bool = False,
     ) -> bool:
         assert self.goal is not None and self._planner is not None
         goal_cell = self._goal_cell(local_map)
@@ -739,10 +848,12 @@ class GotoController:
                 self.goal,
                 goal_cell,
                 require_observed=require_observed,
+                _ignore_peer_exclusions=_ignore_peer_exclusions,
             )
             and self._planner.best_start_connection(
                 (pose.x_m, pose.y_m),
                 self._path[0],
+                _ignore_peer_exclusions=_ignore_peer_exclusions,
             )
             is not None
         )
@@ -760,12 +871,18 @@ class GotoController:
             and self._final_approach_segment_is_safe(pose)
         )
 
-    def _final_approach_segment_is_safe(self, pose: PoseEstimate) -> bool:
+    def _final_approach_segment_is_safe(
+        self,
+        pose: PoseEstimate,
+        *,
+        _ignore_peer_exclusions: bool = False,
+    ) -> bool:
         assert self.goal is not None and self._planner is not None
         return self._planner.is_segment_passable(
             (pose.x_m, pose.y_m),
             self.goal,
             extra_clearance_m=AUTOMATIC_MINIMUM_CLEARANCE_M,
+            _ignore_peer_exclusions=_ignore_peer_exclusions,
         )
 
     def _execution_goal_failure(self) -> str | None:
@@ -786,6 +903,22 @@ class GotoController:
             return "goal_unreachable"
         return None
 
+    def _execution_goal_failure_caused_by_peer(self) -> bool:
+        assert self.goal is not None and self._planner is not None
+        return self._planner.last_failure_caused_by_peer or (
+            not self._planner.is_segment_passable(
+                self.goal,
+                self.goal,
+                extra_clearance_m=AUTOMATIC_MINIMUM_CLEARANCE_M,
+            )
+            and self._planner.is_segment_passable(
+                self.goal,
+                self.goal,
+                extra_clearance_m=AUTOMATIC_MINIMUM_CLEARANCE_M,
+                _ignore_peer_exclusions=True,
+            )
+        )
+
     def _planner_failure(self) -> str:
         assert self._planner is not None
         if self._planner.last_failure == "goal_blocked":
@@ -804,12 +937,30 @@ class GotoController:
         self.reason = None
         self.detail = None
         self._current_waypoint = None
+        self._waiting_for_peer_replan = False
         self._clear_pending_planning()
 
-    def _block_no_path(self, detail: str | None) -> None:
+    def _block_no_path(
+        self,
+        detail: str | None,
+        *,
+        peer_blocked: bool = False,
+    ) -> None:
+        if peer_blocked:
+            self._wait_for_peer_replan(detail)
+            return
         self._set_path(None)
         self._current_waypoint = None
         self.block("no_path", detail)
+
+    def _wait_for_peer_replan(self, detail: str | None) -> None:
+        self._set_path(None)
+        self.status = "active"
+        self.reason = None
+        self.detail = detail
+        self._current_waypoint = None
+        self._waiting_for_peer_replan = True
+        self._clear_pending_planning()
 
     def _clear_pending_planning(self) -> None:
         self._planning_kind = None
@@ -819,6 +970,7 @@ class GotoController:
         self._safe_candidate_index = 0
         self._pending_candidate = None
         self._skip_goal_connected_candidates = False
+        self._safe_search_peer_blocked = False
 
     def _approach_distance_m(self) -> float | None:
         if self.requested_goal is None or self.goal is None:

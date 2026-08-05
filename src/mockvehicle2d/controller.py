@@ -11,6 +11,7 @@ from typing import TYPE_CHECKING, ClassVar
 import uuid
 
 from mockvehicle2d.navigation import GotoController
+from mockvehicle2d.safety import AUTOMATIC_MINIMUM_CLEARANCE_M
 
 if TYPE_CHECKING:
     from mockvehicle2d.local_state import (
@@ -20,6 +21,7 @@ if TYPE_CHECKING:
         PoseEstimate,
     )
     from mockvehicle2d.map_grid import MapGrid
+    from mockvehicle2d.map_sync import PeerVehicleState
     from mockvehicle2d.scan import LaserPoint
     from mockvehicle2d.safety import LocalSafetyRuntime, SafetyAdvanceResult
     from mockvehicle2d.vehicle import Vehicle
@@ -29,6 +31,9 @@ MISSION_ID_PATTERN = re.compile(r"[A-Za-z0-9._:-]{1,64}")
 MISSION_FRAME = "global_map"
 MAX_MISSION_SUBGOALS = 1024
 SUPPORTED_MISSION_TYPES = ("goto", "patrol", "coverage")
+PEER_CONFLICT_HORIZON_S = 4.0
+PEER_YIELD_CLEAR_TICKS = 3
+PEER_ESCAPE_LINEAR_MPS = 0.2
 Goal = tuple[float, float]
 
 
@@ -263,6 +268,153 @@ def _validate_goal(goal: object) -> None:
         raise ValueError("mission coordinates must be finite")
 
 
+def _peer_motion_conflicts(
+    desired: tuple[float, float],
+    vehicle: Vehicle,
+    anchor: AnchorSpec,
+    pose: PoseEstimate,
+    peer: PeerVehicleState,
+    travel_limit_m: float | None,
+) -> bool:
+    own_x_m, own_y_m, own_yaw_rad = anchor.anchor_to_global(
+        pose.x_m,
+        pose.y_m,
+        pose.yaw_rad,
+    )
+    executed_linear_mps, _ = vehicle.body_velocities()
+    projected_linear_mps = (
+        desired[0]
+        if abs(desired[0]) >= abs(executed_linear_mps)
+        else executed_linear_mps
+    )
+    own_vx = projected_linear_mps * math.cos(own_yaw_rad)
+    own_vy = projected_linear_mps * math.sin(own_yaw_rad)
+    relative_x = peer.global_x_m - own_x_m
+    relative_y = peer.global_y_m - own_y_m
+    relative_vx = peer.vx_mps - own_vx
+    relative_vy = peer.vy_mps - own_vy
+    conflict_distance_m = _peer_conflict_distance(
+        vehicle,
+        peer,
+        executed_linear_mps,
+    )
+    if (
+        math.hypot(relative_x, relative_y) <= conflict_distance_m + 1e-12
+        and relative_x * relative_vx + relative_y * relative_vy > 1e-12
+    ):
+        return False
+    own_motion_s = PEER_CONFLICT_HORIZON_S
+    if travel_limit_m is not None and abs(projected_linear_mps) > 1e-12:
+        own_motion_s = min(
+            own_motion_s,
+            travel_limit_m / abs(projected_linear_mps),
+        )
+    closest_distance_m = _closest_approach_distance(
+        relative_x,
+        relative_y,
+        relative_vx,
+        relative_vy,
+        own_motion_s,
+    )
+    if own_motion_s < PEER_CONFLICT_HORIZON_S:
+        relative_x += relative_vx * own_motion_s
+        relative_y += relative_vy * own_motion_s
+        closest_distance_m = min(
+            closest_distance_m,
+            _closest_approach_distance(
+                relative_x,
+                relative_y,
+                peer.vx_mps,
+                peer.vy_mps,
+                PEER_CONFLICT_HORIZON_S - own_motion_s,
+            ),
+        )
+    return closest_distance_m <= conflict_distance_m + 1e-12
+
+
+def _peer_conflict_distance(
+    vehicle: Vehicle,
+    peer: PeerVehicleState,
+    executed_linear_mps: float,
+) -> float:
+    return (
+        vehicle.radius
+        + peer.radius_m
+        + math.sqrt(max(peer.covariance[:2]))
+        + AUTOMATIC_MINIMUM_CLEARANCE_M
+        + executed_linear_mps**2
+        / (2 * vehicle.linear_deceleration_mps2)
+    )
+
+
+def _peer_escape_setpoint(
+    vehicle: Vehicle,
+    anchor: AnchorSpec,
+    pose: PoseEstimate,
+    peer: PeerVehicleState,
+) -> tuple[float, float] | None:
+    own_x_m, own_y_m, own_yaw_rad = anchor.anchor_to_global(
+        pose.x_m,
+        pose.y_m,
+        pose.yaw_rad,
+    )
+    current_distance_m = math.hypot(
+        peer.global_x_m - own_x_m,
+        peer.global_y_m - own_y_m,
+    )
+    conflict_distance_m = _peer_conflict_distance(
+        vehicle,
+        peer,
+        vehicle.body_velocities()[0],
+    )
+    if current_distance_m > conflict_distance_m + 1e-12:
+        return None
+    away_yaw_rad = math.atan2(
+        own_y_m - peer.global_y_m,
+        own_x_m - peer.global_x_m,
+    )
+    heading_error = math.atan2(
+        math.sin(away_yaw_rad - own_yaw_rad),
+        math.cos(away_yaw_rad - own_yaw_rad),
+    )
+    angular_rps = max(
+        -vehicle.angular_speed,
+        min(vehicle.angular_speed, 2 * heading_error),
+    )
+    return (
+        0.0
+        if abs(heading_error) > GotoController.turn_in_place_threshold_rad
+        else min(vehicle.linear_speed, PEER_ESCAPE_LINEAR_MPS),
+        angular_rps,
+    )
+
+
+def _closest_approach_distance(
+    relative_x: float,
+    relative_y: float,
+    relative_vx: float,
+    relative_vy: float,
+    duration_s: float,
+) -> float:
+    relative_speed_squared = relative_vx**2 + relative_vy**2
+    closest_time_s = (
+        0.0
+        if relative_speed_squared <= 1e-12
+        else max(
+            0.0,
+            min(
+                duration_s,
+                -(relative_x * relative_vx + relative_y * relative_vy)
+                / relative_speed_squared,
+            ),
+        )
+    )
+    return math.hypot(
+        relative_x + relative_vx * closest_time_s,
+        relative_y + relative_vy * closest_time_s,
+    )
+
+
 @dataclass(frozen=True)
 class ModeCommand:
     seq: int
@@ -361,10 +513,16 @@ class RobotController:
         self._needs_start = False
         self._subgoal_index = 0
         self._deferred_edge_cell: tuple[int, int] | None = None
+        self._yielding_for: str | None = None
+        self._yield_clear_ticks = 0
 
     @property
     def is_automatic_motion_active(self) -> bool:
         return self.mode is OpMode.AUTO and self.auto_state is AutoState.ACTIVE
+
+    @property
+    def is_yielding(self) -> bool:
+        return self._yielding_for is not None
 
     def handle(
         self,
@@ -397,6 +555,8 @@ class RobotController:
         now: float,
         safety_scan_points: tuple[LaserPoint, ...] | None = None,
         safety_scan_healthy: bool = True,
+        vehicle_id: str | None = None,
+        peer_states: tuple[PeerVehicleState, ...] = (),
     ) -> None:
         if self.mode is OpMode.MANUAL:
             self._tick_manual(
@@ -411,6 +571,7 @@ class RobotController:
         self._manual_setpoint = None
         self._manual_deadline = None
         if self.auto_state is not AutoState.ACTIVE:
+            self._clear_yield()
             vehicle.stop()
             return
 
@@ -435,6 +596,15 @@ class RobotController:
         if self.navigation.status == "blocked":
             self._finish_blocked(vehicle)
             return
+
+        desired = self._coordinate_desired(
+            desired,
+            vehicle=vehicle,
+            vehicle_id=vehicle_id,
+            anchor=anchor,
+            pose=pose,
+            peer_states=peer_states,
+        )
 
         decision = safety.evaluate(
             vehicle,
@@ -467,6 +637,77 @@ class RobotController:
             self._finish_blocked(vehicle)
             return
         vehicle.install_drive(decision.linear_mps, decision.angular_rps, now)
+
+    def _coordinate_desired(
+        self,
+        desired: tuple[float, float],
+        *,
+        vehicle: Vehicle,
+        vehicle_id: str | None,
+        anchor: AnchorSpec,
+        pose: PoseEstimate,
+        peer_states: tuple[PeerVehicleState, ...],
+    ) -> tuple[float, float]:
+        if vehicle_id is None:
+            self._clear_yield()
+            return desired
+
+        peers = {state.source_vehicle_id: state for state in peer_states}
+        motion_target = self.navigation.motion_target
+        travel_limit_m = (
+            None
+            if motion_target is None
+            else math.dist((pose.x_m, pose.y_m), motion_target)
+        )
+        if self._yielding_for is not None:
+            peer = peers.get(self._yielding_for)
+            if peer is None:
+                return 0.0, 0.0
+            if _peer_motion_conflicts(
+                desired,
+                vehicle,
+                anchor,
+                pose,
+                peer,
+                travel_limit_m,
+            ):
+                self._yield_clear_ticks = 0
+                if desired[0] == 0.0 and desired[1] != 0.0:
+                    return desired
+                if desired == (0.0, 0.0):
+                    escape = _peer_escape_setpoint(vehicle, anchor, pose, peer)
+                    if escape is not None:
+                        return escape
+                return 0.0, 0.0
+            self._yield_clear_ticks += 1
+            if self._yield_clear_ticks < PEER_YIELD_CLEAR_TICKS:
+                return 0.0, 0.0
+            self._clear_yield()
+
+        # ponytail: lexical priority is sufficient for two vehicles; replace it
+        # with reservations only when cyclic three-plus-vehicle conflicts require it.
+        conflicts = sorted(
+            state.source_vehicle_id
+            for state in peer_states
+            if vehicle_id > state.source_vehicle_id
+            and _peer_motion_conflicts(
+                desired,
+                vehicle,
+                anchor,
+                pose,
+                state,
+                travel_limit_m,
+            )
+        )
+        if conflicts:
+            self._yielding_for = conflicts[0]
+            self._yield_clear_ticks = 0
+            return 0.0, 0.0
+        return desired
+
+    def _clear_yield(self) -> None:
+        self._yielding_for = None
+        self._yield_clear_ticks = 0
 
     def disconnect(self, vehicle: Vehicle) -> None:
         vehicle.stop()
@@ -706,6 +947,7 @@ class RobotController:
     ) -> None:
         self._needs_start = False
         self._deferred_edge_cell = None
+        self._clear_yield()
         if self.active_mission is None:
             if not self._pending:
                 self.auto_state = AutoState.IDLE
@@ -803,6 +1045,7 @@ class RobotController:
         )
 
     def _pause_active(self, reason: str) -> None:
+        self._clear_yield()
         if self.auto_state is AutoState.PAUSED:
             self._needs_start = False
             return
@@ -819,6 +1062,7 @@ class RobotController:
         self._needs_start = False
 
     def _cancel_all(self, reason: str) -> None:
+        self._clear_yield()
         missions = (
             (() if self.active_mission is None else (self.active_mission,))
             + tuple(self._pending)

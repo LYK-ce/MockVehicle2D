@@ -143,6 +143,76 @@ def test_bounded_planning_reports_unreachable_after_pending() -> None:
     assert search.last_failure == "search_exhausted"
 
 
+def test_peer_failure_provenance_respects_the_expansion_budget(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    search = planner(
+        bounds_margin_m=0.0,
+        max_cells=2_001,
+        max_goal_distance_m=2_001.0,
+    )
+    search.set_peer_forbidden_cells(((1_500, 0),))
+    monkeypatch.setattr(search, "_advance_shortest_path", lambda budget: True)
+
+    before = search.stats["expansions"]
+    progress = search.advance_plan(
+        (0, 0),
+        (2_000, 0),
+        changed_cells=(MapCellUpdate(1_000, 0, OCCUPIED),),
+        expansion_budget=3,
+    )
+
+    assert progress.status == "pending"
+    assert search.stats["expansions"] - before == 3
+
+
+def test_peer_failure_probe_tracks_current_planning_inputs(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def pending_probe() -> DStarLitePlanner:
+        search = planner(
+            bounds_margin_m=0.0,
+            max_cells=2_001,
+            max_goal_distance_m=2_001.0,
+        )
+        search.set_peer_forbidden_cells(((1_500, 0),))
+        monkeypatch.setattr(
+            search,
+            "_advance_shortest_path",
+            lambda budget: True,
+        )
+        assert search.advance_plan(
+            (0, 0),
+            (2_000, 0),
+            expansion_budget=1,
+        ).status == "pending"
+        return search
+
+    map_changed = pending_probe()
+    map_changed.observe_changes((MapCellUpdate(1_000, 0, OCCUPIED),))
+    assert map_changed._peer_route_probe is None
+
+    peer_changed = pending_probe()
+    peer_changed.set_peer_forbidden_cells(((1_501, 0),))
+    assert peer_changed._peer_route_probe is None
+
+    start_changed = pending_probe()
+    assert start_changed.advance_plan(
+        (1, 0),
+        (2_000, 0),
+        expansion_budget=1,
+    ).status == "pending"
+    assert start_changed._peer_route_probe[:2] == ((1, 0), (2_000, 0))
+
+    goal_changed = pending_probe()
+    assert goal_changed.advance_plan(
+        (0, 0),
+        (1_999, 0),
+        expansion_budget=1,
+    ).status == "pending"
+    assert goal_changed._peer_route_probe[:2] == ((0, 0), (1_999, 0))
+
+
 def test_bounded_planning_stops_at_the_cross_frame_expansion_limit(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -715,6 +785,36 @@ def test_no_route_returns_none() -> None:
     wall = tuple(MapCellUpdate(2, y, OCCUPIED) for y in range(0, 4))
     assert search.plan((0, 0), (4, 3), changed_cells=wall) is None
     assert search.last_failure == "search_exhausted"
+
+
+@pytest.mark.parametrize(
+    ("peer_cell", "static_cell", "failure", "caused_by_peer"),
+    (
+        ((0, 0), None, "start_blocked", True),
+        ((4, 0), None, "goal_blocked", True),
+        ((2, 0), None, "search_exhausted", True),
+        ((3, 0), (0, 0), "start_blocked", False),
+        ((3, 0), (4, 0), "goal_blocked", False),
+        ((3, 0), (2, 0), "search_exhausted", False),
+    ),
+)
+def test_peer_failure_evidence_requires_a_peer_caused_failure(
+    peer_cell: tuple[int, int],
+    static_cell: tuple[int, int] | None,
+    failure: str,
+    caused_by_peer: bool,
+) -> None:
+    search = planner(bounds_margin_m=0.0)
+    search.set_peer_forbidden_cells((peer_cell,))
+    changes = (
+        ()
+        if static_cell is None
+        else (MapCellUpdate(*static_cell, OCCUPIED),)
+    )
+
+    assert search.plan((0, 0), (4, 0), changed_cells=changes) is None
+    assert search.last_failure == failure
+    assert search.last_failure_caused_by_peer is caused_by_peer
 
 
 @pytest.mark.parametrize("blocked", [(0, 0), (4, 0)])
