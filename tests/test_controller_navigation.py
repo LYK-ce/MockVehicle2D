@@ -115,7 +115,7 @@ class TestControllerNavigation(unittest.TestCase):
                     pose,
                     local_map,
                     skip_goal_connected=False,
-                    peer_blocked=False,
+                    peer_blocked=True,
                 )
                 navigation._safe_candidates = [candidate]
                 navigation._safe_candidate_index = 1
@@ -151,6 +151,7 @@ class TestControllerNavigation(unittest.TestCase):
                 self.assertEqual(navigation.status, "blocked")
                 self.assertEqual(navigation.reason, "no_path")
                 self.assertFalse(navigation._waiting_for_peer_replan)
+                self.assertFalse(navigation._safe_search_peer_blocked)
 
     def test_nearby_safe_candidates_prefer_the_current_side(self) -> None:
         local_map = ObservedGrid(

@@ -627,6 +627,13 @@ class GotoController:
             )
             if progress.status == "pending":
                 return
+            if (
+                progress.status == "unreachable"
+                and self._planner.last_failure
+                in {"expansion_limit", "path_extraction"}
+            ):
+                self._block_no_path(self._planner.last_failure)
+                return
             if not requested_safe or progress.status == "unreachable":
                 candidate_without_peers = self._candidate_is_safe(
                     point,
