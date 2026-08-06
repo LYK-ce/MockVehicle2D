@@ -127,6 +127,24 @@ tick、所有无序车辆对的最小圆形 footprint 边缘间距（中心距�
 Runner 明确拒绝启用真实 P2P 的场景，因为 localhost libp2p 调度和 map delta 传播不属于
 确定性模拟时钟；当前只提供上述进程内 peer-state relay，不包含定时事件或通信故障注入。
 
+四车任务协同回归使用 `tests/fixtures/four_vehicle_mission_matrix.json` 和显式空场，覆盖
+重复共享路口 Patrol、对向合流 Patrol、互不相交 Patrol、相邻静态条带 Coverage、共享
+入口四象限 Coverage，以及 Goto/Patrol/Coverage 混合任务。Coverage 分区由测试输入静态
+分配，接缝小于一个 `0.5 m` 本地网格；它不引入中央地图，也不把 peer evidence 写入
+OwnMap。默认矩阵运行全部六种 `100 ms` 拓扑：
+
+```bash
+.venv/bin/python -m pytest -p no:cacheprovider -q tests/test_episode.py \
+  -k 'four_vehicle and (patrol or coverage or mixed)'
+```
+
+耗时更长的扩展矩阵选择最困难的对向合流 Patrol 和共享入口 Coverage，分别验证同 seed
+重复、车辆声明反序以及 `50/250 ms` tick。当前开发机约需 17 分钟，因此默认 deselected：
+
+```bash
+.venv/bin/python -m pytest -p no:cacheprovider -q -m extended tests/test_episode.py -k extended_matrix
+```
+
 ## 多车共享世界
 
 `fleet` 入口在一个进程中运行唯一的确定性物理世界和 1～4 个隔离车辆节点。每个节点

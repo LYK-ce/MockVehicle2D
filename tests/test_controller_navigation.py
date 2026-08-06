@@ -89,6 +89,114 @@ def start_missions(runtime: VehicleRuntime, *missions: GotoMission) -> None:
 
 
 class TestControllerNavigation(unittest.TestCase):
+    def test_peer_blocked_start_waits_for_a_map_update(self) -> None:
+        local_map = ObservedGrid(
+            AnchorSpec("peer-blocked-start-anchor", 0.0, 0.0, 0.0),
+            resolution_m=1.0,
+        )
+        pose = PoseEstimate(
+            "peer-blocked-start-anchor",
+            0.5,
+            0.5,
+            0.0,
+            (0.0, 0.0, 0.0),
+            "nominal",
+            0.0,
+            0,
+        )
+        navigation = RobotController().navigation
+        navigation.start(4.5, 0.5, local_map=local_map, pose=pose)
+
+        desired = navigation.update(
+            pose=pose,
+            local_map=local_map,
+            max_linear_mps=1.0,
+            max_angular_rps=1.0,
+            map_delta=LocalMapDelta(
+                (),
+                tuple(
+                    (gx, gy)
+                    for gx in range(-1, 2)
+                    for gy in range(-1, 2)
+                ),
+            ),
+        )
+
+        self.assertEqual(desired, (0.0, 0.0))
+        self.assertEqual(navigation.status, "active")
+        self.assertTrue(navigation._waiting_for_peer_replan)
+        self.assertEqual(navigation.detail, "start_blocked")
+
+    def test_unusable_start_connection_requests_bounded_replan(self) -> None:
+        local_map = ObservedGrid(
+            AnchorSpec("connection-recovery-anchor", 0.0, 0.0, 0.0),
+            resolution_m=1.0,
+        )
+        pose = PoseEstimate(
+            "connection-recovery-anchor",
+            0.5,
+            0.5,
+            0.0,
+            (0.0, 0.0, 0.0),
+            "nominal",
+            0.0,
+            0,
+        )
+        navigation = RobotController().navigation
+        navigation.start(5.5, 0.5, local_map=local_map, pose=pose)
+        navigation._clear_pending_planning()
+        navigation._set_path([(0, 0), (1, 0)])
+        assert navigation._planner is not None
+
+        with (
+            patch.object(
+                navigation._planner,
+                "is_segment_passable",
+                return_value=False,
+            ),
+            patch.object(
+                navigation._planner,
+                "best_start_connection",
+                return_value=None,
+            ),
+            patch.object(
+                navigation._planner,
+                "recover_unusable_plan",
+                side_effect=(True, False),
+            ) as recover,
+        ):
+            first = navigation.update(
+                pose=pose,
+                local_map=local_map,
+                max_linear_mps=1.0,
+                max_angular_rps=1.0,
+                advance_result=SafetyAdvanceResult(
+                    stopped=True,
+                    reason="safety_obstacle",
+                ),
+            )
+            self.assertEqual(first, (0.0, 0.0))
+            self.assertEqual(navigation.status, "active")
+            self.assertEqual(navigation._planning_kind, "goal")
+
+            navigation._clear_pending_planning()
+            navigation._set_path([(0, 0), (1, 0)])
+            second = navigation.update(
+                pose=pose,
+                local_map=local_map,
+                max_linear_mps=1.0,
+                max_angular_rps=1.0,
+                advance_result=SafetyAdvanceResult(
+                    stopped=True,
+                    reason="safety_obstacle",
+                ),
+            )
+
+        self.assertEqual(second, (0.0, 0.0))
+        self.assertEqual(navigation.status, "blocked")
+        self.assertEqual(navigation.detail, "start_connection_unsafe")
+        self.assertEqual(recover.call_count, 2)
+
     def test_safe_candidate_planner_failures_do_not_become_peer_waits(self) -> None:
         local_map = ObservedGrid(
             AnchorSpec("candidate-failure-anchor", 0.0, 0.0, 0.0),

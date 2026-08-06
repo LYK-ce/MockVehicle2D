@@ -6,9 +6,12 @@ import sys
 import unittest
 from unittest.mock import patch
 
+import pytest
+
 from mockvehicle2d.controller import (
     AutoAction,
     AutoCommand,
+    CoverageMission,
     GotoMission,
     ModeAction,
     ModeCommand,
@@ -38,6 +41,36 @@ FOUR_VEHICLE_CROSSING_GOALS = (
     ("mock_vehicle_02", (5.0, 10.0)),
     ("mock_vehicle_03", (10.0, 15.0)),
     ("mock_vehicle_04", (10.0, 5.0)),
+)
+FOUR_VEHICLE_PATROL_ROUTES = (
+    ("mock_vehicle_01", ((12.0, 9.0), (7.0, 9.0))),
+    ("mock_vehicle_02", ((8.0, 11.0), (13.0, 11.0))),
+    ("mock_vehicle_03", ((9.0, 12.0), (9.0, 7.0))),
+    ("mock_vehicle_04", ((11.0, 8.0), (11.0, 13.0))),
+)
+FOUR_VEHICLE_MERGE_PATROL_ROUTES = (
+    ("mock_vehicle_01", ((12.0, 10.0), (7.0, 9.0))),
+    ("mock_vehicle_02", ((8.0, 10.0), (13.0, 11.0))),
+    ("mock_vehicle_03", ((10.0, 12.0), (9.0, 7.0))),
+    ("mock_vehicle_04", ((10.0, 8.0), (11.0, 13.0))),
+)
+FOUR_VEHICLE_DISJOINT_PATROL_ROUTES = (
+    ("mock_vehicle_01", ((6.5, 8.5), (7.0, 9.0))),
+    ("mock_vehicle_02", ((13.5, 11.5), (13.0, 11.0))),
+    ("mock_vehicle_03", ((8.5, 6.5), (9.0, 7.0))),
+    ("mock_vehicle_04", ((11.5, 13.5), (11.0, 13.0))),
+)
+FOUR_VEHICLE_COVERAGE_STRIPES = (
+    ("mock_vehicle_01", (6.0, 8.0, 7.8, 12.0)),
+    ("mock_vehicle_03", (8.2, 8.0, 10.0, 12.0)),
+    ("mock_vehicle_04", (10.4, 8.0, 12.2, 12.0)),
+    ("mock_vehicle_02", (12.6, 8.0, 14.4, 12.0)),
+)
+FOUR_VEHICLE_COVERAGE_QUADRANTS = (
+    ("mock_vehicle_01", (6.0, 6.0, 9.8, 9.8)),
+    ("mock_vehicle_02", (10.2, 10.2, 14.0, 14.0)),
+    ("mock_vehicle_03", (10.2, 6.0, 14.0, 9.8)),
+    ("mock_vehicle_04", (6.0, 10.2, 9.8, 14.0)),
 )
 
 
@@ -81,7 +114,90 @@ def run_four_vehicle_crossing(scenario: FleetScenario) -> EpisodeResult:
     )
 
 
+def run_four_vehicle_merge_patrol(
+    scenario: FleetScenario,
+    *,
+    cycles: int = 2,
+) -> EpisodeResult:
+    return run_episode(
+        scenario,
+        {
+            vehicle_id: (
+                PatrolMission(
+                    f"merge-patrol-{vehicle_id[-2:]}",
+                    "global_map",
+                    waypoints,
+                    cycles,
+                    2,
+                ),
+            )
+            for vehicle_id, waypoints in FOUR_VEHICLE_MERGE_PATROL_ROUTES
+        },
+        max_simulation_s=150.0,
+        grid=MapGrid.from_wall_set(20, 20, set()),
+        linear_speed=1.0,
+    )
+
+
+def run_four_vehicle_quadrant_coverage(
+    scenario: FleetScenario,
+    *,
+    lane_spacing_m: float = 1.9,
+) -> EpisodeResult:
+    return run_episode(
+        scenario,
+        {
+            vehicle_id: (
+                CoverageMission(
+                    f"coverage-quadrant-{vehicle_id[-2:]}",
+                    "global_map",
+                    *area,
+                    lane_spacing_m,
+                    2,
+                ),
+            )
+            for vehicle_id, area in FOUR_VEHICLE_COVERAGE_QUADRANTS
+        },
+        max_simulation_s=160.0,
+        grid=MapGrid.from_wall_set(20, 20, set()),
+        linear_speed=1.0,
+    )
+
+
 class TestEpisodeRunner(unittest.TestCase):
+    def assert_four_vehicle_completed(
+        self,
+        result: EpisodeResult,
+        mission_types: tuple[str, str, str, str],
+        *,
+        max_no_progress_s: float,
+    ) -> None:
+        self.assertTrue(result.success, result.as_dict())
+        self.assertEqual(result.termination_reason, "completed")
+        self.assertEqual(len(result.vehicles), 4)
+        self.assertGreaterEqual(
+            result.minimum_inter_vehicle_clearance_m,
+            AUTOMATIC_MINIMUM_CLEARANCE_M,
+        )
+        self.assertTrue(
+            all(len(vehicle["missions"]) == 1 for vehicle in result.vehicles)
+        )
+        self.assertEqual(
+            [vehicle["missions"][0]["type"] for vehicle in result.vehicles],
+            list(mission_types),
+        )
+        self.assertTrue(
+            all(
+                not vehicle["collision_occurred"]
+                and not vehicle["blocked"]
+                and vehicle["blocked_reason"] is None
+                and vehicle["missions"][0]["status"] == "reached"
+                and vehicle["longest_no_progress_duration_s"]
+                <= max_no_progress_s
+                for vehicle in result.vehicles
+            )
+        )
+
     def test_completion_is_stable_across_realtime_factors(self) -> None:
         results = [
             run_episode(
@@ -302,6 +418,235 @@ class TestEpisodeRunner(unittest.TestCase):
                         for vehicle in result.vehicles
                     )
                 )
+
+    def test_four_vehicle_patrol_repeatedly_clears_shared_crossing(self) -> None:
+        matrix = FleetScenario.load(
+            REPO_ROOT / "tests" / "fixtures" / "four_vehicle_mission_matrix.json"
+        )
+        result = run_episode(
+            matrix,
+            {
+                vehicle_id: (
+                    PatrolMission(
+                        f"patrol-{vehicle_id[-2:]}",
+                        "global_map",
+                        waypoints,
+                        2,
+                        2,
+                    ),
+                )
+                for vehicle_id, waypoints in FOUR_VEHICLE_PATROL_ROUTES
+            },
+            max_simulation_s=120.0,
+            grid=MapGrid.from_wall_set(20, 20, set()),
+            linear_speed=1.0,
+        )
+
+        self.assert_four_vehicle_completed(
+            result,
+            ("patrol",) * 4,
+            max_no_progress_s=30.0,
+        )
+
+    def test_four_vehicle_patrol_clears_opposing_merge_routes(self) -> None:
+        matrix = FleetScenario.load(
+            REPO_ROOT / "tests" / "fixtures" / "four_vehicle_mission_matrix.json"
+        )
+        result = run_four_vehicle_merge_patrol(matrix)
+
+        self.assert_four_vehicle_completed(
+            result,
+            ("patrol",) * 4,
+            max_no_progress_s=45.0,
+        )
+
+    @pytest.mark.extended
+    def test_four_vehicle_merge_patrol_extended_matrix(self) -> None:
+        matrix = FleetScenario.load(
+            REPO_ROOT / "tests" / "fixtures" / "four_vehicle_mission_matrix.json"
+        )
+        reordered = FleetScenario(
+            matrix.scenario_id,
+            tuple(reversed(matrix.vehicles)),
+            matrix.tick_ms,
+        )
+        deterministic = tuple(
+            run_four_vehicle_merge_patrol(scenario, cycles=1)
+            for scenario in (matrix, matrix, reordered)
+        )
+        tick_results = tuple(
+            run_four_vehicle_merge_patrol(
+                FleetScenario(matrix.scenario_id, matrix.vehicles, tick_ms),
+                cycles=1,
+            )
+            for tick_ms in (50, 250)
+        )
+
+        self.assertEqual(len({result.to_json() for result in deterministic}), 1)
+        for result in (*deterministic, *tick_results):
+            self.assert_four_vehicle_completed(
+                result,
+                ("patrol",) * 4,
+                max_no_progress_s=45.0,
+            )
+
+    def test_four_vehicle_disjoint_patrol_has_no_false_coordination_failure(self) -> None:
+        matrix = FleetScenario.load(
+            REPO_ROOT / "tests" / "fixtures" / "four_vehicle_mission_matrix.json"
+        )
+        result = run_episode(
+            matrix,
+            {
+                vehicle_id: (
+                    PatrolMission(
+                        f"disjoint-patrol-{vehicle_id[-2:]}",
+                        "global_map",
+                        waypoints,
+                        2,
+                        2,
+                    ),
+                )
+                for vehicle_id, waypoints in FOUR_VEHICLE_DISJOINT_PATROL_ROUTES
+            },
+            max_simulation_s=30.0,
+            grid=MapGrid.from_wall_set(20, 20, set()),
+            linear_speed=1.0,
+        )
+
+        self.assert_four_vehicle_completed(
+            result,
+            ("patrol",) * 4,
+            max_no_progress_s=10.0,
+        )
+
+    def test_four_vehicle_coverage_completes_adjacent_static_stripes(self) -> None:
+        matrix = FleetScenario.load(
+            REPO_ROOT / "tests" / "fixtures" / "four_vehicle_mission_matrix.json"
+        )
+        result = run_episode(
+            matrix,
+            {
+                vehicle_id: (
+                    CoverageMission(
+                        f"coverage-stripe-{vehicle_id[-2:]}",
+                        "global_map",
+                        *area,
+                        0.9,
+                        2,
+                    ),
+                )
+                for vehicle_id, area in FOUR_VEHICLE_COVERAGE_STRIPES
+            },
+            max_simulation_s=150.0,
+            grid=MapGrid.from_wall_set(20, 20, set()),
+            linear_speed=1.0,
+        )
+
+        self.assert_four_vehicle_completed(
+            result,
+            ("coverage",) * 4,
+            max_no_progress_s=40.0,
+        )
+
+    def test_four_vehicle_coverage_clears_shared_quadrant_ingress(self) -> None:
+        matrix = FleetScenario.load(
+            REPO_ROOT / "tests" / "fixtures" / "four_vehicle_mission_matrix.json"
+        )
+        result = run_four_vehicle_quadrant_coverage(matrix)
+
+        self.assert_four_vehicle_completed(
+            result,
+            ("coverage",) * 4,
+            max_no_progress_s=45.0,
+        )
+
+    @pytest.mark.extended
+    def test_four_vehicle_quadrant_coverage_extended_matrix(self) -> None:
+        matrix = FleetScenario.load(
+            REPO_ROOT / "tests" / "fixtures" / "four_vehicle_mission_matrix.json"
+        )
+        reordered = FleetScenario(
+            matrix.scenario_id,
+            tuple(reversed(matrix.vehicles)),
+            matrix.tick_ms,
+        )
+        deterministic = tuple(
+            run_four_vehicle_quadrant_coverage(
+                scenario,
+                lane_spacing_m=3.8,
+            )
+            for scenario in (matrix, matrix, reordered)
+        )
+        tick_results = tuple(
+            run_four_vehicle_quadrant_coverage(
+                FleetScenario(matrix.scenario_id, matrix.vehicles, tick_ms),
+                lane_spacing_m=3.8,
+            )
+            for tick_ms in (50, 250)
+        )
+
+        self.assertEqual(len({result.to_json() for result in deterministic}), 1)
+        for result in (*deterministic, *tick_results):
+            self.assert_four_vehicle_completed(
+                result,
+                ("coverage",) * 4,
+                max_no_progress_s=45.0,
+            )
+
+    def test_four_vehicle_mixed_missions_share_coordination(self) -> None:
+        matrix = FleetScenario.load(
+            REPO_ROOT / "tests" / "fixtures" / "four_vehicle_mission_matrix.json"
+        )
+        result = run_episode(
+            matrix,
+            {
+                "mock_vehicle_01": (
+                    GotoMission("mixed-goto-01", "global_map", 14.5, 9.0, 2),
+                ),
+                "mock_vehicle_02": (
+                    PatrolMission(
+                        "mixed-patrol-02",
+                        "global_map",
+                        ((6.0, 11.0), (13.0, 11.0)),
+                        1,
+                        2,
+                    ),
+                ),
+                "mock_vehicle_03": (
+                    CoverageMission(
+                        "mixed-coverage-03",
+                        "global_map",
+                        8.5,
+                        7.5,
+                        11.5,
+                        9.5,
+                        1.0,
+                        2,
+                    ),
+                ),
+                "mock_vehicle_04": (
+                    CoverageMission(
+                        "mixed-coverage-04",
+                        "global_map",
+                        8.5,
+                        10.5,
+                        11.5,
+                        12.5,
+                        1.0,
+                        2,
+                    ),
+                ),
+            },
+            max_simulation_s=120.0,
+            grid=MapGrid.from_wall_set(20, 20, set()),
+            linear_speed=1.0,
+        )
+
+        self.assert_four_vehicle_completed(
+            result,
+            ("goto", "patrol", "coverage", "coverage"),
+            max_no_progress_s=35.0,
+        )
 
     def test_completed_episode_drains_residual_motion_before_returning(self) -> None:
         from mockvehicle2d import episode as episode_module

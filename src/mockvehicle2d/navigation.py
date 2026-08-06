@@ -356,7 +356,11 @@ class GotoController:
                 changes,
                 PLANNING_EXPANSIONS_PER_UPDATE,
             )
-        if self._planning_kind is not None or self.status != "active":
+        if (
+            self._planning_kind is not None
+            or self.status != "active"
+            or self._waiting_for_peer_replan
+        ):
             return 0.0, 0.0
         if not self._path:
             self._block_no_path(self.detail)
@@ -429,6 +433,8 @@ class GotoController:
                     self._path[0],
                 )
                 if target_cell is None:
+                    if self._recover_unusable_plan():
+                        return 0.0, 0.0
                     self._block_no_path(
                         "start_connection_unsafe",
                         peer_blocked=self._planner.best_start_connection(
@@ -441,6 +447,7 @@ class GotoController:
                     return 0.0, 0.0
                 target_x = (target_cell[0] + 0.5) * local_map.resolution_m
                 target_y = (target_cell[1] + 0.5) * local_map.resolution_m
+        self._planner.accept_plan()
         self._current_waypoint = target_x, target_y
         target_distance = math.hypot(target_x - x_m, target_y - y_m)
         desired_yaw = math.atan2(target_y - y_m, target_x - x_m)
@@ -660,6 +667,8 @@ class GotoController:
                 (pose.x_m, pose.y_m),
                 progress.path[0],
             ) is None:
+                if self._recover_unusable_plan():
+                    return
                 self._safe_search_peer_blocked |= (
                     self._planner.best_start_connection(
                         (pose.x_m, pose.y_m),
@@ -952,6 +961,16 @@ class GotoController:
         self._set_path(None)
         self._current_waypoint = None
         self.block("no_path", detail)
+
+    def _recover_unusable_plan(self) -> bool:
+        assert self._planner is not None
+        if not self._planner.recover_unusable_plan():
+            return False
+        if self._planning_kind is None:
+            self._planning_kind = "goal"
+        self._planning_previous_path = list(self._path)
+        self._current_waypoint = None
+        return True
 
     def _wait_for_peer_replan(self, detail: str | None) -> None:
         self._set_path(None)
