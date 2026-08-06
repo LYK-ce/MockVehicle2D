@@ -70,7 +70,7 @@ class EpisodeResult:
 
 
 class _DeterministicPeerStateExchange:
-    """Relay validated peer-state JSON after a fixed simulation-tick delay."""
+    """Relay validated peer-state and motion-intent JSON after one fixed tick."""
 
     def __init__(self, fleet: FleetRuntime) -> None:
         self._fleet = fleet
@@ -128,23 +128,26 @@ class _DeterministicPeerStateExchange:
         for source_id in sorted(self._fleet.nodes):
             state = self._fleet.nodes[source_id].map_sync
             assert state is not None
-            payload = state.prepare_peer_state()
-            if payload is None:
-                continue
-            encoded = json.dumps(
-                payload,
-                allow_nan=False,
-                separators=(",", ":"),
-                sort_keys=True,
-            )
-            self._pending.append(
-                (self._tick + PEER_STATE_DELAY_TICKS, source_id, encoded)
-            )
-            state.publish_transport_result(
-                str(payload["protocol"]),
-                int(payload["sequence"]),
-                True,
-            )
+            for payload in (
+                state.prepare_peer_state(),
+                state.prepare_motion_intent(),
+            ):
+                if payload is None:
+                    continue
+                encoded = json.dumps(
+                    payload,
+                    allow_nan=False,
+                    separators=(",", ":"),
+                    sort_keys=True,
+                )
+                self._pending.append(
+                    (self._tick + PEER_STATE_DELAY_TICKS, source_id, encoded)
+                )
+                state.publish_transport_result(
+                    str(payload["protocol"]),
+                    int(payload["sequence"]),
+                    True,
+                )
 
 
 def run_episode(

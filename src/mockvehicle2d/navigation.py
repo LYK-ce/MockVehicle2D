@@ -74,6 +74,41 @@ class GotoController:
     def motion_target(self) -> tuple[float, float] | None:
         return self._current_waypoint
 
+    def coordination_detours(
+        self,
+        pose: PoseEstimate,
+        local_map: ObservedGrid,
+    ) -> tuple[tuple[float, float], ...]:
+        """Return a bounded, deterministic set of statically passable side steps."""
+        if self.status != "active" or self._planner is None:
+            return ()
+        current = self._pose_cell(pose, local_map)
+        preferred = self._current_waypoint or self.goal or (pose.x_m, pose.y_m)
+        choices = []
+        for dx, dy in (
+            (-1, -1),
+            (-1, 0),
+            (-1, 1),
+            (0, -1),
+            (0, 1),
+            (1, -1),
+            (1, 0),
+            (1, 1),
+        ):
+            cell = current[0] + dx, current[1] + dy
+            point = (
+                (cell[0] + 0.5) * local_map.resolution_m,
+                (cell[1] + 0.5) * local_map.resolution_m,
+            )
+            if self._planner.is_segment_passable(
+                (pose.x_m, pose.y_m),
+                point,
+                extra_clearance_m=AUTOMATIC_MINIMUM_CLEARANCE_M,
+                _ignore_peer_exclusions=True,
+            ):
+                choices.append((math.dist(point, preferred), cell[1], cell[0], point))
+        return tuple(choice[-1] for choice in sorted(choices))
+
     def start(
         self,
         x_m: float,

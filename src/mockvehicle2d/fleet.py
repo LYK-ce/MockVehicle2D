@@ -777,6 +777,9 @@ class RobotNode:
         peer_states = (
             () if self.map_sync is None else self.map_sync.peer_vehicle_states()
         )
+        peer_motion_intents = (
+            () if self.map_sync is None else self.map_sync.peer_motion_intents()
+        )
         self._update_planning_map(peer_states=peer_states)
         scan_age_s = (
             None
@@ -804,7 +807,18 @@ class RobotNode:
             safety_scan_healthy=scan_fresh,
             vehicle_id=self.spec.vehicle_id,
             peer_states=peer_states,
+            peer_motion_intents=peer_motion_intents,
         )
+        if self.map_sync is not None:
+            target_m, wait_ticks, owner_id, reserved = self.controller.motion_intent
+            self.map_sync.record_motion_intent(
+                self.local_state.pose,
+                target_m=target_m,
+                wait_ticks=wait_ticks,
+                priority_owner_id=owner_id or self.spec.vehicle_id,
+                reserved=reserved,
+                timestamp_s=now,
+            )
         self._pending_map_delta = None
         self._pending_advance = SafetyAdvanceResult()
 

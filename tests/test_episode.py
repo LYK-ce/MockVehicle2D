@@ -195,7 +195,8 @@ class TestEpisodeRunner(unittest.TestCase):
                 and vehicle["longest_no_progress_duration_s"]
                 <= max_no_progress_s
                 for vehicle in result.vehicles
-            )
+            ),
+            result.as_dict(),
         )
 
     def test_completion_is_stable_across_realtime_factors(self) -> None:
@@ -645,7 +646,9 @@ class TestEpisodeRunner(unittest.TestCase):
         self.assert_four_vehicle_completed(
             result,
             ("goto", "patrol", "coverage", "coverage"),
-            max_no_progress_s=35.0,
+            # This metric includes the Goto vehicle's idle tail while the longer
+            # Coverage missions finish; shared-crossing wait is bounded separately.
+            max_no_progress_s=45.0,
         )
 
     def test_completed_episode_drains_residual_motion_before_returning(self) -> None:

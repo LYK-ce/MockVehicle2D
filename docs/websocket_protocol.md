@@ -440,6 +440,16 @@ cell 状态：`0` 可通行、`1` 墙、`2` 无地面/落差。客户端用
     "rejected_deltas": 0,
     "publish_failures": 0,
     "sequence_gaps": 0,
+    "published_peer_states": 12,
+    "received_peer_states": 18,
+    "rejected_peer_states": 0,
+    "peer_state_publish_failures": 0,
+    "active_peer_vehicle_states": 3,
+    "published_motion_intents": 12,
+    "received_motion_intents": 18,
+    "rejected_motion_intents": 0,
+    "motion_intent_publish_failures": 0,
+    "active_peer_motion_intents": 3,
     "peer_sources": {
       "mock_vehicle_02": {"map_epoch": 1, "last_sequence": 3, "known_cells": 72}
     },
@@ -453,7 +463,9 @@ cell 状态：`0` 可通行、`1` 墙、`2` 无地面/落差。客户端用
 `pose` 不泄露绝对仿真真值。`controller` 是模式、队列和导航的权威快照。
 `localization.quality` 为 `nominal`、`degraded` 或 `lost`。
 没有启用场景级 P2P 时，`p2p_map_sync` 为 `{"enabled":false}`。协同摘要仅供观察，
-远端地图当前不会改变本车 D* Lite 或安全控制。常规遥测不会物化完整协同地图：
+远端地图当前不会改变本车 D* Lite 或安全控制。peer state 与 motion intent 的
+published/received/rejected/failure 计数及当前有效租约数分别由同名字段报告。常规遥测
+不会物化完整协同地图：
 `collaborative_evidence_cells` 是各来源证据格数量之和；只有调用显式协同视图查询后，
 `collaborative_view_current` 才为 `true`，此时 `collaborative_known_cells` 才是去重投影后的
 精确数量，否则为 `null`。

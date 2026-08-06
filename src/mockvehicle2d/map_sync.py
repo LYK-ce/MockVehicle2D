@@ -31,12 +31,15 @@ from mockvehicle2d.local_state import (
 SIDECAR_PROTOCOL = "mockvehicle2d-map-sync-sidecar/1"
 DELTA_PROTOCOL = "mockvehicle2d-map-delta/1"
 PEER_STATE_PROTOCOL = "mockvehicle2d-peer-state/1"
+MOTION_INTENT_PROTOCOL = "mockvehicle2d-motion-intent/1"
 MAX_DELTA_CELLS = 512
 MAX_MESSAGE_BYTES = 256 * 1024
 MAX_GRID_COORDINATE = 1_000_000
 MAP_EPOCH = 1
 TRANSFORM_EPOCH = 1
 PEER_STATE_TTL_S = 0.35
+MOTION_INTENT_TTL_S = 0.35
+MAX_INTENT_WAIT_TICKS = 1_000_000
 MAX_PEER_RADIUS_M = 10.0
 MAX_PEER_POSITION_STDDEV_M = 10.0
 MAX_PEER_OBSTACLE_RADIUS_CELLS = 64
@@ -368,6 +371,48 @@ class PeerVehicleState:
         }
 
 
+@dataclass(frozen=True)
+class PeerMotionIntent:
+    """One short, leased grid move derived from a vehicle's odometry and planner."""
+
+    source_vehicle_id: str
+    intent_generation: int
+    sequence: int
+    timestamp_s: float
+    lease_duration_s: float
+    current_cell: tuple[int, int]
+    target_cell: tuple[int, int] | None
+    wait_ticks: int
+    priority_owner_id: str
+    reserved: bool = False
+
+    def as_payload(self, session_id: str, resolution_m: float) -> dict[str, object]:
+        return {
+            "protocol": MOTION_INTENT_PROTOCOL,
+            "session_id": session_id,
+            "source_vehicle_id": self.source_vehicle_id,
+            "intent_generation": self.intent_generation,
+            "sequence": self.sequence,
+            "frame_id": "global_map",
+            "resolution_m": resolution_m,
+            "timestamp_s": self.timestamp_s,
+            "lease_duration_s": self.lease_duration_s,
+            "current_cell": _cell_payload(self.current_cell),
+            "target_cell": (
+                None if self.target_cell is None else _cell_payload(self.target_cell)
+            ),
+            "priority": {
+                "wait_ticks": self.wait_ticks,
+                "owner_vehicle_id": self.priority_owner_id,
+            },
+            "reserved": self.reserved,
+        }
+
+
+def _cell_payload(cell: tuple[int, int]) -> dict[str, int]:
+    return {"gx": cell[0], "gy": cell[1]}
+
+
 class MapSyncState:
     """Keeps local evidence, remote evidence and a derived read-only view separate."""
 
@@ -420,6 +465,13 @@ class MapSyncState:
         self._peer_state_sequence: dict[str, int] = {}
         self._peer_state_pose_revision: dict[str, int] = {}
         self._peer_state_timestamp: dict[str, float] = {}
+        self._intent_sequence = 0
+        self._intent_inflight: PeerMotionIntent | None = None
+        self._local_motion_intent: PeerMotionIntent | None = None
+        self._peer_motion_intents: dict[str, tuple[PeerMotionIntent, float]] = {}
+        self._peer_intent_generation: dict[str, int] = {}
+        self._peer_intent_sequence: dict[str, int] = {}
+        self._peer_intent_timestamp: dict[str, float] = {}
         self._connected_vehicle_ids: tuple[str, ...] = ()
         self.ready = False
         self.published_deltas = 0
@@ -431,6 +483,10 @@ class MapSyncState:
         self.received_peer_states = 0
         self.rejected_peer_states = 0
         self.peer_state_publish_failures = 0
+        self.published_motion_intents = 0
+        self.received_motion_intents = 0
+        self.rejected_motion_intents = 0
+        self.motion_intent_publish_failures = 0
         self._collaborative_cache: dict[tuple[int, int], int] | None = None
 
     def configure_network(
@@ -514,6 +570,85 @@ class MapSyncState:
         self._state_inflight = state
         return payload
 
+    def record_motion_intent(
+        self,
+        pose: PoseEstimate,
+        *,
+        target_m: tuple[float, float] | None,
+        wait_ticks: int,
+        priority_owner_id: str,
+        reserved: bool,
+        timestamp_s: float,
+    ) -> None:
+        if not isinstance(pose, PoseEstimate) or pose.anchor_id != self.anchor.anchor_id:
+            raise ValueError("motion intent pose must use the configured anchor")
+        if (
+            target_m is not None
+            and (
+                not isinstance(target_m, tuple)
+                or len(target_m) != 2
+                or any(not math.isfinite(value) for value in target_m)
+            )
+        ):
+            raise ValueError("motion intent target must be a finite metric pair")
+        if (
+            type(wait_ticks) is not int
+            or not 0 <= wait_ticks <= MAX_INTENT_WAIT_TICKS
+            or not isinstance(priority_owner_id, str)
+            or priority_owner_id not in {self.vehicle_id, *self._expected_peers}
+            or type(reserved) is not bool
+            or not math.isfinite(timestamp_s)
+        ):
+            raise ValueError("invalid motion intent priority or timestamp")
+        global_x_m, global_y_m, _ = self.anchor.anchor_to_global(
+            pose.x_m,
+            pose.y_m,
+            pose.yaw_rad,
+        )
+        current_cell = self._global_cell(global_x_m, global_y_m)
+        target_cell = None
+        if target_m is not None:
+            target_x_m, target_y_m, _ = self.anchor.anchor_to_global(
+                target_m[0], target_m[1], 0.0
+            )
+            target_cell = self._global_cell(target_x_m, target_y_m)
+        self._local_motion_intent = PeerMotionIntent(
+            self.vehicle_id,
+            self._state_generation,
+            0,
+            timestamp_s,
+            MOTION_INTENT_TTL_S,
+            current_cell,
+            target_cell,
+            wait_ticks,
+            priority_owner_id,
+            reserved,
+        )
+
+    def prepare_motion_intent(self) -> dict[str, object] | None:
+        if self._intent_inflight is not None or self._local_motion_intent is None:
+            return None
+        intent = replace(
+            self._local_motion_intent,
+            sequence=self._intent_sequence + 1,
+        )
+        payload = intent.as_payload(self.session_id, self.resolution_m)
+        if len(json.dumps(payload, separators=(",", ":")).encode()) > MAX_MESSAGE_BYTES:
+            raise RuntimeError("motion intent unexpectedly exceeds message limit")
+        self._intent_inflight = intent
+        return payload
+
+    def publish_motion_intent_result(self, sequence: int, accepted: bool) -> None:
+        if self._intent_inflight is None or self._intent_inflight.sequence != sequence:
+            self.rejected_motion_intents += 1
+            return
+        self._intent_inflight = None
+        if not accepted:
+            self.motion_intent_publish_failures += 1
+            return
+        self._intent_sequence = sequence
+        self.published_motion_intents += 1
+
     def publish_peer_state_result(self, sequence: int, accepted: bool) -> None:
         if self._state_inflight is None or self._state_inflight.sequence != sequence:
             self.rejected_peer_states += 1
@@ -577,6 +712,8 @@ class MapSyncState:
             self.publish_result(int(self._inflight["sequence"]), False)
         if self._state_inflight is not None:
             self.publish_peer_state_result(self._state_inflight.sequence, False)
+        if self._intent_inflight is not None:
+            self.publish_motion_intent_result(self._intent_inflight.sequence, False)
 
     def publish_transport_result(
         self,
@@ -588,6 +725,8 @@ class MapSyncState:
             self.publish_result(sequence, accepted)
         elif protocol == PEER_STATE_PROTOCOL:
             self.publish_peer_state_result(sequence, accepted)
+        elif protocol == MOTION_INTENT_PROTOCOL:
+            self.publish_motion_intent_result(sequence, accepted)
         else:
             raise ValueError("unknown map-sync payload protocol")
 
@@ -602,8 +741,16 @@ class MapSyncState:
             return self.receive(source_peer_id, source_vehicle_id, payload)
         if protocol == PEER_STATE_PROTOCOL:
             return self.receive_peer_state(source_peer_id, source_vehicle_id, payload)
-        self.rejected_peer_states += 1
+        if protocol == MOTION_INTENT_PROTOCOL:
+            return self.receive_motion_intent(source_peer_id, source_vehicle_id, payload)
+        self.rejected_motion_intents += 1
         return False
+
+    def _global_cell(self, x_m: float, y_m: float) -> tuple[int, int]:
+        return (
+            math.floor(x_m / self.resolution_m),
+            math.floor(y_m / self.resolution_m),
+        )
 
     def set_health(self, *, ready: bool, connected_vehicle_ids: Iterable[str] = ()) -> None:
         connected = tuple(sorted(set(connected_vehicle_ids)))
@@ -695,6 +842,177 @@ class MapSyncState:
         self._peer_vehicle_states[source] = state, receipt
         self.received_peer_states += 1
         return True
+
+    def receive_motion_intent(
+        self,
+        source_peer_id: str,
+        reported_source_vehicle_id: str,
+        payload: object,
+        *,
+        received_at_s: float | None = None,
+    ) -> bool:
+        receipt = self._clock() if received_at_s is None else received_at_s
+        if not math.isfinite(receipt):
+            raise ValueError("motion intent receipt time must be finite")
+        try:
+            intent = self._validate_motion_intent(
+                source_peer_id,
+                reported_source_vehicle_id,
+                payload,
+            )
+        except (TypeError, ValueError):
+            self.rejected_motion_intents += 1
+            return False
+
+        source = intent.source_vehicle_id
+        generation = self._peer_intent_generation.get(source, 0)
+        if intent.intent_generation < generation:
+            self.rejected_motion_intents += 1
+            return False
+        if intent.intent_generation > generation:
+            self._peer_intent_generation[source] = intent.intent_generation
+            self._peer_intent_sequence[source] = 0
+            self._peer_intent_timestamp[source] = -math.inf
+        if (
+            intent.sequence <= self._peer_intent_sequence[source]
+            or intent.timestamp_s < self._peer_intent_timestamp[source]
+        ):
+            self.rejected_motion_intents += 1
+            return False
+        self._peer_intent_sequence[source] = intent.sequence
+        self._peer_intent_timestamp[source] = intent.timestamp_s
+        self._peer_motion_intents[source] = intent, receipt
+        self.received_motion_intents += 1
+        return True
+
+    def _validate_motion_intent(
+        self,
+        source_peer_id: str,
+        reported_source_vehicle_id: str,
+        payload: object,
+    ) -> PeerMotionIntent:
+        if len(json.dumps(payload, separators=(",", ":")).encode()) > MAX_MESSAGE_BYTES:
+            raise ValueError("remote motion intent exceeds size limit")
+        fields = frozenset(
+            (
+                "protocol",
+                "session_id",
+                "source_vehicle_id",
+                "intent_generation",
+                "sequence",
+                "frame_id",
+                "resolution_m",
+                "timestamp_s",
+                "lease_duration_s",
+                "current_cell",
+                "target_cell",
+                "priority",
+                "reserved",
+            )
+        )
+        body = _strict_object(
+            payload,
+            required=fields,
+            allowed=fields,
+            name="motion_intent",
+        )
+        source = body["source_vehicle_id"]
+        expected = self._expected_peers.get(source) if isinstance(source, str) else None
+        generation = _positive_integer(body["intent_generation"], "intent_generation")
+        if (
+            source != reported_source_vehicle_id
+            or expected is None
+            or expected[0] != source_peer_id
+            or body["protocol"] != MOTION_INTENT_PROTOCOL
+            or body["session_id"] != self.session_id
+            or body["frame_id"] != "global_map"
+            or generation > (1 << 64) - 1
+        ):
+            raise ValueError("motion intent identity, protocol or frame is incompatible")
+        resolution_m = _finite(body["resolution_m"], "resolution_m")
+        if not math.isclose(
+            resolution_m,
+            self.resolution_m,
+            rel_tol=0.0,
+            abs_tol=1e-9,
+        ):
+            raise ValueError("motion intent resolution is incompatible")
+        lease_duration_s = _finite(body["lease_duration_s"], "lease_duration_s")
+        if not 0 < lease_duration_s <= MOTION_INTENT_TTL_S:
+            raise ValueError("motion intent lease is outside the supported range")
+        current_cell = self._validate_intent_cell(body["current_cell"], "current_cell")
+        target_cell = (
+            None
+            if body["target_cell"] is None
+            else self._validate_intent_cell(body["target_cell"], "target_cell")
+        )
+        priority = _strict_object(
+            body["priority"],
+            required=frozenset(("wait_ticks", "owner_vehicle_id")),
+            allowed=frozenset(("wait_ticks", "owner_vehicle_id")),
+            name="motion_intent.priority",
+        )
+        wait_ticks = _nonnegative_integer(priority["wait_ticks"], "priority.wait_ticks")
+        owner = priority["owner_vehicle_id"]
+        if (
+            wait_ticks > MAX_INTENT_WAIT_TICKS
+            or not isinstance(owner, str)
+            or owner not in {self.vehicle_id, source, *self._expected_peers}
+            or type(body["reserved"]) is not bool
+        ):
+            raise ValueError("motion intent priority is invalid")
+        return PeerMotionIntent(
+            source,
+            generation,
+            _positive_integer(body["sequence"], "sequence"),
+            _finite(body["timestamp_s"], "timestamp_s"),
+            lease_duration_s,
+            current_cell,
+            target_cell,
+            wait_ticks,
+            owner,
+            body["reserved"],
+        )
+
+    @staticmethod
+    def _validate_intent_cell(value: object, name: str) -> tuple[int, int]:
+        cell = _strict_object(
+            value,
+            required=frozenset(("gx", "gy")),
+            allowed=frozenset(("gx", "gy")),
+            name=name,
+        )
+        coordinates = cell["gx"], cell["gy"]
+        if any(
+            type(coordinate) is not int or abs(coordinate) > MAX_GRID_COORDINATE
+            for coordinate in coordinates
+        ):
+            raise ValueError(f"{name} coordinates are invalid")
+        return coordinates
+
+    def peer_motion_intents(
+        self,
+        *,
+        now_s: float | None = None,
+    ) -> tuple[PeerMotionIntent, ...]:
+        now = self._clock() if now_s is None else now_s
+        if not math.isfinite(now):
+            raise ValueError("motion intent query time must be finite")
+        expired = [
+            source
+            for source, (intent, received_at) in self._peer_motion_intents.items()
+            if now - received_at > intent.lease_duration_s + 1e-12
+        ]
+        for source in expired:
+            self._peer_motion_intents.pop(source, None)
+        return tuple(
+            intent
+            for intent, received_at in sorted(
+                self._peer_motion_intents.values(),
+                key=lambda item: item[0].source_vehicle_id,
+            )
+            if received_at <= now
+        )
 
     def _validate_peer_state(
         self,
@@ -1050,6 +1368,11 @@ class MapSyncState:
             "rejected_peer_states": self.rejected_peer_states,
             "peer_state_publish_failures": self.peer_state_publish_failures,
             "active_peer_vehicle_states": len(self.peer_vehicle_states()),
+            "published_motion_intents": self.published_motion_intents,
+            "received_motion_intents": self.received_motion_intents,
+            "rejected_motion_intents": self.rejected_motion_intents,
+            "motion_intent_publish_failures": self.motion_intent_publish_failures,
+            "active_peer_motion_intents": len(self.peer_motion_intents()),
             "peer_sources": {
                 source: {
                     "map_epoch": self._peer_epoch[source],
@@ -1077,7 +1400,7 @@ class _NodeBridge:
         self.ready_event = asyncio.Event()
         self._writer: asyncio.StreamWriter | None = None
         self._writers: set[asyncio.StreamWriter] = set()
-        self._outbound: asyncio.Queue[dict[str, object]] = asyncio.Queue(maxsize=2)
+        self._outbound: asyncio.Queue[dict[str, object]] = asyncio.Queue(maxsize=3)
         self._tasks: set[asyncio.Task[object]] = set()
         self._owned_socket: tuple[int, int] | None = None
         self._close_task: asyncio.Task[None] | None = None
@@ -1214,7 +1537,11 @@ class _NodeBridge:
                     sequence = event.get("sequence")
                     accepted = event.get("accepted")
                     if (
-                        protocol not in {DELTA_PROTOCOL, PEER_STATE_PROTOCOL}
+                        protocol not in {
+                            DELTA_PROTOCOL,
+                            PEER_STATE_PROTOCOL,
+                            MOTION_INTENT_PROTOCOL,
+                        }
                         or type(sequence) is not int
                         or type(accepted) is not bool
                     ):
@@ -1730,7 +2057,11 @@ class P2PFleetSync:
             return
         for vehicle_id, state in self.states.items():
             bridge = self._bridges[vehicle_id]
-            for payload in (state.prepare_peer_state(), state.prepare_delta()):
+            for payload in (
+                state.prepare_peer_state(),
+                state.prepare_delta(),
+                state.prepare_motion_intent(),
+            ):
                 if payload is not None and not bridge.enqueue(payload):
                     state.publish_transport_result(
                         payload["protocol"],

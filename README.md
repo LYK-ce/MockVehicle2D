@@ -106,12 +106,13 @@ velocity；默认线加速、线减速和角加速上限分别为 `1 m/s²`、`1
 时限时失败结束。`episode` 与 `serve`/`fleet` 使用相同的速度、加减速、半径和 watchdog
 CLI 参数。
 
-多车 Episode 不启动 localhost libp2p，而是把现有 peer-state v1 payload 经过 JSON
-序列化、协议校验和 anchor 变换后，以固定 1 tick 延迟在进程内传递；序列、接收时间和
-`0.35 s` 过期规则与实时 P2P 路径一致。启用了真实 `p2p` 配置的场景仍被拒绝，因为
-libp2p 墙钟调度和 map delta 传播不属于确定性 Episode。两车短时轨迹冲突使用稳定的
-`vehicle_id` 字典序决定通行权；低优先级车辆有界制动并保持任务 active，连续确认冲突
-解除后自动恢复。让行期间 peer state 缺失或过期时保持停车，LocalSafety 仍是最终裁决。
+多车 Episode 不启动 localhost libp2p，而是把现有 peer-state v1 和 motion-intent v1
+payload 经过 JSON 序列化及协议校验后，以固定 1 tick 延迟在进程内传递；序列、接收时间
+和 `0.35 s` 过期规则与实时 P2P 路径一致。启用了真实 `p2p` 配置的场景仍被拒绝，因为
+libp2p 墙钟调度和 map delta 传播不属于确定性 Episode。下一格 vertex/edge-swap 冲突
+使用短租约和等待年龄仲裁，`vehicle_id` 只作最终 tie-break；占路车辆可继承请求者优先级
+并尝试一个本地可通行邻格。让行期间任务保持 active，所依赖的 peer state 或 intent
+缺失/过期时保持停车，连续确认冲突解除后恢复；LocalSafety 仍是最终裁决。
 
 标准输出是 schema version 2 的单行 canonical JSON，包含场景 ID、odometry seed、tick 数、
 模拟时长、终止原因，以及每辆车的仿真真值终态、按 tick 采样的路径长度、碰撞/阻断/
@@ -179,11 +180,12 @@ sidecar；默认无顶层 `p2p` 的场景不启动任何网络进程。每辆车
 
 每车严格维护 OwnMap、按来源划分的 PeerEvidence 和只读 CollaborativeView。远端地图证据
 不会进入 OwnMap、不会重新发布，也暂不改变 D* Lite 或本地安全决策；peer vehicle state
-只作为瞬态 footprint exclusion 和让行输入。P2P 健康度、
+只作为瞬态 footprint exclusion 和让行输入；motion intent 只进入租约仲裁，不进入
+OwnMap、PeerEvidence 或 CollaborativeView。P2P 健康度、
 本地/远端 delta 计数和协同视图摘要通过每车 `pose.p2p_map_sync` 遥测提供。当前仅实现
 在线增量和重复/过期拒绝；离线缺包与后加入节点的 tile 快照恢复留到下一里程碑。
 
-Gossipsub topic 为 `mockvehicle2d/<session_id>/map-delta/1`，payload 是严格的
+Gossipsub topic 为 `mockvehicle2d/<session_id>/fleet-sync/1`，payload 是严格的
 `mockvehicle2d-map-delta/1` JSON：
 
 ```json
@@ -205,6 +207,31 @@ Gossipsub topic 为 `mockvehicle2d/<session_id>/map-delta/1`，payload 是严格
 接收端同时校验 Gossipsub 签名作者 PeerId、车辆白名单、session、frame、anchor、epoch、
 resolution、sequence、消息大小和每个 cell。Python 与对应 sidecar 只通过运行目录中的
 Unix domain socket 交换有界 JSONL 消息，控制 tick 不等待该 socket。
+
+同一 fleet-sync topic 还承载严格的 `mockvehicle2d-motion-intent/1` JSON。它只描述由
+本车 odometry 与 D* 当前 waypoint 生成的一个短期移动，不携带仿真真值：
+
+```json
+{
+  "protocol": "mockvehicle2d-motion-intent/1",
+  "session_id": "four_vehicle_exploration",
+  "source_vehicle_id": "mock_vehicle_01",
+  "intent_generation": 1,
+  "sequence": 9,
+  "frame_id": "global_map",
+  "resolution_m": 1.0,
+  "timestamp_s": 42.1,
+  "lease_duration_s": 0.35,
+  "current_cell": {"gx": 9, "gy": 10},
+  "target_cell": {"gx": 10, "gy": 10},
+  "priority": {"wait_ticks": 3, "owner_vehicle_id": "mock_vehicle_01"},
+  "reserved": true
+}
+```
+
+接收端严格校验 generation/sequence、global frame、resolution、cell 边界、优先级 owner
+白名单和租约上限；重复、乱序、超时或额外字段均拒绝。当前协调窗口只有下一格，封闭
+约 3 m 内宽且没有会车位的通道仍可能 `no_path`；需要这类拓扑时再加入 SIPP 时间窗。
 
 ## 控制方式
 

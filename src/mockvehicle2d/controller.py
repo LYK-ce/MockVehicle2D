@@ -11,6 +11,11 @@ from typing import TYPE_CHECKING, ClassVar
 import uuid
 
 from mockvehicle2d.navigation import GotoController
+from mockvehicle2d.map_sync import (
+    MAX_INTENT_WAIT_TICKS,
+    MOTION_INTENT_TTL_S,
+    PeerMotionIntent,
+)
 from mockvehicle2d.safety import AUTOMATIC_MINIMUM_CLEARANCE_M
 
 if TYPE_CHECKING:
@@ -34,6 +39,7 @@ SUPPORTED_MISSION_TYPES = ("goto", "patrol", "coverage")
 PEER_CONFLICT_HORIZON_S = 4.0
 PEER_YIELD_CLEAR_TICKS = 3
 PEER_ESCAPE_LINEAR_MPS = 0.2
+PEER_RESERVATION_MAX_HOLD_TICKS = 40
 Goal = tuple[float, float]
 
 
@@ -332,6 +338,87 @@ def _peer_motion_conflicts(
     return closest_distance_m <= conflict_distance_m + 1e-12
 
 
+def motion_intent_precedes(
+    first: PeerMotionIntent,
+    second: PeerMotionIntent,
+) -> bool:
+    """Return the deterministic winner; a live reservation is a short lease."""
+    if first.reserved != second.reserved:
+        return first.reserved
+    if first.wait_ticks != second.wait_ticks:
+        return first.wait_ticks > second.wait_ticks
+    if first.priority_owner_id != second.priority_owner_id:
+        return first.priority_owner_id < second.priority_owner_id
+    return first.source_vehicle_id < second.source_vehicle_id
+
+
+def inherit_motion_priority(
+    own: PeerMotionIntent,
+    requesters: tuple[PeerMotionIntent, ...],
+) -> PeerMotionIntent:
+    inherited = own
+    for requester in sorted(requesters, key=lambda intent: intent.source_vehicle_id):
+        if motion_intent_precedes(requester, inherited):
+            inherited = requester
+    if inherited is own:
+        return own
+    return PeerMotionIntent(
+        own.source_vehicle_id,
+        own.intent_generation,
+        own.sequence,
+        own.timestamp_s,
+        own.lease_duration_s,
+        own.current_cell,
+        own.target_cell,
+        max(own.wait_ticks, inherited.wait_ticks),
+        inherited.priority_owner_id,
+        own.reserved,
+    )
+
+
+def _motion_intents_conflict(
+    first: PeerMotionIntent,
+    second: PeerMotionIntent,
+) -> bool:
+    if first.target_cell is None or second.target_cell is None:
+        return False
+    return first.target_cell == second.target_cell or (
+        first.current_cell == second.target_cell
+        and first.target_cell == second.current_cell
+    )
+
+
+def _coordination_cell(
+    anchor: AnchorSpec,
+    point_m: tuple[float, float],
+    resolution_m: float,
+) -> tuple[int, int]:
+    global_x_m, global_y_m, _ = anchor.anchor_to_global(*point_m, 0.0)
+    return (
+        math.floor(global_x_m / resolution_m),
+        math.floor(global_y_m / resolution_m),
+    )
+
+
+def _intent_setpoint(
+    target_m: tuple[float, float],
+    pose: PoseEstimate,
+    vehicle: Vehicle,
+) -> tuple[float, float]:
+    dx, dy = target_m[0] - pose.x_m, target_m[1] - pose.y_m
+    distance_m = math.hypot(dx, dy)
+    heading_error = math.atan2(
+        math.sin(math.atan2(dy, dx) - pose.yaw_rad),
+        math.cos(math.atan2(dy, dx) - pose.yaw_rad),
+    )
+    return (
+        0.0
+        if abs(heading_error) > GotoController.turn_in_place_threshold_rad
+        else min(vehicle.linear_speed, distance_m),
+        max(-vehicle.angular_speed, min(vehicle.angular_speed, 2 * heading_error)),
+    )
+
+
 def _peer_conflict_distance(
     vehicle: Vehicle,
     peer: PeerVehicleState,
@@ -514,7 +601,15 @@ class RobotController:
         self._subgoal_index = 0
         self._deferred_edge_cell: tuple[int, int] | None = None
         self._yielding_for: str | None = None
+        self._yield_requires_intent = False
         self._yield_clear_ticks = 0
+        self._reservation_wait_ticks = 0
+        self._intent_priority_owner_id: str | None = None
+        self._intent_target_m: tuple[float, float] | None = None
+        self._intent_reserved = False
+        self._reservation_cells: tuple[tuple[int, int], tuple[int, int]] | None = None
+        self._reservation_hold_ticks = 0
+        self._last_coordination_cell: tuple[int, int] | None = None
 
     @property
     def is_automatic_motion_active(self) -> bool:
@@ -523,6 +618,20 @@ class RobotController:
     @property
     def is_yielding(self) -> bool:
         return self._yielding_for is not None
+
+    @property
+    def motion_intent(self) -> tuple[
+        tuple[float, float] | None,
+        int,
+        str | None,
+        bool,
+    ]:
+        return (
+            self._intent_target_m,
+            self._reservation_wait_ticks,
+            self._intent_priority_owner_id,
+            self._intent_reserved,
+        )
 
     def handle(
         self,
@@ -557,8 +666,10 @@ class RobotController:
         safety_scan_healthy: bool = True,
         vehicle_id: str | None = None,
         peer_states: tuple[PeerVehicleState, ...] = (),
+        peer_motion_intents: tuple[PeerMotionIntent, ...] = (),
     ) -> None:
         if self.mode is OpMode.MANUAL:
+            self._clear_yield()
             self._tick_manual(
                 vehicle,
                 grid,
@@ -603,7 +714,10 @@ class RobotController:
             vehicle_id=vehicle_id,
             anchor=anchor,
             pose=pose,
+            local_map=local_map,
+            now=now,
             peer_states=peer_states,
+            peer_motion_intents=peer_motion_intents,
         )
 
         decision = safety.evaluate(
@@ -646,14 +760,117 @@ class RobotController:
         vehicle_id: str | None,
         anchor: AnchorSpec,
         pose: PoseEstimate,
+        local_map: ObservedGrid,
+        now: float,
         peer_states: tuple[PeerVehicleState, ...],
+        peer_motion_intents: tuple[PeerMotionIntent, ...],
     ) -> tuple[float, float]:
         if vehicle_id is None:
             self._clear_yield()
             return desired
 
         peers = {state.source_vehicle_id: state for state in peer_states}
+        intents = {
+            intent.source_vehicle_id: intent for intent in peer_motion_intents
+        }
         motion_target = self.navigation.motion_target
+        self._intent_target_m = motion_target
+        self._intent_priority_owner_id = vehicle_id
+        current_cell = _coordination_cell(
+            anchor,
+            (pose.x_m, pose.y_m),
+            local_map.resolution_m,
+        )
+        if self._last_coordination_cell != current_cell:
+            self._last_coordination_cell = current_cell
+            self._reservation_wait_ticks = 0
+            self._reservation_hold_ticks = 0
+            self._reservation_cells = None
+        target_cell = (
+            None
+            if motion_target is None
+            else _coordination_cell(anchor, motion_target, local_map.resolution_m)
+        )
+        own = PeerMotionIntent(
+            vehicle_id,
+            1,
+            1,
+            now,
+            MOTION_INTENT_TTL_S,
+            current_cell,
+            target_cell,
+            self._reservation_wait_ticks,
+            vehicle_id,
+            self._intent_reserved
+            and self._reservation_cells == (current_cell, target_cell)
+            and self._reservation_hold_ticks < PEER_RESERVATION_MAX_HOLD_TICKS,
+        )
+
+        requesters = [
+            intent
+            for intent in peer_motion_intents
+            if intent.target_cell == current_cell
+            and intent.current_cell != current_cell
+        ]
+        inherited_from = None
+        inherited_own = inherit_motion_priority(own, tuple(requesters))
+        if inherited_own.priority_owner_id != own.priority_owner_id:
+            inherited_from = next(
+                requester
+                for requester in requesters
+                if requester.priority_owner_id == inherited_own.priority_owner_id
+            )
+            own = inherited_own
+            self._intent_priority_owner_id = own.priority_owner_id
+
+        swap_request = next(
+            (
+                requester
+                for requester in requesters
+                if target_cell is None or requester.current_cell == target_cell
+            ),
+            None,
+        )
+        if swap_request is not None:
+            unavailable = {
+                cell
+                for intent in peer_motion_intents
+                for cell in (intent.current_cell, intent.target_cell)
+                if cell is not None
+            }
+            for detour_m in self.navigation.coordination_detours(pose, local_map):
+                detour_cell = _coordination_cell(
+                    anchor,
+                    detour_m,
+                    local_map.resolution_m,
+                )
+                if detour_cell in unavailable:
+                    continue
+                motion_target = detour_m
+                target_cell = detour_cell
+                desired = _intent_setpoint(detour_m, pose, vehicle)
+                self._intent_target_m = detour_m
+                own = PeerMotionIntent(
+                    vehicle_id,
+                    1,
+                    1,
+                    now,
+                    MOTION_INTENT_TTL_S,
+                    current_cell,
+                    target_cell,
+                    own.wait_ticks,
+                    own.priority_owner_id,
+                    own.reserved,
+                )
+                break
+
+        vacating_for = (
+            None
+            if inherited_from is None
+            or target_cell in {None, current_cell, inherited_from.current_cell}
+            else inherited_from.source_vehicle_id
+        )
+
         travel_limit_m = (
             None
             if motion_target is None
@@ -661,17 +878,36 @@ class RobotController:
         )
         if self._yielding_for is not None:
             peer = peers.get(self._yielding_for)
-            if peer is None:
+            peer_intent = intents.get(self._yielding_for)
+            if peer is None or (
+                self._yield_requires_intent and peer_intent is None
+            ):
+                self._reservation_wait_ticks = min(
+                    MAX_INTENT_WAIT_TICKS,
+                    self._reservation_wait_ticks + 1,
+                )
+                self._intent_reserved = False
                 return 0.0, 0.0
-            if _peer_motion_conflicts(
-                desired,
-                vehicle,
-                anchor,
-                pose,
-                peer,
-                travel_limit_m,
+            still_conflicts = _peer_motion_conflicts(
+                desired, vehicle, anchor, pose, peer, travel_limit_m
+            ) or (
+                peer_intent is not None
+                and (
+                    own.target_cell == peer_intent.current_cell
+                    or _motion_intents_conflict(own, peer_intent)
+                )
+            )
+            if still_conflicts and (
+                peer_intent is None
+                or own.target_cell == peer_intent.current_cell
+                or motion_intent_precedes(peer_intent, own)
             ):
                 self._yield_clear_ticks = 0
+                self._reservation_wait_ticks = min(
+                    MAX_INTENT_WAIT_TICKS,
+                    self._reservation_wait_ticks + 1,
+                )
+                self._intent_reserved = False
                 if desired[0] == 0.0 and desired[1] != 0.0:
                     return desired
                 if desired == (0.0, 0.0):
@@ -682,14 +918,37 @@ class RobotController:
             self._yield_clear_ticks += 1
             if self._yield_clear_ticks < PEER_YIELD_CLEAR_TICKS:
                 return 0.0, 0.0
-            self._clear_yield()
+            self._yielding_for = None
+            self._yield_requires_intent = False
+            self._yield_clear_ticks = 0
 
-        # ponytail: lexical priority is sufficient for two vehicles; replace it
-        # with reservations only when cyclic three-plus-vehicle conflicts require it.
-        conflicts = sorted(
+        intent_conflicts = []
+        for peer_intent in peer_motion_intents:
+            peer = peers.get(peer_intent.source_vehicle_id)
+            if peer is None:
+                continue
+            if peer_intent.source_vehicle_id == vacating_for:
+                continue
+            target_occupied = own.target_cell == peer_intent.current_cell
+            cell_conflict = _motion_intents_conflict(own, peer_intent)
+            trajectory_conflict = _peer_motion_conflicts(
+                desired,
+                vehicle,
+                anchor,
+                pose,
+                peer,
+                travel_limit_m,
+            )
+            if target_occupied or (
+                (cell_conflict or trajectory_conflict)
+                and motion_intent_precedes(peer_intent, own)
+            ):
+                intent_conflicts.append(peer_intent.source_vehicle_id)
+        fallback_conflicts = [
             state.source_vehicle_id
             for state in peer_states
-            if vehicle_id > state.source_vehicle_id
+            if state.source_vehicle_id not in intents
+            and vehicle_id > state.source_vehicle_id
             and _peer_motion_conflicts(
                 desired,
                 vehicle,
@@ -698,16 +957,46 @@ class RobotController:
                 state,
                 travel_limit_m,
             )
-        )
+        ]
+        conflicts = sorted({*intent_conflicts, *fallback_conflicts})
         if conflicts:
             self._yielding_for = conflicts[0]
+            self._yield_requires_intent = conflicts[0] in intents
             self._yield_clear_ticks = 0
+            self._reservation_wait_ticks = min(
+                MAX_INTENT_WAIT_TICKS,
+                self._reservation_wait_ticks + 1,
+            )
+            self._intent_reserved = False
             return 0.0, 0.0
+
+        cells = current_cell, target_cell
+        if target_cell is not None and target_cell != current_cell:
+            if self._reservation_cells == cells:
+                self._reservation_hold_ticks += 1
+            else:
+                self._reservation_cells = cells
+                self._reservation_hold_ticks = 0
+            self._intent_reserved = (
+                self._reservation_hold_ticks < PEER_RESERVATION_MAX_HOLD_TICKS
+            )
+        else:
+            self._intent_reserved = False
+            self._reservation_cells = None
+            self._reservation_hold_ticks = 0
         return desired
 
     def _clear_yield(self) -> None:
         self._yielding_for = None
+        self._yield_requires_intent = False
         self._yield_clear_ticks = 0
+        self._reservation_wait_ticks = 0
+        self._intent_priority_owner_id = None
+        self._intent_target_m = None
+        self._intent_reserved = False
+        self._reservation_cells = None
+        self._reservation_hold_ticks = 0
+        self._last_coordination_cell = None
 
     def disconnect(self, vehicle: Vehicle) -> None:
         vehicle.stop()
