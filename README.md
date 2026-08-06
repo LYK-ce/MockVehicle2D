@@ -73,7 +73,7 @@ mockvehicle2d episode \
   --max-simulation-s 30 \
   --goto mock_vehicle_01,11,10
 
-# 无 localhost libp2p 的双车交叉基准；进程内 peer-state relay 驱动确定性让行
+# 无 localhost libp2p 的双车交叉基准；进程内 peer-state + motion-intent relay 驱动确定性让行
 mockvehicle2d episode \
   --scenario examples/two_vehicle_crossing_episode.json \
   --max-simulation-s 30 \
@@ -126,7 +126,7 @@ tick、所有无序车辆对的最小圆形 footprint 边缘间距（中心距�
 `CoverageMission`。
 
 Runner 明确拒绝启用真实 P2P 的场景，因为 localhost libp2p 调度和 map delta 传播不属于
-确定性模拟时钟；当前只提供上述进程内 peer-state relay，不包含定时事件或通信故障注入。
+确定性模拟时钟；当前只提供上述进程内 peer-state + motion-intent relay，不包含定时事件或通信故障注入。
 
 四车任务协同回归使用 `tests/fixtures/four_vehicle_mission_matrix.json` 和显式空场，覆盖
 重复共享路口 Patrol、对向合流 Patrol、互不相交 Patrol、相邻静态条带 Coverage、共享
