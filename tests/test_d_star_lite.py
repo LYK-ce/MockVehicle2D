@@ -872,6 +872,41 @@ def test_finite_search_recovers_one_transient_path_extraction(
     assert extraction_calls == 2
 
 
+def test_unusable_finite_plan_gets_one_bounded_recovery_until_accepted() -> None:
+    search = planner(bounds_margin_m=6.0)
+    assert search.plan((0, 0), (80, 0)) is not None
+
+    assert search.recover_unusable_plan()
+    before = search.stats["expansions"]
+    progress = search.advance_plan(
+        (0, 0),
+        (80, 0),
+        expansion_budget=1,
+    )
+    assert progress.status == "pending"
+    assert search.stats["expansions"] - before <= 1
+    while progress.status == "pending":
+        progress = search.advance_plan(
+            (0, 0),
+            (80, 0),
+            expansion_budget=7,
+        )
+
+    assert progress.status == "ready"
+    assert not search.recover_unusable_plan()
+    search.accept_plan()
+    assert search.recover_unusable_plan()
+
+
+def test_new_goal_rearms_unusable_plan_recovery() -> None:
+    search = planner()
+    assert search.plan((0, 0), (4, 0)) is not None
+    assert search.recover_unusable_plan()
+
+    assert search.plan((0, 0), (5, 0)) is not None
+    assert search.recover_unusable_plan()
+
+
 def test_blocked_start_equals_goal_returns_none_but_free_returns_singleton() -> None:
     search = planner()
     assert search.plan((2, 2), (2, 2)) == [(2, 2)]
