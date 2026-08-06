@@ -834,10 +834,42 @@ def test_finite_search_without_extractable_path_is_classified(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     search = planner()
-    monkeypatch.setattr(search, "_extract_path", lambda: None)
+    extraction_calls = 0
+
+    def fail_extraction() -> None:
+        nonlocal extraction_calls
+        extraction_calls += 1
+        return None
+
+    monkeypatch.setattr(search, "_extract_path", fail_extraction)
 
     assert search.plan((0, 0), (4, 0)) is None
     assert search.last_failure == "path_extraction"
+    assert extraction_calls == 2
+
+
+def test_finite_search_recovers_one_transient_path_extraction(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    search = planner()
+    real_extraction = search._extract_path
+    extraction_calls = 0
+
+    def transient_failure() -> list[tuple[int, int]] | None:
+        nonlocal extraction_calls
+        extraction_calls += 1
+        return None if extraction_calls == 1 else real_extraction()
+
+    monkeypatch.setattr(search, "_extract_path", transient_failure)
+
+    assert search.plan((0, 0), (4, 0)) == [
+        (0, 0),
+        (1, 0),
+        (2, 0),
+        (3, 0),
+        (4, 0),
+    ]
+    assert extraction_calls == 2
 
 
 def test_blocked_start_equals_goal_returns_none_but_free_returns_singleton() -> None:
