@@ -139,11 +139,10 @@ OwnMap。默认矩阵运行全部六种 `100 ms` 拓扑：
 ```
 
 耗时更长的扩展矩阵选择最困难的对向合流 Patrol 和共享入口 Coverage，分别验证同 seed
-重复、车辆声明反序以及 `50/250 ms` tick。当前开发机约需 17 分钟，因此默认跳过：
+重复、车辆声明反序以及 `50/250 ms` tick。当前开发机约需 17 分钟，因此默认 deselected：
 
 ```bash
-MOCKVEHICLE2D_EXTENDED_EPISODES=1 .venv/bin/python -m pytest \
-  -p no:cacheprovider -q tests/test_episode.py -k extended_matrix
+.venv/bin/python -m pytest -p no:cacheprovider -q -m extended tests/test_episode.py -k extended_matrix
 ```
 
 ## 多车共享世界

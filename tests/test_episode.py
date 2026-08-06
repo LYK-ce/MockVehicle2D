@@ -1,11 +1,12 @@
 """Headless fixed-tick episode execution."""
 
 import json
-import os
 from pathlib import Path
 import sys
 import unittest
 from unittest.mock import patch
+
+import pytest
 
 from mockvehicle2d.controller import (
     AutoAction,
@@ -71,7 +72,6 @@ FOUR_VEHICLE_COVERAGE_QUADRANTS = (
     ("mock_vehicle_03", (10.2, 6.0, 14.0, 9.8)),
     ("mock_vehicle_04", (6.0, 10.2, 9.8, 14.0)),
 )
-RUN_EXTENDED_EPISODES = os.environ.get("MOCKVEHICLE2D_EXTENDED_EPISODES") == "1"
 
 
 def scenario(*, p2p: P2PSettings | None = None) -> FleetScenario:
@@ -460,10 +460,7 @@ class TestEpisodeRunner(unittest.TestCase):
             max_no_progress_s=45.0,
         )
 
-    @unittest.skipUnless(
-        RUN_EXTENDED_EPISODES,
-        "set MOCKVEHICLE2D_EXTENDED_EPISODES=1 to run the tick/order matrix",
-    )
+    @pytest.mark.extended
     def test_four_vehicle_merge_patrol_extended_matrix(self) -> None:
         matrix = FleetScenario.load(
             REPO_ROOT / "tests" / "fixtures" / "four_vehicle_mission_matrix.json"
@@ -563,10 +560,7 @@ class TestEpisodeRunner(unittest.TestCase):
             max_no_progress_s=45.0,
         )
 
-    @unittest.skipUnless(
-        RUN_EXTENDED_EPISODES,
-        "set MOCKVEHICLE2D_EXTENDED_EPISODES=1 to run the tick/order matrix",
-    )
+    @pytest.mark.extended
     def test_four_vehicle_quadrant_coverage_extended_matrix(self) -> None:
         matrix = FleetScenario.load(
             REPO_ROOT / "tests" / "fixtures" / "four_vehicle_mission_matrix.json"

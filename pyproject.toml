@@ -24,3 +24,5 @@ include = ["mockvehicle2d*"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+addopts = "-m 'not extended'"
+markers = ["extended: slow deterministic episode matrices excluded from default runs"]
