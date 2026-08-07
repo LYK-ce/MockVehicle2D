@@ -122,6 +122,11 @@ front waiter 的连续位姿和剩余侧移段未离开 `2r + 0.3 m` 包络前�
 物理制动距离外停车。释放要求整个车体和 `0.3 m` 自动安全余量越过远端边界。这是 PIBT
 启发的局部租约机制，不是完整 PIBT、MAPF 或中央车队调度器。
 
+新 owner 只有在 P2P ready 且本 session 的每个 expected vehicle 都有未过期 motion intent
+时才能确认；`corridor:null` 也算明确的无竞争声明，因此独立走廊不会被全局串行。peer
+断联或 intent 过期时，入口外的新 claim fail-closed；已经确认或已入廊的 owner 保留租约
+直到清空并释放。未启用 P2P 且没有已知 peer 的真正单车仍按连续 3 tick 自确认。
+
 标准输出是 schema version 2 的单行 canonical JSON，包含场景 ID、odometry seed、tick 数、
 模拟时长、终止原因，以及每辆车的仿真真值终态、按 tick 采样的路径长度、碰撞/阻断/
 安全终态和任务状态。顶层 `minimum_inter_vehicle_clearance_m` 从 `t=0` 开始，取所有固定

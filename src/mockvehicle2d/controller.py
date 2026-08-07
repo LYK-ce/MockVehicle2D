@@ -970,6 +970,7 @@ class RobotController:
         self._corridor_rejoin_target_m: tuple[float, float] | None = None
         self._coordination_wait_reason: str | None = None
         self._coordination_wait_owner_id: str | None = None
+        self._known_coordination_peer_ids: set[str] = set()
 
     @property
     def is_automatic_motion_active(self) -> bool:
@@ -1081,6 +1082,8 @@ class RobotController:
         peer_states: tuple[PeerVehicleState, ...] = (),
         peer_motion_intents: tuple[PeerMotionIntent, ...] = (),
         coordination_map: ObservedGrid | None = None,
+        coordination_ready: bool | None = None,
+        expected_peer_vehicle_ids: tuple[str, ...] = (),
     ) -> None:
         if self.mode is OpMode.MANUAL:
             self._clear_yield()
@@ -1221,6 +1224,8 @@ class RobotController:
             peer_states=peer_states,
             peer_motion_intents=peer_motion_intents,
             coordination_map=coordination_map,
+            coordination_ready=coordination_ready,
+            expected_peer_vehicle_ids=expected_peer_vehicle_ids,
         )
         corridor_rejoin_active = self._corridor_rejoin_target_m is not None
 
@@ -1276,6 +1281,8 @@ class RobotController:
         peer_states: tuple[PeerVehicleState, ...],
         peer_motion_intents: tuple[PeerMotionIntent, ...],
         coordination_map: ObservedGrid | None = None,
+        coordination_ready: bool | None = None,
+        expected_peer_vehicle_ids: tuple[str, ...] = (),
     ) -> tuple[float, float]:
         if vehicle_id is None:
             self._clear_yield()
@@ -1285,6 +1292,14 @@ class RobotController:
         intents = {
             intent.source_vehicle_id: intent for intent in peer_motion_intents
         }
+        self._known_coordination_peer_ids.update(expected_peer_vehicle_ids)
+        self._known_coordination_peer_ids.update(peers)
+        self._known_coordination_peer_ids.update(intents)
+        self._known_coordination_peer_ids.discard(vehicle_id)
+        fresh_intent_quorum = (
+            coordination_ready is not False
+            and self._known_coordination_peer_ids <= intents.keys()
+        )
         motion_target = self.navigation.motion_target
         self._intent_target_m = motion_target
         self._intent_priority_owner_id = vehicle_id
@@ -1566,13 +1581,18 @@ class RobotController:
                     PEER_RESERVATION_MAX_HOLD_TICKS,
                     self._corridor_claim_ticks + 1,
                 )
-                acknowledged = bool(corridor_peers) and all(
-                    not intent.reserved
-                    and intent.priority_owner_id == vehicle_id
-                    for intent in corridor_peers
+                acknowledged = (
+                    bool(corridor_peers)
+                    and all(
+                        not intent.reserved
+                        and intent.priority_owner_id == vehicle_id
+                        for intent in corridor_peers
+                    )
+                    and fresh_intent_quorum
                 )
                 uncontested_announcement_complete = (
                     not corridor_peers
+                    and fresh_intent_quorum
                     and self._corridor_claim_ticks >= PEER_YIELD_CLEAR_TICKS
                 )
                 self._corridor_admission_confirmed = (
@@ -1863,6 +1883,7 @@ class RobotController:
         self._corridor_rejoin_target_m = None
         self._coordination_wait_reason = None
         self._coordination_wait_owner_id = None
+        self._known_coordination_peer_ids.clear()
 
     def disconnect(self, vehicle: Vehicle) -> None:
         vehicle.stop()

@@ -827,6 +827,14 @@ class RobotNode:
             peer_states=peer_states,
             peer_motion_intents=peer_motion_intents,
             coordination_map=self.local_state.local_map,
+            coordination_ready=(
+                None if self.map_sync is None else self.map_sync.ready
+            ),
+            expected_peer_vehicle_ids=(
+                ()
+                if self.map_sync is None
+                else self.map_sync.expected_peer_vehicle_ids
+            ),
         )
         if self.map_sync is not None:
             target_m, wait_ticks, owner_id, reserved, corridor = (

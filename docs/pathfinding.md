@@ -102,6 +102,12 @@ tentative claim，只有所有可见竞争者回传同一 owner（或无竞争�
 任一时刻至多一个 confirmed owner；已确认 owner 规划时可忽略明确让给它的走廊等待者，
 但 LocalSafety、动态感知和物理碰撞仲裁始终保留。
 
+“无竞争”必须由成员视图明确证明：P2P 已 ready，且受信 expected allowlist 中每辆车都提供
+同 session、通过 generation/sequence 校验且未过期的 motion intent；fresh `corridor:null`
+表示该 peer 不竞争当前资源。缺失 intent、断联或 sidecar 未 ready 时，入口外 tentative
+claim 不得自确认。已 confirmed 或已在廊内的 owner 不因随后分区被撤权，以免停车占住
+单车道；它继续清空并正常释放。没有 map-sync/已知 peer 的真正单车保留 3 tick 自确认。
+
 在 winner 出口侧，反向等待者按距各自 entry 的纵向格数和 `vehicle_id` 确定唯一 front；
 只有 front 提前执行一次可逆侧移，同侧 rear waiter 保持原地。候选位置必须同时增加相对
 owner 当前至目标/速度外推 sweep 的连续距离，以及相对实际行驶轴线的侧向距离；front 的

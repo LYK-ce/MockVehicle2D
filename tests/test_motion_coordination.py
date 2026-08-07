@@ -708,6 +708,345 @@ class TestMotionCoordination(unittest.TestCase):
             frozenset(),
         )
 
+    def test_corridor_entry_requires_fresh_intents_from_expected_peers(
+        self,
+    ) -> None:
+        anchor = AnchorSpec("spawn", 0.0, 0.0, 0.0)
+        local_map = ObservedGrid(anchor)
+
+        def controller_at_entry() -> tuple[
+            RobotController,
+            Vehicle,
+            PoseEstimate,
+        ]:
+            navigation = Mock(
+                status="active",
+                motion_target=(5.5, 0.5),
+                coordination_corridor=Mock(return_value=None),
+            )
+            controller = RobotController(navigation)
+            controller._corridor = CorridorDescriptor((5, 0), (10, 0))
+            return (
+                controller,
+                Vehicle(4.5, 0.5, now=1.0),
+                PoseEstimate(
+                    anchor.anchor_id,
+                    4.5,
+                    0.5,
+                    0.0,
+                    (0.0, 0.0, 0.0),
+                    "nominal",
+                    1.0,
+                    1,
+                ),
+            )
+
+        def coordinate(
+            controller: RobotController,
+            vehicle: Vehicle,
+            pose: PoseEstimate,
+            *,
+            ready: bool | None,
+            expected: tuple[str, ...],
+            intents: tuple[PeerMotionIntent, ...] = (),
+        ) -> tuple[float, float]:
+            return controller._coordinate_desired(
+                (0.5, 0.0),
+                vehicle=vehicle,
+                vehicle_id="vehicle_1",
+                anchor=anchor,
+                pose=pose,
+                local_map=local_map,
+                now=1.0,
+                peer_states=(),
+                peer_motion_intents=intents,
+                coordination_ready=ready,
+                expected_peer_vehicle_ids=expected,
+            )
+
+        standalone, standalone_vehicle, standalone_pose = controller_at_entry()
+        standalone_results = [
+            coordinate(
+                standalone,
+                standalone_vehicle,
+                standalone_pose,
+                ready=None,
+                expected=(),
+            )
+            for _ in range(3)
+        ]
+        self.assertEqual(standalone_results[-1], (0.5, 0.0))
+        self.assertTrue(standalone._corridor_admission_confirmed)
+
+        disconnected, disconnected_vehicle, disconnected_pose = (
+            controller_at_entry()
+        )
+        for _ in range(5):
+            self.assertEqual(
+                coordinate(
+                    disconnected,
+                    disconnected_vehicle,
+                    disconnected_pose,
+                    ready=False,
+                    expected=(),
+                ),
+                (0.0, 0.0),
+            )
+        self.assertFalse(disconnected._corridor_admission_confirmed)
+
+        partitioned, partitioned_vehicle, partitioned_pose = controller_at_entry()
+        for _ in range(5):
+            self.assertEqual(
+                coordinate(
+                    partitioned,
+                    partitioned_vehicle,
+                    partitioned_pose,
+                    ready=True,
+                    expected=("vehicle_2",),
+                ),
+                (0.0, 0.0),
+            )
+        self.assertFalse(partitioned._corridor_admission_confirmed)
+
+        unrelated = intent(
+            "vehicle_2",
+            current=(20, 5),
+            target=(21, 5),
+            wait_ticks=0,
+        )
+        self.assertEqual(
+            coordinate(
+                partitioned,
+                partitioned_vehicle,
+                partitioned_pose,
+                ready=True,
+                expected=("vehicle_2",),
+                intents=(unrelated,),
+            ),
+            (0.5, 0.0),
+        )
+        self.assertTrue(partitioned._corridor_admission_confirmed)
+
+    def test_expired_corridor_winner_cannot_be_replaced_during_partition(
+        self,
+    ) -> None:
+        anchor = AnchorSpec("spawn", 0.0, 0.0, 0.0)
+        local_map = ObservedGrid(anchor)
+        navigation = Mock(
+            status="active",
+            motion_target=(5.5, 0.5),
+            coordination_corridor=Mock(return_value=None),
+        )
+        navigation.coordination_detours.return_value = ()
+        controller = RobotController(navigation)
+        controller._corridor = CorridorDescriptor((5, 0), (10, 0))
+        vehicle = Vehicle(4.5, 0.5, now=1.0)
+        pose = PoseEstimate(
+            anchor.anchor_id,
+            4.5,
+            0.5,
+            0.0,
+            (0.0, 0.0, 0.0),
+            "nominal",
+            1.0,
+            1,
+        )
+        winner = intent(
+            "vehicle_1",
+            current=(10, 0),
+            target=(9, 0),
+            wait_ticks=0,
+            reserved=True,
+            corridor=CorridorDescriptor((10, 0), (5, 0)),
+        )
+
+        controller._coordinate_desired(
+            (0.5, 0.0),
+            vehicle=vehicle,
+            vehicle_id="vehicle_2",
+            anchor=anchor,
+            pose=pose,
+            local_map=local_map,
+            now=1.0,
+            peer_states=(),
+            peer_motion_intents=(winner,),
+            coordination_ready=True,
+            expected_peer_vehicle_ids=("vehicle_1",),
+        )
+        self.assertEqual(controller._coordination_wait_owner_id, "vehicle_1")
+
+        for tick in range(1, 6):
+            result = controller._coordinate_desired(
+                (0.5, 0.0),
+                vehicle=vehicle,
+                vehicle_id="vehicle_2",
+                anchor=anchor,
+                pose=pose,
+                local_map=local_map,
+                now=1.0 + tick * 0.1,
+                peer_states=(),
+                peer_motion_intents=(),
+                coordination_ready=True,
+                expected_peer_vehicle_ids=("vehicle_1",),
+            )
+            self.assertEqual(result, (0.0, 0.0))
+        self.assertFalse(controller._corridor_admission_confirmed)
+
+    def test_partitioned_corridor_entrants_reconnect_to_one_owner(self) -> None:
+        anchor = AnchorSpec("spawn", 0.0, 0.0, 0.0)
+        local_map = ObservedGrid(anchor)
+        setup = {
+            "vehicle_1": (
+                4.5,
+                (5.5, 0.5),
+                CorridorDescriptor((5, 0), (10, 0)),
+            ),
+            "vehicle_2": (
+                11.5,
+                (10.5, 0.5),
+                CorridorDescriptor((10, 0), (5, 0)),
+            ),
+        }
+        controllers = {}
+        for vehicle_id, (_, target_m, corridor) in setup.items():
+            navigation = Mock(
+                status="active",
+                motion_target=target_m,
+                coordination_corridor=Mock(return_value=None),
+            )
+            navigation.coordination_detours.return_value = ()
+            controller = RobotController(navigation)
+            controller._corridor = corridor
+            controllers[vehicle_id] = controller
+
+        def coordinate(
+            vehicle_id: str,
+            peer_intents: tuple[PeerMotionIntent, ...],
+        ) -> tuple[float, float]:
+            x_m, _, _ = setup[vehicle_id]
+            return controllers[vehicle_id]._coordinate_desired(
+                (0.5, 0.0),
+                vehicle=Vehicle(x_m, 0.5, now=1.0),
+                vehicle_id=vehicle_id,
+                anchor=anchor,
+                pose=PoseEstimate(
+                    anchor.anchor_id,
+                    x_m,
+                    0.5,
+                    0.0,
+                    (0.0, 0.0, 0.0),
+                    "nominal",
+                    1.0,
+                    1,
+                ),
+                local_map=local_map,
+                now=1.0,
+                peer_states=(),
+                peer_motion_intents=peer_intents,
+                coordination_ready=True,
+                expected_peer_vehicle_ids=(
+                    "vehicle_2" if vehicle_id == "vehicle_1" else "vehicle_1",
+                ),
+            )
+
+        def published(vehicle_id: str) -> PeerMotionIntent:
+            x_m, target_m, _ = setup[vehicle_id]
+            _, wait_ticks, owner_id, reserved, corridor = (
+                controllers[vehicle_id].motion_intent
+            )
+            return intent(
+                vehicle_id,
+                current=(math.floor(x_m), 0),
+                target=(math.floor(target_m[0]), 0),
+                wait_ticks=wait_ticks,
+                owner=owner_id,
+                reserved=reserved,
+                corridor=corridor,
+            )
+
+        for _ in range(5):
+            self.assertEqual(coordinate("vehicle_1", ()), (0.0, 0.0))
+            self.assertEqual(coordinate("vehicle_2", ()), (0.0, 0.0))
+        self.assertTrue(
+            all(
+                controller.snapshot()["coordination"]["state"] == "tentative"
+                for controller in controllers.values()
+            )
+        )
+
+        announced = {
+            vehicle_id: published(vehicle_id)
+            for vehicle_id in sorted(controllers)
+        }
+        for _ in range(2):
+            for vehicle_id in sorted(controllers):
+                peer_id = (
+                    "vehicle_2" if vehicle_id == "vehicle_1" else "vehicle_1"
+                )
+                coordinate(vehicle_id, (announced[peer_id],))
+            announced = {
+                vehicle_id: published(vehicle_id)
+                for vehicle_id in sorted(controllers)
+            }
+
+        self.assertEqual(
+            [
+                vehicle_id
+                for vehicle_id, controller in sorted(controllers.items())
+                if controller.snapshot()["coordination"]["state"] == "reserved"
+            ],
+            ["vehicle_1"],
+        )
+        self.assertEqual(
+            controllers["vehicle_2"].snapshot()["coordination"],
+            {
+                "state": "waiting",
+                "reason": "corridor_lease",
+                "priority_owner_vehicle_id": "vehicle_1",
+            },
+        )
+
+    def test_confirmed_corridor_owner_clears_partition_without_revocation(
+        self,
+    ) -> None:
+        anchor = AnchorSpec("spawn", 0.0, 0.0, 0.0)
+        local_map = ObservedGrid(anchor)
+        navigation = Mock(
+            status="active",
+            motion_target=(7.5, 0.5),
+            coordination_corridor=Mock(return_value=None),
+        )
+        controller = RobotController(navigation)
+        controller._corridor = CorridorDescriptor((5, 0), (10, 0))
+        controller._corridor_reserved = True
+        controller._corridor_admission_confirmed = True
+
+        result = controller._coordinate_desired(
+            (0.5, 0.0),
+            vehicle=Vehicle(6.5, 0.5, now=1.0),
+            vehicle_id="vehicle_1",
+            anchor=anchor,
+            pose=PoseEstimate(
+                anchor.anchor_id,
+                6.5,
+                0.5,
+                0.0,
+                (0.0, 0.0, 0.0),
+                "nominal",
+                1.0,
+                1,
+            ),
+            local_map=local_map,
+            now=1.0,
+            peer_states=(),
+            peer_motion_intents=(),
+            coordination_ready=False,
+            expected_peer_vehicle_ids=("vehicle_2",),
+        )
+
+        self.assertEqual(result, (0.5, 0.0))
+        self.assertTrue(controller._corridor_admission_confirmed)
+
     def test_live_corridor_lease_defers_no_path_until_the_lease_expires(
         self,
     ) -> None:
@@ -2090,11 +2429,24 @@ class TestMotionCoordination(unittest.TestCase):
         )
         owner_order = []
         last_wait = {vehicle_id: 0 for vehicle_id in active}
+        retired: set[str] = set()
+
+        def retired_intent(vehicle_id: str) -> PeerMotionIntent:
+            offset = 100 + int(vehicle_id[-1])
+            return intent(
+                vehicle_id,
+                current=(offset, 100),
+                target=(offset + 1, 100),
+                wait_ticks=0,
+            )
 
         while active:
             confirmed = []
             for _ in range(4):
-                next_published = []
+                next_published = [
+                    retired_intent(vehicle_id)
+                    for vehicle_id in sorted(retired)
+                ]
                 for vehicle_id in active:
                     current, target, _ = positions[vehicle_id]
                     pose_m = tuple(
@@ -2123,6 +2475,12 @@ class TestMotionCoordination(unittest.TestCase):
                             item
                             for item in published
                             if item.source_vehicle_id != vehicle_id
+                        ),
+                        coordination_ready=True,
+                        expected_peer_vehicle_ids=tuple(
+                            peer_id
+                            for peer_id in sorted(controllers)
+                            if peer_id != vehicle_id
                         ),
                     )
                     _, wait_ticks, owner_id, reserved, corridor = (
@@ -2155,13 +2513,17 @@ class TestMotionCoordination(unittest.TestCase):
             owner = confirmed[0]
             owner_order.append(owner)
             active.remove(owner)
-            # The remaining published intents still reference the departed
-            # owner for one round.  They must elect a live waiter instead of
-            # perpetually relaying that stale priority owner.
+            retired.add(owner)
+            # A vehicle that leaves this corridor remains a fleet member and
+            # publishes a fresh null descriptor.  Disappearance would be a
+            # partition and must not authorize a replacement owner.
             published = tuple(
                 item
                 for item in published
                 if item.source_vehicle_id in active
+            ) + tuple(
+                retired_intent(vehicle_id)
+                for vehicle_id in sorted(retired)
             )
 
         self.assertEqual(
@@ -2235,6 +2597,12 @@ class TestMotionCoordination(unittest.TestCase):
                         item
                         for item in published
                         if item.source_vehicle_id != vehicle_id
+                    ),
+                    coordination_ready=True,
+                    expected_peer_vehicle_ids=tuple(
+                        peer_id
+                        for peer_id in sorted(controllers)
+                        if peer_id != vehicle_id
                     ),
                 )
                 _, wait_ticks, owner_id, reserved, corridor = (

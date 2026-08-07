@@ -130,6 +130,30 @@ def relay_peer_states(fleet: FleetRuntime) -> None:
 
 
 class TestFleetScenario(unittest.TestCase):
+    def test_robot_node_passes_network_membership_to_coordination(self) -> None:
+        fleet = peer_fleet(AnchorPose(5.0, 5.0, 0.0), AnchorPose(15.0, 5.0, 0.0))
+        node = fleet.nodes["vehicle_1"]
+        node.map_sync.set_health(
+            ready=True,
+            connected_vehicle_ids=("vehicle_2",),
+        )
+        controller = Mock()
+        controller.planning_ignored_peer_ids.return_value = frozenset()
+        controller.motion_intent = (None, 0, "vehicle_1", False, None)
+        node.controller = controller
+
+        node.control(
+            fleet.world.vehicle("vehicle_1"),
+            fleet.world.sensor_grid("vehicle_1"),
+            fleet.world.now,
+        )
+
+        self.assertIs(controller.tick.call_args.kwargs["coordination_ready"], True)
+        self.assertEqual(
+            controller.tick.call_args.kwargs["expected_peer_vehicle_ids"],
+            ("vehicle_2",),
+        )
+
     def test_example_declares_four_unique_endpoints_and_spawns(self) -> None:
         loaded = FleetScenario.load(
             REPO_ROOT / "examples" / "four_vehicle_scenario.json"

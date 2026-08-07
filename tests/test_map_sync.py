@@ -46,6 +46,26 @@ def state(number: int) -> MapSyncState:
 
 
 class TestMapSyncState(unittest.TestCase):
+    def test_expected_peer_ids_remain_immutable_after_configuration(self) -> None:
+        local = state(1)
+        configured = {
+            "vehicle_3": ("peer_3", anchor(3)),
+            "vehicle_2": ("peer_2", anchor(2)),
+        }
+
+        local.configure_network("peer_1", configured)
+        configured.clear()
+        local.set_health(
+            ready=True,
+            connected_vehicle_ids=("vehicle_2", "vehicle_3"),
+        )
+        local.network_disconnected()
+
+        self.assertEqual(
+            local.expected_peer_vehicle_ids,
+            ("vehicle_2", "vehicle_3"),
+        )
+
     def test_peer_state_generation_can_be_fixed_for_deterministic_transport(self) -> None:
         source = MapSyncState(
             "session_1",
@@ -1395,6 +1415,33 @@ class TestLiveLibp2pMesh(unittest.IsolatedAsyncioTestCase):
                 states["vehicle_4"].published_motion_intents,
                 intent.sequence,
             )
+            states["vehicle_4"].record_motion_intent(
+                PoseEstimate(
+                    "spawn_4",
+                    1.0,
+                    2.0,
+                    0.25,
+                    (0.04, 0.09, 0.01),
+                    "nominal",
+                    fleet.world.now,
+                    2,
+                ),
+                target_m=None,
+                wait_ticks=0,
+                priority_owner_id="vehicle_4",
+                reserved=False,
+                corridor=None,
+                timestamp_s=fleet.world.now,
+            )
+            await self._wait_until(
+                lambda: any(
+                    peer.source_vehicle_id == "vehicle_4"
+                    and peer.sequence > intent.sequence
+                    and peer.corridor is None
+                    and not peer.reserved
+                    for peer in states["vehicle_1"].peer_motion_intents()
+                )
+            )
 
             states["vehicle_1"].record_local(
                 LocalMapDelta((MapCellUpdate(7, 8, OCCUPIED),))
@@ -1424,6 +1471,10 @@ class TestLiveLibp2pMesh(unittest.IsolatedAsyncioTestCase):
                     intent.source_vehicle_id == "vehicle_4"
                     for intent in states["vehicle_1"].peer_motion_intents()
                 )
+            )
+            self.assertIn(
+                "vehicle_4",
+                states["vehicle_1"].expected_peer_vehicle_ids,
             )
             fleet.tick(0.1)
             states["vehicle_1"].record_local(

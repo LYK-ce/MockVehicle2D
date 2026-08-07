@@ -1376,6 +1376,10 @@ class MapSyncState:
     def connected_count(self) -> int:
         return len(self._connected_vehicle_ids)
 
+    @property
+    def expected_peer_vehicle_ids(self) -> tuple[str, ...]:
+        return tuple(sorted(self._expected_peers))
+
     def peer_evidence(self, source_vehicle_id: str) -> dict[tuple[int, int], int]:
         return dict(self._peer_evidence.get(source_vehicle_id, {}))
 
