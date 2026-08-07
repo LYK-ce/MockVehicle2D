@@ -869,6 +869,7 @@ class TestFleetRuntime(unittest.TestCase):
                 for node in fleet.nodes.values()
             )
         )
+        nearby_updates = []
         for vehicle_id, node in fleet.nodes.items():
             if node.controller.navigation.goal_mode == "nearby_safe":
                 vehicle = fleet.world.vehicle(vehicle_id)
@@ -876,6 +877,29 @@ class TestFleetRuntime(unittest.TestCase):
                     math.dist((vehicle.x, vehicle.y), goal) - vehicle.radius,
                     1.0,
                 )
+                terminal = node.controller.events_after(0)[-1].as_dict(
+                    fleet.timestamp_at()
+                )
+                nearby_updates.append(terminal)
+                self.assertEqual(terminal["status"], "reached")
+                self.assertEqual(terminal["reason"], "nearby_safe_stop")
+                self.assertEqual(
+                    terminal["goal"],
+                    {
+                        "frame_id": "global_map",
+                        "x_m": goal[0],
+                        "y_m": goal[1],
+                    },
+                )
+                navigation = terminal["navigation"]
+                self.assertEqual(navigation["goal_mode"], "nearby_safe")
+                self.assertEqual(navigation["reason"], "nearby_safe_stop")
+                self.assertNotEqual(
+                    navigation["effective_goal"],
+                    navigation["requested_goal"],
+                )
+                self.assertLessEqual(navigation["approach_distance_m"], 1.0)
+        self.assertTrue(nearby_updates)
         self.assertGreaterEqual(
             minimum_separation,
             first.radius + second.radius + HARD_STOP_CLEARANCE_M - 1e-9,

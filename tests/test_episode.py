@@ -72,6 +72,12 @@ FOUR_VEHICLE_COVERAGE_QUADRANTS = (
     ("mock_vehicle_03", (10.2, 6.0, 14.0, 9.8)),
     ("mock_vehicle_04", (6.0, 10.2, 9.8, 14.0)),
 )
+FOUR_VEHICLE_CYCLE_SPECS = (
+    ("vehicle_1", (8.0, 8.0, 0.0), (12.0, 8.0)),
+    ("vehicle_2", (12.0, 8.0, 1.5707963267948966), (12.0, 12.0)),
+    ("vehicle_3", (12.0, 12.0, 3.141592653589793), (8.0, 12.0)),
+    ("vehicle_4", (8.0, 12.0, -1.5707963267948966), (8.0, 8.0)),
+)
 
 
 def scenario(*, p2p: P2PSettings | None = None) -> FleetScenario:
@@ -419,6 +425,214 @@ class TestEpisodeRunner(unittest.TestCase):
                         for vehicle in result.vehicles
                     )
                 )
+
+    def test_disjoint_goto_is_unchanged_for_one_two_and_four_vehicles(self) -> None:
+        specs = tuple(
+            FleetVehicleSpec(
+                f"vehicle_{index}",
+                19089 + index,
+                f"spawn_{index}",
+                AnchorPose(4.0, 4.0 * index, 0.0),
+            )
+            for index in range(1, 5)
+        )
+        missions = {
+            f"vehicle_{index}": (
+                GotoMission(
+                    f"disjoint-goto-{index}",
+                    "global_map",
+                    7.0,
+                    4.0 * index,
+                    2,
+                ),
+            )
+            for index in range(1, 5)
+        }
+        results = tuple(
+            run_episode(
+                FleetScenario("disjoint_goto", specs[:vehicle_count], 100),
+                {
+                    vehicle_id: vehicle_missions
+                    for vehicle_id, vehicle_missions in missions.items()
+                    if int(vehicle_id[-1]) <= vehicle_count
+                },
+                max_simulation_s=20.0,
+                grid=MapGrid.from_wall_set(24, 24, set()),
+                linear_speed=1.0,
+            )
+            for vehicle_count in (1, 2, 4)
+        )
+
+        baseline = results[0].vehicles[0]
+        self.assertEqual(
+            [result.tick_count for result in results],
+            [results[0].tick_count] * len(results),
+        )
+        for result in results:
+            self.assertTrue(result.success, result.as_dict())
+            self.assertEqual(result.termination_reason, "completed")
+            if len(result.vehicles) > 1:
+                self.assertGreaterEqual(
+                    result.minimum_inter_vehicle_clearance_m,
+                    AUTOMATIC_MINIMUM_CLEARANCE_M,
+                )
+            for vehicle in result.vehicles:
+                self.assertEqual(
+                    (
+                        vehicle["path_length_m"],
+                        vehicle["longest_no_progress_duration_s"],
+                    ),
+                    (
+                        baseline["path_length_m"],
+                        baseline["longest_no_progress_duration_s"],
+                    ),
+                )
+                self.assertFalse(vehicle["collision_occurred"])
+                self.assertFalse(vehicle["blocked"])
+                self.assertEqual(vehicle["missions"][0]["status"], "reached")
+
+    def test_four_vehicle_cycle_keeps_each_goto_on_its_commanded_vehicle(
+        self,
+    ) -> None:
+        specs = tuple(
+            FleetVehicleSpec(
+                vehicle_id,
+                19090 + index,
+                f"spawn_{index + 1}",
+                AnchorPose(*start),
+            )
+            for index, (vehicle_id, start, _) in enumerate(
+                FOUR_VEHICLE_CYCLE_SPECS
+            )
+        )
+        missions = {
+            vehicle_id: (
+                GotoMission(
+                    f"cycle-goto-{vehicle_id[-1]}",
+                    "global_map",
+                    *goal,
+                    2,
+                ),
+            )
+            for vehicle_id, _, goal in FOUR_VEHICLE_CYCLE_SPECS
+        }
+        results = tuple(
+            run_episode(
+                FleetScenario("cycle_goto", ordered_specs, 100),
+                missions,
+                max_simulation_s=30.0,
+                grid=MapGrid.from_wall_set(20, 20, set()),
+                linear_speed=1.0,
+            )
+            for ordered_specs in (specs, tuple(reversed(specs)))
+        )
+
+        self.assertEqual(results[0].to_json(), results[1].to_json())
+        result = results[0]
+        self.assert_four_vehicle_completed(
+            result,
+            ("goto",) * 4,
+            max_no_progress_s=5.0,
+        )
+        self.assertEqual(
+            [vehicle["missions"][0]["mission_id"] for vehicle in result.vehicles],
+            [f"cycle-goto-{index}" for index in range(1, 5)],
+        )
+
+    def test_four_vehicle_adjacent_goto_endpoints_finish_without_reassignment(
+        self,
+    ) -> None:
+        goals = (
+            (12.0, 8.05),
+            (12.0, 9.4),
+            (12.0, 10.75),
+            (12.0, 12.1),
+        )
+        specs = tuple(
+            FleetVehicleSpec(
+                f"vehicle_{index}",
+                19089 + index,
+                f"spawn_{index}",
+                AnchorPose(4.0, 5.0 + 2.5 * index, 0.0),
+            )
+            for index in range(1, 5)
+        )
+        result = run_episode(
+            FleetScenario("adjacent_goto", specs, 100),
+            {
+                f"vehicle_{index}": (
+                    GotoMission(
+                        f"adjacent-goto-{index}",
+                        "global_map",
+                        *goals[index - 1],
+                        2,
+                    ),
+                )
+                for index in range(1, 5)
+            },
+            max_simulation_s=40.0,
+            grid=MapGrid.from_wall_set(20, 20, set()),
+            linear_speed=1.0,
+        )
+
+        self.assert_four_vehicle_completed(
+            result,
+            ("goto",) * 4,
+            max_no_progress_s=10.0,
+        )
+        self.assertEqual(
+            [vehicle["missions"][0]["mission_id"] for vehicle in result.vehicles],
+            [f"adjacent-goto-{index}" for index in range(1, 5)],
+        )
+
+    def test_parked_goal_vehicle_remains_dynamic_while_peer_routes_around_it(
+        self,
+    ) -> None:
+        parked = FleetScenario(
+            "parked_goal",
+            (
+                FleetVehicleSpec(
+                    "vehicle_1",
+                    19090,
+                    "spawn_1",
+                    AnchorPose(10.0, 10.0, 0.0),
+                ),
+                FleetVehicleSpec(
+                    "vehicle_2",
+                    19091,
+                    "spawn_2",
+                    AnchorPose(5.0, 10.0, 0.0),
+                ),
+            ),
+            100,
+        )
+        result = run_episode(
+            parked,
+            {
+                "vehicle_1": (
+                    GotoMission("parked-goto", "global_map", 10.0, 10.0, 2),
+                ),
+                "vehicle_2": (
+                    GotoMission("passing-goto", "global_map", 15.0, 10.0, 2),
+                ),
+            },
+            max_simulation_s=40.0,
+            grid=MapGrid.from_wall_set(20, 20, set()),
+            linear_speed=1.0,
+        )
+
+        self.assertTrue(result.success, result.as_dict())
+        self.assertEqual(result.termination_reason, "completed")
+        self.assertGreaterEqual(
+            result.minimum_inter_vehicle_clearance_m,
+            AUTOMATIC_MINIMUM_CLEARANCE_M,
+        )
+        self.assertEqual(result.vehicles[0]["path_length_m"], 0.0)
+        self.assertGreater(result.vehicles[1]["path_length_m"], 10.0)
+        self.assertEqual(
+            [vehicle["missions"][0]["status"] for vehicle in result.vehicles],
+            ["reached", "reached"],
+        )
 
     def test_four_vehicle_patrol_repeatedly_clears_shared_crossing(self) -> None:
         matrix = FleetScenario.load(

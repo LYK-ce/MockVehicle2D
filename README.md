@@ -142,14 +142,15 @@ Runner 明确拒绝启用真实 P2P 的场景，因为 localhost libp2p 调度�
 确定性模拟时钟；当前只提供上述进程内 peer-state + motion-intent relay，不包含定时事件或通信故障注入。
 
 四车任务协同回归使用 `tests/fixtures/four_vehicle_mission_matrix.json` 和显式空场，覆盖
-重复共享路口 Patrol、对向合流 Patrol、互不相交 Patrol、相邻静态条带 Coverage、共享
-入口四象限 Coverage，以及 Goto/Patrol/Coverage 混合任务。Coverage 分区由测试输入静态
-分配，接缝小于一个 `0.5 m` 本地网格；它不引入中央地图，也不把 peer evidence 写入
-OwnMap。默认矩阵运行全部六种 `100 ms` 拓扑：
+1/2/4 车互不冲突 Goto、四车循环换位、相邻 Goto 终点、终点车辆挡路绕行、重复共享
+路口 Patrol、对向合流 Patrol、互不相交 Patrol、相邻静态条带 Coverage、共享入口四象限
+Coverage，以及 Goto/Patrol/Coverage 混合任务。每项任务仍归接收命令的原车，协调只影响
+执行期运动。Coverage 分区由测试输入静态分配，接缝小于一个 `0.5 m` 本地网格；它不引入
+中央地图，也不把 peer evidence 写入 OwnMap。
 
 ```bash
 .venv/bin/python -m pytest -p no:cacheprovider -q tests/test_episode.py \
-  -k 'four_vehicle and (patrol or coverage or mixed)'
+  -k 'disjoint_goto or parked_goal_vehicle or four_vehicle and (cycle or adjacent or patrol or coverage or mixed)'
 ```
 
 耗时更长的扩展矩阵选择最困难的对向合流 Patrol 和共享入口 Coverage，分别验证同 seed

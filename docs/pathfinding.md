@@ -32,6 +32,10 @@ RobotController ─────────────────────�
 
 `pose` 与紧随其后的 `scan` 使用相同 `seq` 和 `timestamp_s`。
 
+每条 `goto`、`patrol` 或 `coverage` 命令只进入接收该命令的车辆控制器；这里没有车队任务
+分配器。多车协调只能临时改变期望速度、局部绕行点和路权等待，不会交换、重分配或静默
+取消任务，也不会改写 Patrol/Coverage 在本车展开的后续子目标。
+
 ## D* Lite
 
 `DStarLitePlanner` 是实际 `goto` 运行时的增量规划器，并非反复调用 A* 的包装。
