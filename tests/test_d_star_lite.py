@@ -787,6 +787,33 @@ def test_no_route_returns_none() -> None:
     assert search.last_failure == "search_exhausted"
 
 
+def test_transient_restart_keeps_persistent_occupied_cells_blocked() -> None:
+    grid = ObservedGrid(ANCHOR)
+    search = DStarLitePlanner(
+        grid,
+        vehicle_radius_m=0.0,
+        bounds_margin_m=0.0,
+    )
+    assert search.plan((0, 0), (4, 0)) is not None
+    grid._cells[(2, 0)] = OCCUPIED
+    grid.revision += 1
+
+    search.restart_plan((0, 0), (4, 0))
+    progress = search.advance_plan(
+        (0, 0),
+        (4, 0),
+        expansion_budget=100,
+    )
+
+    assert progress.status == "unreachable"
+    assert search.last_failure == "search_exhausted"
+    assert not search.is_segment_passable(
+        (1.5, 0.5),
+        (2.5, 0.5),
+        extra_clearance_m=0.01,
+    )
+
+
 @pytest.mark.parametrize(
     ("peer_cell", "static_cell", "failure", "caused_by_peer"),
     (

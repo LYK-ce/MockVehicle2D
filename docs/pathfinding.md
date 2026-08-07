@@ -80,11 +80,44 @@ Free；选中后保持稳定，并在每帧证据更新后重新验证。
 已验证身份且未过期的 peer vehicle state 作为瞬态 footprint exclusion 单独进入规划，
 不会写入 `ObservedGrid`。只有同一规划请求在忽略 peer exclusion 后存在可行路径，才把
 当前无路归因为瞬态 peer 阻塞并保持 `active`；静态起点、目标或路径阻塞仍终止任务。
-peer 位置变化后增量重试；匿名 LiDAR 动态回波仍按保守的有限视野障碍处理。规划给出的
+该分类复用一个只读 OwnMap D* 可达性证据，不读取共享地图或真值。已归因且租约仍有效的
+peer 阻塞会等待 overlay 更新；匿名 LiDAR 动态阻塞即使 OwnMap 仍有路，也只获得一次有界
+restart grace。单帧匿名遮挡消失后可恢复；持续或闪烁的匿名遮挡不会重置原有无路进度，
+第二次失败稳定报告 `no_path`。持续存在的 OwnMap 墙同样不会被无限等待掩盖。规划给出的
 期望速度进入 LocalSafety 前还会做 4 秒最近接近预测：发生冲突时，`vehicle_id` 字典序
 较大的车辆让行并有界制动，连续 3 个控制 tick 确认冲突解除后恢复。让行期间 peer state
 缺失或超过 `0.35 s` TTL 时不会盲目恢复；若粗 tick 制动后已经落入 peer 安全包络，只
 允许经过 LocalSafety 的低速分离运动退出包络。显式取消或切换模式仍可解除任务。
+
+### 直线窄走廊租约
+
+`GotoController` 还用独立、只读的 OwnMap D* 路径检查前方是否存在完全观测、直线且内宽
+不超过约 `3 m` 的瓶颈。弯曲、分支、过宽、观测不完整或无法在有界规划额度内确认的通道
+不声明 corridor，继续使用普通下一格和轨迹冲突协调。检测不会消费 peer evidence，也
+不会修改正在执行的 D* 路径。
+
+检测到走廊后，车辆通过 motion-intent v2 发布有向 entry/exit cell。重叠的反向部分描述
+可匹配为同一资源；等待年龄决定优先级，`vehicle_id` 只作最终 tie-break。winner 先发布
+tentative claim，只有所有可见竞争者回传同一 owner（或无竞争声明连续稳定）后才进入。
+任一时刻至多一个 confirmed owner；已确认 owner 规划时可忽略明确让给它的走廊等待者，
+但 LocalSafety、动态感知和物理碰撞仲裁始终保留。
+
+在 winner 出口侧，反向等待者按距各自 entry 的纵向格数和 `vehicle_id` 确定唯一 front；
+只有 front 提前执行一次可逆侧移，同侧 rear waiter 保持原地。候选位置必须同时增加相对
+owner 当前至目标/速度外推 sweep 的连续距离，以及相对实际行驶轴线的侧向距离；front 的
+当前连续位姿和剩余侧移段都达到两车半径、定位不确定度与 `0.3 m` 余量之和才算安全。
+
+ACK 只完成分布式 owner 收敛。owner 可在等待 ACK 或 front 清空时继续规划并接近 entry，
+但按当前速度和制动能力在车体跨 entry 前闸停；peer state 缺失时 fail-closed。原进场位姿
+只保存一次。租约仍活跃时 waiter 冻结导航；取得 owner 后，只有整个 saved segment 与目标
+仍在本侧 entry 外才可先于 admission gate 原路返回，任何触及/跨 entry 的段都受 gate
+约束。若上一 owner 已离开租约但 live peer 的安全包络占据 saved segment，则丢弃该旧段，
+从侧袋当前位姿交回本地 D* 重规划；无遮挡时仍沿原段回归。释放边界包含远端 cell 外侧面、
+车体半径和 `0.3 m` 自动安全余量，避免车尾尚未清空时提前交接。
+
+这套机制是 PIBT 启发的去中心化短租约，不是完整 PIBT/MAPF。当前严格一次只允许一辆车
+通过，因此长走廊和深队列吞吐近似线性；暂不可入廊 owner 跳过、同向 directional
+batching/convoy 和 SIPP 时间窗均留作后续优化。
 
 遥测 `navigation` 中可观察：
 
@@ -171,6 +204,8 @@ cell_path = a_star_search(
 - 局部地图和 D* Lite 状态只在进程内存中；重连保留，进程重启丢失。
 - 控制连接断开会停车并暂停活动 `goto`；重连后需显式 `resume`。
 - 暂无路径平滑、运动学轨迹优化和动态目标速度预测。
+- 窄走廊只识别已完全观测的直线 `<=3 m` 类别，且严格单车通行；未实现 ready-owner
+  skipping、同向批处理或 SIPP。
 - Unknown 的无回波 Free 更新沿用当前模拟约定，接入真实 Tmini 前必须校准。
 - 水平 Tmini 无法发现落差；模拟器使用独立下视安全输入。
 - 暂无回环、全局优化和中央地图同步。

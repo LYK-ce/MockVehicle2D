@@ -37,7 +37,7 @@ use tokio::{
 const SIDECAR_PROTOCOL: &str = "mockvehicle2d-map-sync-sidecar/1";
 const DELTA_PROTOCOL: &str = "mockvehicle2d-map-delta/1";
 const PEER_STATE_PROTOCOL: &str = "mockvehicle2d-peer-state/1";
-const MOTION_INTENT_PROTOCOL: &str = "mockvehicle2d-motion-intent/1";
+const MOTION_INTENT_PROTOCOL: &str = "mockvehicle2d-motion-intent/2";
 const MAX_MESSAGE_BYTES: usize = 256 * 1024;
 const MAX_PEERS: usize = 3;
 static IDENTITY_TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);

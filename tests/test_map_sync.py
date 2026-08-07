@@ -22,6 +22,7 @@ from mockvehicle2d.local_state import (
 )
 from mockvehicle2d.map_grid import MapGrid
 from mockvehicle2d.map_sync import (
+    CorridorDescriptor,
     MAX_DELTA_CELLS,
     PEER_STATE_PROTOCOL,
     PEER_STATE_TTL_S,
@@ -1363,6 +1364,7 @@ class TestLiveLibp2pMesh(unittest.IsolatedAsyncioTestCase):
                 wait_ticks=37,
                 priority_owner_id="vehicle_4",
                 reserved=True,
+                corridor=CorridorDescriptor((82, 44), (90, 44)),
                 timestamp_s=fleet.world.now,
             )
             await self._wait_until(
@@ -1373,6 +1375,8 @@ class TestLiveLibp2pMesh(unittest.IsolatedAsyncioTestCase):
                     and intent.wait_ticks == 37
                     and intent.priority_owner_id == "vehicle_4"
                     and intent.reserved
+                    and intent.corridor
+                    == CorridorDescriptor((82, 44), (90, 44))
                     for intent in states["vehicle_1"].peer_motion_intents()
                 )
             )
@@ -1382,6 +1386,10 @@ class TestLiveLibp2pMesh(unittest.IsolatedAsyncioTestCase):
                 if intent.source_vehicle_id == "vehicle_4"
             )
             self.assertGreaterEqual(intent.sequence, 1)
+            self.assertEqual(
+                intent.corridor,
+                CorridorDescriptor((82, 44), (90, 44)),
+            )
             self.assertGreaterEqual(states["vehicle_1"].received_motion_intents, 1)
             self.assertGreaterEqual(
                 states["vehicle_4"].published_motion_intents,

@@ -361,6 +361,49 @@ class TestFleetRuntime(unittest.TestCase):
             (),
         )
 
+    def test_ignored_corridor_peer_keeps_static_and_unattributed_obstacles(self) -> None:
+        fleet = peer_fleet(
+            AnchorPose(5.0, 5.0, 0.0),
+            AnchorPose(10.0, 10.0, 0.0),
+        )
+        source = fleet.nodes["vehicle_1"].map_sync
+        receiver = fleet.nodes["vehicle_2"]
+        payload = source.prepare_peer_state()
+        self.assertTrue(
+            receiver.map_sync.receive_peer_state(
+                "peer_1",
+                "vehicle_1",
+                payload,
+                received_at_s=1.0,
+            )
+        )
+        active = receiver.map_sync.peer_vehicle_states(now_s=1.0)
+        peer_hit = (-10, -10)
+        unattributed_hit = (-8, -10)
+        static_obstacle = (-6, -10)
+        receiver.local_state.local_map._cells[static_obstacle] = OCCUPIED
+        receiver.local_state.local_map.revision += 1
+        receiver._lidar_dynamic_cells = {peer_hit, unattributed_hit}
+
+        receiver._update_planning_map(
+            peer_states=active,
+            ignored_peer_vehicle_ids=frozenset(("vehicle_1",)),
+        )
+
+        self.assertEqual(receiver._pending_map_delta.peer_forbidden_cells, ())
+        self.assertNotEqual(
+            receiver._planning_map.cell_without_peers(*peer_hit),
+            OCCUPIED,
+        )
+        self.assertEqual(
+            receiver._planning_map.cell_without_peers(*unattributed_hit),
+            OCCUPIED,
+        )
+        self.assertEqual(
+            receiver._planning_map.get_cell(*static_obstacle),
+            OCCUPIED,
+        )
+
     def test_lidar_peer_dedup_uses_exact_cell_circle_intersection(self) -> None:
         fleet = peer_fleet(
             AnchorPose(5.0, 5.0, 0.0),

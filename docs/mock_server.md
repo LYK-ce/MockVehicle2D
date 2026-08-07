@@ -126,6 +126,25 @@ Server 进程生命周期内永久保留，不会因任务数量增加而静默�
 因为模拟器当前不提供持久化。
 Auto 已为 Active 时重复 `resume` 也是幂等操作，不会重启 D* 搜索。
 
+### 多车局部协调
+
+多车节点通过 peer-state v1 发布 executed pose/velocity，通过 motion-intent v2 发布下一格、
+等待优先级、短租约和可选的有向 corridor descriptor。它们都来自车辆 odometry 和局部
+规划，不携带仿真真值；收到的 peer map evidence 也不会进入 OwnMap 或自主规划。
+
+普通 vertex、edge swap 和 4 秒轨迹冲突采用 PIBT 启发的优先级继承与有界让行。OwnMap
+能够确认完全观测、直线且内宽不超过约 `3 m` 的瓶颈时，再对重叠 corridor 做去中心化
+选举和确认：模式外停车不受影响；进入前只允许一个 confirmed owner；出口侧反向队列仅
+front waiter 提前做可逆侧移，rear waiter 原地等待；ACK 后 owner 仍要等 front 的连续位姿
+和剩余侧移段离开两车 footprint 与 `0.3 m` 安全包络，才可跨 entry。owner 通过远端边界
+后，车体与安全余量都清空才释放。租约结束后若 saved rejoin 段已被 live peer 占据，waiter
+从侧袋位置交回本地导航重规划。已归因 peer 暂时切断 D* 路径时任务保持 active；匿名动态
+遮挡只有一次有界 restart grace，持续或闪烁阻塞仍会终止为 `no_path`。
+
+这不是中央调度器，也不声称实现完整 PIBT/MAPF。当前走廊严格一次放行一辆车，长走廊和
+深队列吞吐近似线性；ready-owner skipping、同向 batching/convoy 和 SIPP 时间窗尚未实现。
+详细检测、重规划和释放语义见 [有限视野寻路](pathfinding.md)。
+
 ## 连接与故障语义
 
 - 一个 Runtime 同时只允许一个控制 WebSocket；其他连接收到 `vehicle_busy`。

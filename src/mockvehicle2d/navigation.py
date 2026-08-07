@@ -5,6 +5,13 @@ from __future__ import annotations
 import math
 from typing import TYPE_CHECKING
 
+from mockvehicle2d.local_state import (
+    FORBIDDEN,
+    FREE,
+    OCCUPIED,
+    UNKNOWN,
+    MapCellUpdate,
+)
 from mockvehicle2d.pathfinding.d_star_lite import DStarLitePlanner
 from mockvehicle2d.safety import (
     AUTOMATIC_MINIMUM_CLEARANCE_M,
@@ -31,6 +38,9 @@ NEARBY_SAFE_BODY_DISTANCE_M = 1.0
 PLANNING_EXPANSIONS_PER_UPDATE = 256
 CANDIDATE_INSPECTIONS_PER_UPDATE = 256
 MAX_CANDIDATE_INSPECTIONS_PER_MISSION = 256
+# ponytail: the first lease topology is the requested straight 3 m class;
+# promote this to scenario configuration or SIPP when more widths/shapes matter.
+STRAIGHT_CORRIDOR_MAX_WIDTH_M = 3.0
 SafeCandidate = tuple[tuple[float, float], tuple[int, int]]
 
 
@@ -68,11 +78,28 @@ class GotoController:
         self._skip_goal_connected_candidates = False
         self._waiting_safe_stop_goal: tuple[float, float] | None = None
         self._waiting_for_peer_replan = False
+        self._peer_replan_needs_restart = False
+        self._waiting_for_static_route_probe = False
+        self._static_route_probe_attributed = False
+        self._anonymous_replan_grace_used = False
         self._safe_search_peer_blocked = False
+        self._coordination_planner: DStarLitePlanner | None = None
+        self._coordination_map: ObservedGrid | None = None
+        self._coordination_map_revision = -1
+        self._coordination_states: dict[tuple[int, int], int] = {}
+        self._coordination_request: tuple[
+            tuple[int, int], tuple[int, int]
+        ] | None = None
+        self._coordination_path: list[tuple[int, int]] | None = None
+        self._coordination_status: str | None = None
 
     @property
     def motion_target(self) -> tuple[float, float] | None:
         return self._current_waypoint
+
+    @property
+    def static_no_path_probe_pending(self) -> bool:
+        return self._waiting_for_static_route_probe
 
     def coordination_detours(
         self,
@@ -108,6 +135,245 @@ class GotoController:
             ):
                 choices.append((math.dist(point, preferred), cell[1], cell[0], point))
         return tuple(choice[-1] for choice in sorted(choices))
+
+    def coordination_corridor(
+        self,
+        pose: PoseEstimate,
+        local_map: ObservedGrid,
+    ) -> tuple[tuple[int, int], tuple[int, int]] | None:
+        """Return one fully observed straight single-lane route segment."""
+        if self.status != "active" or self._planner is None:
+            return None
+
+        path = self._advance_coordination_path(pose, local_map)
+        if path is None or len(path) < 5:
+            return None
+
+        resolution_m = local_map.resolution_m
+        max_probe_cells = (
+            math.ceil(STRAIGHT_CORRIDOR_MAX_WIDTH_M / resolution_m) + 1
+        )
+
+        def bounded_cross_section(
+            cell: tuple[int, int],
+            axis: tuple[int, int],
+        ) -> tuple[int, int] | None:
+            if local_map.get_cell(*cell) != FREE:
+                return None
+            perpendicular = -axis[1], axis[0]
+            wall_offsets = []
+            for sign in (-1, 1):
+                for offset in range(1, max_probe_cells + 1):
+                    state = local_map.get_cell(
+                        cell[0] + perpendicular[0] * sign * offset,
+                        cell[1] + perpendicular[1] * sign * offset,
+                    )
+                    if state in {OCCUPIED, FORBIDDEN}:
+                        wall_offsets.append(offset)
+                        break
+                    if state != FREE:
+                        return None
+                else:
+                    return None
+            free_width_m = (sum(wall_offsets) - 1) * resolution_m
+            # A range hit occupies the cell beyond a wall face, so the two
+            # inner faces can quantize one cell wider than the physical gap.
+            if free_width_m > (
+                STRAIGHT_CORRIDOR_MAX_WIDTH_M + resolution_m + 1e-12
+            ):
+                return None
+            return wall_offsets[0], wall_offsets[1]
+
+        def observed_opening(
+            cell: tuple[int, int],
+            axis: tuple[int, int],
+            wall_offsets: tuple[int, int],
+        ) -> bool:
+            perpendicular = (-axis[1], axis[0])
+            return local_map.get_cell(*cell) == FREE and all(
+                local_map.get_cell(
+                    cell[0] + perpendicular[0] * sign * offset,
+                    cell[1] + perpendicular[1] * sign * offset,
+                )
+                == FREE
+                for sign, offset in zip((-1, 1), wall_offsets)
+            )
+
+        # ponytail: only straight <=3 m bottlenecks are claimed; use SIPP or
+        # a topology graph when curved, branching or partially observed channels matter.
+        index = 0
+        minimum_cells = math.ceil(
+            STRAIGHT_CORRIDOR_MAX_WIDTH_M / resolution_m
+        )
+        while index + 1 < len(path):
+            current = path[index]
+            following = path[index + 1]
+            step = following[0] - current[0], following[1] - current[1]
+            if step not in {
+                (-1, 0),
+                (1, 0),
+                (0, -1),
+                (0, 1),
+            }:
+                index += 1
+                continue
+            axis = abs(step[0]), abs(step[1])
+            start_walls = bounded_cross_section(current, axis)
+            if start_walls is None or bounded_cross_section(following, axis) is None:
+                index += 1
+                continue
+            start = index
+            end = index + 1
+            while end + 1 < len(path):
+                next_step = (
+                    path[end + 1][0] - path[end][0],
+                    path[end + 1][1] - path[end][1],
+                )
+                if next_step != step or not bounded_cross_section(
+                    path[end + 1], axis
+                ):
+                    break
+                end += 1
+            before = path[start][0] - step[0], path[start][1] - step[1]
+            if (
+                end - start + 1 >= minimum_cells
+                and observed_opening(before, axis, start_walls)
+            ):
+                return path[start], path[end]
+            index = end
+        return None
+
+    def _advance_coordination_path(
+        self,
+        pose: PoseEstimate,
+        local_map: ObservedGrid,
+    ) -> list[tuple[int, int]] | None:
+        """Advance a budgeted OwnMap-only D* route for topology detection."""
+        status = self._advance_coordination_route(pose, local_map)
+        return self._coordination_path if status == "ready" else None
+
+    def _advance_coordination_route(
+        self,
+        pose: PoseEstimate,
+        local_map: ObservedGrid,
+        *,
+        goal_m: tuple[float, float] | None = None,
+    ) -> str:
+        """Advance the shared budgeted OwnMap-only reachability witness."""
+        route_goal = self.goal if goal_m is None else goal_m
+        if route_goal is None:
+            return "unreachable"
+        snapshot = local_map.snapshot()
+        revision = snapshot["revision"]
+        states = {
+            (cell["gx"], cell["gy"]): cell["state"]
+            for cell in snapshot["cells"]
+        }
+        changes: tuple[MapCellUpdate, ...] = ()
+        if self._coordination_planner is None or self._coordination_map is not local_map:
+            self._coordination_planner = DStarLitePlanner(
+                local_map,
+                vehicle_radius_m=self._vehicle_radius_m,
+                hard_clearance_m=AUTOMATIC_MINIMUM_CLEARANCE_M,
+                bounds_margin_m=STRAIGHT_CORRIDOR_MAX_WIDTH_M,
+            )
+            self._coordination_map = local_map
+            self._coordination_request = None
+            self._coordination_path = None
+            self._coordination_status = None
+        elif revision != self._coordination_map_revision:
+            changes = tuple(
+                MapCellUpdate(gx, gy, states.get((gx, gy), UNKNOWN))
+                for gx, gy in sorted(
+                    self._coordination_states.keys() | states.keys(),
+                    key=lambda cell: (cell[1], cell[0]),
+                )
+                if self._coordination_states.get((gx, gy), UNKNOWN)
+                != states.get((gx, gy), UNKNOWN)
+            )
+        self._coordination_map_revision = revision
+        self._coordination_states = states
+
+        request = self._pose_cell(pose, local_map), (
+            math.floor(route_goal[0] / local_map.resolution_m),
+            math.floor(route_goal[1] / local_map.resolution_m),
+        )
+        if request != self._coordination_request or changes:
+            self._coordination_request = request
+            self._coordination_path = None
+            self._coordination_status = None
+        if self._coordination_status is not None:
+            return self._coordination_status
+        progress = self._coordination_planner.advance_plan(
+            *request,
+            changed_cells=changes,
+            start_position_m=(pose.x_m, pose.y_m),
+            expansion_budget=PLANNING_EXPANSIONS_PER_UPDATE,
+        )
+        if progress.status == "ready":
+            self._coordination_planner.accept_plan()
+            self._coordination_path = progress.path
+        if progress.status != "pending":
+            self._coordination_status = progress.status
+        return progress.status
+
+    def classify_no_path_against_persistent(
+        self,
+        pose: PoseEstimate,
+        persistent_map: ObservedGrid,
+        planning_map: ObservedGrid,
+        *,
+        transient_active: bool,
+        attributed_peer_active: bool,
+    ) -> str:
+        """Classify a dynamic no-path result using the budgeted OwnMap route."""
+        if (
+            self.requested_goal is None
+            or not (
+                self._waiting_for_static_route_probe
+                or self.status == "blocked"
+                and self.reason == "no_path"
+            )
+        ):
+            return "static"
+        detail = self.detail
+        attributed = (
+            self._static_route_probe_attributed
+            if self._waiting_for_static_route_probe
+            else attributed_peer_active
+        )
+        if not attributed and self._anonymous_replan_grace_used:
+            if self.status != "blocked":
+                self.block("no_path", detail)
+            return "static"
+        status = self._advance_coordination_route(
+            pose,
+            persistent_map,
+            goal_m=self.requested_goal,
+        )
+        if status == "pending":
+            self._set_path(None)
+            self.status = "active"
+            self.reason = None
+            self.detail = detail
+            self._current_waypoint = None
+            self._waiting_for_static_route_probe = True
+            self._static_route_probe_attributed = attributed
+            self._clear_pending_planning()
+            return "pending"
+        self._waiting_for_static_route_probe = False
+        self._static_route_probe_attributed = False
+        if status == "ready":
+            if attributed and transient_active:
+                self._wait_for_peer_replan(detail, restart=True)
+            else:
+                if not attributed:
+                    self._anonymous_replan_grace_used = True
+                self._resume_after_transient(pose, planning_map, detail)
+            return "transient"
+        if self.status != "blocked":
+            self.block("no_path", detail)
+        return "static"
 
     def start(
         self,
@@ -146,7 +412,18 @@ class GotoController:
         self._skip_goal_connected_candidates = False
         self._waiting_safe_stop_goal = None
         self._waiting_for_peer_replan = False
+        self._peer_replan_needs_restart = False
+        self._waiting_for_static_route_probe = False
+        self._static_route_probe_attributed = False
+        self._anonymous_replan_grace_used = False
         self._safe_search_peer_blocked = False
+        self._coordination_planner = None
+        self._coordination_map = None
+        self._coordination_map_revision = -1
+        self._coordination_states = {}
+        self._coordination_request = None
+        self._coordination_path = None
+        self._coordination_status = None
         self._planner = DStarLitePlanner(
             local_map,
             vehicle_radius_m=vehicle_radius_m,
@@ -165,6 +442,9 @@ class GotoController:
             self.detail = None
             self._waiting_safe_stop_goal = None
             self._waiting_for_peer_replan = False
+            self._peer_replan_needs_restart = False
+            self._waiting_for_static_route_probe = False
+            self._static_route_probe_attributed = False
             self._clear_pending_planning()
 
     def block(self, reason: str, detail: str | None = None) -> None:
@@ -174,6 +454,9 @@ class GotoController:
         self.detail = detail
         self._waiting_safe_stop_goal = None
         self._waiting_for_peer_replan = False
+        self._peer_replan_needs_restart = False
+        self._waiting_for_static_route_probe = False
+        self._static_route_probe_attributed = False
         self._clear_pending_planning()
 
     def block_for_localization_loss(self, pose: PoseEstimate) -> bool:
@@ -205,6 +488,9 @@ class GotoController:
         self.detail = self._nearby_detail or detail
         self._current_waypoint = None
         self._waiting_safe_stop_goal = None
+        self._peer_replan_needs_restart = False
+        self._waiting_for_static_route_probe = False
+        self._static_route_probe_attributed = False
         self._clear_pending_planning()
         return True
 
@@ -254,7 +540,10 @@ class GotoController:
             "detail": self.detail,
             "approach_distance_m": self._approach_distance_m(),
             "final_approach": self._final_approach,
-            "planning": self._planning_kind is not None,
+            "planning": (
+                self._planning_kind is not None
+                or self._waiting_for_static_route_probe
+            ),
         }
         if self._planner is None:
             return snapshot
@@ -346,8 +635,12 @@ class GotoController:
                 map_delta.peer_forbidden_cells
             )
         changes = () if map_delta is None else map_delta.changed_cells
+        if self._waiting_for_static_route_probe:
+            return 0.0, 0.0
         if self._waiting_for_peer_replan:
             if map_delta is None:
+                return 0.0, 0.0
+            if self._peer_replan_needs_restart and not changes:
                 return 0.0, 0.0
             self._waiting_for_peer_replan = False
             self.goal = self.requested_goal
@@ -355,6 +648,13 @@ class GotoController:
             self._goal_access_cell = None
             self._planning_kind = "goal"
             self._safe_search_peer_blocked = False
+            if self._peer_replan_needs_restart:
+                self._planner.restart_plan(
+                    self._pose_cell(pose, local_map),
+                    self._goal_cell(local_map),
+                )
+                self._peer_replan_needs_restart = False
+                changes = ()
         if self._final_approach:
             if changes:
                 self._planner.observe_changes(changes)
@@ -982,6 +1282,9 @@ class GotoController:
         self.detail = None
         self._current_waypoint = None
         self._waiting_for_peer_replan = False
+        self._peer_replan_needs_restart = False
+        self._waiting_for_static_route_probe = False
+        self._static_route_probe_attributed = False
         self._clear_pending_planning()
 
     def _block_no_path(
@@ -1007,14 +1310,51 @@ class GotoController:
         self._current_waypoint = None
         return True
 
-    def _wait_for_peer_replan(self, detail: str | None) -> None:
+    def _wait_for_peer_replan(
+        self,
+        detail: str | None,
+        *,
+        restart: bool = False,
+    ) -> None:
         self._set_path(None)
         self.status = "active"
         self.reason = None
         self.detail = detail
         self._current_waypoint = None
         self._waiting_for_peer_replan = True
+        self._peer_replan_needs_restart = restart
+        self._waiting_for_static_route_probe = False
+        self._static_route_probe_attributed = False
         self._clear_pending_planning()
+
+    def _resume_after_transient(
+        self,
+        pose: PoseEstimate,
+        planning_map: ObservedGrid,
+        detail: str | None,
+    ) -> None:
+        assert self._planner is not None
+        self._set_path(None)
+        self.goal = self.requested_goal
+        self.goal_mode = "exact"
+        self._goal_access_cell = None
+        self._final_approach = False
+        self.status = "active"
+        self.reason = None
+        self.detail = detail
+        self._current_waypoint = None
+        self._waiting_safe_stop_goal = None
+        self._waiting_for_peer_replan = False
+        self._peer_replan_needs_restart = False
+        self._waiting_for_static_route_probe = False
+        self._static_route_probe_attributed = False
+        self._clear_pending_planning()
+        self._planner.restart_plan(
+            self._pose_cell(pose, planning_map),
+            self._goal_cell(planning_map),
+        )
+        self._planning_kind = "goal"
+        self._planning_previous_path = []
 
     def _clear_pending_planning(self) -> None:
         self._planning_kind = None

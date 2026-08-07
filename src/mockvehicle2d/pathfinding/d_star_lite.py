@@ -163,6 +163,23 @@ class DStarLitePlanner:
         """Re-arm recovery after the caller confirms the route is usable."""
         self._unusable_plan_recovery = None
 
+    def restart_plan(self, start: Cell, goal: Cell) -> None:
+        """Restart from the grid's current snapshot after a transient blockage."""
+        self.validate_plan_request(start, goal)
+        snapshot = self._grid.snapshot()
+        self._states = {
+            (cell["gx"], cell["gy"]): cell["state"]
+            for cell in snapshot["cells"]
+        }
+        self._peer_forbidden_cells = {
+            (cell["gx"], cell["gy"])
+            for cell in snapshot.get("peer_forbidden_cells", ())
+        }
+        self._start_position_cells = None
+        self._reset(start, goal)
+        self._planning_expansions = 0
+        self._planning_pending = True
+
     def observe_changes(
         self,
         changed_cells: Iterable[MapCellUpdate],

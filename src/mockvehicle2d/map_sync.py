@@ -31,7 +31,7 @@ from mockvehicle2d.local_state import (
 SIDECAR_PROTOCOL = "mockvehicle2d-map-sync-sidecar/1"
 DELTA_PROTOCOL = "mockvehicle2d-map-delta/1"
 PEER_STATE_PROTOCOL = "mockvehicle2d-peer-state/1"
-MOTION_INTENT_PROTOCOL = "mockvehicle2d-motion-intent/1"
+MOTION_INTENT_PROTOCOL = "mockvehicle2d-motion-intent/2"
 MAX_DELTA_CELLS = 512
 MAX_MESSAGE_BYTES = 256 * 1024
 MAX_GRID_COORDINATE = 1_000_000
@@ -372,6 +372,33 @@ class PeerVehicleState:
 
 
 @dataclass(frozen=True)
+class CorridorDescriptor:
+    entry_cell: tuple[int, int]
+    exit_cell: tuple[int, int]
+
+    def __post_init__(self) -> None:
+        if any(
+            not isinstance(cell, tuple)
+            or len(cell) != 2
+            or any(
+                type(value) is not int or abs(value) > MAX_GRID_COORDINATE
+                for value in cell
+            )
+            for cell in (self.entry_cell, self.exit_cell)
+        ) or not (
+            self.entry_cell[0] == self.exit_cell[0]
+            or self.entry_cell[1] == self.exit_cell[1]
+        ) or self.entry_cell == self.exit_cell:
+            raise ValueError("corridor endpoints must be distinct axis-aligned cells")
+
+    def as_payload(self) -> dict[str, object]:
+        return {
+            "entry_cell": _cell_payload(self.entry_cell),
+            "exit_cell": _cell_payload(self.exit_cell),
+        }
+
+
+@dataclass(frozen=True)
 class PeerMotionIntent:
     """One short, leased grid move derived from a vehicle's odometry and planner."""
 
@@ -385,6 +412,7 @@ class PeerMotionIntent:
     wait_ticks: int
     priority_owner_id: str
     reserved: bool = False
+    corridor: CorridorDescriptor | None = None
 
     def as_payload(self, session_id: str, resolution_m: float) -> dict[str, object]:
         return {
@@ -406,6 +434,9 @@ class PeerMotionIntent:
                 "owner_vehicle_id": self.priority_owner_id,
             },
             "reserved": self.reserved,
+            "corridor": (
+                None if self.corridor is None else self.corridor.as_payload()
+            ),
         }
 
 
@@ -578,6 +609,7 @@ class MapSyncState:
         wait_ticks: int,
         priority_owner_id: str,
         reserved: bool,
+        corridor: CorridorDescriptor | None = None,
         timestamp_s: float,
     ) -> None:
         if not isinstance(pose, PoseEstimate) or pose.anchor_id != self.anchor.anchor_id:
@@ -597,6 +629,7 @@ class MapSyncState:
             or not isinstance(priority_owner_id, str)
             or priority_owner_id not in {self.vehicle_id, *self._expected_peers}
             or type(reserved) is not bool
+            or (corridor is not None and not isinstance(corridor, CorridorDescriptor))
             or not math.isfinite(timestamp_s)
         ):
             raise ValueError("invalid motion intent priority or timestamp")
@@ -623,6 +656,7 @@ class MapSyncState:
             wait_ticks,
             priority_owner_id,
             reserved,
+            corridor,
         )
 
     def prepare_motion_intent(self) -> dict[str, object] | None:
@@ -908,6 +942,7 @@ class MapSyncState:
                 "target_cell",
                 "priority",
                 "reserved",
+                "corridor",
             )
         )
         body = _strict_object(
@@ -946,6 +981,25 @@ class MapSyncState:
             if body["target_cell"] is None
             else self._validate_intent_cell(body["target_cell"], "target_cell")
         )
+        corridor_payload = body["corridor"]
+        corridor = None
+        if corridor_payload is not None:
+            corridor_body = _strict_object(
+                corridor_payload,
+                required=frozenset(("entry_cell", "exit_cell")),
+                allowed=frozenset(("entry_cell", "exit_cell")),
+                name="motion_intent.corridor",
+            )
+            corridor = CorridorDescriptor(
+                self._validate_intent_cell(
+                    corridor_body["entry_cell"],
+                    "corridor.entry_cell",
+                ),
+                self._validate_intent_cell(
+                    corridor_body["exit_cell"],
+                    "corridor.exit_cell",
+                ),
+            )
         priority = _strict_object(
             body["priority"],
             required=frozenset(("wait_ticks", "owner_vehicle_id")),
@@ -972,6 +1026,7 @@ class MapSyncState:
             wait_ticks,
             owner,
             body["reserved"],
+            corridor,
         )
 
     @staticmethod
