@@ -484,6 +484,13 @@ fn validate_motion_intent_timing(
         }
         previous = Some((cell, leave));
     }
+    if committed
+        > previous
+            .map(|(_, leave)| leave)
+            .ok_or("missing trajectory")?
+    {
+        return Err("motion commit exceeds trajectory");
+    }
     Ok(())
 }
 
@@ -939,8 +946,10 @@ mod tests {
         hold["trajectory"] = serde_json::json!([{
             "cell": {"gx": 0, "gy": 0},
             "enter_offset_s": 0.0,
-            "leave_offset_s": 4.0
+            "leave_offset_s": 0.1
         }]);
+        assert!(payload_identity(&hold).is_err());
+        hold["committed_until_offset_s"] = serde_json::json!(0.1);
         assert!(payload_identity(&hold).is_ok());
     }
 }

@@ -714,6 +714,13 @@ class MapSyncState:
             or not 0 <= task_sequence <= (1 << 64) - 1
             or type(task_age_ticks) is not int
             or not 0 <= task_age_ticks <= MAX_INTENT_WAIT_TICKS
+            or (
+                plan_generation is not None
+                and (
+                    type(plan_generation) is not int
+                    or not 0 < plan_generation <= (1 << 64) - 1
+                )
+            )
             or not isinstance(trajectory, tuple)
             or any(not isinstance(item, TimedCell) for item in trajectory)
             or not math.isfinite(committed_until_offset_s)
@@ -752,6 +759,8 @@ class MapSyncState:
             current_cell=current_cell,
             target_cell=target_cell,
         )
+        if committed_until_offset_s > timed_trajectory[-1].leave_offset_s:
+            raise ValueError("motion intent commit exceeds trajectory")
         signature = (
             task_sequence,
             tuple(item.cell for item in timed_trajectory),
@@ -759,20 +768,20 @@ class MapSyncState:
         )
         if plan_generation is None:
             if signature != self._local_plan_signature:
-                self._local_plan_generation += 1
-                self._local_plan_signature = signature
-            plan_generation = self._local_plan_generation
+                plan_generation = self._local_plan_generation + 1
+            else:
+                plan_generation = self._local_plan_generation
         else:
             if plan_generation < self._local_plan_generation:
                 raise ValueError("plan_generation cannot regress")
-            self._local_plan_generation = plan_generation
-            self._local_plan_signature = signature
-        if (
-            type(plan_generation) is not int
-            or not 0 < plan_generation <= (1 << 64) - 1
-        ):
+            if (
+                plan_generation == self._local_plan_generation
+                and signature != self._local_plan_signature
+            ):
+                raise ValueError("plan_generation cannot change plan signature")
+        if not 0 < plan_generation <= (1 << 64) - 1:
             raise ValueError("plan_generation must be an unsigned 64-bit integer")
-        self._local_motion_intent = PeerMotionIntent(
+        intent = PeerMotionIntent(
             self.vehicle_id,
             self._state_generation,
             0,
@@ -793,6 +802,11 @@ class MapSyncState:
             safety_time_margin_s,
             timestamp_s,
         )
+        (
+            self._local_plan_generation,
+            self._local_plan_signature,
+            self._local_motion_intent,
+        ) = (plan_generation, signature, intent)
 
     def prepare_motion_intent(self) -> dict[str, object] | None:
         if self._intent_inflight is not None or self._local_motion_intent is None:
@@ -1253,7 +1267,7 @@ class MapSyncState:
             <= committed_until_offset_s
             <= MOTION_COMMIT_HORIZON_S
             or committed_until_offset_s
-            > trajectory[-1].leave_offset_s + 1e-12
+            > trajectory[-1].leave_offset_s
             or type(body["goal_hold"]) is not bool
             or not 0.0
             <= safety_time_margin_s

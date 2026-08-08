@@ -114,6 +114,43 @@ def peer_state(
     )
 
 
+def motion_sync_states() -> tuple[MapSyncState, MapSyncState, PoseEstimate]:
+    source_anchor = AnchorSpec("spawn_1", 0.0, 0.0, 0.0)
+    receiver_anchor = AnchorSpec("spawn_2", 0.0, 0.0, 0.0)
+    source = MapSyncState(
+        "session_1",
+        "vehicle_1",
+        source_anchor,
+        1.0,
+        state_generation=1,
+    )
+    receiver = MapSyncState(
+        "session_1",
+        "vehicle_2",
+        receiver_anchor,
+        1.0,
+        clock=lambda: 1.0,
+        state_generation=2,
+    )
+    source.configure_network(
+        "peer_1", {"vehicle_2": ("peer_2", receiver_anchor)}
+    )
+    receiver.configure_network(
+        "peer_2", {"vehicle_1": ("peer_1", source_anchor)}
+    )
+    pose = PoseEstimate(
+        source_anchor.anchor_id,
+        0.5,
+        0.5,
+        0.0,
+        (0.0, 0.0, 0.0),
+        "nominal",
+        1.0,
+        1,
+    )
+    return source, receiver, pose
+
+
 class TestMotionCoordination(unittest.TestCase):
     def test_off_axis_route_detects_corridor_from_static_own_map(self) -> None:
         anchor = AnchorSpec("spawn", 0.0, 0.0, 0.0)
@@ -2993,6 +3030,212 @@ class TestMotionCoordination(unittest.TestCase):
         self.assertIsNone(receiver.prepare_delta())
         now[0] += MOTION_INTENT_TTL_S + 0.01
         self.assertEqual(receiver.peer_motion_intents(), ())
+
+    def test_explicit_plan_generation_overflow_does_not_poison_sender(self) -> None:
+        source, _, pose = motion_sync_states()
+        common = {
+            "wait_ticks": 0,
+            "priority_owner_id": "vehicle_1",
+            "reserved": True,
+            "timestamp_s": 1.0,
+        }
+        source.record_motion_intent(
+            pose,
+            target_m=(1.5, 0.5),
+            plan_generation=7,
+            **common,
+        )
+        first = source.prepare_motion_intent()
+        assert first is not None
+        source.publish_motion_intent_result(first["sequence"], True)
+
+        for invalid in (True, 0, -1, 1 << 64, "8", 8.0):
+            with self.subTest(plan_generation=invalid), self.assertRaises(
+                ValueError
+            ):
+                source.record_motion_intent(
+                    pose,
+                    target_m=(2.5, 0.5),
+                    plan_generation=invalid,
+                    **common,
+                )
+        with self.assertRaises(ValueError):
+            source.record_motion_intent(
+                pose,
+                target_m=(2.5, 0.5),
+                plan_generation=8,
+                task_sequence=-1,
+                **common,
+            )
+        with self.assertRaises(ValueError):
+            source.record_motion_intent(
+                pose,
+                target_m=(2.5, 0.5),
+                plan_generation=8,
+                trajectory=(
+                    TimedCell((0, 0), 0.0, 0.0),
+                    TimedCell((2, 0), 0.0, 4.0),
+                ),
+                **common,
+            )
+        with self.assertRaises(ValueError):
+            source.record_motion_intent(
+                pose,
+                target_m=None,
+                plan_generation=8,
+                trajectory=(TimedCell((0, 0), 0.0, 0.1),),
+                committed_until_offset_s=0.8,
+                goal_hold=True,
+                **common,
+            )
+
+        source.record_motion_intent(
+            pose,
+            target_m=(3.5, 0.5),
+            plan_generation=8,
+            **common,
+        )
+        recovered = source.prepare_motion_intent()
+        assert recovered is not None
+        self.assertEqual(recovered["plan_generation"], 8)
+        self.assertEqual(recovered["target_cell"], {"gx": 3, "gy": 0})
+
+    def test_same_plan_generation_has_one_signature_on_both_endpoints(self) -> None:
+        source, receiver, pose = motion_sync_states()
+        common = {
+            "wait_ticks": 0,
+            "priority_owner_id": "vehicle_1",
+            "reserved": True,
+            "timestamp_s": 1.0,
+            "plan_generation": 7,
+        }
+        source.record_motion_intent(
+            pose,
+            target_m=(1.5, 0.5),
+            **common,
+        )
+        first = source.prepare_motion_intent()
+        assert first is not None
+        self.assertTrue(
+            receiver.receive_transport("peer_1", "vehicle_1", first)
+        )
+        source.publish_motion_intent_result(first["sequence"], True)
+
+        changed_records = (
+            {"target_m": (2.5, 0.5)},
+            {"target_m": (1.5, 0.5), "task_sequence": 1},
+            {"target_m": (1.5, 0.5), "goal_hold": True},
+        )
+        for changed in changed_records:
+            with self.subTest(sender=changed), self.assertRaises(ValueError):
+                source.record_motion_intent(pose, **common, **changed)
+
+        changed_payloads = []
+        changed_path = deepcopy(first)
+        changed_path["target_cell"] = {"gx": 2, "gy": 0}
+        changed_path["trajectory"][1]["cell"] = {"gx": 2, "gy": 0}
+        changed_payloads.append(changed_path)
+        changed_task = deepcopy(first)
+        changed_task["priority"]["task_sequence"] = 1
+        changed_payloads.append(changed_task)
+        changed_goal = deepcopy(first)
+        changed_goal["goal_hold"] = True
+        changed_payloads.append(changed_goal)
+        for changed in changed_payloads:
+            changed["sequence"] = 2
+            changed["timestamp_s"] = 1.1
+            with self.subTest(receiver=changed):
+                self.assertFalse(
+                    receiver.receive_transport("peer_1", "vehicle_1", changed)
+                )
+
+        source.record_motion_intent(
+            pose,
+            target_m=(2.5, 0.5),
+            **{**common, "plan_generation": 8},
+        )
+        next_plan = source.prepare_motion_intent()
+        assert next_plan is not None
+        self.assertTrue(
+            receiver.receive_transport("peer_1", "vehicle_1", next_plan)
+        )
+
+    def test_automatic_plan_generation_overflow_is_atomic(self) -> None:
+        source, _, pose = motion_sync_states()
+        common = {
+            "wait_ticks": 0,
+            "priority_owner_id": "vehicle_1",
+            "reserved": True,
+            "timestamp_s": 1.0,
+        }
+        source.record_motion_intent(
+            pose,
+            target_m=(1.5, 0.5),
+            plan_generation=(1 << 64) - 1,
+            **common,
+        )
+        first = source.prepare_motion_intent()
+        assert first is not None
+        source.publish_motion_intent_result(first["sequence"], True)
+
+        with self.assertRaises(ValueError):
+            source.record_motion_intent(
+                pose,
+                target_m=(2.5, 0.5),
+                **common,
+            )
+
+        source.record_motion_intent(
+            pose,
+            target_m=(1.5, 0.5),
+            plan_generation=(1 << 64) - 1,
+            **common,
+        )
+        recovered = source.prepare_motion_intent()
+        assert recovered is not None
+        self.assertEqual(recovered["plan_generation"], (1 << 64) - 1)
+        self.assertEqual(recovered["target_cell"], {"gx": 1, "gy": 0})
+
+    def test_short_hold_commit_must_not_outlive_trajectory(self) -> None:
+        source, receiver, pose = motion_sync_states()
+        trajectory = (TimedCell((0, 0), 0.0, 0.1),)
+        common = {
+            "target_m": None,
+            "wait_ticks": 0,
+            "priority_owner_id": "vehicle_1",
+            "reserved": True,
+            "timestamp_s": 1.0,
+            "plan_generation": 1,
+            "trajectory": trajectory,
+            "goal_hold": True,
+        }
+
+        with self.assertRaises(ValueError):
+            source.record_motion_intent(
+                pose,
+                committed_until_offset_s=0.8,
+                **common,
+            )
+
+        source.record_motion_intent(
+            pose,
+            committed_until_offset_s=0.1,
+            **common,
+        )
+        payload = source.prepare_motion_intent()
+        assert payload is not None
+        self.assertEqual(payload["committed_until_offset_s"], 0.1)
+        self.assertTrue(
+            receiver.receive_transport("peer_1", "vehicle_1", payload)
+        )
+
+        excessive = deepcopy(payload)
+        excessive["sequence"] = 2
+        excessive["timestamp_s"] = 1.1
+        excessive["committed_until_offset_s"] = 0.8
+        self.assertFalse(
+            receiver.receive_transport("peer_1", "vehicle_1", excessive)
+        )
 
     def test_runtime_arbitration_promotes_an_older_high_id_waiter(self) -> None:
         anchor = AnchorSpec("spawn_4", 0.0, 0.0, 0.0)

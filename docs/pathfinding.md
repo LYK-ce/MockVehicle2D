@@ -110,8 +110,11 @@ motion-intent v3 的 trajectory 由相对 `enter_offset_s` / `leave_offset_s` �
 receipt time 重建绝对区间，不比较不同车辆的 monotonic clock；intent generation、plan
 generation 和严格递增 sequence 防止重启、旧计划和乱序包回灌。plan generation 只在 cell
 序列、任务或 goal-hold 语义改变时增长，滚动重发的相对 offset 不会独自制造新代次。
+显式 generation 必须是正的 u64；同一 generation 不得更改上述签名，所有字段校验成功后
+才原子更新本地 generation/签名/待发布 intent，失败后下一次合法 generation 可继续。
 相邻 trajectory cell 必须不同且满足 `next.enter > previous.leave`，禁止零时长 teleport；
-单 cell 原地 hold 合法。commit 只允许 `0..0.8 s`，`0.8 s` 之后的轨迹仅是未提交候选。
+单 cell 原地 hold 合法。commit 只允许
+`0..min(0.8 s, trajectory 最后 leave_offset_s)`，其后的轨迹仅是未提交候选。
 
 内部 `ReservationTable` 分别保存：
 
