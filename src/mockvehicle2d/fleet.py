@@ -840,6 +840,15 @@ class RobotNode:
             target_m, wait_ticks, owner_id, reserved, corridor = (
                 self.controller.motion_intent
             )
+            (
+                _plan_generation,
+                task_sequence,
+                task_age_ticks,
+                trajectory,
+                committed_until_offset_s,
+                goal_hold,
+                safety_time_margin_s,
+            ) = self.controller.temporal_motion_intent
             self.map_sync.record_motion_intent(
                 self.local_state.pose,
                 target_m=target_m,
@@ -848,6 +857,12 @@ class RobotNode:
                 reserved=reserved,
                 corridor=corridor,
                 timestamp_s=now,
+                task_sequence=task_sequence,
+                task_age_ticks=task_age_ticks,
+                trajectory=trajectory,
+                committed_until_offset_s=committed_until_offset_s,
+                goal_hold=goal_hold,
+                safety_time_margin_s=safety_time_margin_s,
             )
         self._pending_map_delta = None
         self._pending_advance = SafetyAdvanceResult()

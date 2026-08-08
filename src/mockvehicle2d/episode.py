@@ -31,6 +31,7 @@ RESULT_SCHEMA_VERSION = 2
 MIN_PROGRESS_TRANSLATION_M = 0.001
 PEER_STATE_DELAY_TICKS = 1
 _MISSION_TYPES = (GotoMission, PatrolMission, CoverageMission)
+_TERMINAL_MISSION_STATUSES = frozenset(("blocked", "cancelled", "reached"))
 
 
 @dataclass(frozen=True)
@@ -101,7 +102,20 @@ class _DeterministicPeerStateExchange:
                     other_id for other_id in vehicle_ids if other_id != vehicle_id
                 ),
             )
+            state.record_motion_intent(
+                fleet.nodes[vehicle_id].local_state.pose,
+                target_m=None,
+                wait_ticks=0,
+                priority_owner_id=vehicle_id,
+                reserved=False,
+                timestamp_s=fleet.world.now,
+                task_sequence=(1 << 64) - 1,
+                goal_hold=True,
+            )
         self._publish()
+        # Establish the configured mesh before mission time starts. Normal
+        # traffic still keeps the fixed one-tick relay delay.
+        self.advance()
 
     def advance(self) -> None:
         self._tick += 1
@@ -316,6 +330,10 @@ def run_episode(
                 no_progress_ticks[vehicle_id],
                 longest_no_progress_ticks[vehicle_id],
                 translation_m,
+                work_active=(
+                    termination_reason is None
+                    and _vehicle_has_unfinished_work(statuses, vehicle_id)
+                ),
             )
             vehicle = fleet.world.vehicle(vehicle_id)
             node = fleet.nodes[vehicle_id]
@@ -440,8 +458,23 @@ def _update_no_progress(
     current_ticks: int,
     longest_ticks: int,
     translation_m: float,
+    *,
+    work_active: bool,
 ) -> tuple[int, int]:
+    if not work_active:
+        return 0, longest_ticks
     if translation_m >= MIN_PROGRESS_TRANSLATION_M:
         return 0, longest_ticks
     current_ticks += 1
     return current_ticks, max(longest_ticks, current_ticks)
+
+
+def _vehicle_has_unfinished_work(
+    statuses: Mapping[tuple[str, str], str],
+    vehicle_id: str,
+) -> bool:
+    return any(
+        source_vehicle_id == vehicle_id
+        and status not in _TERMINAL_MISSION_STATUSES
+        for (source_vehicle_id, _), status in statuses.items()
+    )

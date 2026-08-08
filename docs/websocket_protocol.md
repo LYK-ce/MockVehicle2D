@@ -469,9 +469,11 @@ cell 状态：`0` 可通行、`1` 墙、`2` 无地面/落差。客户端用
 `localization.quality` 为 `nominal`、`degraded` 或 `lost`。
 `controller.coordination.state` 为 `idle`、`tentative`、`reserved` 或 `waiting`：
 `tentative` 表示本车已声明走廊但尚未得到对端确认，`reserved` 表示本车是唯一已确认
-owner，`waiting` 的 `reason` 为 `corridor_election` 或 `corridor_lease`，并通过
-`priority_owner_vehicle_id` 指出当前胜者。该摘要只用于观察；客户端不得据此绕过
-`RobotController` 或 LocalSafety 下发运动。
+owner，`waiting` 的 `reason` 还可为 `corridor_election`、`corridor_lease`、
+`reservation_sync`（expected peer state/intent 不完整）或 `space_time_reservation`
+（motion-intent v3 时间窗尚不可进入）。已知胜者通过 `priority_owner_vehicle_id` 指出；
+同步等待可能为 `null`。该摘要只用于观察；客户端不得据此绕过 `RobotController` 或
+LocalSafety 下发运动。
 没有启用场景级 P2P 时，`p2p_map_sync` 为 `{"enabled":false}`。协同摘要仅供观察，
 远端地图当前不会改变本车 D* Lite 或安全控制。peer state 与 motion intent 的
 published/received/rejected/failure 计数及当前有效租约数分别由同名字段报告。常规遥测

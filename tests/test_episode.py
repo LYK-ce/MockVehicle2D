@@ -22,6 +22,7 @@ from mockvehicle2d.episode import (
     MIN_PROGRESS_TRANSLATION_M,
     _DeterministicPeerStateExchange,
     _update_no_progress,
+    _vehicle_has_unfinished_work,
     run_episode,
 )
 from mockvehicle2d.fleet import (
@@ -278,9 +279,29 @@ class TestEpisodeRunner(unittest.TestCase):
                 current,
                 longest,
                 translation_m,
+                work_active=True,
             )
 
         self.assertEqual((current, longest), (3, 3))
+
+    def test_no_progress_excludes_terminal_idle_but_tracks_pending_work(self) -> None:
+        statuses = {
+            ("early", "first"): "reached",
+            ("other", "only"): "not_started",
+        }
+        self.assertFalse(_vehicle_has_unfinished_work(statuses, "early"))
+        self.assertTrue(_vehicle_has_unfinished_work(statuses, "other"))
+        self.assertEqual(
+            _update_no_progress(4, 4, 0.0, work_active=False),
+            (0, 4),
+        )
+
+        statuses[("early", "second")] = "not_started"
+        self.assertTrue(_vehicle_has_unfinished_work(statuses, "early"))
+        self.assertEqual(
+            _update_no_progress(4, 4, 0.0, work_active=True),
+            (5, 5),
+        )
 
     def test_two_vehicle_crossing_example_reports_interaction_metrics(self) -> None:
         from mockvehicle2d import episode as episode_module

@@ -106,15 +106,24 @@ velocity；默认线加速、线减速和角加速上限分别为 `1 m/s²`、`1
 时限时失败结束。`episode` 与 `serve`/`fleet` 使用相同的速度、加减速、半径和 watchdog
 CLI 参数。
 
-多车 Episode 不启动 localhost libp2p，而是把现有 peer-state v1 和 motion-intent v2
+多车 Episode 不启动 localhost libp2p，而是把现有 peer-state v1 和 motion-intent v3
 payload 经过 JSON 序列化及协议校验后，以固定 1 tick 延迟在进程内传递；序列、接收时间
 和 `0.35 s` 过期规则与实时 P2P 路径一致。启用了真实 `p2p` 配置的场景仍被拒绝，因为
-libp2p 墙钟调度和 map delta 传播不属于确定性 Episode。下一格 vertex/edge-swap 冲突
-使用短租约和等待年龄仲裁，`vehicle_id` 只作最终 tie-break；占路车辆可继承请求者优先级
-并尝试一个本地可通行邻格。让行期间任务保持 active，所依赖的 peer state 或 intent
-缺失/过期时保持停车，连续确认冲突解除后恢复；LocalSafety 仍是最终裁决。
+libp2p 墙钟调度和 map delta 传播不属于确定性 Episode。每辆车沿 OwnMap D* 路径发布
+约 `4 s` 的相对 cell 时间窗；接收端以 receipt time 重建 cell/edge/goal reservation，加入
+车体、安全余量、加减速和通信不确定性后运行 prioritized SIPP，每次只执行前 `0.8 s`
+并滚动重算。同格、对向 edge swap、同步几何交叉和已到达车辆的 goal hold 都进入冲突
+检查；无冲突路径不增加等待。
 
-完全观测且内宽不超过约 `3 m` 的直线瓶颈还会使用 motion-intent v2 的有向 corridor
+未提交候选先比较等待年龄，再按继承 owner 和 `vehicle_id` 排序；一旦进入短 commit，
+仲裁只使用所有节点都能看到的 owner/vehicle ID，不允许未同步的本地年龄抢占。协议中的
+活动任务年龄当前仅供观测，跨车“任务更早”需要后续引入 Lamport task token 才能安全参与
+全序。占路车辆会沿 request chain 递归继承优先级，并只尝试一个本地可通行邻格作为有界
+回溯。第一版没有独立的网络 propose/ACK/commit 往返；commit 依赖上一 tick 的全员 fresh
+intent、确定性优先级和短执行前缀，并继续由下一格租约、物理碰撞仲裁与 LocalSafety
+兜底。peer state 或 intent 缺失/过期、sidecar 未 ready 或 generation 回退时保持停车。
+
+完全观测且内宽不超过约 `3 m` 的直线瓶颈还会使用 motion-intent v3 的有向 corridor
 descriptor 做短租约仲裁。只有一个经对端确认的 owner 可以进入；与 owner 方向相反的
 失败者按距出口侧 entry 的纵向距离和 `vehicle_id` 选出唯一 front waiter，提前进入可逆
 侧向等待，同侧 rear waiter 原地排队。ACK 只确认 owner，不等于入口已安全；
@@ -132,9 +141,10 @@ front waiter 的连续位姿和剩余侧移段未离开 `2r + 0.3 m` 包络前�
 安全终态和任务状态。顶层 `minimum_inter_vehicle_clearance_m` 从 `t=0` 开始，取所有固定
 tick、所有无序车辆对的最小圆形 footprint 边缘间距（中心距减去两车半径）；单车时为
 `null`，负值表示 footprint 已重叠。每车 `longest_no_progress_duration_s` 是连续固定 tick
-内真值中心每 tick 平移小于 1 mm 的最长模拟时长，原地转向和等待计入，恢复至少 1 mm
-平移后重新计数，episode 结束时尚未恢复的尾段也计入。真值只由评估层读取，不会进入
-自主控制链。Python 调用入口为
+内真值中心每 tick 平移小于 1 mm 的最长模拟时长；只在该车仍有未完成任务时统计，原地
+转向和等待计入，恢复至少 1 mm 平移后重新计数。某车完成全部任务后等待其他车辆的正常
+停驻以及 episode 终止后的制动不计入。真值只由评估层读取，不会进入自主控制链。Python
+调用入口为
 `mockvehicle2d.episode.run_episode`，可直接传入现有 `GotoMission`、`PatrolMission` 或
 `CoverageMission`。
 
@@ -232,12 +242,12 @@ Gossipsub topic 为 `mockvehicle2d/<session_id>/fleet-sync/1`，payload 是严�
 resolution、sequence、消息大小和每个 cell。Python 与对应 sidecar 只通过运行目录中的
 Unix domain socket 交换有界 JSONL 消息，控制 tick 不等待该 socket。
 
-同一 fleet-sync topic 还承载严格的 `mockvehicle2d-motion-intent/2` JSON。它只描述由
-本车 odometry 与 D* 当前 waypoint 生成的一个短期移动，不携带仿真真值：
+同一 fleet-sync topic 还承载严格的 `mockvehicle2d-motion-intent/3` JSON。它只描述由
+本车 odometry 与 OwnMap D* 路径生成的短时域计划，不携带仿真真值：
 
 ```json
 {
-  "protocol": "mockvehicle2d-motion-intent/2",
+  "protocol": "mockvehicle2d-motion-intent/3",
   "session_id": "four_vehicle_exploration",
   "source_vehicle_id": "mock_vehicle_01",
   "intent_generation": 1,
@@ -246,10 +256,23 @@ Unix domain socket 交换有界 JSONL 消息，控制 tick 不等待该 socket�
   "resolution_m": 1.0,
   "timestamp_s": 42.1,
   "lease_duration_s": 0.35,
+  "plan_generation": 3,
   "current_cell": {"gx": 9, "gy": 10},
   "target_cell": {"gx": 10, "gy": 10},
-  "priority": {"wait_ticks": 3, "owner_vehicle_id": "mock_vehicle_01"},
+  "priority": {
+    "wait_ticks": 3,
+    "task_age_ticks": 27,
+    "task_sequence": 6,
+    "owner_vehicle_id": "mock_vehicle_01"
+  },
   "reserved": true,
+  "trajectory": [
+    {"cell":{"gx":9,"gy":10},"enter_offset_s":0.0,"leave_offset_s":0.2},
+    {"cell":{"gx":10,"gy":10},"enter_offset_s":0.7,"leave_offset_s":1.0}
+  ],
+  "committed_until_offset_s": 0.8,
+  "goal_hold": false,
+  "safety_time_margin_s": 0.6,
   "corridor": {
     "entry_cell": {"gx": 9, "gy": 10},
     "exit_cell": {"gx": 14, "gy": 10}
@@ -257,16 +280,18 @@ Unix domain socket 交换有界 JSONL 消息，控制 tick 不等待该 socket�
 }
 ```
 
-接收端严格校验 generation/sequence、global frame、resolution、cell 边界、优先级 owner
-白名单、租约上限和有向 axis-aligned corridor；重复、乱序、超时或额外字段均拒绝。
+接收端严格校验 intent/plan generation、sequence、global frame、resolution、cell 边界、
+最多 64 个且 `0..4 s` 单调的相对时间窗、commit/margin 上限、优先级 owner 白名单、租约
+上限和有向 axis-aligned corridor；重复、乱序、超时或额外字段均拒绝。相对时间以接收时刻
+重建，不要求不同车辆的 monotonic clock 同步；sender timestamp 只用于同源防回退。
 没有走廊声明时 `corridor` 必须为 `null`。走廊只从车辆 OwnMap 上已完全观测的直线窄通道
 推导；peer evidence 和仿真真值不会参与检测。相反方向看到的部分 descriptor 会按重叠轴
 匹配并单调扩展释放边界，进入前需要一轮 owner 声明/对端确认。
 
 当前走廊策略严格一次只放行一辆车，因此长走廊和深队列的吞吐近似线性增长。暂未实现
-“暂不可入廊 owner”跳过、同向 directional batching/convoy 或 SIPP 时间窗；这些是后续
-吞吐优化方向。弯曲、分支、过宽或观测不完整的通道回退到下一格与轨迹冲突协调，不会
-被误宣称为完整 PIBT 能力。
+“暂不可入廊 owner”跳过或同向 directional batching/convoy。弯曲、分支、过宽或观测
+不完整的通道使用通用 SIPP 时间窗，但第一版只在一条 D* 空间候选及一个邻格 detour 上
+做调度，不是联合最优 MAPF，也不宣称完整 PIBT 回溯。
 
 ## 控制方式
 
