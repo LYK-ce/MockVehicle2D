@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from collections import deque
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from enum import Enum
 import math
 import re
@@ -11,6 +11,12 @@ from typing import TYPE_CHECKING, ClassVar
 import uuid
 
 from mockvehicle2d.navigation import GotoController
+from mockvehicle2d.map_sync import (
+    CorridorDescriptor,
+    MAX_INTENT_WAIT_TICKS,
+    MOTION_INTENT_TTL_S,
+    PeerMotionIntent,
+)
 from mockvehicle2d.safety import AUTOMATIC_MINIMUM_CLEARANCE_M
 
 if TYPE_CHECKING:
@@ -34,6 +40,8 @@ SUPPORTED_MISSION_TYPES = ("goto", "patrol", "coverage")
 PEER_CONFLICT_HORIZON_S = 4.0
 PEER_YIELD_CLEAR_TICKS = 3
 PEER_ESCAPE_LINEAR_MPS = 0.2
+PEER_RESERVATION_MAX_HOLD_TICKS = 40
+CORRIDOR_REJOIN_TOLERANCE_M = 0.1
 Goal = tuple[float, float]
 
 
@@ -332,6 +340,350 @@ def _peer_motion_conflicts(
     return closest_distance_m <= conflict_distance_m + 1e-12
 
 
+def motion_intent_precedes(
+    first: PeerMotionIntent,
+    second: PeerMotionIntent,
+) -> bool:
+    """Return the deterministic winner; a live reservation is a short lease."""
+    if first.reserved != second.reserved:
+        return first.reserved
+    if first.wait_ticks != second.wait_ticks:
+        return first.wait_ticks > second.wait_ticks
+    if first.priority_owner_id != second.priority_owner_id:
+        return first.priority_owner_id < second.priority_owner_id
+    return first.source_vehicle_id < second.source_vehicle_id
+
+
+def inherit_motion_priority(
+    own: PeerMotionIntent,
+    requesters: tuple[PeerMotionIntent, ...],
+) -> PeerMotionIntent:
+    inherited = own
+    for requester in sorted(requesters, key=lambda intent: intent.source_vehicle_id):
+        if motion_intent_precedes(requester, inherited):
+            inherited = requester
+    if inherited is own:
+        return own
+    return PeerMotionIntent(
+        own.source_vehicle_id,
+        own.intent_generation,
+        own.sequence,
+        own.timestamp_s,
+        own.lease_duration_s,
+        own.current_cell,
+        own.target_cell,
+        max(own.wait_ticks, inherited.wait_ticks),
+        inherited.priority_owner_id,
+        own.reserved,
+        own.corridor,
+    )
+
+
+def _motion_intents_conflict(
+    first: PeerMotionIntent,
+    second: PeerMotionIntent,
+) -> bool:
+    if first.target_cell is None or second.target_cell is None:
+        return False
+    return first.target_cell == second.target_cell or (
+        first.current_cell == second.target_cell
+        and first.target_cell == second.current_cell
+    )
+
+
+def corridor_descriptors_conflict(
+    first: CorridorDescriptor,
+    second: CorridorDescriptor,
+) -> bool:
+    first_horizontal = first.entry_cell[1] == first.exit_cell[1]
+    second_horizontal = second.entry_cell[1] == second.exit_cell[1]
+    if first_horizontal != second_horizontal:
+        return False
+    axis = 0 if first_horizontal else 1
+    fixed = 1 - axis
+    if first.entry_cell[fixed] != second.entry_cell[fixed]:
+        return False
+    first_interval = sorted((first.entry_cell[axis], first.exit_cell[axis]))
+    second_interval = sorted((second.entry_cell[axis], second.exit_cell[axis]))
+    return max(first_interval[0], second_interval[0]) <= min(
+        first_interval[1], second_interval[1]
+    )
+
+
+def _corridor_progress(
+    corridor: CorridorDescriptor,
+    cell: tuple[int, int],
+) -> int:
+    axis = 0 if corridor.entry_cell[1] == corridor.exit_cell[1] else 1
+    direction = 1 if corridor.exit_cell[axis] > corridor.entry_cell[axis] else -1
+    return (cell[axis] - corridor.entry_cell[axis]) * direction
+
+
+def _corridor_direction(corridor: CorridorDescriptor) -> tuple[int, int]:
+    axis = 0 if corridor.entry_cell[1] == corridor.exit_cell[1] else 1
+    direction = 1 if corridor.exit_cell[axis] > corridor.entry_cell[axis] else -1
+    return axis, direction
+
+
+def _front_corridor_waiter(
+    winner: PeerMotionIntent,
+    candidates: tuple[PeerMotionIntent, ...],
+) -> PeerMotionIntent | None:
+    """Return the deterministic front waiter approaching the winner's exit."""
+    if winner.corridor is None:
+        return None
+    winner_axis, winner_direction = _corridor_direction(winner.corridor)
+    waiters = []
+    for candidate in candidates:
+        if (
+            candidate.source_vehicle_id == winner.source_vehicle_id
+            or candidate.corridor is None
+            or not corridor_descriptors_conflict(
+                winner.corridor,
+                candidate.corridor,
+            )
+        ):
+            continue
+        axis, direction = _corridor_direction(candidate.corridor)
+        if axis != winner_axis or direction == winner_direction:
+            continue
+        waiters.append(
+            (
+                max(
+                    0,
+                    -_corridor_progress(
+                        candidate.corridor,
+                        candidate.current_cell,
+                    ),
+                ),
+                candidate.source_vehicle_id,
+                candidate,
+            )
+        )
+    return None if not waiters else min(waiters, key=lambda item: item[:2])[2]
+
+
+def _corridor_path_fixed_m(
+    intent: PeerMotionIntent,
+    peer: PeerVehicleState | None,
+    resolution_m: float,
+    fallback_position_m: tuple[float, float] | None = None,
+) -> float:
+    assert intent.corridor is not None
+    axis, _ = _corridor_direction(intent.corridor)
+    fixed_axis = 1 - axis
+    if intent.target_cell is not None:
+        return (intent.target_cell[fixed_axis] + 0.5) * resolution_m
+    if peer is not None:
+        return (peer.global_x_m, peer.global_y_m)[fixed_axis]
+    if fallback_position_m is not None:
+        return fallback_position_m[fixed_axis]
+    return (intent.corridor.entry_cell[fixed_axis] + 0.5) * resolution_m
+
+
+def _corridor_waiter_is_staged(
+    winner: PeerMotionIntent,
+    waiter: PeerMotionIntent,
+    winner_state: PeerVehicleState | None,
+    waiter_state: PeerVehicleState | None,
+    resolution_m: float,
+    winner_radius_m: float,
+    winner_position_m: tuple[float, float],
+) -> bool:
+    """Require the waiter's current pose and remaining stage sweep off-axis."""
+    if winner.corridor is None or waiter_state is None:
+        return False
+    axis, _ = _corridor_direction(winner.corridor)
+    fixed_axis = 1 - axis
+    path_fixed_m = _corridor_path_fixed_m(
+        winner,
+        winner_state,
+        resolution_m,
+        winner_position_m,
+    )
+    current_fixed_m = (
+        waiter_state.global_x_m,
+        waiter_state.global_y_m,
+    )[fixed_axis]
+    sweep_fixed_m = current_fixed_m
+    if waiter.target_cell is not None:
+        sweep_fixed_m = (
+            waiter.target_cell[fixed_axis] + 0.5
+        ) * resolution_m
+    current_side = current_fixed_m - path_fixed_m
+    sweep_side = sweep_fixed_m - path_fixed_m
+    sweep_clearance_m = (
+        0.0
+        if current_side * sweep_side < 0.0
+        else min(abs(current_side), abs(sweep_side))
+    )
+    required_center_clearance_m = (
+        winner_radius_m
+        + waiter_state.radius_m
+        + math.sqrt(max(waiter_state.covariance[:2]))
+        + AUTOMATIC_MINIMUM_CLEARANCE_M
+    )
+    return (
+        abs(current_side) >= required_center_clearance_m - 1e-12
+        and sweep_clearance_m >= required_center_clearance_m - 1e-12
+    )
+
+
+def _corridor_entry_gate_reached(
+    corridor: CorridorDescriptor,
+    point_m: tuple[float, float],
+    resolution_m: float,
+    vehicle: Vehicle,
+) -> bool:
+    """Start bounded braking before the vehicle footprint crosses the entry."""
+    axis, direction = _corridor_direction(corridor)
+    entry_face_m = (
+        corridor.entry_cell[axis] * resolution_m
+        if direction > 0
+        else (corridor.entry_cell[axis] + 1) * resolution_m
+    )
+    linear_mps = abs(vehicle.body_velocities()[0])
+    braking_distance_m = linear_mps**2 / (
+        2 * vehicle.linear_deceleration_mps2
+    )
+    hold_center_m = entry_face_m - direction * (
+        vehicle.radius + braking_distance_m
+    )
+    return direction * point_m[axis] >= direction * hold_center_m - 1e-12
+
+
+def _rejoin_segment_stays_before_corridor_entry(
+    corridor: CorridorDescriptor,
+    start_m: tuple[float, float],
+    end_m: tuple[float, float],
+    resolution_m: float,
+    vehicle_radius_m: float,
+) -> bool:
+    axis, direction = _corridor_direction(corridor)
+    entry_face_m = (
+        corridor.entry_cell[axis] * resolution_m
+        if direction > 0
+        else (corridor.entry_cell[axis] + 1) * resolution_m
+    )
+    footprint_limit_m = direction * entry_face_m - vehicle_radius_m
+    return max(
+        direction * start_m[axis],
+        direction * end_m[axis],
+    ) <= footprint_limit_m + 1e-12
+
+
+def _corridor_passed(
+    corridor: CorridorDescriptor,
+    point_m: tuple[float, float],
+    resolution_m: float,
+    vehicle_radius_m: float,
+) -> bool:
+    """Require the whole collision footprint and safety margin past the exit."""
+    axis = 0 if corridor.entry_cell[1] == corridor.exit_cell[1] else 1
+    direction = 1 if corridor.exit_cell[axis] > corridor.entry_cell[axis] else -1
+    far_face_m = (
+        (corridor.exit_cell[axis] + 1) * resolution_m
+        if direction > 0
+        else corridor.exit_cell[axis] * resolution_m
+    )
+    release_center_m = far_face_m + direction * (
+        vehicle_radius_m + AUTOMATIC_MINIMUM_CLEARANCE_M
+    )
+    return direction * point_m[axis] > direction * release_center_m
+
+
+def _extend_corridor_release(
+    corridor: CorridorDescriptor,
+    peer_corridor: CorridorDescriptor,
+) -> CorridorDescriptor:
+    """Monotonically include the opposite peer's confirmed entry boundary."""
+    axis = 0 if corridor.entry_cell[1] == corridor.exit_cell[1] else 1
+    current_length = round(math.dist(corridor.entry_cell, corridor.exit_cell))
+    if _corridor_progress(corridor, peer_corridor.entry_cell) <= current_length:
+        return corridor
+    exit_cell = list(corridor.exit_cell)
+    exit_cell[axis] = peer_corridor.entry_cell[axis]
+    return CorridorDescriptor(corridor.entry_cell, tuple(exit_cell))
+
+
+def _effective_corridor_intent(
+    intent: PeerMotionIntent,
+    live_corridor_vehicle_ids: frozenset[str],
+) -> PeerMotionIntent:
+    """Drop inherited ownership after that owner leaves this corridor lease."""
+    if intent.priority_owner_id in live_corridor_vehicle_ids:
+        return intent
+    return replace(
+        intent,
+        priority_owner_id=intent.source_vehicle_id,
+        reserved=False,
+    )
+
+
+def _coordination_cell(
+    anchor: AnchorSpec,
+    point_m: tuple[float, float],
+    resolution_m: float,
+) -> tuple[int, int]:
+    global_x_m, global_y_m, _ = anchor.anchor_to_global(*point_m, 0.0)
+    return (
+        math.floor(global_x_m / resolution_m),
+        math.floor(global_y_m / resolution_m),
+    )
+
+
+def _global_corridor(
+    anchor: AnchorSpec,
+    local_corridor: tuple[tuple[int, int], tuple[int, int]],
+    resolution_m: float,
+    current_cell: tuple[int, int],
+) -> CorridorDescriptor | None:
+    transformed = []
+    for gx, gy in local_corridor:
+        global_x_m, global_y_m, _ = anchor.anchor_to_global(
+            (gx + 0.5) * resolution_m,
+            (gy + 0.5) * resolution_m,
+            0.0,
+        )
+        transformed.append(
+            (
+                math.floor(global_x_m / resolution_m),
+                math.floor(global_y_m / resolution_m),
+            )
+        )
+    first, second = transformed
+    delta_x = abs(second[0] - first[0])
+    delta_y = abs(second[1] - first[1])
+    if delta_x and not delta_y:
+        first = first[0], current_cell[1]
+        second = second[0], current_cell[1]
+    elif delta_y and not delta_x:
+        first = current_cell[0], first[1]
+        second = current_cell[0], second[1]
+    else:
+        return None
+    return CorridorDescriptor(first, second)
+
+
+def _intent_setpoint(
+    target_m: tuple[float, float],
+    pose: PoseEstimate,
+    vehicle: Vehicle,
+) -> tuple[float, float]:
+    dx, dy = target_m[0] - pose.x_m, target_m[1] - pose.y_m
+    distance_m = math.hypot(dx, dy)
+    heading_error = math.atan2(
+        math.sin(math.atan2(dy, dx) - pose.yaw_rad),
+        math.cos(math.atan2(dy, dx) - pose.yaw_rad),
+    )
+    return (
+        0.0
+        if abs(heading_error) > GotoController.turn_in_place_threshold_rad
+        else min(vehicle.linear_speed, distance_m),
+        max(-vehicle.angular_speed, min(vehicle.angular_speed, 2 * heading_error)),
+    )
+
+
 def _peer_conflict_distance(
     vehicle: Vehicle,
     peer: PeerVehicleState,
@@ -412,6 +764,94 @@ def _closest_approach_distance(
     return math.hypot(
         relative_x + relative_vx * closest_time_s,
         relative_y + relative_vy * closest_time_s,
+    )
+
+
+def _point_segment_distance(
+    point: tuple[float, float],
+    start: tuple[float, float],
+    end: tuple[float, float],
+) -> float:
+    delta_x, delta_y = end[0] - start[0], end[1] - start[1]
+    length_squared = delta_x**2 + delta_y**2
+    if length_squared <= 1e-12:
+        return math.dist(point, start)
+    projection = max(
+        0.0,
+        min(
+            1.0,
+            (
+                (point[0] - start[0]) * delta_x
+                + (point[1] - start[1]) * delta_y
+            )
+            / length_squared,
+        ),
+    )
+    return math.dist(
+        point,
+        (
+            start[0] + projection * delta_x,
+            start[1] + projection * delta_y,
+        ),
+    )
+
+
+def _intent_sweep_distance(
+    point_m: tuple[float, float],
+    intent: PeerMotionIntent,
+    peer: PeerVehicleState | None,
+    resolution_m: float,
+) -> float:
+    start = (
+        (
+            (intent.current_cell[0] + 0.5) * resolution_m,
+            (intent.current_cell[1] + 0.5) * resolution_m,
+        )
+        if peer is None
+        else (peer.global_x_m, peer.global_y_m)
+    )
+    endpoints = []
+    if intent.target_cell is not None:
+        endpoints.append(
+            (
+                (intent.target_cell[0] + 0.5) * resolution_m,
+                (intent.target_cell[1] + 0.5) * resolution_m,
+            )
+        )
+    if peer is not None and math.hypot(peer.vx_mps, peer.vy_mps) > 1e-12:
+        endpoints.append(
+            (
+                start[0] + peer.vx_mps * PEER_CONFLICT_HORIZON_S,
+                start[1] + peer.vy_mps * PEER_CONFLICT_HORIZON_S,
+            )
+        )
+    return min(
+        (
+            _point_segment_distance(point_m, start, endpoint)
+            for endpoint in endpoints
+        ),
+        default=math.dist(point_m, start),
+    )
+
+
+def _rejoin_segment_blocked_by_peer(
+    start_m: tuple[float, float],
+    end_m: tuple[float, float],
+    vehicle: Vehicle,
+    peers: tuple[PeerVehicleState, ...],
+) -> bool:
+    return any(
+        _point_segment_distance(
+            (peer.global_x_m, peer.global_y_m),
+            start_m,
+            end_m,
+        )
+        <= vehicle.radius
+        + peer.radius_m
+        + math.sqrt(max(peer.covariance[:2]))
+        + AUTOMATIC_MINIMUM_CLEARANCE_M
+        + 1e-12
+        for peer in peers
     )
 
 
@@ -514,7 +954,23 @@ class RobotController:
         self._subgoal_index = 0
         self._deferred_edge_cell: tuple[int, int] | None = None
         self._yielding_for: str | None = None
+        self._yield_requires_intent = False
         self._yield_clear_ticks = 0
+        self._reservation_wait_ticks = 0
+        self._intent_priority_owner_id: str | None = None
+        self._intent_target_m: tuple[float, float] | None = None
+        self._intent_reserved = False
+        self._reservation_cells: tuple[tuple[int, int], tuple[int, int]] | None = None
+        self._reservation_hold_ticks = 0
+        self._last_coordination_cell: tuple[int, int] | None = None
+        self._corridor: CorridorDescriptor | None = None
+        self._corridor_reserved = False
+        self._corridor_admission_confirmed = False
+        self._corridor_claim_ticks = 0
+        self._corridor_rejoin_target_m: tuple[float, float] | None = None
+        self._coordination_wait_reason: str | None = None
+        self._coordination_wait_owner_id: str | None = None
+        self._known_coordination_peer_ids: set[str] = set()
 
     @property
     def is_automatic_motion_active(self) -> bool:
@@ -523,6 +979,73 @@ class RobotController:
     @property
     def is_yielding(self) -> bool:
         return self._yielding_for is not None
+
+    @property
+    def motion_intent(self) -> tuple[
+        tuple[float, float] | None,
+        int,
+        str | None,
+        bool,
+        CorridorDescriptor | None,
+    ]:
+        return (
+            self._intent_target_m,
+            self._reservation_wait_ticks,
+            self._intent_priority_owner_id,
+            self._intent_reserved,
+            self._corridor,
+        )
+
+    def planning_ignored_peer_ids(
+        self,
+        vehicle_id: str,
+        peer_motion_intents: tuple[PeerMotionIntent, ...],
+    ) -> frozenset[str]:
+        """Return yielded corridor peers the confirmed owner may plan through."""
+        if (
+            self._corridor is None
+            or not self._corridor_reserved
+            or not self._corridor_admission_confirmed
+            or self._intent_priority_owner_id != vehicle_id
+        ):
+            return frozenset()
+        return frozenset(
+            intent.source_vehicle_id
+            for intent in peer_motion_intents
+            if intent.corridor is not None
+            and not intent.reserved
+            and intent.priority_owner_id == vehicle_id
+            and corridor_descriptors_conflict(self._corridor, intent.corridor)
+        )
+
+    def _live_corridor_lease_owner(
+        self,
+        vehicle_id: str | None,
+        peer_motion_intents: tuple[PeerMotionIntent, ...],
+    ) -> str | None:
+        """Return the peer whose live matching lease this vehicle is yielding to."""
+        owner_id = self._intent_priority_owner_id
+        if (
+            vehicle_id is None
+            or self._corridor is None
+            or self._corridor_reserved
+            or owner_id is None
+            or owner_id == vehicle_id
+        ):
+            return None
+        for intent in peer_motion_intents:
+            if (
+                intent.source_vehicle_id == owner_id
+                and intent.priority_owner_id == owner_id
+                and intent.reserved
+                and intent.corridor is not None
+                and corridor_descriptors_conflict(
+                    self._corridor,
+                    intent.corridor,
+                )
+            ):
+                return owner_id
+        return None
 
     def handle(
         self,
@@ -557,8 +1080,13 @@ class RobotController:
         safety_scan_healthy: bool = True,
         vehicle_id: str | None = None,
         peer_states: tuple[PeerVehicleState, ...] = (),
+        peer_motion_intents: tuple[PeerMotionIntent, ...] = (),
+        coordination_map: ObservedGrid | None = None,
+        coordination_ready: bool | None = None,
+        expected_peer_vehicle_ids: tuple[str, ...] = (),
     ) -> None:
         if self.mode is OpMode.MANUAL:
+            self._clear_yield()
             self._tick_manual(
                 vehicle,
                 grid,
@@ -581,21 +1109,109 @@ class RobotController:
             vehicle.stop()
             return
 
-        desired = self.navigation.update(
-            pose=pose,
-            local_map=local_map,
-            max_linear_mps=vehicle.linear_speed,
-            max_angular_rps=vehicle.angular_speed,
-            advance_result=advance_result,
-            map_delta=map_delta,
-            safety=safety,
+        persistent_map = coordination_map
+        if persistent_map is None:
+            persistent_grid = getattr(local_map, "persistent_grid", None)
+            if callable(persistent_grid):
+                persistent_map = persistent_grid()
+        has_transient_obstacles = getattr(
+            local_map,
+            "has_transient_obstacles",
+            None,
         )
-        if self.navigation.status == "reached":
-            self._complete_subgoal(vehicle, anchor, pose, local_map)
-            return
-        if self.navigation.status == "blocked":
-            self._finish_blocked(vehicle)
-            return
+        transient_active = (
+            bool(has_transient_obstacles())
+            if callable(has_transient_obstacles)
+            else False
+        )
+        has_attributed_peer_obstacles = getattr(
+            local_map,
+            "has_attributed_peer_obstacles",
+            None,
+        )
+        attributed_peer_active = (
+            bool(has_attributed_peer_obstacles())
+            if callable(has_attributed_peer_obstacles)
+            else False
+        )
+        classify_no_path = getattr(
+            self.navigation,
+            "classify_no_path_against_persistent",
+            None,
+        )
+        corridor_wait_owner = self._live_corridor_lease_owner(
+            vehicle_id,
+            peer_motion_intents,
+        )
+        if getattr(
+            self.navigation,
+            "static_no_path_probe_pending",
+            False,
+        ) is True:
+            if persistent_map is None or not callable(classify_no_path):
+                self.navigation.block("no_path", self.navigation.detail)
+                self._finish_blocked(vehicle)
+                return
+            no_path_kind = classify_no_path(
+                pose,
+                persistent_map,
+                local_map,
+                transient_active=transient_active,
+                attributed_peer_active=attributed_peer_active,
+            )
+            if no_path_kind == "static":
+                self._finish_blocked(vehicle)
+                return
+            desired = (0.0, 0.0)
+        elif (
+            corridor_wait_owner is None
+            and self._corridor_rejoin_target_m is None
+        ):
+            self._coordination_wait_reason = None
+            self._coordination_wait_owner_id = None
+            desired = self.navigation.update(
+                pose=pose,
+                local_map=local_map,
+                max_linear_mps=vehicle.linear_speed,
+                max_angular_rps=vehicle.angular_speed,
+                advance_result=advance_result,
+                map_delta=map_delta,
+                safety=safety,
+            )
+            if self.navigation.status == "reached":
+                self._complete_subgoal(vehicle, anchor, pose, local_map)
+                return
+            if self.navigation.status == "blocked":
+                if (
+                    self.navigation.reason == "no_path"
+                    and persistent_map is not None
+                    and callable(classify_no_path)
+                ):
+                    no_path_kind = classify_no_path(
+                        pose,
+                        persistent_map,
+                        local_map,
+                        transient_active=transient_active,
+                        attributed_peer_active=attributed_peer_active,
+                    )
+                    if no_path_kind != "static":
+                        desired = (0.0, 0.0)
+                    else:
+                        self._finish_blocked(vehicle)
+                        return
+                else:
+                    self._finish_blocked(vehicle)
+                    return
+        else:
+            # A live corridor lease is an explicit coordination wait, not a
+            # navigation failure.  A staged waiter also keeps it frozen until
+            # it has reversed over the already-validated segment; planning
+            # from the side pocket can otherwise produce a terminal no_path.
+            self._coordination_wait_reason = (
+                None if corridor_wait_owner is None else "corridor_lease"
+            )
+            self._coordination_wait_owner_id = corridor_wait_owner
+            desired = (0.0, 0.0)
 
         desired = self._coordinate_desired(
             desired,
@@ -603,8 +1219,15 @@ class RobotController:
             vehicle_id=vehicle_id,
             anchor=anchor,
             pose=pose,
+            local_map=local_map,
+            now=now,
             peer_states=peer_states,
+            peer_motion_intents=peer_motion_intents,
+            coordination_map=coordination_map,
+            coordination_ready=coordination_ready,
+            expected_peer_vehicle_ids=expected_peer_vehicle_ids,
         )
+        corridor_rejoin_active = self._corridor_rejoin_target_m is not None
 
         decision = safety.evaluate(
             vehicle,
@@ -622,6 +1245,13 @@ class RobotController:
             return
         if decision.state == "stopped":
             vehicle.stop(now)
+            if (
+                corridor_rejoin_active
+                and decision.reason == "safety_obstacle"
+                and safety_scan_points is not None
+                and any(point.dynamic for point in safety_scan_points)
+            ):
+                return
             if self.navigation.finish_nearby_safe_stop(pose, decision.reason):
                 self._complete_subgoal(vehicle, anchor, pose, local_map)
                 return
@@ -646,14 +1276,474 @@ class RobotController:
         vehicle_id: str | None,
         anchor: AnchorSpec,
         pose: PoseEstimate,
+        local_map: ObservedGrid,
+        now: float,
         peer_states: tuple[PeerVehicleState, ...],
+        peer_motion_intents: tuple[PeerMotionIntent, ...],
+        coordination_map: ObservedGrid | None = None,
+        coordination_ready: bool | None = None,
+        expected_peer_vehicle_ids: tuple[str, ...] = (),
     ) -> tuple[float, float]:
         if vehicle_id is None:
             self._clear_yield()
             return desired
 
         peers = {state.source_vehicle_id: state for state in peer_states}
+        intents = {
+            intent.source_vehicle_id: intent for intent in peer_motion_intents
+        }
+        self._known_coordination_peer_ids.update(expected_peer_vehicle_ids)
+        self._known_coordination_peer_ids.update(peers)
+        self._known_coordination_peer_ids.update(intents)
+        self._known_coordination_peer_ids.discard(vehicle_id)
+        fresh_intent_quorum = (
+            coordination_ready is not False
+            and self._known_coordination_peer_ids <= intents.keys()
+        )
         motion_target = self.navigation.motion_target
+        self._intent_target_m = motion_target
+        self._intent_priority_owner_id = vehicle_id
+        current_cell = _coordination_cell(
+            anchor,
+            (pose.x_m, pose.y_m),
+            local_map.resolution_m,
+        )
+        global_x_m, global_y_m, _ = anchor.anchor_to_global(
+            pose.x_m,
+            pose.y_m,
+            pose.yaw_rad,
+        )
+        if self._corridor is not None and _corridor_passed(
+            self._corridor,
+            (global_x_m, global_y_m),
+            local_map.resolution_m,
+            vehicle.radius,
+        ):
+            self._corridor = None
+            self._corridor_reserved = False
+            self._corridor_admission_confirmed = False
+            self._corridor_claim_ticks = 0
+            self._corridor_rejoin_target_m = None
+            self._coordination_wait_reason = None
+            self._coordination_wait_owner_id = None
+        if self._corridor is None:
+            corridor_source = coordination_map or local_map
+            detect_corridor = getattr(self.navigation, "coordination_corridor", None)
+            local_corridor = (
+                None
+                if detect_corridor is None
+                else detect_corridor(pose, corridor_source)
+            )
+            if (
+                isinstance(local_corridor, tuple)
+                and len(local_corridor) == 2
+                and all(
+                    isinstance(cell, tuple)
+                    and len(cell) == 2
+                    and all(type(value) is int for value in cell)
+                    for cell in local_corridor
+                )
+            ):
+                self._corridor = _global_corridor(
+                    anchor,
+                    local_corridor,
+                    local_map.resolution_m,
+                    current_cell,
+                )
+                self._corridor_admission_confirmed = False
+                self._corridor_claim_ticks = 0
+        if self._last_coordination_cell != current_cell:
+            self._last_coordination_cell = current_cell
+            if self._corridor is None:
+                self._reservation_wait_ticks = 0
+            self._reservation_hold_ticks = 0
+            self._reservation_cells = None
+        target_cell = (
+            None
+            if motion_target is None
+            else _coordination_cell(anchor, motion_target, local_map.resolution_m)
+        )
+        corridor_peers: list[PeerMotionIntent] = []
+        if self._corridor is not None:
+            while True:
+                corridor_peers = [
+                    intent
+                    for intent in peer_motion_intents
+                    if intent.corridor is not None
+                    and corridor_descriptors_conflict(
+                        self._corridor,
+                        intent.corridor,
+                    )
+                ]
+                extended = self._corridor
+                for peer_intent in corridor_peers:
+                    assert peer_intent.corridor is not None
+                    extended = _extend_corridor_release(
+                        extended,
+                        peer_intent.corridor,
+                    )
+                if extended == self._corridor:
+                    break
+                self._corridor = extended
+        own = PeerMotionIntent(
+            vehicle_id,
+            1,
+            1,
+            now,
+            MOTION_INTENT_TTL_S,
+            current_cell,
+            target_cell,
+            self._reservation_wait_ticks,
+            vehicle_id,
+            (
+                self._corridor_reserved
+                if self._corridor is not None
+                else self._intent_reserved
+                and self._reservation_cells == (current_cell, target_cell)
+                and self._reservation_hold_ticks
+                < PEER_RESERVATION_MAX_HOLD_TICKS
+            ),
+            self._corridor,
+        )
+        corridor_peer_ids = {
+            intent.source_vehicle_id for intent in corridor_peers
+        }
+        if self._corridor is not None:
+            live_corridor_vehicle_ids = frozenset(
+                corridor_peer_ids | {vehicle_id}
+            )
+            corridor_length = round(
+                math.dist(
+                    self._corridor.entry_cell,
+                    self._corridor.exit_cell,
+                )
+            )
+            inside = 0 <= _corridor_progress(self._corridor, current_cell) <= (
+                corridor_length
+            )
+            winner = own
+            if not inside:
+                for peer_intent in sorted(
+                    corridor_peers,
+                    key=lambda intent: intent.source_vehicle_id,
+                ):
+                    peer_intent = _effective_corridor_intent(
+                        peer_intent,
+                        live_corridor_vehicle_ids,
+                    )
+                    if motion_intent_precedes(peer_intent, winner):
+                        winner = peer_intent
+            front_waiter = _front_corridor_waiter(
+                winner,
+                (own, *corridor_peers),
+            )
+            if winner is not own:
+                self._corridor_reserved = False
+                self._corridor_admission_confirmed = False
+                self._corridor_claim_ticks = 0
+                self._intent_reserved = False
+                self._intent_priority_owner_id = winner.priority_owner_id
+                self._coordination_wait_reason = (
+                    "corridor_lease"
+                    if winner.reserved
+                    and winner.source_vehicle_id == winner.priority_owner_id
+                    else "corridor_election"
+                )
+                self._coordination_wait_owner_id = winner.priority_owner_id
+                self._reservation_wait_ticks = min(
+                    MAX_INTENT_WAIT_TICKS,
+                    self._reservation_wait_ticks + 1,
+                )
+                axis = (
+                    0
+                    if self._corridor.entry_cell[1]
+                    == self._corridor.exit_cell[1]
+                    else 1
+                )
+                fixed_axis = 1 - axis
+                winner_state = peers.get(winner.source_vehicle_id)
+                winner_path_fixed_m = _corridor_path_fixed_m(
+                    winner,
+                    winner_state,
+                    local_map.resolution_m,
+                )
+                required_center_clearance_m = (
+                    2 * vehicle.radius + AUTOMATIC_MINIMUM_CLEARANCE_M
+                    if winner_state is None
+                    else vehicle.radius
+                    + winner_state.radius_m
+                    + math.sqrt(max(winner_state.covariance[:2]))
+                    + AUTOMATIC_MINIMUM_CLEARANCE_M
+                )
+                current_lateral_clearance_m = abs(
+                    (global_x_m, global_y_m)[fixed_axis]
+                    - winner_path_fixed_m
+                )
+                current_sweep_clearance_m = _intent_sweep_distance(
+                    (global_x_m, global_y_m),
+                    winner,
+                    winner_state,
+                    local_map.resolution_m,
+                )
+                current_clearance_score_m = min(
+                    current_lateral_clearance_m,
+                    current_sweep_clearance_m,
+                )
+                unavailable = {
+                    cell
+                    for intent in peer_motion_intents
+                    for cell in (intent.current_cell, intent.target_cell)
+                    if cell is not None
+                }
+                choices = []
+                for detour_m in self.navigation.coordination_detours(
+                    pose,
+                    local_map,
+                ):
+                    detour_cell = _coordination_cell(
+                        anchor,
+                        detour_m,
+                        local_map.resolution_m,
+                    )
+                    lateral_offset = abs(
+                        detour_cell[fixed_axis]
+                        - self._corridor.entry_cell[fixed_axis]
+                    )
+                    detour_global_x_m, detour_global_y_m, _ = (
+                        anchor.anchor_to_global(*detour_m, 0.0)
+                    )
+                    detour_lateral_clearance_m = abs(
+                        (detour_global_x_m, detour_global_y_m)[fixed_axis]
+                        - winner_path_fixed_m
+                    )
+                    detour_sweep_clearance_m = _intent_sweep_distance(
+                        (detour_global_x_m, detour_global_y_m),
+                        winner,
+                        winner_state,
+                        local_map.resolution_m,
+                    )
+                    detour_clearance_score_m = min(
+                        detour_lateral_clearance_m,
+                        detour_sweep_clearance_m,
+                    )
+                    if (
+                        detour_cell in unavailable
+                        or _corridor_progress(self._corridor, detour_cell) > 0
+                        or lateral_offset
+                        <= abs(
+                            current_cell[fixed_axis]
+                            - self._corridor.entry_cell[fixed_axis]
+                        )
+                        or detour_clearance_score_m
+                        <= current_clearance_score_m + 1e-12
+                    ):
+                        continue
+                    choices.append(
+                        (
+                            -detour_clearance_score_m,
+                            -lateral_offset,
+                            detour_cell,
+                            detour_m,
+                        )
+                    )
+                staged_position_clear = (
+                    current_lateral_clearance_m
+                    >= required_center_clearance_m - 1e-12
+                    and current_sweep_clearance_m
+                    >= required_center_clearance_m - 1e-12
+                )
+                stage_until_clear = (
+                    not staged_position_clear
+                    and front_waiter is not None
+                    and front_waiter.source_vehicle_id == vehicle_id
+                )
+                if choices and stage_until_clear:
+                    _, _, target_cell, motion_target = min(choices)
+                    if self._corridor_rejoin_target_m is None:
+                        self._corridor_rejoin_target_m = (
+                            pose.x_m,
+                            pose.y_m,
+                        )
+                    self._intent_target_m = motion_target
+                    return _intent_setpoint(motion_target, pose, vehicle)
+                if staged_position_clear:
+                    self._intent_target_m = None
+                return 0.0, 0.0
+            self._corridor_reserved = True
+            self._intent_reserved = True
+            self._intent_priority_owner_id = vehicle_id
+            self._coordination_wait_reason = None
+            self._coordination_wait_owner_id = None
+            if inside:
+                self._corridor_admission_confirmed = True
+            elif not self._corridor_admission_confirmed:
+                self._corridor_claim_ticks = min(
+                    PEER_RESERVATION_MAX_HOLD_TICKS,
+                    self._corridor_claim_ticks + 1,
+                )
+                acknowledged = (
+                    bool(corridor_peers)
+                    and all(
+                        not intent.reserved
+                        and intent.priority_owner_id == vehicle_id
+                        for intent in corridor_peers
+                    )
+                    and fresh_intent_quorum
+                )
+                uncontested_announcement_complete = (
+                    not corridor_peers
+                    and fresh_intent_quorum
+                    and self._corridor_claim_ticks >= PEER_YIELD_CLEAR_TICKS
+                )
+                self._corridor_admission_confirmed = (
+                    acknowledged or uncontested_announcement_complete
+                )
+            own = PeerMotionIntent(
+                vehicle_id,
+                1,
+                1,
+                now,
+                MOTION_INTENT_TTL_S,
+                current_cell,
+                target_cell,
+                self._reservation_wait_ticks,
+                vehicle_id,
+                True,
+                self._corridor,
+            )
+            front_waiter_state = (
+                None
+                if front_waiter is None
+                else peers.get(front_waiter.source_vehicle_id)
+            )
+            front_waiter_staged = (
+                front_waiter is None
+                or _corridor_waiter_is_staged(
+                    own,
+                    front_waiter,
+                    None,
+                    front_waiter_state,
+                    local_map.resolution_m,
+                    vehicle.radius,
+                    (global_x_m, global_y_m),
+                )
+            )
+            rejoin_target = self._corridor_rejoin_target_m
+            rejoin_global_m = None
+            rejoin_stays_before_entry = False
+            if rejoin_target is not None:
+                rejoin_global_x_m, rejoin_global_y_m, _ = anchor.anchor_to_global(
+                    *rejoin_target,
+                    0.0,
+                )
+                rejoin_global_m = rejoin_global_x_m, rejoin_global_y_m
+                rejoin_stays_before_entry = (
+                    _rejoin_segment_stays_before_corridor_entry(
+                        self._corridor,
+                        (global_x_m, global_y_m),
+                        rejoin_global_m,
+                        local_map.resolution_m,
+                        vehicle.radius,
+                    )
+                )
+            entry_gate_blocked = (
+                not self._corridor_admission_confirmed
+                or not front_waiter_staged
+            ) and _corridor_entry_gate_reached(
+                self._corridor,
+                (global_x_m, global_y_m),
+                local_map.resolution_m,
+                vehicle,
+            )
+            if entry_gate_blocked and not rejoin_stays_before_entry:
+                return 0.0, 0.0
+            if rejoin_target is not None:
+                assert rejoin_global_m is not None
+                if _rejoin_segment_blocked_by_peer(
+                    (global_x_m, global_y_m),
+                    rejoin_global_m,
+                    vehicle,
+                    peer_states,
+                ):
+                    self._corridor_rejoin_target_m = None
+                    self._intent_target_m = None
+                    return 0.0, 0.0
+                if math.dist(
+                    (pose.x_m, pose.y_m),
+                    rejoin_target,
+                ) > CORRIDOR_REJOIN_TOLERANCE_M:
+                    self._intent_target_m = rejoin_target
+                    return _intent_setpoint(rejoin_target, pose, vehicle)
+                self._corridor_rejoin_target_m = None
+                self._intent_target_m = None
+                return 0.0, 0.0
+        requesters = [
+            intent
+            for intent in peer_motion_intents
+            if intent.source_vehicle_id not in corridor_peer_ids
+            and intent.target_cell == current_cell
+            and intent.current_cell != current_cell
+        ]
+        inherited_from = None
+        inherited_own = inherit_motion_priority(own, tuple(requesters))
+        if inherited_own.priority_owner_id != own.priority_owner_id:
+            inherited_from = next(
+                requester
+                for requester in requesters
+                if requester.priority_owner_id == inherited_own.priority_owner_id
+            )
+            own = inherited_own
+            self._intent_priority_owner_id = own.priority_owner_id
+
+        swap_request = next(
+            (
+                requester
+                for requester in requesters
+                if target_cell is None or requester.current_cell == target_cell
+            ),
+            None,
+        )
+        if swap_request is not None:
+            unavailable = {
+                cell
+                for intent in peer_motion_intents
+                for cell in (intent.current_cell, intent.target_cell)
+                if cell is not None
+            }
+            for detour_m in self.navigation.coordination_detours(pose, local_map):
+                detour_cell = _coordination_cell(
+                    anchor,
+                    detour_m,
+                    local_map.resolution_m,
+                )
+                if detour_cell in unavailable:
+                    continue
+                motion_target = detour_m
+                target_cell = detour_cell
+                desired = _intent_setpoint(detour_m, pose, vehicle)
+                self._intent_target_m = detour_m
+                own = PeerMotionIntent(
+                    vehicle_id,
+                    1,
+                    1,
+                    now,
+                    MOTION_INTENT_TTL_S,
+                    current_cell,
+                    target_cell,
+                    own.wait_ticks,
+                    own.priority_owner_id,
+                    own.reserved,
+                    own.corridor,
+                )
+                break
+
+        vacating_for = (
+            None
+            if inherited_from is None
+            or target_cell in {None, current_cell, inherited_from.current_cell}
+            else inherited_from.source_vehicle_id
+        )
+
         travel_limit_m = (
             None
             if motion_target is None
@@ -661,17 +1751,36 @@ class RobotController:
         )
         if self._yielding_for is not None:
             peer = peers.get(self._yielding_for)
-            if peer is None:
+            peer_intent = intents.get(self._yielding_for)
+            if peer is None or (
+                self._yield_requires_intent and peer_intent is None
+            ):
+                self._reservation_wait_ticks = min(
+                    MAX_INTENT_WAIT_TICKS,
+                    self._reservation_wait_ticks + 1,
+                )
+                self._intent_reserved = False
                 return 0.0, 0.0
-            if _peer_motion_conflicts(
-                desired,
-                vehicle,
-                anchor,
-                pose,
-                peer,
-                travel_limit_m,
+            still_conflicts = _peer_motion_conflicts(
+                desired, vehicle, anchor, pose, peer, travel_limit_m
+            ) or (
+                peer_intent is not None
+                and (
+                    own.target_cell == peer_intent.current_cell
+                    or _motion_intents_conflict(own, peer_intent)
+                )
+            )
+            if still_conflicts and (
+                peer_intent is None
+                or own.target_cell == peer_intent.current_cell
+                or motion_intent_precedes(peer_intent, own)
             ):
                 self._yield_clear_ticks = 0
+                self._reservation_wait_ticks = min(
+                    MAX_INTENT_WAIT_TICKS,
+                    self._reservation_wait_ticks + 1,
+                )
+                self._intent_reserved = False
                 if desired[0] == 0.0 and desired[1] != 0.0:
                     return desired
                 if desired == (0.0, 0.0):
@@ -682,14 +1791,39 @@ class RobotController:
             self._yield_clear_ticks += 1
             if self._yield_clear_ticks < PEER_YIELD_CLEAR_TICKS:
                 return 0.0, 0.0
-            self._clear_yield()
+            self._yielding_for = None
+            self._yield_requires_intent = False
+            self._yield_clear_ticks = 0
 
-        # ponytail: lexical priority is sufficient for two vehicles; replace it
-        # with reservations only when cyclic three-plus-vehicle conflicts require it.
-        conflicts = sorted(
+        intent_conflicts = []
+        for peer_intent in peer_motion_intents:
+            if peer_intent.source_vehicle_id in corridor_peer_ids:
+                continue
+            peer = peers.get(peer_intent.source_vehicle_id)
+            if peer is None:
+                continue
+            if peer_intent.source_vehicle_id == vacating_for:
+                continue
+            target_occupied = own.target_cell == peer_intent.current_cell
+            cell_conflict = _motion_intents_conflict(own, peer_intent)
+            trajectory_conflict = _peer_motion_conflicts(
+                desired,
+                vehicle,
+                anchor,
+                pose,
+                peer,
+                travel_limit_m,
+            )
+            if target_occupied or (
+                (cell_conflict or trajectory_conflict)
+                and motion_intent_precedes(peer_intent, own)
+            ):
+                intent_conflicts.append(peer_intent.source_vehicle_id)
+        fallback_conflicts = [
             state.source_vehicle_id
             for state in peer_states
-            if vehicle_id > state.source_vehicle_id
+            if state.source_vehicle_id not in intents
+            and vehicle_id > state.source_vehicle_id
             and _peer_motion_conflicts(
                 desired,
                 vehicle,
@@ -698,16 +1832,58 @@ class RobotController:
                 state,
                 travel_limit_m,
             )
-        )
+        ]
+        conflicts = sorted({*intent_conflicts, *fallback_conflicts})
         if conflicts:
             self._yielding_for = conflicts[0]
+            self._yield_requires_intent = conflicts[0] in intents
             self._yield_clear_ticks = 0
+            self._reservation_wait_ticks = min(
+                MAX_INTENT_WAIT_TICKS,
+                self._reservation_wait_ticks + 1,
+            )
+            self._intent_reserved = False
             return 0.0, 0.0
+
+        if self._corridor is not None:
+            self._intent_reserved = self._corridor_reserved
+            return desired
+
+        cells = current_cell, target_cell
+        if target_cell is not None and target_cell != current_cell:
+            if self._reservation_cells == cells:
+                self._reservation_hold_ticks += 1
+            else:
+                self._reservation_cells = cells
+                self._reservation_hold_ticks = 0
+            self._intent_reserved = (
+                self._reservation_hold_ticks < PEER_RESERVATION_MAX_HOLD_TICKS
+            )
+        else:
+            self._intent_reserved = False
+            self._reservation_cells = None
+            self._reservation_hold_ticks = 0
         return desired
 
     def _clear_yield(self) -> None:
         self._yielding_for = None
+        self._yield_requires_intent = False
         self._yield_clear_ticks = 0
+        self._reservation_wait_ticks = 0
+        self._intent_priority_owner_id = None
+        self._intent_target_m = None
+        self._intent_reserved = False
+        self._reservation_cells = None
+        self._reservation_hold_ticks = 0
+        self._last_coordination_cell = None
+        self._corridor = None
+        self._corridor_reserved = False
+        self._corridor_admission_confirmed = False
+        self._corridor_claim_ticks = 0
+        self._corridor_rejoin_target_m = None
+        self._coordination_wait_reason = None
+        self._coordination_wait_owner_id = None
+        self._known_coordination_peer_ids.clear()
 
     def disconnect(self, vehicle: Vehicle) -> None:
         vehicle.stop()
@@ -760,6 +1936,26 @@ class RobotController:
                 "mission_ids": [mission.mission_id for mission in self._pending],
             },
             "manual_setpoint_active": manual_setpoint_active,
+            "coordination": {
+                "state": (
+                    "waiting"
+                    if self._coordination_wait_reason is not None
+                    else "reserved"
+                    if self._corridor_reserved
+                    and self._corridor_admission_confirmed
+                    else "tentative"
+                    if self._corridor_reserved
+                    else "idle"
+                ),
+                "reason": self._coordination_wait_reason,
+                "priority_owner_vehicle_id": (
+                    self._coordination_wait_owner_id
+                    if self._coordination_wait_reason is not None
+                    else self._intent_priority_owner_id
+                    if self._corridor_reserved
+                    else None
+                ),
+            },
             "navigation": self.navigation.snapshot(),
             "mission_events": {
                 "event_epoch": self.event_epoch,

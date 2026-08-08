@@ -130,6 +130,30 @@ def relay_peer_states(fleet: FleetRuntime) -> None:
 
 
 class TestFleetScenario(unittest.TestCase):
+    def test_robot_node_passes_network_membership_to_coordination(self) -> None:
+        fleet = peer_fleet(AnchorPose(5.0, 5.0, 0.0), AnchorPose(15.0, 5.0, 0.0))
+        node = fleet.nodes["vehicle_1"]
+        node.map_sync.set_health(
+            ready=True,
+            connected_vehicle_ids=("vehicle_2",),
+        )
+        controller = Mock()
+        controller.planning_ignored_peer_ids.return_value = frozenset()
+        controller.motion_intent = (None, 0, "vehicle_1", False, None)
+        node.controller = controller
+
+        node.control(
+            fleet.world.vehicle("vehicle_1"),
+            fleet.world.sensor_grid("vehicle_1"),
+            fleet.world.now,
+        )
+
+        self.assertIs(controller.tick.call_args.kwargs["coordination_ready"], True)
+        self.assertEqual(
+            controller.tick.call_args.kwargs["expected_peer_vehicle_ids"],
+            ("vehicle_2",),
+        )
+
     def test_example_declares_four_unique_endpoints_and_spawns(self) -> None:
         loaded = FleetScenario.load(
             REPO_ROOT / "examples" / "four_vehicle_scenario.json"
@@ -359,6 +383,49 @@ class TestFleetRuntime(unittest.TestCase):
         self.assertEqual(
             receiver._planning_map.peer_exclusion_circles(),
             (),
+        )
+
+    def test_ignored_corridor_peer_keeps_static_and_unattributed_obstacles(self) -> None:
+        fleet = peer_fleet(
+            AnchorPose(5.0, 5.0, 0.0),
+            AnchorPose(10.0, 10.0, 0.0),
+        )
+        source = fleet.nodes["vehicle_1"].map_sync
+        receiver = fleet.nodes["vehicle_2"]
+        payload = source.prepare_peer_state()
+        self.assertTrue(
+            receiver.map_sync.receive_peer_state(
+                "peer_1",
+                "vehicle_1",
+                payload,
+                received_at_s=1.0,
+            )
+        )
+        active = receiver.map_sync.peer_vehicle_states(now_s=1.0)
+        peer_hit = (-10, -10)
+        unattributed_hit = (-8, -10)
+        static_obstacle = (-6, -10)
+        receiver.local_state.local_map._cells[static_obstacle] = OCCUPIED
+        receiver.local_state.local_map.revision += 1
+        receiver._lidar_dynamic_cells = {peer_hit, unattributed_hit}
+
+        receiver._update_planning_map(
+            peer_states=active,
+            ignored_peer_vehicle_ids=frozenset(("vehicle_1",)),
+        )
+
+        self.assertEqual(receiver._pending_map_delta.peer_forbidden_cells, ())
+        self.assertNotEqual(
+            receiver._planning_map.cell_without_peers(*peer_hit),
+            OCCUPIED,
+        )
+        self.assertEqual(
+            receiver._planning_map.cell_without_peers(*unattributed_hit),
+            OCCUPIED,
+        )
+        self.assertEqual(
+            receiver._planning_map.get_cell(*static_obstacle),
+            OCCUPIED,
         )
 
     def test_lidar_peer_dedup_uses_exact_cell_circle_intersection(self) -> None:
@@ -802,6 +869,7 @@ class TestFleetRuntime(unittest.TestCase):
                 for node in fleet.nodes.values()
             )
         )
+        nearby_updates = []
         for vehicle_id, node in fleet.nodes.items():
             if node.controller.navigation.goal_mode == "nearby_safe":
                 vehicle = fleet.world.vehicle(vehicle_id)
@@ -809,6 +877,29 @@ class TestFleetRuntime(unittest.TestCase):
                     math.dist((vehicle.x, vehicle.y), goal) - vehicle.radius,
                     1.0,
                 )
+                terminal = node.controller.events_after(0)[-1].as_dict(
+                    fleet.timestamp_at()
+                )
+                nearby_updates.append(terminal)
+                self.assertEqual(terminal["status"], "reached")
+                self.assertEqual(terminal["reason"], "nearby_safe_stop")
+                self.assertEqual(
+                    terminal["goal"],
+                    {
+                        "frame_id": "global_map",
+                        "x_m": goal[0],
+                        "y_m": goal[1],
+                    },
+                )
+                navigation = terminal["navigation"]
+                self.assertEqual(navigation["goal_mode"], "nearby_safe")
+                self.assertEqual(navigation["reason"], "nearby_safe_stop")
+                self.assertNotEqual(
+                    navigation["effective_goal"],
+                    navigation["requested_goal"],
+                )
+                self.assertLessEqual(navigation["approach_distance_m"], 1.0)
+        self.assertTrue(nearby_updates)
         self.assertGreaterEqual(
             minimum_separation,
             first.radius + second.radius + HARD_STOP_CLEARANCE_M - 1e-9,

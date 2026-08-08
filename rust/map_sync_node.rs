@@ -37,6 +37,7 @@ use tokio::{
 const SIDECAR_PROTOCOL: &str = "mockvehicle2d-map-sync-sidecar/1";
 const DELTA_PROTOCOL: &str = "mockvehicle2d-map-delta/1";
 const PEER_STATE_PROTOCOL: &str = "mockvehicle2d-peer-state/1";
+const MOTION_INTENT_PROTOCOL: &str = "mockvehicle2d-motion-intent/2";
 const MAX_MESSAGE_BYTES: usize = 256 * 1024;
 const MAX_PEERS: usize = 3;
 static IDENTITY_TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
@@ -419,7 +420,10 @@ fn payload_identity(payload: &Value) -> Result<(&str, &str, &str, u64), &'static
         .get("protocol")
         .and_then(Value::as_str)
         .ok_or("missing protocol")?;
-    if !matches!(protocol, DELTA_PROTOCOL | PEER_STATE_PROTOCOL) {
+    if !matches!(
+        protocol,
+        DELTA_PROTOCOL | PEER_STATE_PROTOCOL | MOTION_INTENT_PROTOCOL
+    ) {
         return Err("unsupported map-sync protocol");
     }
     let session = object
@@ -830,18 +834,19 @@ mod tests {
     fn authorization_binds_signed_peer_to_vehicle_and_session() {
         let peer = identity::Keypair::generate_ed25519().public().to_peer_id();
         let peers = HashMap::from([(peer, "vehicle_1".to_string())]);
-        let payload = serde_json::json!({
-            "protocol": PEER_STATE_PROTOCOL,
-            "session_id": "session_1",
-            "source_vehicle_id": "vehicle_1",
-            "state_generation": 42,
-            "sequence": 1
-        });
+        for protocol in [PEER_STATE_PROTOCOL, MOTION_INTENT_PROTOCOL] {
+            let payload = serde_json::json!({
+                "protocol": protocol,
+                "session_id": "session_1",
+                "source_vehicle_id": "vehicle_1",
+                "sequence": 1
+            });
 
-        assert_eq!(
-            authorized_payload(&payload, &peer, "session_1", &peers),
-            Some(("vehicle_1", 1)),
-        );
-        assert!(authorized_payload(&payload, &peer, "other", &peers).is_none());
+            assert_eq!(
+                authorized_payload(&payload, &peer, "session_1", &peers),
+                Some(("vehicle_1", 1)),
+            );
+            assert!(authorized_payload(&payload, &peer, "other", &peers).is_none());
+        }
     }
 }

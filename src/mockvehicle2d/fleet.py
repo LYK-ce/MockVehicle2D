@@ -608,6 +608,18 @@ class _TransientPlanningGrid:
     def peer_exclusion_circles(self) -> tuple[PeerExclusion, ...]:
         return self._peer_exclusion_circles
 
+    def persistent_grid(self) -> ObservedGrid:
+        """Return the OwnMap view without any transient obstacle overlay."""
+        return self._persistent
+
+    def has_transient_obstacles(self) -> bool:
+        return bool(self._cells or self._peer_exclusion_circles)
+
+    def has_attributed_peer_obstacles(self) -> bool:
+        return bool(
+            self._peer_forbidden_cells or self._peer_exclusion_circles
+        )
+
     def snapshot(self) -> dict[str, object]:
         snapshot = self._persistent.snapshot()
         states = {
@@ -777,7 +789,16 @@ class RobotNode:
         peer_states = (
             () if self.map_sync is None else self.map_sync.peer_vehicle_states()
         )
-        self._update_planning_map(peer_states=peer_states)
+        peer_motion_intents = (
+            () if self.map_sync is None else self.map_sync.peer_motion_intents()
+        )
+        self._update_planning_map(
+            peer_states=peer_states,
+            ignored_peer_vehicle_ids=self.controller.planning_ignored_peer_ids(
+                self.spec.vehicle_id,
+                peer_motion_intents,
+            ),
+        )
         scan_age_s = (
             None
             if self._latest_scan_monotonic_s is None
@@ -804,7 +825,30 @@ class RobotNode:
             safety_scan_healthy=scan_fresh,
             vehicle_id=self.spec.vehicle_id,
             peer_states=peer_states,
+            peer_motion_intents=peer_motion_intents,
+            coordination_map=self.local_state.local_map,
+            coordination_ready=(
+                None if self.map_sync is None else self.map_sync.ready
+            ),
+            expected_peer_vehicle_ids=(
+                ()
+                if self.map_sync is None
+                else self.map_sync.expected_peer_vehicle_ids
+            ),
         )
+        if self.map_sync is not None:
+            target_m, wait_ticks, owner_id, reserved, corridor = (
+                self.controller.motion_intent
+            )
+            self.map_sync.record_motion_intent(
+                self.local_state.pose,
+                target_m=target_m,
+                wait_ticks=wait_ticks,
+                priority_owner_id=owner_id or self.spec.vehicle_id,
+                reserved=reserved,
+                corridor=corridor,
+                timestamp_s=now,
+            )
         self._pending_map_delta = None
         self._pending_advance = SafetyAdvanceResult()
 
@@ -813,16 +857,32 @@ class RobotNode:
         *,
         peer_states: tuple[PeerVehicleState, ...] | None = None,
         persistent_delta: LocalMapDelta | None = None,
+        ignored_peer_vehicle_ids: frozenset[str] = frozenset(),
     ) -> None:
         if peer_states is None:
             peer_states = (
                 () if self.map_sync is None else self.map_sync.peer_vehicle_states()
             )
-        peer_cells, peer_circles, peer_hit_envelopes = _peer_vehicle_exclusions(
+        all_peer_exclusions = _peer_vehicle_exclusions(
             peer_states,
             self.local_state.anchor,
             self.local_state.local_map.resolution_m,
             self._own_radius_m,
+        )
+        peer_hit_envelopes = all_peer_exclusions[2]
+        peer_cells, peer_circles, _ = (
+            all_peer_exclusions
+            if not ignored_peer_vehicle_ids
+            else _peer_vehicle_exclusions(
+                tuple(
+                    state
+                    for state in peer_states
+                    if state.source_vehicle_id not in ignored_peer_vehicle_ids
+                ),
+                self.local_state.anchor,
+                self.local_state.local_map.resolution_m,
+                self._own_radius_m,
+            )
         )
         dynamic_cells = {
             cell

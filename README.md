@@ -73,7 +73,7 @@ mockvehicle2d episode \
   --max-simulation-s 30 \
   --goto mock_vehicle_01,11,10
 
-# 无 localhost libp2p 的双车交叉基准；进程内 peer-state relay 驱动确定性让行
+# 无 localhost libp2p 的双车交叉基准；进程内 peer-state + motion-intent relay 驱动确定性让行
 mockvehicle2d episode \
   --scenario examples/two_vehicle_crossing_episode.json \
   --max-simulation-s 30 \
@@ -106,12 +106,26 @@ velocity；默认线加速、线减速和角加速上限分别为 `1 m/s²`、`1
 时限时失败结束。`episode` 与 `serve`/`fleet` 使用相同的速度、加减速、半径和 watchdog
 CLI 参数。
 
-多车 Episode 不启动 localhost libp2p，而是把现有 peer-state v1 payload 经过 JSON
-序列化、协议校验和 anchor 变换后，以固定 1 tick 延迟在进程内传递；序列、接收时间和
-`0.35 s` 过期规则与实时 P2P 路径一致。启用了真实 `p2p` 配置的场景仍被拒绝，因为
-libp2p 墙钟调度和 map delta 传播不属于确定性 Episode。两车短时轨迹冲突使用稳定的
-`vehicle_id` 字典序决定通行权；低优先级车辆有界制动并保持任务 active，连续确认冲突
-解除后自动恢复。让行期间 peer state 缺失或过期时保持停车，LocalSafety 仍是最终裁决。
+多车 Episode 不启动 localhost libp2p，而是把现有 peer-state v1 和 motion-intent v2
+payload 经过 JSON 序列化及协议校验后，以固定 1 tick 延迟在进程内传递；序列、接收时间
+和 `0.35 s` 过期规则与实时 P2P 路径一致。启用了真实 `p2p` 配置的场景仍被拒绝，因为
+libp2p 墙钟调度和 map delta 传播不属于确定性 Episode。下一格 vertex/edge-swap 冲突
+使用短租约和等待年龄仲裁，`vehicle_id` 只作最终 tie-break；占路车辆可继承请求者优先级
+并尝试一个本地可通行邻格。让行期间任务保持 active，所依赖的 peer state 或 intent
+缺失/过期时保持停车，连续确认冲突解除后恢复；LocalSafety 仍是最终裁决。
+
+完全观测且内宽不超过约 `3 m` 的直线瓶颈还会使用 motion-intent v2 的有向 corridor
+descriptor 做短租约仲裁。只有一个经对端确认的 owner 可以进入；与 owner 方向相反的
+失败者按距出口侧 entry 的纵向距离和 `vehicle_id` 选出唯一 front waiter，提前进入可逆
+侧向等待，同侧 rear waiter 原地排队。ACK 只确认 owner，不等于入口已安全；
+front waiter 的连续位姿和剩余侧移段未离开 `2r + 0.3 m` 包络前，owner 只能接近入口并在
+物理制动距离外停车。释放要求整个车体和 `0.3 m` 自动安全余量越过远端边界。这是 PIBT
+启发的局部租约机制，不是完整 PIBT、MAPF 或中央车队调度器。
+
+新 owner 只有在 P2P ready 且本 session 的每个 expected vehicle 都有未过期 motion intent
+时才能确认；`corridor:null` 也算明确的无竞争声明，因此独立走廊不会被全局串行。peer
+断联或 intent 过期时，入口外的新 claim fail-closed；已经确认或已入廊的 owner 保留租约
+直到清空并释放。未启用 P2P 且没有已知 peer 的真正单车仍按连续 3 tick 自确认。
 
 标准输出是 schema version 2 的单行 canonical JSON，包含场景 ID、odometry seed、tick 数、
 模拟时长、终止原因，以及每辆车的仿真真值终态、按 tick 采样的路径长度、碰撞/阻断/
@@ -125,17 +139,18 @@ tick、所有无序车辆对的最小圆形 footprint 边缘间距（中心距�
 `CoverageMission`。
 
 Runner 明确拒绝启用真实 P2P 的场景，因为 localhost libp2p 调度和 map delta 传播不属于
-确定性模拟时钟；当前只提供上述进程内 peer-state relay，不包含定时事件或通信故障注入。
+确定性模拟时钟；当前只提供上述进程内 peer-state + motion-intent relay，不包含定时事件或通信故障注入。
 
 四车任务协同回归使用 `tests/fixtures/four_vehicle_mission_matrix.json` 和显式空场，覆盖
-重复共享路口 Patrol、对向合流 Patrol、互不相交 Patrol、相邻静态条带 Coverage、共享
-入口四象限 Coverage，以及 Goto/Patrol/Coverage 混合任务。Coverage 分区由测试输入静态
-分配，接缝小于一个 `0.5 m` 本地网格；它不引入中央地图，也不把 peer evidence 写入
-OwnMap。默认矩阵运行全部六种 `100 ms` 拓扑：
+1/2/4 车互不冲突 Goto、四车循环换位、相邻 Goto 终点、终点车辆挡路绕行、重复共享
+路口 Patrol、对向合流 Patrol、互不相交 Patrol、相邻静态条带 Coverage、共享入口四象限
+Coverage，以及 Goto/Patrol/Coverage 混合任务。每项任务仍归接收命令的原车，协调只影响
+执行期运动。Coverage 分区由测试输入静态分配，接缝小于一个 `0.5 m` 本地网格；它不引入
+中央地图，也不把 peer evidence 写入 OwnMap。
 
 ```bash
 .venv/bin/python -m pytest -p no:cacheprovider -q tests/test_episode.py \
-  -k 'four_vehicle and (patrol or coverage or mixed)'
+  -k 'disjoint_goto or parked_goal_vehicle or four_vehicle and (cycle or adjacent or patrol or coverage or mixed)'
 ```
 
 耗时更长的扩展矩阵选择最困难的对向合流 Patrol 和共享入口 Coverage，分别验证同 seed
@@ -143,6 +158,16 @@ OwnMap。默认矩阵运行全部六种 `100 ms` 拓扑：
 
 ```bash
 .venv/bin/python -m pytest -p no:cacheprovider -q -m extended tests/test_episode.py -k extended_matrix
+```
+
+四车争用同一条 `5 m` 单车道的严格串行验收也标为 extended。当前策略不组成同向 convoy；
+验收给进场、可逆侧移/回归、前车出口冲突和末段共 `130 s` 确定性完成预算，并把深队列
+的连续活动等待限制在 `90 s`：
+
+```bash
+.venv/bin/python -m pytest -p no:cacheprovider -q -m extended \
+  tests/test_motion_coordination.py \
+  -k four_vehicles_share_one_corridor
 ```
 
 ## 多车共享世界
@@ -179,11 +204,12 @@ sidecar；默认无顶层 `p2p` 的场景不启动任何网络进程。每辆车
 
 每车严格维护 OwnMap、按来源划分的 PeerEvidence 和只读 CollaborativeView。远端地图证据
 不会进入 OwnMap、不会重新发布，也暂不改变 D* Lite 或本地安全决策；peer vehicle state
-只作为瞬态 footprint exclusion 和让行输入。P2P 健康度、
+只作为瞬态 footprint exclusion 和让行输入；motion intent 只进入租约仲裁，不进入
+OwnMap、PeerEvidence 或 CollaborativeView。P2P 健康度、
 本地/远端 delta 计数和协同视图摘要通过每车 `pose.p2p_map_sync` 遥测提供。当前仅实现
 在线增量和重复/过期拒绝；离线缺包与后加入节点的 tile 快照恢复留到下一里程碑。
 
-Gossipsub topic 为 `mockvehicle2d/<session_id>/map-delta/1`，payload 是严格的
+Gossipsub topic 为 `mockvehicle2d/<session_id>/fleet-sync/1`，payload 是严格的
 `mockvehicle2d-map-delta/1` JSON：
 
 ```json
@@ -205,6 +231,42 @@ Gossipsub topic 为 `mockvehicle2d/<session_id>/map-delta/1`，payload 是严格
 接收端同时校验 Gossipsub 签名作者 PeerId、车辆白名单、session、frame、anchor、epoch、
 resolution、sequence、消息大小和每个 cell。Python 与对应 sidecar 只通过运行目录中的
 Unix domain socket 交换有界 JSONL 消息，控制 tick 不等待该 socket。
+
+同一 fleet-sync topic 还承载严格的 `mockvehicle2d-motion-intent/2` JSON。它只描述由
+本车 odometry 与 D* 当前 waypoint 生成的一个短期移动，不携带仿真真值：
+
+```json
+{
+  "protocol": "mockvehicle2d-motion-intent/2",
+  "session_id": "four_vehicle_exploration",
+  "source_vehicle_id": "mock_vehicle_01",
+  "intent_generation": 1,
+  "sequence": 9,
+  "frame_id": "global_map",
+  "resolution_m": 1.0,
+  "timestamp_s": 42.1,
+  "lease_duration_s": 0.35,
+  "current_cell": {"gx": 9, "gy": 10},
+  "target_cell": {"gx": 10, "gy": 10},
+  "priority": {"wait_ticks": 3, "owner_vehicle_id": "mock_vehicle_01"},
+  "reserved": true,
+  "corridor": {
+    "entry_cell": {"gx": 9, "gy": 10},
+    "exit_cell": {"gx": 14, "gy": 10}
+  }
+}
+```
+
+接收端严格校验 generation/sequence、global frame、resolution、cell 边界、优先级 owner
+白名单、租约上限和有向 axis-aligned corridor；重复、乱序、超时或额外字段均拒绝。
+没有走廊声明时 `corridor` 必须为 `null`。走廊只从车辆 OwnMap 上已完全观测的直线窄通道
+推导；peer evidence 和仿真真值不会参与检测。相反方向看到的部分 descriptor 会按重叠轴
+匹配并单调扩展释放边界，进入前需要一轮 owner 声明/对端确认。
+
+当前走廊策略严格一次只放行一辆车，因此长走廊和深队列的吞吐近似线性增长。暂未实现
+“暂不可入廊 owner”跳过、同向 directional batching/convoy 或 SIPP 时间窗；这些是后续
+吞吐优化方向。弯曲、分支、过宽或观测不完整的通道回退到下一格与轨迹冲突协调，不会
+被误宣称为完整 PIBT 能力。
 
 ## 控制方式
 
