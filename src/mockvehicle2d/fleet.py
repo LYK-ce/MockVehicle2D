@@ -1051,6 +1051,7 @@ class FleetRuntime:
         self.realtime_factor = realtime_factor
         self._sensor_epoch = world.now
         self._next_scan_index = {vehicle_id: 1 for vehicle_id in nodes}
+        self._control_stop_transitions: frozenset[str] = frozenset()
         self.map_chunks = _encode_map_chunks(world.debug_voxels, world.debug_grid.width)
 
     @classmethod
@@ -1173,6 +1174,11 @@ class FleetRuntime:
             self.world.now if simulation_now is None else simulation_now
         )
 
+    @property
+    def control_stop_transitions(self) -> frozenset[str]:
+        """Vehicles whose controller started bounded braking this tick."""
+        return self._control_stop_transitions
+
     def handle_command(self, vehicle_id: str, command: Command) -> CommandResult:
         node = self.nodes[vehicle_id]
         vehicle = self.world.vehicle(vehicle_id)
@@ -1198,6 +1204,11 @@ class FleetRuntime:
     def tick(self, wall_timestamp: float) -> None:
         if not math.isfinite(wall_timestamp):
             raise ValueError("wall timestamp must be finite")
+        moving_targets = {
+            vehicle_id
+            for vehicle_id in self.nodes
+            if self.world.vehicle(vehicle_id).target_velocities() != (0.0, 0.0)
+        }
         sensor_grids = {
             vehicle_id: self.world.sensor_grid(vehicle_id)
             for vehicle_id in sorted(self.nodes)
@@ -1208,6 +1219,12 @@ class FleetRuntime:
                 sensor_grids[vehicle_id],
                 self.world.now,
             )
+        self._control_stop_transitions = frozenset(
+            vehicle_id
+            for vehicle_id in moving_targets
+            if self.world.vehicle(vehicle_id).target_velocities() == (0.0, 0.0)
+            and self.world.vehicle(vehicle_id).body_velocities() != (0.0, 0.0)
+        )
         target_time = self.world.now + self.tick_s
         self._sample_due_scans(target_time)
         if self.world.now < target_time:

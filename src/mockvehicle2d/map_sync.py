@@ -496,7 +496,7 @@ def _validate_timed_trajectory(
         or not math.isclose(trajectory[0].enter_offset_s, 0.0, abs_tol=1e-12)
         or trajectory[-1].leave_offset_s > MOTION_PLAN_HORIZON_S + 1e-12
         or any(
-            first.leave_offset_s > second.enter_offset_s + 1e-12
+            second.enter_offset_s <= first.leave_offset_s
             or first.cell == second.cell
             for first, second in zip(trajectory, trajectory[1:])
         )
@@ -717,7 +717,7 @@ class MapSyncState:
             or not isinstance(trajectory, tuple)
             or any(not isinstance(item, TimedCell) for item in trajectory)
             or not math.isfinite(committed_until_offset_s)
-            or not 0.0 <= committed_until_offset_s <= MOTION_PLAN_HORIZON_S
+            or not 0.0 <= committed_until_offset_s <= MOTION_COMMIT_HORIZON_S
             or type(goal_hold) is not bool
             or not math.isfinite(safety_time_margin_s)
             or not 0.0 <= safety_time_margin_s <= MAX_RESERVATION_TIME_MARGIN_S
@@ -1251,7 +1251,7 @@ class MapSyncState:
             or type(body["reserved"]) is not bool
             or not 0.0
             <= committed_until_offset_s
-            <= MOTION_PLAN_HORIZON_S
+            <= MOTION_COMMIT_HORIZON_S
             or committed_until_offset_s
             > trajectory[-1].leave_offset_s + 1e-12
             or type(body["goal_hold"]) is not bool

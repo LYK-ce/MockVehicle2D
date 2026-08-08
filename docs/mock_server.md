@@ -138,8 +138,9 @@ map evidence 也不会进入 OwnMap 或自主规划。接收端按 receipt time 
 交叉和 goal hold。未提交候选按冲突等待年龄及 owner/vehicle ID 排序，已 commit 的冲突
 声明只使用 owner/vehicle ID 全序；未同步的 `task_age_ticks` 仅供观测，未来需 Lamport task
 token 才能表达跨车任务先后。占路链递归传播 owner 并只尝试一个邻格 detour。expected
-peer 的 state/intent 缺失、过期或 sidecar 未 ready 时新前缀 fail-closed；LocalSafety 和
-同步物理碰撞仲裁仍是最终保障。OwnMap
+peer 的 state/intent 缺失、过期、同源 generation 不一致或 sidecar 未 ready 时新前缀
+fail-closed。相邻不同 cell 的时间窗必须有正 travel time，commit 上限严格为 `0.8 s`；
+LocalSafety 和同步物理碰撞仲裁仍是最终保障。OwnMap
 能够确认完全观测、直线且内宽不超过约 `3 m` 的瓶颈时，再对重叠 corridor 做去中心化
 选举和确认：模式外停车不受影响；进入前只允许一个 confirmed owner；出口侧反向队列仅
 front waiter 提前做可逆侧移，rear waiter 原地等待；ACK 后 owner 仍要等 front 的连续位姿

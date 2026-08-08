@@ -470,7 +470,8 @@ cell 状态：`0` 可通行、`1` 墙、`2` 无地面/落差。客户端用
 `controller.coordination.state` 为 `idle`、`tentative`、`reserved` 或 `waiting`：
 `tentative` 表示本车已声明走廊但尚未得到对端确认，`reserved` 表示本车是唯一已确认
 owner，`waiting` 的 `reason` 还可为 `corridor_election`、`corridor_lease`、
-`reservation_sync`（expected peer state/intent 不完整）或 `space_time_reservation`
+`reservation_sync`（expected peer state/intent 不完整或同源 generation 不一致）或
+`space_time_reservation`
 （motion-intent v3 时间窗尚不可进入）。已知胜者通过 `priority_owner_vehicle_id` 指出；
 同步等待可能为 `null`。该摘要只用于观察；客户端不得据此绕过 `RobotController` 或
 LocalSafety 下发运动。

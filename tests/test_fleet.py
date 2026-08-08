@@ -1190,6 +1190,7 @@ class TestFleetRuntime(unittest.TestCase):
 
         fleet.tick(1.0)
         fleet.tick(2.0)
+        self.assertEqual(fleet.control_stop_transitions, frozenset())
         poses = fleet.world.truth_snapshot()
         distance_squared = (
             (poses["vehicle_1"][0] - poses["vehicle_2"][0]) ** 2
@@ -1238,6 +1239,35 @@ class TestFleetRuntime(unittest.TestCase):
                 for vehicle_id in reversed_fleet.nodes
             )
         )
+
+    def test_tick_records_control_stop_when_low_speed_brakes_within_one_tick(
+        self,
+    ) -> None:
+        fleet = FleetRuntime.create(
+            scenario(spec(1, 5.0, 5.0)),
+            grid=free_grid(),
+            command_timeout=10.0,
+        )
+        vehicle = fleet.world.vehicle("vehicle_1")
+        vehicle.install_drive(0.05, 0.0, 0.0)
+        fleet.world.advance_to(0.05)
+        vehicle = fleet.world.vehicle("vehicle_1")
+        self.assertEqual(vehicle.body_velocities(), (0.05, 0.0))
+
+        with patch.object(
+            fleet.nodes["vehicle_1"],
+            "control",
+            side_effect=lambda controlled, _grid, _now: controlled.stop(),
+        ):
+            fleet.tick(0.15)
+
+        vehicle = fleet.world.vehicle("vehicle_1")
+        self.assertEqual(
+            fleet.control_stop_transitions,
+            frozenset({"vehicle_1"}),
+        )
+        self.assertEqual(vehicle.target_velocities(), (0.0, 0.0))
+        self.assertEqual(vehicle.body_velocities(), (0.0, 0.0))
 
     def test_accelerating_trajectories_use_physical_time_for_arbitration(self) -> None:
         fleet = FleetRuntime.create(

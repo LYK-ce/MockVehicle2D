@@ -1551,6 +1551,7 @@ class RobotController:
                     now + MOTION_COMMIT_HORIZON_S
                 )
             self._temporal_committed_until_s = min(
+                MOTION_COMMIT_HORIZON_S,
                 self._temporal_commit_deadline_s - now,
                 plan[-1].leave_offset_s,
             )
@@ -1627,6 +1628,11 @@ class RobotController:
             coordination_ready is not False
             and self._known_coordination_peer_ids
             <= (intents.keys() & peers.keys())
+            and all(
+                peers[source].state_generation
+                == intents[source].intent_generation
+                for source in self._known_coordination_peer_ids
+            )
         )
         motion_target = self.navigation.motion_target
         self._intent_target_m = motion_target
@@ -2012,6 +2018,13 @@ class RobotController:
         if self._corridor is None:
             if temporal_quorum_required and not fresh_temporal_quorum:
                 self._invalidate_temporal_commit()
+                if self._yielding_for not in self._known_coordination_peer_ids:
+                    self._yielding_for = min(
+                        self._known_coordination_peer_ids,
+                        default=None,
+                    )
+                self._yield_requires_intent = self._yielding_for is not None
+                self._yield_clear_ticks = 0
                 sync_signature = (
                     "reservation_sync",
                     (
@@ -2620,6 +2633,7 @@ class RobotController:
         pose: PoseEstimate,
         local_map: ObservedGrid,
     ) -> None:
+        self._invalidate_temporal_commit()
         if self._advance_subgoal(vehicle):
             self._start_or_resume(
                 anchor,

@@ -8,6 +8,7 @@ from unittest.mock import Mock, patch
 
 import pytest
 
+from mockvehicle2d.coordination import TimedCell
 from mockvehicle2d.controller import (
     AutoState,
     CoverageMission,
@@ -42,6 +43,7 @@ from mockvehicle2d.local_state import (
 from mockvehicle2d.map_grid import MapGrid
 from mockvehicle2d.map_sync import (
     CorridorDescriptor,
+    MOTION_COMMIT_HORIZON_S,
     MOTION_INTENT_PROTOCOL,
     MOTION_INTENT_TTL_S,
     MapSyncState,
@@ -2383,6 +2385,159 @@ class TestMotionCoordination(unittest.TestCase):
         self.assertEqual(result, (0.5, 0.0))
         self.assertIsNone(controller.snapshot()["coordination"]["reason"])
 
+    def test_temporal_quorum_fails_closed_during_peer_restart_topic_skew(
+        self,
+    ) -> None:
+        anchor = AnchorSpec("spawn_1", 0.0, 0.0, 0.0)
+        peer_anchor = AnchorSpec("spawn_2", 0.0, 0.0, 0.0)
+        receiver = MapSyncState(
+            "session_1",
+            "vehicle_1",
+            anchor,
+            1.0,
+            clock=lambda: 1.0,
+            state_generation=1,
+        )
+        old_peer = MapSyncState(
+            "session_1",
+            "vehicle_2",
+            peer_anchor,
+            1.0,
+            state_generation=1,
+        )
+        restarted_peer = MapSyncState(
+            "session_1",
+            "vehicle_2",
+            peer_anchor,
+            1.0,
+            state_generation=2,
+        )
+        receiver.configure_network(
+            "peer_1",
+            {"vehicle_2": ("peer_2", peer_anchor)},
+        )
+        for source in (old_peer, restarted_peer):
+            source.configure_network(
+                "peer_2",
+                {"vehicle_1": ("peer_1", anchor)},
+            )
+        peer_pose = PoseEstimate(
+            peer_anchor.anchor_id,
+            10.5,
+            0.5,
+            0.0,
+            (0.0, 0.0, 0.0),
+            "nominal",
+            1.0,
+            1,
+        )
+        old_peer.record_motion_intent(
+            peer_pose,
+            target_m=(11.5, 0.5),
+            wait_ticks=0,
+            priority_owner_id="vehicle_2",
+            reserved=True,
+            timestamp_s=1.0,
+        )
+        restarted_peer.record_vehicle_state(
+            peer_pose,
+            radius_m=0.5,
+            linear_mps=0.0,
+            omega_rps=0.0,
+        )
+        self.assertTrue(
+            receiver.receive_transport(
+                "peer_2",
+                "vehicle_2",
+                old_peer.prepare_motion_intent(),
+            )
+        )
+        self.assertTrue(
+            receiver.receive_transport(
+                "peer_2",
+                "vehicle_2",
+                restarted_peer.prepare_peer_state(),
+            )
+        )
+        reverse_receiver = MapSyncState(
+            "session_1",
+            "vehicle_1",
+            anchor,
+            1.0,
+            clock=lambda: 1.0,
+            state_generation=1,
+        )
+        reverse_receiver.configure_network(
+            "peer_1",
+            {"vehicle_2": ("peer_2", peer_anchor)},
+        )
+        old_peer.record_vehicle_state(
+            peer_pose,
+            radius_m=0.5,
+            linear_mps=0.0,
+            omega_rps=0.0,
+        )
+        restarted_peer.record_motion_intent(
+            peer_pose,
+            target_m=(11.5, 0.5),
+            wait_ticks=0,
+            priority_owner_id="vehicle_2",
+            reserved=True,
+            timestamp_s=1.0,
+        )
+        self.assertTrue(
+            reverse_receiver.receive_transport(
+                "peer_2",
+                "vehicle_2",
+                old_peer.prepare_peer_state(),
+            )
+        )
+        self.assertTrue(
+            reverse_receiver.receive_transport(
+                "peer_2",
+                "vehicle_2",
+                restarted_peer.prepare_motion_intent(),
+            )
+        )
+
+        local_pose = PoseEstimate(
+            anchor.anchor_id,
+            0.5,
+            0.5,
+            0.0,
+            (0.0, 0.0, 0.0),
+            "nominal",
+            1.0,
+            1,
+        )
+        for skewed_receiver in (receiver, reverse_receiver):
+            controller = RobotController(
+                Mock(
+                    motion_target=(1.5, 0.5),
+                    coordination_path_cells=Mock(return_value=((0, 0), (1, 0))),
+                    coordination_detours=Mock(return_value=()),
+                )
+            )
+            desired = controller._coordinate_desired(
+                (0.5, 0.0),
+                vehicle=Vehicle(0.5, 0.5, now=0.0),
+                vehicle_id="vehicle_1",
+                anchor=anchor,
+                pose=local_pose,
+                local_map=ObservedGrid(anchor),
+                now=1.0,
+                peer_states=skewed_receiver.peer_vehicle_states(),
+                peer_motion_intents=skewed_receiver.peer_motion_intents(),
+                coordination_ready=True,
+                expected_peer_vehicle_ids=("vehicle_2",),
+            )
+
+            self.assertEqual(desired, (0.0, 0.0))
+            self.assertEqual(
+                controller.snapshot()["coordination"]["reason"],
+                "reservation_sync",
+            )
+
     def test_temporal_commit_survives_cell_progress_then_expires(self) -> None:
         anchor = AnchorSpec("spawn_1", 0.0, 0.0, 0.0)
         local_map = ObservedGrid(anchor)
@@ -2656,17 +2811,18 @@ class TestMotionCoordination(unittest.TestCase):
         receiver.configure_network(
             "peer_2", {"vehicle_1": ("peer_1", first_anchor)}
         )
+        source_pose = PoseEstimate(
+            first_anchor.anchor_id,
+            0.25,
+            0.25,
+            0.0,
+            (0.0, 0.0, 0.0),
+            "nominal",
+            4.0,
+            1,
+        )
         source.record_motion_intent(
-            PoseEstimate(
-                first_anchor.anchor_id,
-                0.25,
-                0.25,
-                0.0,
-                (0.0, 0.0, 0.0),
-                "nominal",
-                4.0,
-                1,
-            ),
+            source_pose,
             target_m=(1.5, 0.5),
             wait_ticks=3,
             priority_owner_id="vehicle_2",
@@ -2675,8 +2831,38 @@ class TestMotionCoordination(unittest.TestCase):
             timestamp_s=4.0,
         )
         payload = source.prepare_motion_intent()
+        with self.assertRaises(ValueError):
+            source.record_motion_intent(
+                source_pose,
+                target_m=(1.5, 0.5),
+                wait_ticks=0,
+                priority_owner_id="vehicle_1",
+                reserved=False,
+                timestamp_s=4.0,
+                trajectory=(
+                    TimedCell((10, 5), 0.0, 0.0),
+                    TimedCell((11, 5), 0.0, 4.0),
+                ),
+            )
+        with self.assertRaises(ValueError):
+            source.record_motion_intent(
+                source_pose,
+                target_m=(1.5, 0.5),
+                wait_ticks=0,
+                priority_owner_id="vehicle_1",
+                reserved=False,
+                timestamp_s=4.0,
+                committed_until_offset_s=math.nextafter(
+                    MOTION_COMMIT_HORIZON_S,
+                    math.inf,
+                ),
+            )
 
         self.assertEqual(payload["protocol"], MOTION_INTENT_PROTOCOL)
+        self.assertEqual(
+            payload["committed_until_offset_s"],
+            MOTION_COMMIT_HORIZON_S,
+        )
         self.assertEqual(payload["plan_generation"], 1)
         self.assertEqual(payload["priority"]["task_age_ticks"], 0)
         self.assertEqual(
@@ -2731,8 +2917,14 @@ class TestMotionCoordination(unittest.TestCase):
         reversed_times = deepcopy(payload)
         reversed_times["trajectory"][1]["enter_offset_s"] = -0.1
         malformed_corridors.append(reversed_times)
+        zero_travel_time = deepcopy(payload)
+        zero_travel_time["trajectory"][1]["enter_offset_s"] = 0.0
+        malformed_corridors.append(zero_travel_time)
         commit_past_horizon = deepcopy(payload)
-        commit_past_horizon["committed_until_offset_s"] = 4.1
+        commit_past_horizon["committed_until_offset_s"] = math.nextafter(
+            MOTION_COMMIT_HORIZON_S,
+            math.inf,
+        )
         malformed_corridors.append(commit_past_horizon)
         excessive_margin = deepcopy(payload)
         excessive_margin["safety_time_margin_s"] = 10.1
@@ -2756,6 +2948,25 @@ class TestMotionCoordination(unittest.TestCase):
         self.assertEqual(
             received.corridor,
             CorridorDescriptor((10, 5), (15, 5)),
+        )
+        single_cell_hold = deepcopy(payload)
+        single_cell_hold["sequence"] = 2
+        single_cell_hold["timestamp_s"] = 4.1
+        single_cell_hold["plan_generation"] = 2
+        single_cell_hold["target_cell"] = None
+        single_cell_hold["trajectory"] = [
+            {
+                "cell": {"gx": 10, "gy": 5},
+                "enter_offset_s": 0.0,
+                "leave_offset_s": 4.0,
+            }
+        ]
+        self.assertTrue(
+            receiver.receive_transport(
+                "peer_1",
+                "vehicle_1",
+                single_cell_hold,
+            )
         )
         self.assertFalse(
             receiver.receive_transport("peer_1", "vehicle_1", payload)

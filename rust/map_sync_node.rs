@@ -38,6 +38,7 @@ const SIDECAR_PROTOCOL: &str = "mockvehicle2d-map-sync-sidecar/1";
 const DELTA_PROTOCOL: &str = "mockvehicle2d-map-delta/1";
 const PEER_STATE_PROTOCOL: &str = "mockvehicle2d-peer-state/1";
 const MOTION_INTENT_PROTOCOL: &str = "mockvehicle2d-motion-intent/3";
+const MOTION_COMMIT_HORIZON_S: f64 = 0.8;
 const MAX_MESSAGE_BYTES: usize = 256 * 1024;
 const MAX_PEERS: usize = 3;
 static IDENTITY_TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
@@ -438,7 +439,52 @@ fn payload_identity(payload: &Value) -> Result<(&str, &str, &str, u64), &'static
         .get("sequence")
         .and_then(Value::as_u64)
         .ok_or("missing sequence")?;
+    if protocol == MOTION_INTENT_PROTOCOL {
+        validate_motion_intent_timing(object)?;
+    }
     Ok((protocol, session, vehicle, sequence))
+}
+
+fn validate_motion_intent_timing(
+    payload: &serde_json::Map<String, Value>,
+) -> Result<(), &'static str> {
+    let committed = payload
+        .get("committed_until_offset_s")
+        .and_then(Value::as_f64)
+        .ok_or("missing committed_until_offset_s")?;
+    if !(0.0..=MOTION_COMMIT_HORIZON_S).contains(&committed) {
+        return Err("motion commit exceeds the supported horizon");
+    }
+    let trajectory = payload
+        .get("trajectory")
+        .and_then(Value::as_array)
+        .filter(|trajectory| !trajectory.is_empty())
+        .ok_or("missing trajectory")?;
+    let mut previous: Option<(&Value, f64)> = None;
+    for item in trajectory {
+        let item = item
+            .as_object()
+            .ok_or("trajectory item must be an object")?;
+        let cell = item.get("cell").ok_or("trajectory cell is missing")?;
+        let enter = item
+            .get("enter_offset_s")
+            .and_then(Value::as_f64)
+            .ok_or("trajectory enter time is missing")?;
+        let leave = item
+            .get("leave_offset_s")
+            .and_then(Value::as_f64)
+            .ok_or("trajectory leave time is missing")?;
+        if enter < 0.0 || leave < enter {
+            return Err("trajectory interval is invalid");
+        }
+        if let Some((previous_cell, previous_leave)) = previous
+            && (cell == previous_cell || enter <= previous_leave)
+        {
+            return Err("trajectory travel time must be positive");
+        }
+        previous = Some((cell, leave));
+    }
+    Ok(())
 }
 
 fn authorized_payload<'a>(
@@ -835,12 +881,20 @@ mod tests {
         let peer = identity::Keypair::generate_ed25519().public().to_peer_id();
         let peers = HashMap::from([(peer, "vehicle_1".to_string())]);
         for protocol in [PEER_STATE_PROTOCOL, MOTION_INTENT_PROTOCOL] {
-            let payload = serde_json::json!({
+            let mut payload = serde_json::json!({
                 "protocol": protocol,
                 "session_id": "session_1",
                 "source_vehicle_id": "vehicle_1",
                 "sequence": 1
             });
+            if protocol == MOTION_INTENT_PROTOCOL {
+                payload["trajectory"] = serde_json::json!([{
+                    "cell": {"gx": 0, "gy": 0},
+                    "enter_offset_s": 0.0,
+                    "leave_offset_s": 4.0
+                }]);
+                payload["committed_until_offset_s"] = serde_json::json!(0.8);
+            }
 
             assert_eq!(
                 authorized_payload(&payload, &peer, "session_1", &peers),
@@ -848,5 +902,45 @@ mod tests {
             );
             assert!(authorized_payload(&payload, &peer, "other", &peers).is_none());
         }
+    }
+
+    #[test]
+    fn motion_intent_v3_rejects_teleport_and_commit_past_short_horizon() {
+        let valid = serde_json::json!({
+            "protocol": MOTION_INTENT_PROTOCOL,
+            "session_id": "session_1",
+            "source_vehicle_id": "vehicle_1",
+            "sequence": 1,
+            "trajectory": [
+                {
+                    "cell": {"gx": 0, "gy": 0},
+                    "enter_offset_s": 0.0,
+                    "leave_offset_s": 0.0
+                },
+                {
+                    "cell": {"gx": 1, "gy": 0},
+                    "enter_offset_s": 0.5,
+                    "leave_offset_s": 4.0
+                }
+            ],
+            "committed_until_offset_s": 0.8
+        });
+        assert!(payload_identity(&valid).is_ok());
+
+        let mut teleport = valid.clone();
+        teleport["trajectory"][1]["enter_offset_s"] = serde_json::json!(0.0);
+        assert!(payload_identity(&teleport).is_err());
+
+        let mut excessive_commit = valid.clone();
+        excessive_commit["committed_until_offset_s"] = serde_json::json!(0.8000000000000002);
+        assert!(payload_identity(&excessive_commit).is_err());
+
+        let mut hold = valid;
+        hold["trajectory"] = serde_json::json!([{
+            "cell": {"gx": 0, "gy": 0},
+            "enter_offset_s": 0.0,
+            "leave_offset_s": 4.0
+        }]);
+        assert!(payload_identity(&hold).is_ok());
     }
 }

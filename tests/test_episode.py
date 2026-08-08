@@ -318,7 +318,9 @@ class TestEpisodeRunner(unittest.TestCase):
             ),
         }
         observed_stopping = []
+        observed_control_stops = []
         real_stopped = episode_module._vehicles_stopped
+        real_tick = FleetRuntime.tick
 
         def record_stopping_state(fleet, vehicle_ids):
             observed_stopping.append(
@@ -332,10 +334,15 @@ class TestEpisodeRunner(unittest.TestCase):
             )
             return real_stopped(fleet, vehicle_ids)
 
+        def record_control_stops(fleet, now):
+            result = real_tick(fleet, now)
+            observed_control_stops.append(fleet.control_stop_transitions)
+            return result
+
         with patch(
             "mockvehicle2d.episode._vehicles_stopped",
             side_effect=record_stopping_state,
-        ):
+        ), patch.object(FleetRuntime, "tick", new=record_control_stops):
             results = [
                 run_episode(
                     crossing,
@@ -366,9 +373,8 @@ class TestEpisodeRunner(unittest.TestCase):
         )
         self.assertTrue(
             any(
-                target == (0.0, 0.0) and executed != (0.0, 0.0)
-                for state in observed_stopping
-                for target, executed in state
+                transition
+                for transition in observed_control_stops
             )
         )
         self.assertTrue(

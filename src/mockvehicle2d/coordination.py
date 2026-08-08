@@ -218,6 +218,51 @@ class ReservationTable:
         )
         return max(conflicts, default=None)
 
+    def safe_intervals(
+        self,
+        cell: Cell,
+        start_time_s: float,
+        end_time_s: float,
+    ) -> tuple[tuple[float, float], ...]:
+        """Return conservative intervals where a vehicle may occupy ``cell``."""
+        if (
+            not isinstance(cell, tuple)
+            or len(cell) != 2
+            or any(type(value) is not int for value in cell)
+            or not all(math.isfinite(value) for value in (start_time_s, end_time_s))
+            or end_time_s < start_time_s
+        ):
+            raise ValueError("safe interval query is invalid")
+        blocked = [
+            (reservation.enter_time_s, reservation.leave_time_s)
+            for reservation in self.cells
+            if self._cells_overlap(cell, reservation.cell, reservation.radius_m)
+        ]
+        point = self._center(cell)
+        blocked.extend(
+            (reservation.enter_time_s, reservation.leave_time_s)
+            for reservation in self.edges
+            if self._stationary_edge_overlap(
+                point,
+                reservation.enter_time_s,
+                reservation.leave_time_s,
+                reservation,
+            )
+        )
+        cursor = start_time_s
+        safe = []
+        for blocked_start, blocked_end in sorted(blocked):
+            if blocked_end <= cursor or blocked_start >= end_time_s:
+                continue
+            if blocked_start > cursor:
+                safe.append((cursor, min(blocked_start, end_time_s)))
+            cursor = max(cursor, blocked_end)
+            if cursor >= end_time_s:
+                break
+        if cursor < end_time_s:
+            safe.append((cursor, end_time_s))
+        return tuple(safe)
+
     def _center(self, cell: Cell) -> tuple[float, float]:
         return (
             (cell[0] + 0.5) * self.resolution_m,
@@ -395,10 +440,30 @@ def prioritized_sipp(
         for index, cell in enumerate(path)
         if not index or cell != path[index - 1]
     )
-    arrivals = [0.0]
-    departures: list[float] = []
+    interval_end_s = now_s + horizon_s + time_margin_s
+    safe_intervals = tuple(
+        reservations.safe_intervals(
+            cell,
+            now_s - time_margin_s,
+            interval_end_s,
+        )
+        for cell in cells
+    )
+    states: list[dict[int, tuple[float, int | None, float | None]]] = [
+        {} for _ in cells
+    ]
+    for interval_index, (safe_start, safe_end) in enumerate(safe_intervals[0]):
+        if (
+            safe_start <= now_s - time_margin_s
+            and safe_end >= now_s + time_margin_s
+        ):
+            states[0][interval_index] = (0.0, None, None)
+            break
+    if not states[0]:
+        return None
+
     heading = initial_yaw_rad
-    for current, following in zip(cells, cells[1:]):
+    for path_index, (current, following) in enumerate(zip(cells, cells[1:])):
         target_heading = math.atan2(
             following[1] - current[1],
             following[0] - current[0],
@@ -414,71 +479,88 @@ def prioritized_sipp(
             * reservations.resolution_m
             / linear_speed_mps
         )
-        departure = arrivals[-1] + turn_s
-        for _ in range(MAX_SIPP_DELAY_ITERATIONS):
-            arrival = departure + travel_s
-            if arrival > horizon_s + 1e-12:
-                break
-            conflict_end = reservations.edge_conflict_end(
-                current,
-                following,
-                now_s + departure - time_margin_s,
-                now_s + arrival + time_margin_s,
-            )
-            destination_conflict_end = reservations.cell_conflict_end(
-                following,
-                now_s + arrival - time_margin_s,
-                now_s + arrival + time_margin_s,
-            )
-            conflict_end = max(
-                (
-                    value
-                    for value in (conflict_end, destination_conflict_end)
-                    if value is not None
-                ),
-                default=None,
-            )
-            if conflict_end is None:
-                break
-            if math.isinf(conflict_end):
-                departure = math.inf
-                break
-            departure = max(departure, conflict_end - now_s + time_margin_s)
-            hold_conflict = reservations.cell_conflict_end(
-                current,
-                now_s + arrivals[-1] - time_margin_s,
-                now_s + departure + time_margin_s,
-            )
-            if hold_conflict is not None:
-                departure = math.inf
-                break
-        else:
-            departure = math.inf
-        if not math.isfinite(departure) or departure + travel_s > horizon_s + 1e-12:
-            break
-        departures.append(departure)
-        arrivals.append(departure + travel_s)
+        for current_interval, (arrival, _, _) in states[path_index].items():
+            current_safe_start, current_safe_end = safe_intervals[path_index][
+                current_interval
+            ]
+            if now_s + arrival - time_margin_s < current_safe_start:
+                continue
+            for destination_interval, (
+                destination_start,
+                destination_end,
+            ) in enumerate(safe_intervals[path_index + 1]):
+                departure = max(
+                    arrival + turn_s,
+                    destination_start - now_s + time_margin_s - travel_s,
+                )
+                for _ in range(MAX_SIPP_DELAY_ITERATIONS):
+                    next_arrival = departure + travel_s
+                    if (
+                        next_arrival > horizon_s
+                        or now_s + departure + time_margin_s
+                        > current_safe_end
+                        or now_s + next_arrival - time_margin_s
+                        < destination_start
+                        or now_s + next_arrival + time_margin_s
+                        > destination_end
+                    ):
+                        break
+                    conflict_end = reservations.edge_conflict_end(
+                        current,
+                        following,
+                        now_s + departure - time_margin_s,
+                        now_s + next_arrival + time_margin_s,
+                    )
+                    if conflict_end is None:
+                        previous = states[path_index + 1].get(destination_interval)
+                        if previous is None or next_arrival < previous[0] - 1e-12:
+                            states[path_index + 1][destination_interval] = (
+                                next_arrival,
+                                current_interval,
+                                departure,
+                            )
+                        break
+                    if math.isinf(conflict_end):
+                        break
+                    delayed = conflict_end - now_s + time_margin_s
+                    if delayed <= departure:
+                        break
+                    departure = delayed
         heading = target_heading
 
-    scheduled_cells = cells[: len(arrivals)]
-    if len(scheduled_cells) == 1 and len(cells) > 1:
+    selected: tuple[int, int] | None = None
+    for path_index in range(len(cells) - 1, -1, -1):
+        candidates = [
+            (arrival, interval_index)
+            for interval_index, (arrival, _, _) in states[path_index].items()
+            if safe_intervals[path_index][interval_index][1]
+            >= interval_end_s
+        ]
+        if candidates:
+            _, interval_index = min(candidates)
+            selected = path_index, interval_index
+            break
+    if selected is None or (selected[0] == 0 and len(cells) > 1):
         return None
-    result = [
-        TimedCell(cell, arrival, departures[index])
-        for index, (cell, arrival) in enumerate(
-            zip(scheduled_cells[:-1], arrivals[:-1])
+
+    final_index, interval_index = selected
+    arrivals = [0.0] * (final_index + 1)
+    departures = [0.0] * final_index
+    for path_index in range(final_index, -1, -1):
+        arrival, previous_interval, departure = states[path_index][interval_index]
+        arrivals[path_index] = arrival
+        if path_index:
+            assert previous_interval is not None and departure is not None
+            departures[path_index - 1] = departure
+            interval_index = previous_interval
+    return tuple(
+        TimedCell(
+            cell,
+            arrivals[index],
+            horizon_s if index == final_index else departures[index],
         )
-    ]
-    final_leave = horizon_s
-    final_conflict = reservations.cell_conflict_end(
-        scheduled_cells[-1],
-        now_s + arrivals[-1] - time_margin_s,
-        now_s + horizon_s + time_margin_s,
+        for index, cell in enumerate(cells[: final_index + 1])
     )
-    if final_conflict is not None:
-        final_leave = arrivals[-1]
-    result.append(TimedCell(scheduled_cells[-1], arrivals[-1], final_leave))
-    return tuple(result)
 
 
 def _intervals_overlap(

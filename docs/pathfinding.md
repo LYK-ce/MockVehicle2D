@@ -110,6 +110,8 @@ motion-intent v3 的 trajectory 由相对 `enter_offset_s` / `leave_offset_s` �
 receipt time 重建绝对区间，不比较不同车辆的 monotonic clock；intent generation、plan
 generation 和严格递增 sequence 防止重启、旧计划和乱序包回灌。plan generation 只在 cell
 序列、任务或 goal-hold 语义改变时增长，滚动重发的相对 offset 不会独自制造新代次。
+相邻 trajectory cell 必须不同且满足 `next.enter > previous.leave`，禁止零时长 teleport；
+单 cell 原地 hold 合法。commit 只允许 `0..0.8 s`，`0.8 s` 之后的轨迹仅是未提交候选。
 
 内部 `ReservationTable` 分别保存：
 
@@ -126,11 +128,14 @@ owner/vehicle ID，避免每台车都因一跳延迟而误判自己的本地年�
 chain 递归继承最高优先级，并尝试一个 D* 已确认可通行的邻格；找不到时回退为等待，让
 上游下一轮改时或改路。
 
-expected peer 存在时，sidecar 未 ready、任一 peer-state/intent 缺失或 TTL 过期都使新短
-前缀 fail-closed。第一版没有额外的网络 propose/ACK/commit 往返：它依赖上一 tick 的全员
-fresh intent、确定性优先级和短 commit 前缀收敛；并发首次提案仍保留下一格租约、同步物理
-碰撞仲裁、LiDAR 与 LocalSafety 作为最终保障。当前 SIPP 只给一条 D* 空间候选和一个有界
-邻格 detour 排时，不搜索多条空间路径，也不是 CBS/PBS、联合最优 MAPF 或完整 PIBT 回溯。
+expected peer 存在时，sidecar 未 ready、任一 peer-state/intent 缺失、TTL 过期，或同一来源
+两类 topic 的 state/intent generation 不一致，都使新短前缀 fail-closed。SIPP 在固定 D*
+候选上保留每个 `(path index, safe interval)` 的最早可达状态；中间格的等待/转向必须完整
+落在同一安全区间，edge 或终点冲突可选择后续区间并从可行前驱重排。第一版没有额外的
+网络 propose/ACK/commit 往返：它依赖上一 tick 的全员 fresh intent、确定性优先级和短
+commit 前缀收敛；并发首次提案仍保留下一格租约、同步物理碰撞仲裁、LiDAR 与 LocalSafety
+作为最终保障。当前 SIPP 只给一条 D* 空间候选和一个有界邻格 detour 排时，不搜索多条
+空间路径，也不是 CBS/PBS、联合最优 MAPF 或完整 PIBT 回溯。
 
 ### 直线窄走廊租约
 

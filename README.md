@@ -281,9 +281,11 @@ Unix domain socket 交换有界 JSONL 消息，控制 tick 不等待该 socket�
 ```
 
 接收端严格校验 intent/plan generation、sequence、global frame、resolution、cell 边界、
-最多 64 个且 `0..4 s` 单调的相对时间窗、commit/margin 上限、优先级 owner 白名单、租约
-上限和有向 axis-aligned corridor；重复、乱序、超时或额外字段均拒绝。相对时间以接收时刻
-重建，不要求不同车辆的 monotonic clock 同步；sender timestamp 只用于同源防回退。
+最多 64 个且 `0..4 s` 的相对时间窗、优先级 owner 白名单、租约上限和有向 axis-aligned
+corridor。相邻不同 cell 必须满足 `next.enter > previous.leave`，零时长 teleport 被拒绝，
+单 cell hold 保留；commit 接受 `0..0.8 s`，任何更大值均拒绝。重复、乱序、超时或额外字段
+也均拒绝。相对时间以接收时刻重建，不要求不同车辆的 monotonic clock 同步；sender
+timestamp 只用于同源防回退。
 没有走廊声明时 `corridor` 必须为 `null`。走廊只从车辆 OwnMap 上已完全观测的直线窄通道
 推导；peer evidence 和仿真真值不会参与检测。相反方向看到的部分 descriptor 会按重叠轴
 匹配并单调扩展释放边界，进入前需要一轮 owner 声明/对端确认。
