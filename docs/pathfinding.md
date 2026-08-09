@@ -131,14 +131,29 @@ owner/vehicle ID，避免每台车都因一跳延迟而误判自己的本地年�
 chain 递归继承最高优先级，并尝试一个 D* 已确认可通行的邻格；找不到时回退为等待，让
 上游下一轮改时或改路。
 
+当动态 peer exclusion 使当前单条 D* 候选暂时无路、但 OwnMap-only 路线仍存在时，控制器
+可在完全观测的 Free 区域内搜索一条最长 `4 m` 的确定性让行路径。该搜索只寻找离开原路线
+安全包络的 passing place，允许先沿路线绕过墙角再侧移；它不会穿过 Unknown/Occupied，
+也不会扩展成第二套全局规划器。选中的单条让行路径仍交给同一 SIPP 和 LocalSafety 执行。
+
+让行状态区分请求来源与继承的 priority owner。显式 current/target 请求在请求者真正进入
+所请求包络前不会因普通 Goto waypoint 恢复而消失；进入后，只有请求者 current 与 target
+都离开包络才释放。没有显式 cell 的瞬态请求使用 peer trajectory/goal reservation 与本车
+剩余 D* 路线的 cell/edge 冲突来归因实际 blocker，同时保留继承 owner；无法归因、peer
+证据失鲜或动态无路仍存在时保持 fail-closed。上述状态完全复用 motion-intent v3 现有字段，
+没有增加 ACK 或多候选路径协议。静止且没有任务/目标/预留的 peer 不会成为让行 owner；
+仅由车体膨胀包络与路线相交、但自身时序轨迹会离开的 peer 继续交给 SIPP 等待，不新建
+让行 session。priority root 也不会为已经继承该 root 的下游 blocker 新建或继续 implicit
+让行；检测到这一跳环时会在同一 tick 回到普通 reservation/SIPP 仲裁。
+
 expected peer 存在时，sidecar 未 ready、任一 peer-state/intent 缺失、TTL 过期，或同一来源
 两类 topic 的 state/intent generation 不一致，都使新短前缀 fail-closed。SIPP 在固定 D*
 候选上保留每个 `(path index, safe interval)` 的最早可达状态；中间格的等待/转向必须完整
 落在同一安全区间，edge 或终点冲突可选择后续区间并从可行前驱重排。第一版没有额外的
 网络 propose/ACK/commit 往返：它依赖上一 tick 的全员 fresh intent、确定性优先级和短
 commit 前缀收敛；并发首次提案仍保留下一格租约、同步物理碰撞仲裁、LiDAR 与 LocalSafety
-作为最终保障。当前 SIPP 只给一条 D* 空间候选和一个有界邻格 detour 排时，不搜索多条
-空间路径，也不是 CBS/PBS、联合最优 MAPF 或完整 PIBT 回溯。
+作为最终保障。当前 SIPP 只给一条 D* 空间候选和一条有界 passing-place detour 排时，不
+搜索多条空间路径，也不是 CBS/PBS、联合最优 MAPF 或完整 PIBT 回溯。
 
 ### 直线窄走廊租约
 

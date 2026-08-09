@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections import deque
 import math
 from typing import TYPE_CHECKING
 
@@ -41,6 +42,9 @@ MAX_CANDIDATE_INSPECTIONS_PER_MISSION = 256
 # ponytail: the first lease topology is the requested straight 3 m class;
 # promote this to scenario configuration or SIPP when more widths/shapes matter.
 STRAIGHT_CORRIDOR_MAX_WIDTH_M = 3.0
+# ponytail: four metres covers the simulator's local passing bays; promote to
+# scenario configuration only when a measured topology needs a wider search.
+COORDINATION_VACATE_RADIUS_M = 4.0
 SafeCandidate = tuple[tuple[float, float], tuple[int, int]]
 
 
@@ -98,6 +102,10 @@ class GotoController:
         return self._current_waypoint
 
     @property
+    def transient_peer_blocked(self) -> bool:
+        return self._waiting_for_peer_replan
+
+    @property
     def static_no_path_probe_pending(self) -> bool:
         return self._waiting_for_static_route_probe
 
@@ -135,6 +143,101 @@ class GotoController:
             ):
                 choices.append((math.dist(point, preferred), cell[1], cell[0], point))
         return tuple(choice[-1] for choice in sorted(choices))
+
+    def coordination_vacate_path(
+        self,
+        pose: PoseEstimate,
+        local_map: ObservedGrid,
+        required_clearance_m: float,
+    ) -> tuple[tuple[float, float], ...]:
+        """Find one bounded, observed path to a passing place off the route."""
+        if (
+            not math.isfinite(required_clearance_m)
+            or required_clearance_m <= 0
+            or self.status != "active"
+            or self._planner is None
+        ):
+            return ()
+        route = self._advance_coordination_path(pose, local_map)
+        if route is None or len(route) < 2:
+            return ()
+        origin = route[0]
+        direction = next(
+            (
+                (cell[0] - origin[0], cell[1] - origin[1])
+                for cell in route[1:]
+                if cell != origin
+            ),
+            None,
+        )
+        if direction is None:
+            return ()
+        direction_length = math.hypot(*direction)
+        resolution_m = local_map.resolution_m
+        radius_cells = COORDINATION_VACATE_RADIUS_M / resolution_m
+        start = self._pose_cell(pose, local_map)
+        pending = deque((start,))
+        previous: dict[tuple[int, int], tuple[int, int] | None] = {start: None}
+
+        def clearance(cell: tuple[int, int]) -> float:
+            offset_x = cell[0] - origin[0]
+            offset_y = cell[1] - origin[1]
+            return (
+                abs(offset_x * direction[1] - offset_y * direction[0])
+                / direction_length
+                * resolution_m
+            )
+
+        while pending:
+            current = pending.popleft()
+            if current != start and clearance(current) >= required_clearance_m:
+                cells = []
+                while current != start:
+                    cells.append(current)
+                    parent = previous[current]
+                    assert parent is not None
+                    current = parent
+                return tuple(
+                    (
+                        (gx + 0.5) * resolution_m,
+                        (gy + 0.5) * resolution_m,
+                    )
+                    for gx, gy in reversed(cells)
+                )
+            for neighbour in sorted(
+                (
+                    (current[0] + dx, current[1] + dy)
+                    for dx in (-1, 0, 1)
+                    for dy in (-1, 0, 1)
+                    if dx or dy
+                ),
+                key=lambda cell: (cell[1], cell[0]),
+            ):
+                if (
+                    neighbour in previous
+                    or math.dist(start, neighbour) > radius_cells + 1e-12
+                    or local_map.get_cell(*neighbour) != FREE
+                ):
+                    continue
+                source_m = (
+                    (current[0] + 0.5) * resolution_m,
+                    (current[1] + 0.5) * resolution_m,
+                )
+                target_m = (
+                    (neighbour[0] + 0.5) * resolution_m,
+                    (neighbour[1] + 0.5) * resolution_m,
+                )
+                if not self._planner.is_segment_passable(
+                    source_m,
+                    target_m,
+                    extra_clearance_m=AUTOMATIC_MINIMUM_CLEARANCE_M,
+                    require_observed=True,
+                    _ignore_peer_exclusions=True,
+                ):
+                    continue
+                previous[neighbour] = current
+                pending.append(neighbour)
+        return ()
 
     def coordination_corridor(
         self,
