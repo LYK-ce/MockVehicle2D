@@ -10,11 +10,14 @@ import re
 from typing import TYPE_CHECKING, ClassVar
 import uuid
 
+from mockvehicle2d.coordination import ReservationTable, TimedCell, prioritized_sipp
 from mockvehicle2d.navigation import GotoController
 from mockvehicle2d.map_sync import (
     CorridorDescriptor,
     MAX_INTENT_WAIT_TICKS,
+    MOTION_COMMIT_HORIZON_S,
     MOTION_INTENT_TTL_S,
+    MOTION_PLAN_HORIZON_S,
     PeerMotionIntent,
 )
 from mockvehicle2d.safety import AUTOMATIC_MINIMUM_CLEARANCE_M
@@ -345,37 +348,60 @@ def motion_intent_precedes(
     second: PeerMotionIntent,
 ) -> bool:
     """Return the deterministic winner; a live reservation is a short lease."""
-    if first.reserved != second.reserved:
-        return first.reserved
-    if first.wait_ticks != second.wait_ticks:
-        return first.wait_ticks > second.wait_ticks
-    if first.priority_owner_id != second.priority_owner_id:
-        return first.priority_owner_id < second.priority_owner_id
-    return first.source_vehicle_id < second.source_vehicle_id
+    return _motion_intent_priority_key(first) < _motion_intent_priority_key(second)
+
+
+def _motion_intent_priority_key(
+    intent: PeerMotionIntent,
+) -> tuple[int, int, str, str]:
+    return (
+        0 if intent.reserved else 1,
+        0 if intent.reserved else -intent.wait_ticks,
+        intent.priority_owner_id,
+        intent.source_vehicle_id,
+    )
 
 
 def inherit_motion_priority(
     own: PeerMotionIntent,
     requesters: tuple[PeerMotionIntent, ...],
+    intents: tuple[PeerMotionIntent, ...] = (),
 ) -> PeerMotionIntent:
+    def chain_winner(
+        candidate: PeerMotionIntent,
+        visited: frozenset[str],
+    ) -> PeerMotionIntent:
+        winner = candidate
+        next_visited = visited | {candidate.source_vehicle_id}
+        upstream = (
+            intent
+            for intent in intents
+            if intent.source_vehicle_id not in next_visited
+            and intent.target_cell == candidate.current_cell
+            and intent.current_cell != candidate.current_cell
+        )
+        for requester in sorted(
+            upstream,
+            key=lambda intent: intent.source_vehicle_id,
+        ):
+            inherited = chain_winner(requester, next_visited)
+            if motion_intent_precedes(inherited, winner):
+                winner = inherited
+        return winner
+
     inherited = own
     for requester in sorted(requesters, key=lambda intent: intent.source_vehicle_id):
+        requester = chain_winner(requester, frozenset((own.source_vehicle_id,)))
         if motion_intent_precedes(requester, inherited):
             inherited = requester
     if inherited is own:
         return own
-    return PeerMotionIntent(
-        own.source_vehicle_id,
-        own.intent_generation,
-        own.sequence,
-        own.timestamp_s,
-        own.lease_duration_s,
-        own.current_cell,
-        own.target_cell,
-        max(own.wait_ticks, inherited.wait_ticks),
-        inherited.priority_owner_id,
-        own.reserved,
-        own.corridor,
+    return replace(
+        own,
+        wait_ticks=max(own.wait_ticks, inherited.wait_ticks),
+        task_sequence=min(own.task_sequence, inherited.task_sequence),
+        task_age_ticks=max(own.task_age_ticks, inherited.task_age_ticks),
+        priority_owner_id=inherited.priority_owner_id,
     )
 
 
@@ -630,6 +656,45 @@ def _coordination_cell(
         math.floor(global_x_m / resolution_m),
         math.floor(global_y_m / resolution_m),
     )
+
+
+def _global_coordination_path(
+    anchor: AnchorSpec,
+    local_path: tuple[tuple[int, int], ...],
+    resolution_m: float,
+    current_cell: tuple[int, int],
+    target_cell: tuple[int, int] | None,
+) -> tuple[tuple[int, int], ...]:
+    transformed = []
+    for gx, gy in local_path:
+        global_x_m, global_y_m, _ = anchor.anchor_to_global(
+            (gx + 0.5) * resolution_m,
+            (gy + 0.5) * resolution_m,
+            0.0,
+        )
+        cell = (
+            math.floor(global_x_m / resolution_m),
+            math.floor(global_y_m / resolution_m),
+        )
+        if not transformed or transformed[-1] != cell:
+            transformed.append(cell)
+    result = [current_cell]
+    if target_cell is None or target_cell == current_cell:
+        return tuple(result)
+    result.append(target_cell)
+    if target_cell in transformed:
+        result.extend(transformed[transformed.index(target_cell) + 1 :])
+    return tuple(result)
+
+
+def _reservation_time_margin_s(vehicle: Vehicle) -> float:
+    """Cover one publish lease plus acceleration/braking timing uncertainty."""
+    speed = vehicle.linear_speed
+    dynamic_margin_s = max(
+        speed / (2 * vehicle.linear_acceleration_mps2),
+        speed / (2 * vehicle.linear_deceleration_mps2),
+    )
+    return MOTION_INTENT_TTL_S + dynamic_margin_s
 
 
 def _global_corridor(
@@ -971,6 +1036,14 @@ class RobotController:
         self._coordination_wait_reason: str | None = None
         self._coordination_wait_owner_id: str | None = None
         self._known_coordination_peer_ids: set[str] = set()
+        self._active_task_age_ticks = 0
+        self._temporal_plan_generation = 0
+        self._temporal_plan_signature: tuple[object, ...] | None = None
+        self._temporal_trajectory: tuple[TimedCell, ...] = ()
+        self._temporal_committed_until_s = 0.0
+        self._temporal_goal_hold = False
+        self._temporal_safety_margin_s = 0.0
+        self._temporal_commit_deadline_s = 0.0
 
     @property
     def is_automatic_motion_active(self) -> bool:
@@ -994,6 +1067,34 @@ class RobotController:
             self._intent_priority_owner_id,
             self._intent_reserved,
             self._corridor,
+        )
+
+    @property
+    def temporal_motion_intent(self) -> tuple[
+        int | None,
+        int,
+        int,
+        tuple[TimedCell, ...],
+        float,
+        bool,
+        float,
+    ]:
+        return (
+            (
+                self._temporal_plan_generation
+                if self._temporal_trajectory
+                else None
+            ),
+            (
+                self.active_mission.submitted_seq
+                if self.active_mission is not None
+                else (1 << 64) - 1
+            ),
+            self._active_task_age_ticks,
+            self._temporal_trajectory,
+            self._temporal_committed_until_s,
+            self._temporal_goal_hold,
+            self._temporal_safety_margin_s,
         )
 
     def planning_ignored_peer_ids(
@@ -1108,6 +1209,10 @@ class RobotController:
         if self.auto_state is not AutoState.ACTIVE or self.active_mission is None:
             vehicle.stop()
             return
+        self._active_task_age_ticks = min(
+            MAX_INTENT_WAIT_TICKS,
+            self._active_task_age_ticks + 1,
+        )
 
         persistent_map = coordination_map
         if persistent_map is None:
@@ -1268,6 +1373,222 @@ class RobotController:
             return
         vehicle.install_drive(decision.linear_mps, decision.angular_rps, now)
 
+    def _schedule_temporal_motion(
+        self,
+        desired: tuple[float, float],
+        *,
+        own: PeerMotionIntent,
+        vehicle: Vehicle,
+        anchor: AnchorSpec,
+        pose: PoseEstimate,
+        local_map: ObservedGrid,
+        now: float,
+        peers: dict[str, PeerVehicleState],
+        peer_motion_intents: tuple[PeerMotionIntent, ...],
+        coordination_map: ObservedGrid | None,
+    ) -> tuple[tuple[float, float], tuple[int, int] | None, PeerMotionIntent, bool]:
+        current_cell, target_cell = own.current_cell, own.target_cell
+        route_source = coordination_map or local_map
+        route_method = getattr(self.navigation, "coordination_path_cells", None)
+        local_path = (
+            route_method(pose, route_source)
+            if callable(route_method)
+            else None
+        )
+        spatial_path = _global_coordination_path(
+            anchor,
+            local_path if isinstance(local_path, tuple) else (),
+            local_map.resolution_m,
+            current_cell,
+            target_cell,
+        )
+        own_margin_s = _reservation_time_margin_s(vehicle)
+        reservations = ReservationTable(
+            local_map.resolution_m,
+            own_radius_m=vehicle.radius,
+            clearance_m=AUTOMATIC_MINIMUM_CLEARANCE_M,
+        )
+        higher_priority = tuple(
+            intent
+            for intent in peer_motion_intents
+            if intent.target_cell != current_cell
+            and motion_intent_precedes(intent, own)
+        )
+        for intent in sorted(
+            higher_priority,
+            key=lambda item: item.source_vehicle_id,
+        ):
+            peer = peers.get(intent.source_vehicle_id)
+            reservations.add(
+                intent.source_vehicle_id,
+                intent.timed_trajectory,
+                base_time_s=(
+                    now
+                    if intent.received_at_s is None
+                    else intent.received_at_s
+                ),
+                radius_m=(
+                    vehicle.radius
+                    if peer is None
+                    else peer.radius_m
+                    + math.sqrt(max(peer.covariance[:2]))
+                ),
+                time_margin_s=intent.safety_time_margin_s,
+                goal_hold=intent.goal_hold,
+            )
+
+        global_yaw_rad = anchor.anchor_to_global(
+            pose.x_m,
+            pose.y_m,
+            pose.yaw_rad,
+        )[2]
+
+        def schedule(path: tuple[tuple[int, int], ...]) -> tuple[TimedCell, ...] | None:
+            return prioritized_sipp(
+                path,
+                reservations,
+                now_s=now,
+                horizon_s=MOTION_PLAN_HORIZON_S,
+                linear_speed_mps=vehicle.linear_speed,
+                angular_speed_rps=vehicle.angular_speed,
+                initial_yaw_rad=global_yaw_rad,
+                time_margin_s=own_margin_s,
+            )
+
+        plan = schedule(spatial_path)
+        if plan is None:
+            detours = getattr(self.navigation, "coordination_detours", None)
+            choices = detours(pose, local_map) if callable(detours) else ()
+            for detour_m in choices if isinstance(choices, tuple) else ():
+                detour_cell = _coordination_cell(
+                    anchor,
+                    detour_m,
+                    local_map.resolution_m,
+                )
+                candidate = schedule((current_cell, detour_cell))
+                if candidate is None:
+                    continue
+                self._invalidate_temporal_commit()
+                plan = candidate
+                target_cell = detour_cell
+                desired = _intent_setpoint(detour_m, pose, vehicle)
+                self._intent_target_m = detour_m
+                own = replace(own, target_cell=target_cell)
+                break
+
+        task_sequence = own.task_sequence
+        peer_plans = tuple(
+            sorted(
+                (
+                    intent.source_vehicle_id,
+                    intent.intent_generation,
+                    intent.plan_generation,
+                )
+                for intent in higher_priority
+            )
+        )
+        if plan is None:
+            plan = (TimedCell(current_cell, 0.0, MOTION_PLAN_HORIZON_S),)
+            target_cell = None
+            own = replace(own, target_cell=None)
+            self._intent_target_m = None
+            goal_hold = False
+            blocked = True
+        else:
+            goal_cell = (
+                None
+                if self.active_mission is None
+                else (
+                    math.floor(
+                        self.active_mission.subgoals[self._subgoal_index][0]
+                        / local_map.resolution_m
+                    ),
+                    math.floor(
+                        self.active_mission.subgoals[self._subgoal_index][1]
+                        / local_map.resolution_m
+                    ),
+                )
+            )
+            goal_hold = (
+                goal_cell is not None
+                and plan[-1].cell == goal_cell
+                and len(plan) == len(spatial_path)
+            )
+            if len(plan) < 2:
+                blocked = target_cell not in {None, current_cell}
+            else:
+                target_heading = math.atan2(
+                    plan[1].cell[1] - current_cell[1],
+                    plan[1].cell[0] - current_cell[0],
+                )
+                nominal_turn_s = abs(
+                    math.atan2(
+                        math.sin(target_heading - global_yaw_rad),
+                        math.cos(target_heading - global_yaw_rad),
+                    )
+                ) / vehicle.angular_speed
+                blocked = plan[0].leave_offset_s > nominal_turn_s + 1e-9
+
+        signature = (
+            task_sequence,
+            tuple(item.cell for item in plan),
+            blocked,
+            goal_hold,
+            peer_plans,
+        )
+        if signature != self._temporal_plan_signature:
+            self._temporal_plan_generation += 1
+            self._temporal_plan_signature = signature
+        self._temporal_trajectory = plan
+        self._temporal_goal_hold = goal_hold
+        self._temporal_safety_margin_s = own_margin_s
+        if blocked:
+            self._temporal_commit_deadline_s = 0.0
+            self._temporal_committed_until_s = 0.0
+        else:
+            if self._temporal_commit_deadline_s <= now:
+                self._temporal_commit_deadline_s = (
+                    now + MOTION_COMMIT_HORIZON_S
+                )
+            self._temporal_committed_until_s = min(
+                MOTION_COMMIT_HORIZON_S,
+                self._temporal_commit_deadline_s - now,
+                plan[-1].leave_offset_s,
+            )
+            own = replace(own, reserved=True)
+        return desired, target_cell, own, blocked
+
+    def _hold_for_temporal_reservation(
+        self,
+        own: PeerMotionIntent,
+        peer_motion_intents: tuple[PeerMotionIntent, ...],
+    ) -> tuple[float, float]:
+        temporal_winner = next(
+            (
+                intent
+                for intent in sorted(
+                    peer_motion_intents,
+                    key=_motion_intent_priority_key,
+                )
+                if motion_intent_precedes(intent, own)
+            ),
+            None,
+        )
+        self._yielding_for = (
+            None if temporal_winner is None else temporal_winner.source_vehicle_id
+        )
+        self._yield_requires_intent = temporal_winner is not None
+        self._intent_reserved = False
+        self._coordination_wait_reason = "space_time_reservation"
+        self._coordination_wait_owner_id = (
+            None if temporal_winner is None else temporal_winner.priority_owner_id
+        )
+        self._reservation_wait_ticks = min(
+            MAX_INTENT_WAIT_TICKS,
+            self._reservation_wait_ticks + 1,
+        )
+        return 0.0, 0.0
+
     def _coordinate_desired(
         self,
         desired: tuple[float, float],
@@ -1299,6 +1620,19 @@ class RobotController:
         fresh_intent_quorum = (
             coordination_ready is not False
             and self._known_coordination_peer_ids <= intents.keys()
+        )
+        temporal_quorum_required = (
+            bool(expected_peer_vehicle_ids) or coordination_ready is not None
+        )
+        fresh_temporal_quorum = (
+            coordination_ready is not False
+            and self._known_coordination_peer_ids
+            <= (intents.keys() & peers.keys())
+            and all(
+                peers[source].state_generation
+                == intents[source].intent_generation
+                for source in self._known_coordination_peer_ids
+            )
         )
         motion_target = self.navigation.motion_target
         self._intent_target_m = motion_target
@@ -1350,6 +1684,8 @@ class RobotController:
                     local_map.resolution_m,
                     current_cell,
                 )
+                if self._corridor is not None:
+                    self._invalidate_temporal_commit()
                 self._corridor_admission_confirmed = False
                 self._corridor_claim_ticks = 0
         if self._last_coordination_cell != current_cell:
@@ -1399,11 +1735,17 @@ class RobotController:
                 self._corridor_reserved
                 if self._corridor is not None
                 else self._intent_reserved
-                and self._reservation_cells == (current_cell, target_cell)
+                and now < self._temporal_commit_deadline_s
                 and self._reservation_hold_ticks
                 < PEER_RESERVATION_MAX_HOLD_TICKS
             ),
             self._corridor,
+            task_sequence=(
+                self.active_mission.submitted_seq
+                if self.active_mission is not None
+                else (1 << 64) - 1
+            ),
+            task_age_ticks=self._active_task_age_ticks,
         )
         corridor_peer_ids = {
             intent.source_vehicle_id for intent in corridor_peers
@@ -1442,6 +1784,7 @@ class RobotController:
                 self._corridor_admission_confirmed = False
                 self._corridor_claim_ticks = 0
                 self._intent_reserved = False
+                self._invalidate_temporal_commit()
                 self._intent_priority_owner_id = winner.priority_owner_id
                 self._coordination_wait_reason = (
                     "corridor_lease"
@@ -1598,18 +1941,13 @@ class RobotController:
                 self._corridor_admission_confirmed = (
                     acknowledged or uncontested_announcement_complete
                 )
-            own = PeerMotionIntent(
-                vehicle_id,
-                1,
-                1,
-                now,
-                MOTION_INTENT_TTL_S,
-                current_cell,
-                target_cell,
-                self._reservation_wait_ticks,
-                vehicle_id,
-                True,
-                self._corridor,
+            own = replace(
+                own,
+                target_cell=target_cell,
+                wait_ticks=self._reservation_wait_ticks,
+                priority_owner_id=vehicle_id,
+                reserved=True,
+                corridor=self._corridor,
             )
             front_waiter_state = (
                 None
@@ -1677,6 +2015,73 @@ class RobotController:
                 self._corridor_rejoin_target_m = None
                 self._intent_target_m = None
                 return 0.0, 0.0
+        if self._corridor is None:
+            if temporal_quorum_required and not fresh_temporal_quorum:
+                self._invalidate_temporal_commit()
+                if self._yielding_for not in self._known_coordination_peer_ids:
+                    self._yielding_for = min(
+                        self._known_coordination_peer_ids,
+                        default=None,
+                    )
+                self._yield_requires_intent = self._yielding_for is not None
+                self._yield_clear_ticks = 0
+                sync_signature = (
+                    "reservation_sync",
+                    (
+                        self.active_mission.submitted_seq
+                        if self.active_mission is not None
+                        else (1 << 64) - 1
+                    ),
+                    current_cell,
+                )
+                if sync_signature != self._temporal_plan_signature:
+                    self._temporal_plan_generation += 1
+                    self._temporal_plan_signature = sync_signature
+                self._temporal_trajectory = (
+                    TimedCell(
+                        current_cell,
+                        0.0,
+                        MOTION_PLAN_HORIZON_S,
+                    ),
+                )
+                self._temporal_committed_until_s = MOTION_COMMIT_HORIZON_S
+                self._temporal_goal_hold = False
+                self._temporal_safety_margin_s = _reservation_time_margin_s(
+                    vehicle
+                )
+                self._intent_target_m = None
+                self._intent_reserved = False
+                self._coordination_wait_reason = "reservation_sync"
+                self._coordination_wait_owner_id = None
+                self._reservation_wait_ticks = min(
+                    MAX_INTENT_WAIT_TICKS,
+                    self._reservation_wait_ticks + 1,
+                )
+                return 0.0, 0.0
+            desired, target_cell, own, temporal_blocked = (
+                self._schedule_temporal_motion(
+                    desired,
+                    own=own,
+                    vehicle=vehicle,
+                    anchor=anchor,
+                    pose=pose,
+                    local_map=local_map,
+                    now=now,
+                    peers=peers,
+                    peer_motion_intents=peer_motion_intents,
+                    coordination_map=coordination_map,
+                )
+            )
+            if temporal_blocked:
+                return self._hold_for_temporal_reservation(
+                    own,
+                    peer_motion_intents,
+                )
+            self._coordination_wait_reason = None
+            self._coordination_wait_owner_id = None
+            temporal_target_cell = target_cell
+        else:
+            temporal_target_cell = None
         requesters = [
             intent
             for intent in peer_motion_intents
@@ -1685,12 +2090,23 @@ class RobotController:
             and intent.current_cell != current_cell
         ]
         inherited_from = None
-        inherited_own = inherit_motion_priority(own, tuple(requesters))
+        inherited_own = inherit_motion_priority(
+            own,
+            tuple(requesters),
+            peer_motion_intents,
+        )
         if inherited_own.priority_owner_id != own.priority_owner_id:
             inherited_from = next(
-                requester
-                for requester in requesters
-                if requester.priority_owner_id == inherited_own.priority_owner_id
+                (
+                    requester
+                    for requester in requesters
+                    if requester.priority_owner_id
+                    == inherited_own.priority_owner_id
+                ),
+                min(
+                    requesters,
+                    key=lambda requester: requester.source_vehicle_id,
+                ),
             )
             own = inherited_own
             self._intent_priority_owner_id = own.priority_owner_id
@@ -1722,20 +2138,30 @@ class RobotController:
                 target_cell = detour_cell
                 desired = _intent_setpoint(detour_m, pose, vehicle)
                 self._intent_target_m = detour_m
-                own = PeerMotionIntent(
-                    vehicle_id,
-                    1,
-                    1,
-                    now,
-                    MOTION_INTENT_TTL_S,
-                    current_cell,
-                    target_cell,
-                    own.wait_ticks,
-                    own.priority_owner_id,
-                    own.reserved,
-                    own.corridor,
-                )
+                own = replace(own, target_cell=target_cell)
                 break
+
+        if self._corridor is None and target_cell != temporal_target_cell:
+            self._invalidate_temporal_commit()
+            desired, target_cell, own, temporal_blocked = (
+                self._schedule_temporal_motion(
+                    desired,
+                    own=own,
+                    vehicle=vehicle,
+                    anchor=anchor,
+                    pose=pose,
+                    local_map=local_map,
+                    now=now,
+                    peers=peers,
+                    peer_motion_intents=peer_motion_intents,
+                    coordination_map=coordination_map,
+                )
+            )
+            if temporal_blocked:
+                return self._hold_for_temporal_reservation(
+                    own,
+                    peer_motion_intents,
+                )
 
         vacating_for = (
             None
@@ -1786,6 +2212,8 @@ class RobotController:
                 if desired == (0.0, 0.0):
                     escape = _peer_escape_setpoint(vehicle, anchor, pose, peer)
                     if escape is not None:
+                        self._invalidate_temporal_commit()
+                        self._intent_target_m = None
                         return escape
                 return 0.0, 0.0
             self._yield_clear_ticks += 1
@@ -1865,6 +2293,14 @@ class RobotController:
             self._reservation_hold_ticks = 0
         return desired
 
+    def _invalidate_temporal_commit(self) -> None:
+        self._temporal_plan_signature = None
+        self._temporal_trajectory = ()
+        self._temporal_committed_until_s = 0.0
+        self._temporal_goal_hold = False
+        self._temporal_safety_margin_s = 0.0
+        self._temporal_commit_deadline_s = 0.0
+
     def _clear_yield(self) -> None:
         self._yielding_for = None
         self._yield_requires_intent = False
@@ -1884,6 +2320,7 @@ class RobotController:
         self._coordination_wait_reason = None
         self._coordination_wait_owner_id = None
         self._known_coordination_peer_ids.clear()
+        self._invalidate_temporal_commit()
 
     def disconnect(self, vehicle: Vehicle) -> None:
         vehicle.stop()
@@ -2150,6 +2587,7 @@ class RobotController:
                 return
             self.active_mission = self._pending.popleft()
             self._subgoal_index = 0
+            self._active_task_age_ticks = 0
         mission = self.active_mission
         goal_x_m, goal_y_m = mission.subgoals[self._subgoal_index]
         local_x_m, local_y_m, _ = anchor.global_to_anchor(
@@ -2195,6 +2633,7 @@ class RobotController:
         pose: PoseEstimate,
         local_map: ObservedGrid,
     ) -> None:
+        self._invalidate_temporal_commit()
         if self._advance_subgoal(vehicle):
             self._start_or_resume(
                 anchor,

@@ -243,6 +243,19 @@ class GotoController:
             index = end
         return None
 
+    def coordination_path_cells(
+        self,
+        pose: PoseEstimate,
+        local_map: ObservedGrid,
+        *,
+        max_cells: int = MAX_REPORTED_PATH_CELLS,
+    ) -> tuple[tuple[int, int], ...] | None:
+        """Return a bounded OwnMap-only D* route for time scheduling."""
+        if type(max_cells) is not int or max_cells <= 0:
+            raise ValueError("max_cells must be a positive integer")
+        path = self._advance_coordination_path(pose, local_map)
+        return None if path is None else tuple(path[:max_cells])
+
     def _advance_coordination_path(
         self,
         pose: PoseEstimate,
@@ -263,14 +276,19 @@ class GotoController:
         route_goal = self.goal if goal_m is None else goal_m
         if route_goal is None:
             return "unreachable"
-        snapshot = local_map.snapshot()
-        revision = snapshot["revision"]
-        states = {
-            (cell["gx"], cell["gy"]): cell["state"]
-            for cell in snapshot["cells"]
-        }
+        revision = local_map.revision
         changes: tuple[MapCellUpdate, ...] = ()
-        if self._coordination_planner is None or self._coordination_map is not local_map:
+        new_map = (
+            self._coordination_planner is None
+            or self._coordination_map is not local_map
+        )
+        if new_map or revision != self._coordination_map_revision:
+            snapshot = local_map.snapshot()
+            states = {
+                (cell["gx"], cell["gy"]): cell["state"]
+                for cell in snapshot["cells"]
+            }
+        if new_map:
             self._coordination_planner = DStarLitePlanner(
                 local_map,
                 vehicle_radius_m=self._vehicle_radius_m,
@@ -291,8 +309,9 @@ class GotoController:
                 if self._coordination_states.get((gx, gy), UNKNOWN)
                 != states.get((gx, gy), UNKNOWN)
             )
-        self._coordination_map_revision = revision
-        self._coordination_states = states
+        if new_map or revision != self._coordination_map_revision:
+            self._coordination_map_revision = revision
+            self._coordination_states = states
 
         request = self._pose_cell(pose, local_map), (
             math.floor(route_goal[0] / local_map.resolution_m),

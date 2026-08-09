@@ -22,6 +22,7 @@ from mockvehicle2d.episode import (
     MIN_PROGRESS_TRANSLATION_M,
     _DeterministicPeerStateExchange,
     _update_no_progress,
+    _vehicle_has_unfinished_work,
     run_episode,
 )
 from mockvehicle2d.fleet import (
@@ -278,9 +279,29 @@ class TestEpisodeRunner(unittest.TestCase):
                 current,
                 longest,
                 translation_m,
+                work_active=True,
             )
 
         self.assertEqual((current, longest), (3, 3))
+
+    def test_no_progress_excludes_terminal_idle_but_tracks_pending_work(self) -> None:
+        statuses = {
+            ("early", "first"): "reached",
+            ("other", "only"): "not_started",
+        }
+        self.assertFalse(_vehicle_has_unfinished_work(statuses, "early"))
+        self.assertTrue(_vehicle_has_unfinished_work(statuses, "other"))
+        self.assertEqual(
+            _update_no_progress(4, 4, 0.0, work_active=False),
+            (0, 4),
+        )
+
+        statuses[("early", "second")] = "not_started"
+        self.assertTrue(_vehicle_has_unfinished_work(statuses, "early"))
+        self.assertEqual(
+            _update_no_progress(4, 4, 0.0, work_active=True),
+            (5, 5),
+        )
 
     def test_two_vehicle_crossing_example_reports_interaction_metrics(self) -> None:
         from mockvehicle2d import episode as episode_module
@@ -297,7 +318,9 @@ class TestEpisodeRunner(unittest.TestCase):
             ),
         }
         observed_stopping = []
+        observed_control_stops = []
         real_stopped = episode_module._vehicles_stopped
+        real_tick = FleetRuntime.tick
 
         def record_stopping_state(fleet, vehicle_ids):
             observed_stopping.append(
@@ -311,10 +334,15 @@ class TestEpisodeRunner(unittest.TestCase):
             )
             return real_stopped(fleet, vehicle_ids)
 
+        def record_control_stops(fleet, now):
+            result = real_tick(fleet, now)
+            observed_control_stops.append(fleet.control_stop_transitions)
+            return result
+
         with patch(
             "mockvehicle2d.episode._vehicles_stopped",
             side_effect=record_stopping_state,
-        ):
+        ), patch.object(FleetRuntime, "tick", new=record_control_stops):
             results = [
                 run_episode(
                     crossing,
@@ -345,9 +373,8 @@ class TestEpisodeRunner(unittest.TestCase):
         )
         self.assertTrue(
             any(
-                target == (0.0, 0.0) and executed != (0.0, 0.0)
-                for state in observed_stopping
-                for target, executed in state
+                transition
+                for transition in observed_control_stops
             )
         )
         self.assertTrue(

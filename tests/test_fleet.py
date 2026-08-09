@@ -129,6 +129,38 @@ def relay_peer_states(fleet: FleetRuntime) -> None:
         )
 
 
+def relay_peer_coordination(fleet: FleetRuntime) -> None:
+    """Model one healthy transport round for peer state and motion intent."""
+    for source_id, source in fleet.nodes.items():
+        source.map_sync.set_health(
+            ready=True,
+            connected_vehicle_ids=tuple(
+                receiver_id
+                for receiver_id in fleet.nodes
+                if receiver_id != source_id
+            ),
+        )
+    relay_peer_states(fleet)
+    outbound = {
+        vehicle_id: node.map_sync.prepare_motion_intent()
+        for vehicle_id, node in fleet.nodes.items()
+    }
+    for source_id, payload in outbound.items():
+        if payload is None:
+            continue
+        for receiver_id, receiver in fleet.nodes.items():
+            if receiver_id != source_id:
+                receiver.map_sync.receive_motion_intent(
+                    f"peer_{source_id[-1]}",
+                    source_id,
+                    payload,
+                )
+        fleet.nodes[source_id].map_sync.publish_motion_intent_result(
+            payload["sequence"],
+            True,
+        )
+
+
 class TestFleetScenario(unittest.TestCase):
     def test_robot_node_passes_network_membership_to_coordination(self) -> None:
         fleet = peer_fleet(AnchorPose(5.0, 5.0, 0.0), AnchorPose(15.0, 5.0, 0.0))
@@ -140,6 +172,15 @@ class TestFleetScenario(unittest.TestCase):
         controller = Mock()
         controller.planning_ignored_peer_ids.return_value = frozenset()
         controller.motion_intent = (None, 0, "vehicle_1", False, None)
+        controller.temporal_motion_intent = (
+            0,
+            (1 << 64) - 1,
+            0,
+            (),
+            0.0,
+            False,
+            0.0,
+        )
         node.controller = controller
 
         node.control(
@@ -696,7 +737,7 @@ class TestFleetRuntime(unittest.TestCase):
         final_approach_distances = []
         final_approach_started = False
         for tick in range(180):
-            relay_peer_states(fleet)
+            relay_peer_coordination(fleet)
             fleet.tick((tick + 1) * fleet.tick_s)
             follower = fleet.world.vehicle(follower_id)
             leader = fleet.world.vehicle(leader_id)
@@ -728,7 +769,7 @@ class TestFleetRuntime(unittest.TestCase):
         for drain_tick in range(10):
             if fleet.world.vehicle(follower_id).body_velocities() == (0.0, 0.0):
                 break
-            relay_peer_states(fleet)
+            relay_peer_coordination(fleet)
             fleet.tick((tick + drain_tick + 2) * fleet.tick_s)
             follower = fleet.world.vehicle(follower_id)
             leader = fleet.world.vehicle(leader_id)
@@ -800,7 +841,7 @@ class TestFleetRuntime(unittest.TestCase):
         tail_positions = {vehicle_id: [] for vehicle_id in fleet.nodes}
         revision_at_tail_start = None
         for tick in range(600):
-            relay_peer_states(fleet)
+            relay_peer_coordination(fleet)
             fleet.tick((tick + 1) * fleet.tick_s)
             first = fleet.world.vehicle("vehicle_1")
             second = fleet.world.vehicle("vehicle_2")
@@ -1149,6 +1190,7 @@ class TestFleetRuntime(unittest.TestCase):
 
         fleet.tick(1.0)
         fleet.tick(2.0)
+        self.assertEqual(fleet.control_stop_transitions, frozenset())
         poses = fleet.world.truth_snapshot()
         distance_squared = (
             (poses["vehicle_1"][0] - poses["vehicle_2"][0]) ** 2
@@ -1197,6 +1239,35 @@ class TestFleetRuntime(unittest.TestCase):
                 for vehicle_id in reversed_fleet.nodes
             )
         )
+
+    def test_tick_records_control_stop_when_low_speed_brakes_within_one_tick(
+        self,
+    ) -> None:
+        fleet = FleetRuntime.create(
+            scenario(spec(1, 5.0, 5.0)),
+            grid=free_grid(),
+            command_timeout=10.0,
+        )
+        vehicle = fleet.world.vehicle("vehicle_1")
+        vehicle.install_drive(0.05, 0.0, 0.0)
+        fleet.world.advance_to(0.05)
+        vehicle = fleet.world.vehicle("vehicle_1")
+        self.assertEqual(vehicle.body_velocities(), (0.05, 0.0))
+
+        with patch.object(
+            fleet.nodes["vehicle_1"],
+            "control",
+            side_effect=lambda controlled, _grid, _now: controlled.stop(),
+        ):
+            fleet.tick(0.15)
+
+        vehicle = fleet.world.vehicle("vehicle_1")
+        self.assertEqual(
+            fleet.control_stop_transitions,
+            frozenset({"vehicle_1"}),
+        )
+        self.assertEqual(vehicle.target_velocities(), (0.0, 0.0))
+        self.assertEqual(vehicle.body_velocities(), (0.0, 0.0))
 
     def test_accelerating_trajectories_use_physical_time_for_arbitration(self) -> None:
         fleet = FleetRuntime.create(

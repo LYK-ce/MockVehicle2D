@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 import errno
 import fcntl
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 import json
 import math
 import os
@@ -16,6 +16,7 @@ import tempfile
 import time
 from typing import Callable, Iterable
 
+from mockvehicle2d.coordination import TimedCell
 from mockvehicle2d.local_state import (
     FREE,
     FORBIDDEN,
@@ -31,7 +32,7 @@ from mockvehicle2d.local_state import (
 SIDECAR_PROTOCOL = "mockvehicle2d-map-sync-sidecar/1"
 DELTA_PROTOCOL = "mockvehicle2d-map-delta/1"
 PEER_STATE_PROTOCOL = "mockvehicle2d-peer-state/1"
-MOTION_INTENT_PROTOCOL = "mockvehicle2d-motion-intent/2"
+MOTION_INTENT_PROTOCOL = "mockvehicle2d-motion-intent/3"
 MAX_DELTA_CELLS = 512
 MAX_MESSAGE_BYTES = 256 * 1024
 MAX_GRID_COORDINATE = 1_000_000
@@ -39,6 +40,10 @@ MAP_EPOCH = 1
 TRANSFORM_EPOCH = 1
 PEER_STATE_TTL_S = 0.35
 MOTION_INTENT_TTL_S = 0.35
+MOTION_PLAN_HORIZON_S = 4.0
+MOTION_COMMIT_HORIZON_S = 0.8
+MAX_MOTION_TRAJECTORY_CELLS = 64
+MAX_RESERVATION_TIME_MARGIN_S = 10.0
 MAX_INTENT_WAIT_TICKS = 1_000_000
 MAX_PEER_RADIUS_M = 10.0
 MAX_PEER_POSITION_STDDEV_M = 10.0
@@ -413,6 +418,26 @@ class PeerMotionIntent:
     priority_owner_id: str
     reserved: bool = False
     corridor: CorridorDescriptor | None = None
+    plan_generation: int = 1
+    task_sequence: int = 0
+    task_age_ticks: int = 0
+    trajectory: tuple[TimedCell, ...] = ()
+    committed_until_offset_s: float = 0.0
+    goal_hold: bool = False
+    safety_time_margin_s: float = 0.0
+    received_at_s: float | None = field(default=None, compare=False)
+
+    @property
+    def timed_trajectory(self) -> tuple[TimedCell, ...]:
+        if self.trajectory:
+            return self.trajectory
+        if self.target_cell is None or self.target_cell == self.current_cell:
+            return (TimedCell(self.current_cell, 0.0, MOTION_PLAN_HORIZON_S),)
+        travel_s = min(1.0, MOTION_PLAN_HORIZON_S)
+        return (
+            TimedCell(self.current_cell, 0.0, 0.0),
+            TimedCell(self.target_cell, travel_s, MOTION_PLAN_HORIZON_S),
+        )
 
     def as_payload(self, session_id: str, resolution_m: float) -> dict[str, object]:
         return {
@@ -425,15 +450,29 @@ class PeerMotionIntent:
             "resolution_m": resolution_m,
             "timestamp_s": self.timestamp_s,
             "lease_duration_s": self.lease_duration_s,
+            "plan_generation": self.plan_generation,
             "current_cell": _cell_payload(self.current_cell),
             "target_cell": (
                 None if self.target_cell is None else _cell_payload(self.target_cell)
             ),
             "priority": {
                 "wait_ticks": self.wait_ticks,
+                "task_age_ticks": self.task_age_ticks,
+                "task_sequence": self.task_sequence,
                 "owner_vehicle_id": self.priority_owner_id,
             },
             "reserved": self.reserved,
+            "trajectory": [
+                {
+                    "cell": _cell_payload(item.cell),
+                    "enter_offset_s": item.enter_offset_s,
+                    "leave_offset_s": item.leave_offset_s,
+                }
+                for item in self.timed_trajectory
+            ],
+            "committed_until_offset_s": self.committed_until_offset_s,
+            "goal_hold": self.goal_hold,
+            "safety_time_margin_s": self.safety_time_margin_s,
             "corridor": (
                 None if self.corridor is None else self.corridor.as_payload()
             ),
@@ -442,6 +481,35 @@ class PeerMotionIntent:
 
 def _cell_payload(cell: tuple[int, int]) -> dict[str, int]:
     return {"gx": cell[0], "gy": cell[1]}
+
+
+def _validate_timed_trajectory(
+    trajectory: tuple[TimedCell, ...],
+    *,
+    current_cell: tuple[int, int],
+    target_cell: tuple[int, int] | None,
+) -> None:
+    if (
+        not trajectory
+        or len(trajectory) > MAX_MOTION_TRAJECTORY_CELLS
+        or trajectory[0].cell != current_cell
+        or not math.isclose(trajectory[0].enter_offset_s, 0.0, abs_tol=1e-12)
+        or trajectory[-1].leave_offset_s > MOTION_PLAN_HORIZON_S + 1e-12
+        or any(
+            second.enter_offset_s <= first.leave_offset_s
+            or first.cell == second.cell
+            for first, second in zip(trajectory, trajectory[1:])
+        )
+        or (
+            target_cell is not None
+            and target_cell != current_cell
+            and (
+                len(trajectory) < 2
+                or trajectory[1].cell != target_cell
+            )
+        )
+    ):
+        raise ValueError("motion intent trajectory is invalid")
 
 
 class MapSyncState:
@@ -497,12 +565,16 @@ class MapSyncState:
         self._peer_state_pose_revision: dict[str, int] = {}
         self._peer_state_timestamp: dict[str, float] = {}
         self._intent_sequence = 0
+        self._local_plan_generation = 0
+        self._local_plan_signature: tuple[object, ...] | None = None
         self._intent_inflight: PeerMotionIntent | None = None
         self._local_motion_intent: PeerMotionIntent | None = None
         self._peer_motion_intents: dict[str, tuple[PeerMotionIntent, float]] = {}
         self._peer_intent_generation: dict[str, int] = {}
         self._peer_intent_sequence: dict[str, int] = {}
         self._peer_intent_timestamp: dict[str, float] = {}
+        self._peer_plan_generation: dict[str, int] = {}
+        self._peer_plan_signature: dict[str, tuple[object, ...]] = {}
         self._connected_vehicle_ids: tuple[str, ...] = ()
         self.ready = False
         self.published_deltas = 0
@@ -611,6 +683,13 @@ class MapSyncState:
         reserved: bool,
         corridor: CorridorDescriptor | None = None,
         timestamp_s: float,
+        plan_generation: int | None = None,
+        task_sequence: int = 0,
+        task_age_ticks: int = 0,
+        trajectory: tuple[TimedCell, ...] = (),
+        committed_until_offset_s: float = MOTION_COMMIT_HORIZON_S,
+        goal_hold: bool = False,
+        safety_time_margin_s: float = 0.0,
     ) -> None:
         if not isinstance(pose, PoseEstimate) or pose.anchor_id != self.anchor.anchor_id:
             raise ValueError("motion intent pose must use the configured anchor")
@@ -631,6 +710,24 @@ class MapSyncState:
             or type(reserved) is not bool
             or (corridor is not None and not isinstance(corridor, CorridorDescriptor))
             or not math.isfinite(timestamp_s)
+            or type(task_sequence) is not int
+            or not 0 <= task_sequence <= (1 << 64) - 1
+            or type(task_age_ticks) is not int
+            or not 0 <= task_age_ticks <= MAX_INTENT_WAIT_TICKS
+            or (
+                plan_generation is not None
+                and (
+                    type(plan_generation) is not int
+                    or not 0 < plan_generation <= (1 << 64) - 1
+                )
+            )
+            or not isinstance(trajectory, tuple)
+            or any(not isinstance(item, TimedCell) for item in trajectory)
+            or not math.isfinite(committed_until_offset_s)
+            or not 0.0 <= committed_until_offset_s <= MOTION_COMMIT_HORIZON_S
+            or type(goal_hold) is not bool
+            or not math.isfinite(safety_time_margin_s)
+            or not 0.0 <= safety_time_margin_s <= MAX_RESERVATION_TIME_MARGIN_S
         ):
             raise ValueError("invalid motion intent priority or timestamp")
         global_x_m, global_y_m, _ = self.anchor.anchor_to_global(
@@ -645,7 +742,46 @@ class MapSyncState:
                 target_m[0], target_m[1], 0.0
             )
             target_cell = self._global_cell(target_x_m, target_y_m)
-        self._local_motion_intent = PeerMotionIntent(
+        timed_trajectory = trajectory or (
+            (TimedCell(current_cell, 0.0, MOTION_PLAN_HORIZON_S),)
+            if target_cell is None or target_cell == current_cell
+            else (
+                TimedCell(current_cell, 0.0, 0.0),
+                TimedCell(
+                    target_cell,
+                    min(1.0, MOTION_PLAN_HORIZON_S),
+                    MOTION_PLAN_HORIZON_S,
+                ),
+            )
+        )
+        _validate_timed_trajectory(
+            timed_trajectory,
+            current_cell=current_cell,
+            target_cell=target_cell,
+        )
+        if committed_until_offset_s > timed_trajectory[-1].leave_offset_s:
+            raise ValueError("motion intent commit exceeds trajectory")
+        signature = (
+            task_sequence,
+            tuple(item.cell for item in timed_trajectory),
+            goal_hold,
+        )
+        if plan_generation is None:
+            if signature != self._local_plan_signature:
+                plan_generation = self._local_plan_generation + 1
+            else:
+                plan_generation = self._local_plan_generation
+        else:
+            if plan_generation < self._local_plan_generation:
+                raise ValueError("plan_generation cannot regress")
+            if (
+                plan_generation == self._local_plan_generation
+                and signature != self._local_plan_signature
+            ):
+                raise ValueError("plan_generation cannot change plan signature")
+        if not 0 < plan_generation <= (1 << 64) - 1:
+            raise ValueError("plan_generation must be an unsigned 64-bit integer")
+        intent = PeerMotionIntent(
             self.vehicle_id,
             self._state_generation,
             0,
@@ -657,7 +793,20 @@ class MapSyncState:
             priority_owner_id,
             reserved,
             corridor,
+            plan_generation,
+            task_sequence,
+            task_age_ticks,
+            timed_trajectory,
+            committed_until_offset_s,
+            goal_hold,
+            safety_time_margin_s,
+            timestamp_s,
         )
+        (
+            self._local_plan_generation,
+            self._local_plan_signature,
+            self._local_motion_intent,
+        ) = (plan_generation, signature, intent)
 
     def prepare_motion_intent(self) -> dict[str, object] | None:
         if self._intent_inflight is not None or self._local_motion_intent is None:
@@ -907,15 +1056,33 @@ class MapSyncState:
             self._peer_intent_generation[source] = intent.intent_generation
             self._peer_intent_sequence[source] = 0
             self._peer_intent_timestamp[source] = -math.inf
+            self._peer_plan_generation[source] = 0
+            self._peer_plan_signature.pop(source, None)
+        plan_generation = self._peer_plan_generation.get(source, 0)
+        plan_signature = (
+            intent.task_sequence,
+            tuple(item.cell for item in intent.trajectory),
+            intent.goal_hold,
+        )
         if (
             intent.sequence <= self._peer_intent_sequence[source]
             or intent.timestamp_s < self._peer_intent_timestamp[source]
+            or intent.plan_generation < plan_generation
+            or (
+                intent.plan_generation == plan_generation
+                and self._peer_plan_signature.get(source) != plan_signature
+            )
         ):
             self.rejected_motion_intents += 1
             return False
         self._peer_intent_sequence[source] = intent.sequence
         self._peer_intent_timestamp[source] = intent.timestamp_s
-        self._peer_motion_intents[source] = intent, receipt
+        self._peer_plan_generation[source] = intent.plan_generation
+        self._peer_plan_signature[source] = plan_signature
+        self._peer_motion_intents[source] = replace(
+            intent,
+            received_at_s=receipt,
+        ), receipt
         self.received_motion_intents += 1
         return True
 
@@ -938,10 +1105,15 @@ class MapSyncState:
                 "resolution_m",
                 "timestamp_s",
                 "lease_duration_s",
+                "plan_generation",
                 "current_cell",
                 "target_cell",
                 "priority",
                 "reserved",
+                "trajectory",
+                "committed_until_offset_s",
+                "goal_hold",
+                "safety_time_margin_s",
                 "corridor",
             )
         )
@@ -981,6 +1153,47 @@ class MapSyncState:
             if body["target_cell"] is None
             else self._validate_intent_cell(body["target_cell"], "target_cell")
         )
+        trajectory_payload = body["trajectory"]
+        if (
+            not isinstance(trajectory_payload, list)
+            or not trajectory_payload
+            or len(trajectory_payload) > MAX_MOTION_TRAJECTORY_CELLS
+        ):
+            raise ValueError("motion intent trajectory length is invalid")
+        timed_cells = []
+        for item in trajectory_payload:
+            timed = _strict_object(
+                item,
+                required=frozenset(
+                    ("cell", "enter_offset_s", "leave_offset_s")
+                ),
+                allowed=frozenset(
+                    ("cell", "enter_offset_s", "leave_offset_s")
+                ),
+                name="motion_intent.trajectory[]",
+            )
+            timed_cells.append(
+                TimedCell(
+                    self._validate_intent_cell(
+                        timed["cell"],
+                        "trajectory.cell",
+                    ),
+                    _finite(
+                        timed["enter_offset_s"],
+                        "trajectory.enter_offset_s",
+                    ),
+                    _finite(
+                        timed["leave_offset_s"],
+                        "trajectory.leave_offset_s",
+                    ),
+                )
+            )
+        trajectory = tuple(timed_cells)
+        _validate_timed_trajectory(
+            trajectory,
+            current_cell=current_cell,
+            target_cell=target_cell,
+        )
         corridor_payload = body["corridor"]
         corridor = None
         if corridor_payload is not None:
@@ -1002,17 +1215,63 @@ class MapSyncState:
             )
         priority = _strict_object(
             body["priority"],
-            required=frozenset(("wait_ticks", "owner_vehicle_id")),
-            allowed=frozenset(("wait_ticks", "owner_vehicle_id")),
+            required=frozenset(
+                (
+                    "wait_ticks",
+                    "task_age_ticks",
+                    "task_sequence",
+                    "owner_vehicle_id",
+                )
+            ),
+            allowed=frozenset(
+                (
+                    "wait_ticks",
+                    "task_age_ticks",
+                    "task_sequence",
+                    "owner_vehicle_id",
+                )
+            ),
             name="motion_intent.priority",
         )
         wait_ticks = _nonnegative_integer(priority["wait_ticks"], "priority.wait_ticks")
+        task_sequence = _nonnegative_integer(
+            priority["task_sequence"],
+            "priority.task_sequence",
+        )
+        task_age_ticks = _nonnegative_integer(
+            priority["task_age_ticks"],
+            "priority.task_age_ticks",
+        )
         owner = priority["owner_vehicle_id"]
+        plan_generation = _positive_integer(
+            body["plan_generation"],
+            "plan_generation",
+        )
+        committed_until_offset_s = _finite(
+            body["committed_until_offset_s"],
+            "committed_until_offset_s",
+        )
+        safety_time_margin_s = _finite(
+            body["safety_time_margin_s"],
+            "safety_time_margin_s",
+        )
         if (
             wait_ticks > MAX_INTENT_WAIT_TICKS
+            or task_sequence > (1 << 64) - 1
+            or task_age_ticks > MAX_INTENT_WAIT_TICKS
+            or plan_generation > (1 << 64) - 1
             or not isinstance(owner, str)
             or owner not in {self.vehicle_id, source, *self._expected_peers}
             or type(body["reserved"]) is not bool
+            or not 0.0
+            <= committed_until_offset_s
+            <= MOTION_COMMIT_HORIZON_S
+            or committed_until_offset_s
+            > trajectory[-1].leave_offset_s
+            or type(body["goal_hold"]) is not bool
+            or not 0.0
+            <= safety_time_margin_s
+            <= MAX_RESERVATION_TIME_MARGIN_S
         ):
             raise ValueError("motion intent priority is invalid")
         return PeerMotionIntent(
@@ -1027,6 +1286,13 @@ class MapSyncState:
             owner,
             body["reserved"],
             corridor,
+            plan_generation,
+            task_sequence,
+            task_age_ticks,
+            trajectory,
+            committed_until_offset_s,
+            body["goal_hold"],
+            safety_time_margin_s,
         )
 
     @staticmethod
