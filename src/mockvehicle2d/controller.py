@@ -20,6 +20,7 @@ from mockvehicle2d.navigation import (
 from mockvehicle2d.map_sync import (
     CorridorDescriptor,
     MAX_INTENT_WAIT_TICKS,
+    MAX_MOTION_TRAJECTORY_CELLS,
     MOTION_COMMIT_HORIZON_S,
     MOTION_INTENT_TTL_S,
     MOTION_PLAN_HORIZON_S,
@@ -712,6 +713,53 @@ def _coordination_route_from_current(
         if result[-1] != cell:
             result.append(cell)
     return tuple(result)
+
+
+def _coordination_route_progress(
+    cells: tuple[tuple[int, int], ...],
+    current_cell: tuple[int, int],
+) -> tuple[
+    int,
+    tuple[tuple[int, int], ...],
+    tuple[tuple[int, int], ...],
+] | None:
+    expanded: list[tuple[int, int]] = []
+    suffix = None
+    for index, (start, end) in enumerate(zip(cells, cells[1:])):
+        segment = _coordination_segment_cells(start, end)
+        if suffix is None and current_cell in segment:
+            suffix = _coordination_route_from_current(
+                cells[index + 1 :],
+                current_cell,
+            )
+        for cell in segment:
+            if not expanded or cell != expanded[-1]:
+                expanded.append(cell)
+    if suffix is None:
+        return None
+    return expanded.index(current_cell), tuple(expanded), suffix
+
+
+def _coordination_segment_cells(
+    start: tuple[int, int],
+    end: tuple[int, int],
+) -> tuple[tuple[int, int], ...]:
+    delta_x = end[0] - start[0]
+    delta_y = end[1] - start[1]
+    if abs(delta_x) == 2 and abs(delta_y) == 1:
+        middle_x = start[0] + (1 if delta_x > 0 else -1)
+        return start, (middle_x, start[1]), (middle_x, end[1]), end
+    if abs(delta_x) == 1 and abs(delta_y) == 2:
+        middle_y = start[1] + (1 if delta_y > 0 else -1)
+        return start, (start[0], middle_y), (end[0], middle_y), end
+    steps = max(abs(delta_x), abs(delta_y))
+    if steps == 0:
+        return (start,)
+    step_x, step_y = delta_x // steps, delta_y // steps
+    return tuple(
+        (start[0] + step * step_x, start[1] + step * step_y)
+        for step in range(steps + 1)
+    )
 
 
 def _global_coordination_cells(
@@ -2469,7 +2517,7 @@ class RobotController:
                 local_map.resolution_m,
             ),
             own.current_cell,
-        )
+        )[:MAX_MOTION_TRAJECTORY_CELLS]
         for intent in sorted(
             peer_motion_intents,
             key=lambda item: item.source_vehicle_id,
@@ -2955,16 +3003,25 @@ class RobotController:
                     + AUTOMATIC_MINIMUM_CLEARANCE_M
                 )
                 route_cells = previous_vacate_request.route_cells
+                route_progress = _coordination_route_progress(
+                    route_cells,
+                    current_cell,
+                )
+                progress_cells = (
+                    route_cells
+                    if route_progress is None
+                    else route_progress[1]
+                )
                 blocked_route_indices = tuple(
                     index
-                    for index, cell in enumerate(route_cells)
+                    for index, cell in enumerate(progress_cells)
                     if math.dist(cell, previous_vacate_request.cell)
                     * local_map.resolution_m
                     <= spacing_m + 1e-12
                 )
                 route_index = (
-                    route_cells.index(current_cell)
-                    if current_cell in route_cells
+                    route_progress[0]
+                    if route_progress is not None
                     else None
                 )
                 passed_request = (
@@ -2980,7 +3037,8 @@ class RobotController:
                     if cell is not None
                 )
                 if not (passed_request and request_clear) and route_index is not None:
-                    remaining_route = route_cells[route_index:]
+                    assert route_progress is not None
+                    remaining_route = route_progress[2]
                     if len(remaining_route) >= 2:
                         self._vacate_request = replace(
                             previous_vacate_request,

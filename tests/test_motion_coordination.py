@@ -4075,7 +4075,10 @@ class TestMotionCoordination(unittest.TestCase):
     ) -> None:
         anchor = AnchorSpec("rotated-requester", 0.0, 0.0, math.pi / 4)
         local_map = ObservedGrid(anchor)
-        local_route = ((0, 0), (1, 0), (2, 0), (3, 0), (4, 0))
+        local_route = tuple((index, index) for index in range(64))
+        global_route = _global_coordination_cells(anchor, local_route, 1.0)
+        self.assertEqual(len(global_route), 64)
+        blocker_cell = global_route[16]
         navigation = Mock(
             transient_peer_blocked=True,
             motion_target=None,
@@ -4107,7 +4110,14 @@ class TestMotionCoordination(unittest.TestCase):
             pose=pose,
             local_map=local_map,
             now=1.0,
-            peer_states=(peer_state("vehicle_b", 1.5, 2.5, 0.0),),
+            peer_states=(
+                peer_state(
+                    "vehicle_b",
+                    blocker_cell[0] + 0.5,
+                    blocker_cell[1] + 0.5,
+                    0.0,
+                ),
+            ),
             peer_motion_intents=(
                 PeerMotionIntent(
                     "vehicle_b",
@@ -4115,7 +4125,7 @@ class TestMotionCoordination(unittest.TestCase):
                     1,
                     1.0,
                     MOTION_INTENT_TTL_S,
-                    (1, 2),
+                    blocker_cell,
                     None,
                     0,
                     "vehicle_b",
@@ -4127,6 +4137,8 @@ class TestMotionCoordination(unittest.TestCase):
         )
         request = controller.vacate_request
         assert request is not None
+        self.assertEqual(len(request.route_cells), 64)
+        self.assertIn(blocker_cell, request.route_cells)
         sync = MapSyncState(
             "session", "vehicle_a", anchor, 1.0, state_generation=1
         )
@@ -4285,17 +4297,14 @@ class TestMotionCoordination(unittest.TestCase):
     ) -> None:
         route = (
             (0, 0),
-            (0, 1),
             (0, 2),
-            (1, 2),
             (2, 2),
-            (2, 1),
             (2, 0),
         )
         controller, _ = parked_idle_request_once(
             route=route,
-            peer_current=(0, 2),
-            peer_position_m=(0.5, 2.5),
+            peer_current=(2, 2),
+            peer_position_m=(2.5, 2.5),
         )
         request = controller.vacate_request
         assert request is not None
@@ -4303,14 +4312,14 @@ class TestMotionCoordination(unittest.TestCase):
         responder = replace(
             intent(
                 "vehicle_b",
-                current=(0, 3),
+                current=(3, 2),
                 target=None,
                 wait_ticks=0,
                 owner="vehicle_a",
             ),
             task_sequence=(1 << 64) - 1,
         )
-        responder_state = peer_state("vehicle_b", 0.5, 3.5, 0.0)
+        responder_state = peer_state("vehicle_b", 3.5, 2.5, 0.0)
         anchor = AnchorSpec("spawn_vehicle_a", 0.0, 0.0, 0.0)
         local_map = ObservedGrid(anchor)
 
@@ -4342,22 +4351,99 @@ class TestMotionCoordination(unittest.TestCase):
         )
         self.assertEqual(
             controller.vacate_request,
-            replace(request, route_cells=route[1:]),
+            replace(
+                request,
+                route_cells=((0, 1), (0, 2), (2, 2), (2, 0)),
+            ),
         )
 
         coordinate_once(
             controller,
-            Vehicle(2.5, 2.5, radius=0.5, now=0.0),
+            Vehicle(2.5, 0.5, radius=0.5, now=0.0),
             anchor,
             local_map,
             vehicle_id="vehicle_a",
             now=1.3,
-            position_m=(2.5, 2.5),
+            position_m=(2.5, 0.5),
             peer_states=(responder_state,),
             peer_intents=(responder,),
             desired=(0.0, 0.0),
         )
         self.assertIsNone(controller.vacate_request)
+
+    def test_vacate_request_progress_covers_legal_two_cell_route_steps(
+        self,
+    ) -> None:
+        cases = (
+            (((0, 0), (2, 0), (4, 0)), (1, 0)),
+            (((0, 0), (2, 1), (4, 1)), (1, 0)),
+            (((0, 0), (2, 1), (4, 1)), (1, 1)),
+            (((0, 0), (1, 2), (1, 4)), (0, 1)),
+            (((0, 0), (1, 2), (1, 4)), (1, 1)),
+        )
+        anchor = AnchorSpec("spawn_vehicle_a", 0.0, 0.0, 0.0)
+        local_map = ObservedGrid(anchor)
+        for route, current_cell in cases:
+            with self.subTest(route=route, current_cell=current_cell):
+                blocker_cell = route[1]
+                controller, _ = parked_idle_request_once(
+                    route=route,
+                    peer_current=blocker_cell,
+                    peer_position_m=(
+                        blocker_cell[0] + 0.5,
+                        blocker_cell[1] + 0.5,
+                    ),
+                )
+                request = controller.vacate_request
+                assert request is not None
+                controller.navigation.transient_peer_blocked = False
+                responder_cell = (blocker_cell[0], blocker_cell[1] + 1)
+                responder = replace(
+                    intent(
+                        "vehicle_b",
+                        current=responder_cell,
+                        target=None,
+                        wait_ticks=0,
+                        owner="vehicle_a",
+                    ),
+                    task_sequence=(1 << 64) - 1,
+                )
+
+                coordinate_once(
+                    controller,
+                    Vehicle(
+                        current_cell[0] + 0.5,
+                        current_cell[1] + 0.5,
+                        radius=0.5,
+                        now=0.0,
+                    ),
+                    anchor,
+                    local_map,
+                    vehicle_id="vehicle_a",
+                    now=1.1,
+                    position_m=(
+                        current_cell[0] + 0.5,
+                        current_cell[1] + 0.5,
+                    ),
+                    peer_states=(
+                        peer_state(
+                            "vehicle_b",
+                            responder_cell[0] + 0.5,
+                            responder_cell[1] + 0.5,
+                            0.0,
+                        ),
+                    ),
+                    peer_intents=(responder,),
+                    desired=(0.0, 0.0),
+                )
+
+                self.assertEqual(
+                    controller.vacate_request,
+                    replace(
+                        request,
+                        route_cells=(current_cell, *route[1:]),
+                    ),
+                )
 
     def test_explicit_idle_vacate_defers_new_corridor_detection(self) -> None:
         requester = vacate_intent()
