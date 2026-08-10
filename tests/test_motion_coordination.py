@@ -66,7 +66,7 @@ def intent(
     vehicle_id: str,
     *,
     current: tuple[int, int],
-    target: tuple[int, int],
+    target: tuple[int, int] | None,
     wait_ticks: int,
     owner: str | None = None,
     reserved: bool = False,
@@ -111,6 +111,44 @@ def peer_state(
         vy_mps,
         0.0,
         0.5,
+    )
+
+
+def coordinate_once(
+    controller: RobotController,
+    vehicle: Vehicle,
+    anchor: AnchorSpec,
+    local_map: ObservedGrid,
+    *,
+    vehicle_id: str,
+    now: float,
+    position_m: tuple[float, float],
+    peer_states: tuple[PeerVehicleState, ...],
+    peer_intents: tuple[PeerMotionIntent, ...],
+    desired: tuple[float, float] = (0.5, 0.0),
+) -> tuple[float, float]:
+    return controller._coordinate_desired(
+        desired,
+        vehicle=vehicle,
+        vehicle_id=vehicle_id,
+        anchor=anchor,
+        pose=PoseEstimate(
+            anchor.anchor_id,
+            *position_m,
+            0.0,
+            (0.0, 0.0, 0.0),
+            "nominal",
+            now,
+            round(now * 10),
+        ),
+        local_map=local_map,
+        now=now,
+        peer_states=peer_states,
+        peer_motion_intents=peer_intents,
+        coordination_ready=True,
+        expected_peer_vehicle_ids=tuple(
+            intent.source_vehicle_id for intent in peer_intents
+        ),
     )
 
 
@@ -236,6 +274,140 @@ class TestMotionCoordination(unittest.TestCase):
             all(
                 navigation.coordination_corridor(pose, local_map) is None
                 for _ in range(16)
+            )
+        )
+
+    def test_vacate_path_can_look_past_a_wall_corner(self) -> None:
+        anchor = AnchorSpec("vacate-corner", 0.0, 0.0, 0.0)
+        local_map = ObservedGrid(anchor)
+        local_map._cells.update(
+            {
+                (0, 0): FREE,
+                (1, 0): FREE,
+                (1, 1): FREE,
+                (1, 2): FREE,
+            }
+        )
+        pose = PoseEstimate(
+            anchor.anchor_id,
+            0.5,
+            0.5,
+            0.0,
+            (0.0, 0.0, 0.0),
+            "nominal",
+            1.0,
+            1,
+        )
+        navigation = GotoController()
+        navigation.status = "active"
+        planner = Mock()
+        planner.is_segment_passable.side_effect = (
+            lambda source, target, **_: not (
+                source == (0.5, 0.5) and target == (1.5, 1.5)
+            )
+        )
+        navigation._planner = planner
+
+        with patch.object(
+            navigation,
+            "_advance_coordination_path",
+            return_value=[(0, 0), (1, 0), (2, 0)],
+        ):
+            path = navigation.coordination_vacate_path(
+                pose,
+                local_map,
+                required_clearance_m=2.0,
+            )
+
+        self.assertEqual(
+            path,
+            ((1.5, 0.5), (1.5, 1.5), (1.5, 2.5)),
+        )
+
+    def test_vacate_path_does_not_cross_unknown_or_static_cells(self) -> None:
+        anchor = AnchorSpec("vacate-blocked", 0.0, 0.0, 0.0)
+        pose = PoseEstimate(
+            anchor.anchor_id,
+            0.5,
+            0.5,
+            0.0,
+            (0.0, 0.0, 0.0),
+            "nominal",
+            1.0,
+            1,
+        )
+        for state in (UNKNOWN, OCCUPIED):
+            with self.subTest(state=state):
+                local_map = ObservedGrid(anchor)
+                local_map._cells[(0, 0)] = FREE
+                if state != UNKNOWN:
+                    local_map._cells.update(
+                        {
+                            (gx, gy): state
+                            for gx in range(-1, 2)
+                            for gy in range(-1, 2)
+                            if (gx, gy) != (0, 0)
+                        }
+                    )
+                navigation = GotoController()
+                navigation.status = "active"
+                navigation._planner = Mock(
+                    is_segment_passable=Mock(return_value=True)
+                )
+                with patch.object(
+                    navigation,
+                    "_advance_coordination_path",
+                    return_value=[(0, 0), (1, 0), (2, 0)],
+                ):
+                    self.assertEqual(
+                        navigation.coordination_vacate_path(
+                            pose,
+                            local_map,
+                            required_clearance_m=1.0,
+                        ),
+                        (),
+                    )
+
+    def test_vacate_path_search_is_bounded_to_four_metres(self) -> None:
+        anchor = AnchorSpec("vacate-bounded", 0.0, 0.0, 0.0)
+        local_map = ObservedGrid(anchor)
+        local_map._cells.update(
+            {
+                (gx, gy): FREE
+                for gx in range(-6, 7)
+                for gy in range(-6, 7)
+            }
+        )
+        pose = PoseEstimate(
+            anchor.anchor_id,
+            0.5,
+            0.5,
+            0.0,
+            (0.0, 0.0, 0.0),
+            "nominal",
+            1.0,
+            1,
+        )
+        navigation = GotoController()
+        navigation.status = "active"
+        planner = Mock(is_segment_passable=Mock(return_value=True))
+        navigation._planner = planner
+        with patch.object(
+            navigation,
+            "_advance_coordination_path",
+            return_value=[(0, 0), (1, 0), (2, 0)],
+        ):
+            path = navigation.coordination_vacate_path(
+                pose,
+                local_map,
+                required_clearance_m=4.5,
+            )
+
+        self.assertEqual(path, ())
+        self.assertTrue(
+            all(
+                math.dist((0.5, 0.5), call.args[1]) <= 4.0 + 1e-12
+                for call in planner.is_segment_passable.call_args_list
             )
         )
 
@@ -2750,6 +2922,1250 @@ class TestMotionCoordination(unittest.TestCase):
             published["target_cell"],
         )
 
+    def test_peer_vacate_request_survives_a_target_change_before_entry(
+        self,
+    ) -> None:
+        anchor = AnchorSpec("spawn_2", 0.0, 0.0, 0.0)
+        local_map = ObservedGrid(anchor)
+        navigation = Mock(
+            motion_target=None,
+            coordination_path_cells=Mock(return_value=((1, 0),)),
+            coordination_detours=Mock(return_value=((1.5, 1.5),)),
+        )
+        controller = RobotController(navigation)
+        vehicle = Vehicle(1.5, 0.5, radius=0.2, now=0.0)
+
+        coordinate_once(
+            controller,
+            vehicle,
+            anchor,
+            local_map,
+            vehicle_id="vehicle_2",
+            now=1.0,
+            position_m=(1.5, 0.5),
+            peer_states=(peer_state("vehicle_1", 0.5, 0.5, 0.0),),
+            peer_intents=(
+                intent(
+                    "vehicle_1",
+                    current=(0, 0),
+                    target=(2, 0),
+                    wait_ticks=5,
+                    reserved=True,
+                ),
+            ),
+            desired=(0.0, 0.0),
+        )
+        self.assertEqual(controller._peer_vacate_request_cell, (1, 0))
+
+        navigation.motion_target = (2.5, 1.5)
+        held = coordinate_once(
+            controller,
+            vehicle,
+            anchor,
+            local_map,
+            vehicle_id="vehicle_2",
+            now=1.1,
+            position_m=(1.5, 1.5),
+            peer_states=(peer_state("vehicle_1", 0.5, 0.5, 0.0),),
+            peer_intents=(
+                intent(
+                    "vehicle_1",
+                    current=(0, 0),
+                    target=(2, 0),
+                    wait_ticks=5,
+                    reserved=True,
+                ),
+            ),
+        )
+
+        self.assertEqual(held, (0.0, 0.0))
+
+        entered = coordinate_once(
+            controller,
+            vehicle,
+            anchor,
+            local_map,
+            vehicle_id="vehicle_2",
+            now=1.2,
+            position_m=(1.5, 1.5),
+            peer_states=(peer_state("vehicle_1", 1.5, 0.5, 0.0),),
+            peer_intents=(
+                intent(
+                    "vehicle_1",
+                    current=(1, 0),
+                    target=(2, 0),
+                    wait_ticks=5,
+                    reserved=True,
+                ),
+            ),
+        )
+        self.assertEqual(entered, (0.0, 0.0))
+
+        navigation.coordination_path_cells.return_value = ((1, 1), (2, 1))
+        coordinate_once(
+            controller,
+            vehicle,
+            anchor,
+            local_map,
+            vehicle_id="vehicle_2",
+            now=1.3,
+            position_m=(1.5, 1.5),
+            peer_states=(peer_state("vehicle_1", 3.5, 0.5, 0.0),),
+            peer_intents=(
+                intent(
+                    "vehicle_1",
+                    current=(3, 0),
+                    target=(4, 0),
+                    wait_ticks=5,
+                    reserved=True,
+                ),
+            ),
+        )
+
+        self.assertIsNone(controller._peer_vacate_request_cell)
+
+    def test_peer_vacate_request_can_be_explicitly_retracted_before_entry(
+        self,
+    ) -> None:
+        anchor = AnchorSpec("spawn_2", 0.0, 0.0, 0.0)
+        local_map = ObservedGrid(anchor)
+        navigation = Mock(
+            motion_target=None,
+            coordination_path_cells=Mock(return_value=((1, 0),)),
+            coordination_detours=Mock(return_value=((1.5, 1.5),)),
+        )
+        controller = RobotController(navigation)
+        vehicle = Vehicle(1.5, 0.5, radius=0.1, now=0.0)
+
+        coordinate_once(
+            controller,
+            vehicle,
+            anchor,
+            local_map,
+            vehicle_id="vehicle_2",
+            now=1.0,
+            position_m=(1.5, 0.5),
+            peer_states=(peer_state("vehicle_1", 0.5, 0.5, 0.0),),
+            peer_intents=(
+                intent(
+                    "vehicle_1",
+                    current=(0, 0),
+                    target=(1, 0),
+                    wait_ticks=5,
+                    reserved=True,
+                ),
+            ),
+            desired=(0.0, 0.0),
+        )
+
+        navigation.motion_target = (2.5, 1.5)
+        navigation.coordination_path_cells.return_value = ((1, 1), (2, 1))
+        coordinate_once(
+            controller,
+            vehicle,
+            anchor,
+            local_map,
+            vehicle_id="vehicle_2",
+            now=1.1,
+            position_m=(1.5, 1.5),
+            peer_states=(peer_state("vehicle_1", 0.5, 0.5, 0.0),),
+            peer_intents=(
+                intent(
+                    "vehicle_1",
+                    current=(0, 0),
+                    target=None,
+                    wait_ticks=5,
+                    reserved=False,
+                ),
+            ),
+        )
+
+        self.assertIsNone(controller._peer_vacate_request_cell)
+
+    def test_implicit_vacate_rebinds_to_a_same_owner_explicit_request(
+        self,
+    ) -> None:
+        anchor = AnchorSpec("spawn_c", 0.0, 0.0, 0.0)
+        local_map = ObservedGrid(anchor)
+        navigation = Mock(
+            transient_peer_blocked=True,
+            motion_target=None,
+            coordination_path_cells=Mock(
+                return_value=((1, 0), (2, 0), (3, 0))
+            ),
+            coordination_vacate_path=Mock(return_value=((1.5, 1.5),)),
+            coordination_detours=Mock(return_value=((1.5, 2.5),)),
+        )
+        controller = RobotController(navigation)
+        vehicle = Vehicle(1.5, 0.5, radius=0.1, now=0.0)
+
+        coordinate_once(
+            controller,
+            vehicle,
+            anchor,
+            local_map,
+            vehicle_id="vehicle_c",
+            now=1.0,
+            position_m=(1.5, 0.5),
+            peer_states=(peer_state("vehicle_a", 0.5, 0.5, 0.0),),
+            peer_intents=(
+                intent(
+                    "vehicle_a",
+                    current=(0, 0),
+                    target=(3, 0),
+                    wait_ticks=5,
+                    reserved=True,
+                ),
+            ),
+            desired=(0.0, 0.0),
+        )
+        self.assertEqual(
+            controller._yielding_for,
+            "vehicle_a",
+        )
+        self.assertIsNone(controller._peer_vacate_request_cell)
+
+        navigation.transient_peer_blocked = False
+        navigation.motion_target = (2.5, 1.5)
+        coordinate_once(
+            controller,
+            vehicle,
+            anchor,
+            local_map,
+            vehicle_id="vehicle_c",
+            now=1.1,
+            position_m=(1.5, 1.5),
+            peer_states=(
+                peer_state("vehicle_a", 0.5, 0.5, 0.0),
+                peer_state("vehicle_b", 2.5, 1.5, 0.0),
+            ),
+            peer_intents=(
+                intent(
+                    "vehicle_a",
+                    current=(0, 0),
+                    target=(3, 0),
+                    wait_ticks=5,
+                    reserved=True,
+                ),
+                intent(
+                    "vehicle_b",
+                    current=(2, 1),
+                    target=(1, 1),
+                    wait_ticks=7,
+                    owner="vehicle_a",
+                ),
+            ),
+        )
+
+        self.assertEqual(
+            controller._yielding_for,
+            "vehicle_b",
+        )
+        self.assertEqual(controller.motion_intent[2], "vehicle_a")
+        self.assertEqual(controller._peer_vacate_request_cell, (1, 1))
+        self.assertFalse(controller._peer_vacate_request_entered)
+
+    def test_inactive_peer_vacate_preserves_generic_yield_clear_debounce(
+        self,
+    ) -> None:
+        anchor = AnchorSpec("spawn_b", 0.0, 0.0, 0.0)
+        local_map = ObservedGrid(anchor)
+        navigation = Mock(
+            transient_peer_blocked=False,
+            motion_target=(1.5, 0.5),
+            coordination_corridor=Mock(return_value=None),
+        )
+        controller = RobotController(navigation)
+        controller._yielding_for = "vehicle_a"
+        controller._yield_requires_intent = True
+        controller._yield_clear_ticks = 1
+        controller._schedule_temporal_motion = Mock(
+            side_effect=lambda desired, **kwargs: (
+                desired,
+                kwargs["own"].target_cell,
+                kwargs["own"],
+                False,
+            )
+        )
+        vehicle = Vehicle(0.5, 0.5, radius=0.5, now=0.0)
+        remote_state = peer_state("vehicle_a", 8.5, 8.5, 0.0)
+        remote_intent = intent(
+            "vehicle_a",
+            current=(8, 8),
+            target=(9, 8),
+            wait_ticks=0,
+        )
+
+        held = coordinate_once(
+            controller,
+            vehicle,
+            anchor,
+            local_map,
+            vehicle_id="vehicle_b",
+            now=1.0,
+            position_m=(0.5, 0.5),
+            peer_states=(remote_state,),
+            peer_intents=(remote_intent,),
+        )
+
+        self.assertEqual(held, (0.0, 0.0))
+        self.assertEqual(controller._yield_clear_ticks, 2)
+        released = coordinate_once(
+            controller,
+            vehicle,
+            anchor,
+            local_map,
+            vehicle_id="vehicle_b",
+            now=1.1,
+            position_m=(0.5, 0.5),
+            peer_states=(remote_state,),
+            peer_intents=(remote_intent,),
+        )
+
+        self.assertEqual(released, (0.5, 0.0))
+        self.assertIsNone(controller._yielding_for)
+
+    def test_implicit_vacate_does_not_yield_forever_to_a_parked_idle_peer(
+        self,
+    ) -> None:
+        anchor = AnchorSpec("spawn_c", 0.0, 0.0, 0.0)
+        local_map = ObservedGrid(anchor)
+
+        def blocker(
+            *,
+            target: tuple[int, int] | None = None,
+            reserved: bool = False,
+            goal_hold: bool = False,
+            task_sequence: int = (1 << 64) - 1,
+        ) -> PeerMotionIntent:
+            return PeerMotionIntent(
+                "vehicle_b",
+                1,
+                1,
+                1.0,
+                0.35,
+                (4, 0),
+                target,
+                5,
+                "vehicle_b",
+                reserved,
+                task_sequence=task_sequence,
+                trajectory=(TimedCell((4, 0), 0.0, 4.0),),
+                goal_hold=goal_hold,
+            )
+
+        def seeded_controller() -> tuple[RobotController, Mock, Vehicle]:
+            navigation = Mock(
+                transient_peer_blocked=True,
+                motion_target=None,
+                coordination_path_cells=Mock(
+                    return_value=((2, 0), (3, 0), (4, 0))
+                ),
+                coordination_vacate_path=Mock(return_value=((0.5, 3.5),)),
+                coordination_detours=Mock(return_value=()),
+            )
+            controller = RobotController(navigation)
+            controller._schedule_temporal_motion = Mock(
+                side_effect=lambda desired, **kwargs: (
+                    desired,
+                    kwargs["own"].target_cell,
+                    kwargs["own"],
+                    False,
+                )
+            )
+            vehicle = Vehicle(0.5, 0.5, radius=0.5, now=0.0)
+            controller._transient_peer_vacate(
+                own=intent(
+                    "vehicle_c",
+                    current=(0, 0),
+                    target=(1, 0),
+                    wait_ticks=0,
+                ),
+                vehicle=vehicle,
+                anchor=anchor,
+                pose=PoseEstimate(
+                    anchor.anchor_id,
+                    0.5,
+                    0.5,
+                    0.0,
+                    (0.0, 0.0, 0.0),
+                    "nominal",
+                    1.0,
+                    10,
+                ),
+                local_map=local_map,
+                peers={"vehicle_b": peer_state("vehicle_b", 4.5, 0.5, 0.0)},
+                peer_motion_intents=(
+                    blocker(target=(3, 0), task_sequence=1),
+                ),
+                coordination_map=None,
+                now=1.0,
+            )
+            navigation.transient_peer_blocked = False
+            return controller, navigation, vehicle
+
+        cases = (
+            ("parked idle", blocker(), True),
+            ("moving target", blocker(target=(3, 0)), False),
+            ("reserved", blocker(reserved=True), False),
+            ("goal hold", blocker(goal_hold=True), False),
+        )
+        for label, peer_intent, should_release in cases:
+            with self.subTest(label=label):
+                controller, _, vehicle = seeded_controller()
+                for tick in range(3):
+                    held = controller._transient_peer_vacate(
+                        own=intent(
+                            "vehicle_c",
+                            current=(0, 3),
+                            target=(1, 3),
+                            wait_ticks=0,
+                        ),
+                        vehicle=vehicle,
+                        anchor=anchor,
+                        pose=PoseEstimate(
+                            anchor.anchor_id,
+                            0.5,
+                            3.5,
+                            0.0,
+                            (0.0, 0.0, 0.0),
+                            "nominal",
+                            1.1 + tick / 10,
+                            11 + tick,
+                        ),
+                        local_map=local_map,
+                        peers={
+                            "vehicle_b": peer_state(
+                                "vehicle_b", 4.5, 0.5, 0.0
+                            )
+                        },
+                        peer_motion_intents=(peer_intent,),
+                        coordination_map=None,
+                        now=1.1 + tick / 10,
+                    )
+                    if tick < 2 or not should_release:
+                        self.assertEqual(held, (0.0, 0.0))
+
+                if should_release:
+                    self.assertIsNone(held)
+                    self.assertIsNone(controller._peer_vacate_origin_cell)
+                else:
+                    self.assertEqual(controller._peer_vacate_origin_cell, (0, 0))
+
+    def test_transient_no_path_does_not_vacate_for_a_self_clearing_blocker(
+        self,
+    ) -> None:
+        anchor = AnchorSpec("spawn_b", 0.0, 0.0, 0.0)
+        local_map = ObservedGrid(anchor, resolution_m=0.5)
+        temporal_prefix = (TimedCell((0, 0), 0.0, 4.0),)
+
+        def peer_intent(
+            *,
+            target: tuple[int, int] | None,
+            task_sequence: int,
+        ) -> PeerMotionIntent:
+            trajectory = (
+                (TimedCell((6, 0), 0.0, 4.0),)
+                if target is None
+                else (
+                    TimedCell((6, 2), 0.0, 0.5),
+                    TimedCell((5, 2), 0.5, 1.0),
+                    TimedCell((4, 2), 1.0, 4.0),
+                )
+            )
+            return PeerMotionIntent(
+                "vehicle_a",
+                1,
+                1,
+                1.0,
+                0.35,
+                (6, 0) if target is None else (6, 2),
+                target,
+                5,
+                "vehicle_a",
+                False,
+                task_sequence=task_sequence,
+                trajectory=trajectory,
+            )
+
+        def own(current: tuple[int, int]) -> PeerMotionIntent:
+            return PeerMotionIntent(
+                "vehicle_b",
+                1,
+                1,
+                1.0,
+                0.35,
+                current,
+                (1, current[1]),
+                0,
+                "vehicle_b",
+                task_sequence=2,
+            )
+
+        def controller_fixture() -> tuple[RobotController, Mock, Vehicle]:
+            navigation = Mock(
+                transient_peer_blocked=True,
+                motion_target=None,
+                coordination_path_cells=Mock(
+                    return_value=tuple((gx, 0) for gx in range(7))
+                ),
+                coordination_vacate_path=Mock(return_value=((0.25, 1.25),)),
+                coordination_detours=Mock(return_value=()),
+            )
+            controller = RobotController(navigation)
+            controller._temporal_trajectory = temporal_prefix
+            controller._temporal_commit_deadline_s = 5.0
+            controller._intent_reserved = True
+            controller._schedule_temporal_motion = Mock(
+                side_effect=lambda desired, **kwargs: (
+                    desired,
+                    kwargs["own"].target_cell,
+                    kwargs["own"],
+                    False,
+                )
+            )
+            return controller, navigation, Vehicle(
+                0.25, 0.25, radius=0.5, now=0.0
+            )
+
+        def coordinate(
+            controller: RobotController,
+            vehicle: Vehicle,
+            peer: PeerMotionIntent,
+            *,
+            now: float,
+            own_cell: tuple[int, int] = (0, 0),
+        ) -> tuple[float, float] | None:
+            return controller._transient_peer_vacate(
+                own=own(own_cell),
+                vehicle=vehicle,
+                anchor=anchor,
+                pose=PoseEstimate(
+                    anchor.anchor_id,
+                    (own_cell[0] + 0.5) * local_map.resolution_m,
+                    (own_cell[1] + 0.5) * local_map.resolution_m,
+                    0.0,
+                    (0.0, 0.0, 0.0),
+                    "nominal",
+                    now,
+                    round(now * 10),
+                ),
+                local_map=local_map,
+                peers={
+                    "vehicle_a": peer_state(
+                        "vehicle_a",
+                        peer.current_cell[0] + 0.5,
+                        peer.current_cell[1] + 0.5,
+                        0.0,
+                    )
+                },
+                peer_motion_intents=(peer,),
+                coordination_map=None,
+                now=now,
+            )
+
+        moving = peer_intent(target=(5, 2), task_sequence=1)
+        controller, _, vehicle = controller_fixture()
+        self.assertIsNone(coordinate(controller, vehicle, moving, now=1.0))
+        self.assertIsNone(controller._peer_vacate_origin_cell)
+        self.assertEqual(controller._temporal_trajectory, temporal_prefix)
+        self.assertTrue(controller._intent_reserved)
+
+        stationary = peer_intent(target=None, task_sequence=1)
+        controller, navigation, vehicle = controller_fixture()
+        self.assertIsNotNone(coordinate(controller, vehicle, stationary, now=1.0))
+        self.assertEqual(controller._peer_vacate_origin_cell, (0, 0))
+        navigation.transient_peer_blocked = False
+        self.assertIsNotNone(
+            coordinate(
+                controller,
+                vehicle,
+                moving,
+                now=1.1,
+                own_cell=(0, 2),
+            )
+        )
+        self.assertEqual(controller._peer_vacate_origin_cell, (0, 0))
+
+        direct = PeerMotionIntent(
+            "vehicle_a",
+            1,
+            1,
+            1.0,
+            0.35,
+            (6, 2),
+            (6, 1),
+            5,
+            "vehicle_a",
+            task_sequence=1,
+            trajectory=(
+                TimedCell((6, 2), 0.0, 0.5),
+                TimedCell((6, 1), 0.5, 1.0),
+                TimedCell((6, 0), 1.0, 4.0),
+            ),
+        )
+        controller, _, vehicle = controller_fixture()
+        self.assertIsNotNone(coordinate(controller, vehicle, direct, now=1.0))
+        self.assertEqual(controller._peer_vacate_origin_cell, (0, 0))
+
+        idle = peer_intent(target=None, task_sequence=(1 << 64) - 1)
+        controller, _, vehicle = controller_fixture()
+        self.assertIsNone(coordinate(controller, vehicle, idle, now=1.0))
+        self.assertIsNone(controller._peer_vacate_origin_cell)
+
+    def test_priority_root_does_not_vacate_for_its_descendant(
+        self,
+    ) -> None:
+        anchor = AnchorSpec("spawn_a", 0.0, 0.0, 0.0)
+        local_map = ObservedGrid(anchor, resolution_m=0.5)
+
+        def controller_fixture() -> tuple[RobotController, Vehicle]:
+            navigation = Mock(
+                transient_peer_blocked=True,
+                motion_target=None,
+                coordination_path_cells=Mock(
+                    return_value=tuple((gx, 0) for gx in range(7))
+                ),
+                coordination_corridor=Mock(return_value=None),
+                coordination_vacate_path=Mock(return_value=((0.25, 1.75),)),
+                coordination_detours=Mock(return_value=()),
+            )
+            controller = RobotController(navigation)
+            controller._schedule_temporal_motion = Mock(
+                side_effect=lambda desired, **kwargs: (
+                    desired,
+                    kwargs["own"].target_cell,
+                    kwargs["own"],
+                    False,
+                )
+            )
+            return controller, Vehicle(0.25, 0.25, radius=0.5, now=0.0)
+
+        own = PeerMotionIntent(
+            "vehicle_a",
+            1,
+            1,
+            1.0,
+            0.35,
+            (0, 0),
+            (1, 0),
+            0,
+            "vehicle_a",
+            task_sequence=1,
+        )
+
+        def blocker(*, root: str, reserved: bool) -> PeerMotionIntent:
+            return PeerMotionIntent(
+                "vehicle_b",
+                1,
+                1,
+                1.0,
+                0.35,
+                (6, 0),
+                (5, 0),
+                10,
+                root,
+                reserved,
+                task_sequence=2,
+                trajectory=(
+                    TimedCell((6, 0), 0.0, 0.5),
+                    TimedCell((5, 0), 0.5, 4.0),
+                ),
+            )
+
+        def coordinate(
+            controller: RobotController,
+            vehicle: Vehicle,
+            peer: PeerMotionIntent,
+        ) -> tuple[float, float] | None:
+            return controller._transient_peer_vacate(
+                own=own,
+                vehicle=vehicle,
+                anchor=anchor,
+                pose=PoseEstimate(
+                    anchor.anchor_id,
+                    0.25,
+                    0.25,
+                    0.0,
+                    (0.0, 0.0, 0.0),
+                    "nominal",
+                    1.0,
+                    1,
+                ),
+                local_map=local_map,
+                peers={
+                    "vehicle_b": peer_state(
+                        "vehicle_b", 3.25, 0.25, 0.0
+                    )
+                },
+                peer_motion_intents=(peer,),
+                coordination_map=None,
+                now=1.0,
+            )
+
+        descendant_controller, descendant_vehicle = controller_fixture()
+        descendant_result = coordinate(
+            descendant_controller,
+            descendant_vehicle,
+            blocker(root="vehicle_a", reserved=False),
+        )
+        independent_controller, independent_vehicle = controller_fixture()
+        independent_result = coordinate(
+            independent_controller,
+            independent_vehicle,
+            blocker(root="vehicle_b", reserved=True),
+        )
+
+        self.assertIsNone(descendant_result)
+        self.assertIsNone(descendant_controller._peer_vacate_origin_cell)
+        self.assertIsNotNone(independent_result)
+        self.assertEqual(independent_controller._peer_vacate_origin_cell, (0, 0))
+
+        independent_controller.navigation.transient_peer_blocked = False
+        independent_controller.navigation.motion_target = (0.75, 0.25)
+        independent_controller._schedule_temporal_motion = Mock(
+            side_effect=lambda desired, **kwargs: (
+                desired,
+                kwargs["own"].target_cell,
+                kwargs["own"],
+                True,
+            )
+        )
+        inherited_result = independent_controller._coordinate_desired(
+            (0.5, 0.0),
+            vehicle=independent_vehicle,
+            vehicle_id="vehicle_a",
+            anchor=anchor,
+            pose=PoseEstimate(
+                anchor.anchor_id,
+                0.25,
+                0.25,
+                0.0,
+                (0.0, 0.0, 0.0),
+                "nominal",
+                1.1,
+                2,
+            ),
+            local_map=local_map,
+            now=1.1,
+            peer_states=(peer_state("vehicle_b", 3.25, 0.25, 0.0),),
+            peer_motion_intents=(
+                blocker(root="vehicle_a", reserved=False),
+            ),
+        )
+
+        retained_controller, retained_vehicle = controller_fixture()
+        self.assertIsNotNone(
+            coordinate(
+                retained_controller,
+                retained_vehicle,
+                blocker(root="vehicle_b", reserved=True),
+            )
+        )
+        retained_controller.navigation.transient_peer_blocked = False
+        retained_controller.navigation.motion_target = (0.75, 0.25)
+        retained_controller._schedule_temporal_motion = Mock(
+            side_effect=lambda desired, **kwargs: (
+                desired,
+                kwargs["own"].target_cell,
+                kwargs["own"],
+                True,
+            )
+        )
+        retained_result = retained_controller._coordinate_desired(
+            (0.5, 0.0),
+            vehicle=retained_vehicle,
+            vehicle_id="vehicle_a",
+            anchor=anchor,
+            pose=PoseEstimate(
+                anchor.anchor_id,
+                0.25,
+                0.25,
+                0.0,
+                (0.0, 0.0, 0.0),
+                "nominal",
+                1.1,
+                2,
+            ),
+            local_map=local_map,
+            now=1.1,
+            peer_states=(peer_state("vehicle_b", 3.25, 0.25, 0.0),),
+            peer_motion_intents=(
+                blocker(root="vehicle_b", reserved=True),
+            ),
+        )
+
+        self.assertEqual(inherited_result, (0.0, 0.0))
+        self.assertEqual(
+            independent_controller._coordination_wait_reason,
+            "space_time_reservation",
+        )
+        self.assertIsNone(independent_controller._peer_vacate_origin_cell)
+        self.assertEqual(retained_result, (0.0, 0.0))
+        self.assertEqual(
+            retained_controller._coordination_wait_reason,
+            "peer_vacate",
+        )
+        self.assertEqual(retained_controller._peer_vacate_origin_cell, (0, 0))
+
+    def test_implicit_vacate_debounces_clear_before_route_blocker_rebind(
+        self,
+    ) -> None:
+        anchor = AnchorSpec("spawn_c", 0.0, 0.0, 0.0)
+        local_map = ObservedGrid(anchor)
+        navigation = Mock(
+            transient_peer_blocked=True,
+            motion_target=None,
+            coordination_path_cells=Mock(
+                return_value=((2, 0), (3, 0), (4, 0))
+            ),
+            coordination_vacate_path=Mock(return_value=((0.5, 3.5),)),
+            coordination_detours=Mock(return_value=()),
+        )
+        controller = RobotController(navigation)
+        vehicle = Vehicle(0.5, 0.5, radius=0.5, now=0.0)
+        controller._schedule_temporal_motion = Mock(
+            side_effect=lambda desired, **kwargs: (
+                desired,
+                kwargs["own"].target_cell,
+                kwargs["own"],
+                False,
+            )
+        )
+
+        def linked_intent(
+            vehicle_id: str,
+            *,
+            current: tuple[int, int],
+            target: tuple[int, int] | None,
+            trajectory: tuple[TimedCell, ...],
+        ) -> PeerMotionIntent:
+            return PeerMotionIntent(
+                vehicle_id,
+                1,
+                1,
+                1.0,
+                0.35,
+                current,
+                target,
+                5,
+                "vehicle_a",
+                True,
+                trajectory=trajectory,
+            )
+
+        root = linked_intent(
+            "vehicle_a",
+            current=(8, 0),
+            target=(9, 0),
+            trajectory=(TimedCell((8, 0), 0.0, 4.0),),
+        )
+        far_same_owner = linked_intent(
+            "vehicle_d",
+            current=(8, 8),
+            target=(9, 8),
+            trajectory=(TimedCell((8, 8), 0.0, 4.0),),
+        )
+        controller._transient_peer_vacate(
+            own=intent(
+                "vehicle_c",
+                current=(0, 0),
+                target=(1, 0),
+                wait_ticks=0,
+            ),
+            vehicle=vehicle,
+            anchor=anchor,
+            pose=PoseEstimate(
+                anchor.anchor_id,
+                0.5,
+                0.5,
+                0.0,
+                (0.0, 0.0, 0.0),
+                "nominal",
+                1.0,
+                10,
+            ),
+            local_map=local_map,
+            peers={"vehicle_a": peer_state("vehicle_a", 8.5, 0.5, 0.0)},
+            peer_motion_intents=(root,),
+            coordination_map=None,
+            now=1.0,
+        )
+        navigation.transient_peer_blocked = False
+
+        def coordinate(
+            now: float,
+            peer_intents: tuple[PeerMotionIntent, ...],
+        ) -> tuple[float, float] | None:
+            states = tuple(
+                peer_state(
+                    peer.source_vehicle_id,
+                    peer.current_cell[0] + 0.5,
+                    peer.current_cell[1] + 0.5,
+                    0.0,
+                )
+                for peer in peer_intents
+            )
+            return controller._transient_peer_vacate(
+                own=intent(
+                    "vehicle_c",
+                    current=(0, 3),
+                    target=(1, 3),
+                    wait_ticks=0,
+                ),
+                vehicle=vehicle,
+                anchor=anchor,
+                pose=PoseEstimate(
+                    anchor.anchor_id,
+                    0.5,
+                    3.5,
+                    0.0,
+                    (0.0, 0.0, 0.0),
+                    "nominal",
+                    now,
+                    round(now * 10),
+                ),
+                local_map=local_map,
+                peers={state.source_vehicle_id: state for state in states},
+                peer_motion_intents=peer_intents,
+                coordination_map=None,
+                now=now,
+            )
+
+        self.assertEqual(
+            coordinate(1.1, (root, far_same_owner)),
+            (0.0, 0.0),
+        )
+        self.assertEqual(controller._yield_clear_ticks, 1)
+        self.assertEqual(controller._peer_vacate_origin_cell, (0, 0))
+        self.assertEqual(
+            controller._peer_vacate_route_cells,
+            ((2, 0), (3, 0), (4, 0)),
+        )
+
+        route_blocker = linked_intent(
+            "vehicle_b",
+            current=(5, 1),
+            target=(3, 0),
+            trajectory=(
+                TimedCell((5, 1), 0.0, 0.5),
+                TimedCell((4, 0), 0.5, 1.0),
+                TimedCell((3, 0), 1.0, 4.0),
+            ),
+        )
+        self.assertEqual(
+            coordinate(1.2, (root, route_blocker, far_same_owner)),
+            (0.0, 0.0),
+        )
+        self.assertEqual(controller._yielding_for, "vehicle_b")
+        self.assertEqual(controller.motion_intent[2], "vehicle_a")
+        self.assertEqual(controller._yield_clear_ticks, 0)
+
+        blocker_clear = linked_intent(
+            "vehicle_b",
+            current=(8, 7),
+            target=(9, 7),
+            trajectory=(TimedCell((8, 7), 0.0, 4.0),),
+        )
+        clear_peers = root, blocker_clear, far_same_owner
+        for now in (1.3, 1.4):
+            self.assertEqual(coordinate(now, clear_peers), (0.0, 0.0))
+            self.assertIsNotNone(controller._peer_vacate_origin_cell)
+
+        self.assertIsNone(coordinate(1.5, clear_peers))
+        self.assertIsNone(controller._peer_vacate_origin_cell)
+        self.assertIsNone(controller._yielding_for)
+
+    def test_implicit_vacate_releases_only_after_the_source_is_clear(
+        self,
+    ) -> None:
+        anchor = AnchorSpec("spawn_b", 0.0, 0.0, 0.0)
+        local_map = ObservedGrid(anchor)
+        navigation = Mock(
+            transient_peer_blocked=True,
+            motion_target=None,
+            coordination_path_cells=Mock(
+                return_value=((1, 0), (2, 0), (3, 0))
+            ),
+            coordination_vacate_path=Mock(return_value=((1.5, 1.5),)),
+            coordination_detours=Mock(return_value=()),
+        )
+        controller = RobotController(navigation)
+        vehicle = Vehicle(1.5, 0.5, radius=0.1, now=0.0)
+
+        def coordinate(
+            *,
+            now: float,
+            pose_y_m: float,
+            source_current: tuple[int, int],
+            source_target: tuple[int, int],
+        ) -> tuple[float, float]:
+            return coordinate_once(
+                controller,
+                vehicle,
+                anchor,
+                local_map,
+                vehicle_id="vehicle_b",
+                now=now,
+                position_m=(1.5, pose_y_m),
+                peer_states=(
+                    peer_state(
+                        "vehicle_a",
+                        source_current[0] + 0.5,
+                        source_current[1] + 0.5,
+                        0.0,
+                    ),
+                ),
+                peer_intents=(
+                    intent(
+                        "vehicle_a",
+                        current=source_current,
+                        target=source_target,
+                        wait_ticks=5,
+                        reserved=True,
+                    ),
+                ),
+            )
+
+        coordinate(
+            now=1.0,
+            pose_y_m=0.5,
+            source_current=(1, 0),
+            source_target=(3, 0),
+        )
+        navigation.transient_peer_blocked = False
+        navigation.motion_target = (2.5, 1.5)
+        held = coordinate(
+            now=1.1,
+            pose_y_m=1.5,
+            source_current=(1, 0),
+            source_target=(3, 0),
+        )
+
+        self.assertEqual(held, (0.0, 0.0))
+        self.assertEqual(
+            controller._yielding_for,
+            "vehicle_a",
+        )
+
+        navigation.coordination_path_cells.return_value = ((1, 1), (2, 1))
+        coordinate(
+            now=1.2,
+            pose_y_m=1.5,
+            source_current=(4, 0),
+            source_target=(5, 0),
+        )
+        coordinate(
+            now=1.3,
+            pose_y_m=1.5,
+            source_current=(4, 0),
+            source_target=(5, 0),
+        )
+        coordinate(
+            now=1.4,
+            pose_y_m=1.5,
+            source_current=(4, 0),
+            source_target=(5, 0),
+        )
+
+        self.assertIsNone(controller._yielding_for)
+
+    def test_implicit_vacate_keeps_the_planner_route_axis(self) -> None:
+        anchor = AnchorSpec("spawn_b", 0.0, 0.0, 0.0)
+        local_map = ObservedGrid(anchor)
+        navigation = Mock(
+            transient_peer_blocked=True,
+            motion_target=None,
+            coordination_path_cells=Mock(
+                return_value=((30, 10), (29, 10), (28, 10))
+            ),
+            coordination_vacate_path=Mock(
+                side_effect=(((27.5, 7.5),), ((31.5, 11.5),))
+            ),
+            coordination_detours=Mock(return_value=()),
+        )
+        controller = RobotController(navigation)
+        vehicle = Vehicle(31.5, 11.5, radius=0.8, now=0.0)
+        controller._schedule_temporal_motion = Mock(
+            side_effect=lambda desired, **kwargs: (
+                desired,
+                kwargs["own"].target_cell,
+                kwargs["own"],
+                False,
+            )
+        )
+        owner = intent(
+            "vehicle_a",
+            current=(32, 11),
+            target=(33, 11),
+            wait_ticks=5,
+            reserved=True,
+        )
+
+        first = controller._transient_peer_vacate(
+            own=intent(
+                "vehicle_b",
+                current=(31, 11),
+                target=(30, 10),
+                wait_ticks=0,
+            ),
+            vehicle=vehicle,
+            anchor=anchor,
+            pose=PoseEstimate(
+                anchor.anchor_id,
+                31.5,
+                11.5,
+                0.0,
+                (0.0, 0.0, 0.0),
+                "nominal",
+                1.0,
+                10,
+            ),
+            local_map=local_map,
+            peers={"vehicle_a": peer_state("vehicle_a", 32.5, 11.5, 0.0)},
+            peer_motion_intents=(owner,),
+            coordination_map=None,
+            now=1.0,
+        )
+
+        self.assertIsNotNone(first)
+        navigation.transient_peer_blocked = False
+
+        def clear(now: float) -> tuple[float, float] | None:
+            return controller._transient_peer_vacate(
+                own=intent(
+                    "vehicle_b",
+                    current=(27, 7),
+                    target=(28, 8),
+                    wait_ticks=0,
+                ),
+                vehicle=vehicle,
+                anchor=anchor,
+                pose=PoseEstimate(
+                    anchor.anchor_id,
+                    27.5,
+                    7.5,
+                    0.0,
+                    (0.0, 0.0, 0.0),
+                    "nominal",
+                    now,
+                    round(now * 10),
+                ),
+                local_map=local_map,
+                peers={
+                    "vehicle_a": peer_state("vehicle_a", 40.5, 11.5, 0.0)
+                },
+                peer_motion_intents=(
+                    intent(
+                        "vehicle_a",
+                        current=(40, 11),
+                        target=(41, 11),
+                        wait_ticks=5,
+                        reserved=True,
+                    ),
+                ),
+                coordination_map=None,
+                now=now,
+            )
+
+        self.assertEqual(clear(1.1), (0.0, 0.0))
+        self.assertEqual(clear(1.2), (0.0, 0.0))
+        self.assertEqual(navigation.coordination_vacate_path.call_count, 1)
+        self.assertIsNone(clear(1.3))
+        self.assertIsNone(controller._yielding_for)
+
+    def test_implicit_vacate_attributes_the_blocking_goal_reservation(
+        self,
+    ) -> None:
+        anchor = AnchorSpec("spawn_b", 0.0, 0.0, 0.0)
+        local_map = ObservedGrid(anchor)
+        navigation = Mock(
+            transient_peer_blocked=True,
+            motion_target=None,
+            coordination_path_cells=Mock(
+                return_value=((1, 0), (2, 0), (3, 0))
+            ),
+            coordination_vacate_path=Mock(return_value=((1.5, 1.5),)),
+            coordination_detours=Mock(return_value=()),
+        )
+        controller = RobotController(navigation)
+        vehicle = Vehicle(1.5, 0.5, radius=0.1, now=0.0)
+
+        coordinate_once(
+            controller,
+            vehicle,
+            anchor,
+            local_map,
+            vehicle_id="vehicle_b",
+            now=1.0,
+            position_m=(1.5, 0.5),
+            peer_states=(peer_state("vehicle_a", 0.5, 0.5, 0.0),),
+            peer_intents=(
+                intent(
+                    "vehicle_a",
+                    current=(0, 0),
+                    target=(3, 0),
+                    wait_ticks=5,
+                    reserved=True,
+                ),
+            ),
+            desired=(0.0, 0.0),
+        )
+        self.assertEqual(controller.motion_intent[2], "vehicle_a")
+
+        far_owner = PeerMotionIntent(
+            "vehicle_a",
+            1,
+            2,
+            1.1,
+            0.35,
+            (8, 8),
+            (9, 8),
+            5,
+            "vehicle_a",
+            True,
+            trajectory=(
+                TimedCell((8, 8), 0.0, 0.5),
+                TimedCell((9, 8), 0.5, 4.0),
+            ),
+        )
+        blocking_goal = PeerMotionIntent(
+            "vehicle_c",
+            1,
+            2,
+            1.1,
+            0.35,
+            (2, 0),
+            None,
+            0,
+            "vehicle_c",
+            False,
+            trajectory=(TimedCell((2, 0), 0.0, 4.0),),
+            goal_hold=True,
+        )
+        coordinate_once(
+            controller,
+            vehicle,
+            anchor,
+            local_map,
+            vehicle_id="vehicle_b",
+            now=1.1,
+            position_m=(1.5, 1.5),
+            peer_states=(
+                peer_state("vehicle_a", 8.5, 8.5, 0.0),
+                peer_state("vehicle_c", 2.5, 0.5, 0.0),
+            ),
+            peer_intents=(far_owner, blocking_goal),
+            desired=(0.0, 0.0),
+        )
+
+        self.assertEqual(
+            controller._yielding_for,
+            "vehicle_c",
+        )
+        self.assertEqual(controller.motion_intent[2], "vehicle_a")
+        self.assertIsNone(controller._peer_vacate_request_cell)
+
     def test_entering_corridor_discards_stale_sipp_trajectory(self) -> None:
         anchor = AnchorSpec("spawn_3", 0.0, 0.0, 0.0)
         pose = PoseEstimate(
@@ -3258,7 +4674,12 @@ class TestMotionCoordination(unittest.TestCase):
         )
         peer = peer_state("vehicle_1", 2.5, 0.5, -0.5)
 
-        older = RobotController(Mock(motion_target=(1.5, 0.5)))
+        older = RobotController(
+            Mock(
+                motion_target=(1.5, 0.5),
+                coordination_detours=Mock(return_value=()),
+            )
+        )
         older._reservation_wait_ticks = 8
         older._last_coordination_cell = (0, 0)
         desired = older._coordinate_desired(
@@ -3272,7 +4693,12 @@ class TestMotionCoordination(unittest.TestCase):
             peer_states=(peer,),
             peer_motion_intents=(peer_intent,),
         )
-        newcomer = RobotController(Mock(motion_target=(1.5, 0.5)))
+        newcomer = RobotController(
+            Mock(
+                motion_target=(1.5, 0.5),
+                coordination_detours=Mock(return_value=()),
+            )
+        )
         lexical_result = newcomer._coordinate_desired(
             (0.5, 0.0),
             vehicle=Vehicle(0.5, 0.5, now=0.0),

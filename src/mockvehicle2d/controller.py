@@ -665,6 +665,21 @@ def _global_coordination_path(
     current_cell: tuple[int, int],
     target_cell: tuple[int, int] | None,
 ) -> tuple[tuple[int, int], ...]:
+    transformed = _global_coordination_cells(anchor, local_path, resolution_m)
+    result = [current_cell]
+    if target_cell is None or target_cell == current_cell:
+        return tuple(result)
+    result.append(target_cell)
+    if target_cell in transformed:
+        result.extend(transformed[transformed.index(target_cell) + 1 :])
+    return tuple(result)
+
+
+def _global_coordination_cells(
+    anchor: AnchorSpec,
+    local_path: tuple[tuple[int, int], ...],
+    resolution_m: float,
+) -> tuple[tuple[int, int], ...]:
     transformed = []
     for gx, gy in local_path:
         global_x_m, global_y_m, _ = anchor.anchor_to_global(
@@ -678,13 +693,7 @@ def _global_coordination_path(
         )
         if not transformed or transformed[-1] != cell:
             transformed.append(cell)
-    result = [current_cell]
-    if target_cell is None or target_cell == current_cell:
-        return tuple(result)
-    result.append(target_cell)
-    if target_cell in transformed:
-        result.extend(transformed[transformed.index(target_cell) + 1 :])
-    return tuple(result)
+    return tuple(transformed)
 
 
 def _reservation_time_margin_s(vehicle: Vehicle) -> float:
@@ -1033,6 +1042,11 @@ class RobotController:
         self._corridor_admission_confirmed = False
         self._corridor_claim_ticks = 0
         self._corridor_rejoin_target_m: tuple[float, float] | None = None
+        self._peer_vacate_path_m: tuple[tuple[float, float], ...] = ()
+        self._peer_vacate_route_cells: tuple[tuple[int, int], ...] = ()
+        self._peer_vacate_origin_cell: tuple[int, int] | None = None
+        self._peer_vacate_request_cell: tuple[int, int] | None = None
+        self._peer_vacate_request_entered = False
         self._coordination_wait_reason: str | None = None
         self._coordination_wait_owner_id: str | None = None
         self._known_coordination_peer_ids: set[str] = set()
@@ -1373,6 +1387,473 @@ class RobotController:
             return
         vehicle.install_drive(decision.linear_mps, decision.angular_rps, now)
 
+    def _transient_peer_vacate(
+        self,
+        *,
+        own: PeerMotionIntent,
+        vehicle: Vehicle,
+        anchor: AnchorSpec,
+        pose: PoseEstimate,
+        local_map: ObservedGrid,
+        peers: dict[str, PeerVehicleState],
+        peer_motion_intents: tuple[PeerMotionIntent, ...],
+        coordination_map: ObservedGrid | None,
+        now: float,
+    ) -> tuple[float, float] | None:
+        active = bool(self._peer_vacate_route_cells) or (
+            self._peer_vacate_request_cell is not None
+        )
+        transient_peer_blocked = (
+            getattr(self.navigation, "transient_peer_blocked", False) is True
+        )
+        resolution_m = local_map.resolution_m
+
+        def peer_spacing(intent: PeerMotionIntent) -> float:
+            peer = peers.get(intent.source_vehicle_id)
+            return (
+                vehicle.radius
+                + (vehicle.radius if peer is None else peer.radius_m)
+                + (0.0 if peer is None else math.sqrt(max(peer.covariance[:2])))
+                + AUTOMATIC_MINIMUM_CLEARANCE_M
+            )
+
+        def target_overlaps(
+            intent: PeerMotionIntent,
+            cell: tuple[int, int],
+        ) -> bool:
+            return intent.target_cell is not None and (
+                math.dist(intent.target_cell, cell) * resolution_m
+                <= peer_spacing(intent) + 1e-12
+            )
+
+        def requests_vacated_route(intent: PeerMotionIntent) -> bool:
+            return not (
+                intent.target_cell is None
+                and not intent.reserved
+                and not intent.goal_hold
+                and intent.task_sequence == (1 << 64) - 1
+            )
+
+        def self_clearing_moving_blocker(intent: PeerMotionIntent) -> bool:
+            route_cells = frozenset(self._peer_vacate_route_cells)
+            trajectory_cells = tuple(
+                timed.cell for timed in intent.timed_trajectory
+            )
+            route_edges = frozenset(
+                zip(
+                    self._peer_vacate_route_cells,
+                    self._peer_vacate_route_cells[1:],
+                )
+            )
+            trajectory_edges = tuple(
+                zip(trajectory_cells, trajectory_cells[1:])
+            )
+            directly_occupies_route = bool(
+                route_cells.intersection(trajectory_cells)
+            ) or any(
+                edge in route_edges or (edge[1], edge[0]) in route_edges
+                for edge in trajectory_edges
+            )
+            return (
+                intent.task_sequence != (1 << 64) - 1
+                and intent.target_cell is not None
+                and any(
+                    timed.cell != intent.current_cell
+                    for timed in intent.timed_trajectory
+                )
+                and not directly_occupies_route
+            )
+
+        def blocks_remaining_route(intent: PeerMotionIntent) -> bool:
+            if not self._peer_vacate_route_cells:
+                return False
+            peer = peers.get(intent.source_vehicle_id)
+            reservations = ReservationTable(
+                resolution_m,
+                own_radius_m=vehicle.radius,
+                clearance_m=AUTOMATIC_MINIMUM_CLEARANCE_M,
+            )
+            reservations.add(
+                intent.source_vehicle_id,
+                intent.timed_trajectory,
+                base_time_s=(
+                    now
+                    if intent.received_at_s is None
+                    else intent.received_at_s
+                ),
+                radius_m=(
+                    vehicle.radius
+                    if peer is None
+                    else peer.radius_m
+                    + math.sqrt(max(peer.covariance[:2]))
+                ),
+                time_margin_s=intent.safety_time_margin_s,
+                goal_hold=intent.goal_hold,
+            )
+            end_time_s = now + MOTION_PLAN_HORIZON_S
+            if any(
+                reservations.cell_conflict_end(cell, now, end_time_s)
+                is not None
+                for cell in self._peer_vacate_route_cells
+            ):
+                return True
+            return any(
+                reservations.edge_conflict_end(
+                    first,
+                    second,
+                    now,
+                    end_time_s,
+                )
+                is not None
+                for first, second in zip(
+                    self._peer_vacate_route_cells,
+                    self._peer_vacate_route_cells[1:],
+                )
+            )
+
+        requesters = tuple(
+            intent
+            for intent in peer_motion_intents
+            if target_overlaps(intent, own.current_cell)
+            and motion_intent_precedes(intent, own)
+        )
+        if not transient_peer_blocked and not active and not requesters:
+            self._clear_peer_vacate()
+            return None
+        inherited = inherit_motion_priority(
+            own,
+            requesters,
+            peer_motion_intents,
+        )
+        explicit_owner = next(
+            (
+                intent
+                for intent in sorted(
+                    requesters,
+                    key=_motion_intent_priority_key,
+                )
+                if intent.priority_owner_id == inherited.priority_owner_id
+            ),
+            None,
+        )
+        route_blocker = (
+            None
+            if self._peer_vacate_request_cell is not None
+            else next(
+                (
+                    intent
+                    for intent in sorted(
+                        peer_motion_intents,
+                        key=_motion_intent_priority_key,
+                    )
+                    if requests_vacated_route(intent)
+                    and blocks_remaining_route(intent)
+                ),
+                None,
+            )
+        )
+        if (
+            explicit_owner is not None
+            and self._peer_vacate_request_cell is None
+            and (
+                self._coordination_wait_owner_id is None
+                or explicit_owner.priority_owner_id
+                == self._coordination_wait_owner_id
+            )
+        ):
+            self._clear_peer_vacate()
+            self._peer_vacate_request_cell = own.current_cell
+            owner = explicit_owner
+        elif (
+            active
+            and self._peer_vacate_request_cell is None
+            and route_blocker is not None
+        ):
+            self._peer_vacate_request_entered = False
+            owner = route_blocker
+        else:
+            owner = next(
+                (
+                    intent
+                    for intent in peer_motion_intents
+                    if intent.source_vehicle_id
+                    == self._yielding_for
+                ),
+                None,
+            )
+        if owner is None and not active:
+            owner = next(
+                (
+                    intent
+                    for intent in sorted(
+                        peer_motion_intents,
+                        key=_motion_intent_priority_key,
+                    )
+                    if motion_intent_precedes(intent, own)
+                ),
+                None,
+            )
+        if owner is None:
+            if active:
+                self._invalidate_temporal_commit()
+                self._yield_requires_intent = True
+                self._yield_clear_ticks = 0
+                self._intent_target_m = None
+                self._intent_priority_owner_id = self._coordination_wait_owner_id
+                self._intent_reserved = False
+                self._coordination_wait_reason = "peer_vacate"
+                return 0.0, 0.0
+            self._clear_peer_vacate()
+            return None
+
+        if (
+            active
+            and self._peer_vacate_request_cell is None
+            and owner.source_vehicle_id == self._yielding_for
+            and owner.priority_owner_id == own.source_vehicle_id
+        ):
+            self._clear_peer_vacate()
+            return None
+
+        request_cell = self._peer_vacate_request_cell
+        if request_cell is not None:
+            request_spacing_m = peer_spacing(owner)
+            requester_current_inside = (
+                math.dist(owner.current_cell, request_cell) * resolution_m
+                <= request_spacing_m + 1e-12
+            )
+            requester_target_inside = (
+                owner.target_cell is not None
+                and math.dist(owner.target_cell, request_cell) * resolution_m
+                <= request_spacing_m + 1e-12
+            )
+            if requester_current_inside:
+                self._peer_vacate_request_entered = True
+            if (
+                not requester_current_inside
+                and not requester_target_inside
+                and (
+                    self._peer_vacate_request_entered
+                    or owner.target_cell is None
+                )
+            ):
+                self._clear_peer_vacate()
+                return None
+        if request_cell is None and not self._peer_vacate_route_cells:
+            route_source = coordination_map or local_map
+            route = self.navigation.coordination_path_cells(pose, route_source)
+            if route is None:
+                return None
+            route_cells = _global_coordination_cells(
+                anchor,
+                route,
+                local_map.resolution_m,
+            )
+            self._peer_vacate_origin_cell = own.current_cell
+            self._peer_vacate_route_cells = route_cells
+            if len(self._peer_vacate_route_cells) < 2:
+                self._clear_peer_vacate()
+                return None
+            initial_route_blocker = next(
+                (
+                    intent
+                    for intent in sorted(
+                        peer_motion_intents,
+                        key=_motion_intent_priority_key,
+                    )
+                    if requests_vacated_route(intent)
+                    and blocks_remaining_route(intent)
+                ),
+                None,
+            )
+            if (
+                initial_route_blocker is not None
+                and (
+                    initial_route_blocker.priority_owner_id
+                    == own.source_vehicle_id
+                    or self_clearing_moving_blocker(initial_route_blocker)
+                )
+            ) or (
+                initial_route_blocker is None
+                and not requests_vacated_route(owner)
+            ):
+                self._clear_peer_vacate()
+                return None
+
+        required_clearance_m = peer_spacing(owner)
+        if request_cell is None:
+            route_origin = self._peer_vacate_route_cells[0]
+            route_direction = next(
+                (
+                    (
+                        cell[0] - route_origin[0],
+                        cell[1] - route_origin[1],
+                    )
+                    for cell in self._peer_vacate_route_cells[1:]
+                    if cell != route_origin
+                ),
+                None,
+            )
+            if route_direction is None:
+                self._clear_peer_vacate()
+                return None
+            route_length = math.hypot(*route_direction)
+
+            def clearance(cell: tuple[int, int]) -> float:
+                offset_x = cell[0] - route_origin[0]
+                offset_y = cell[1] - route_origin[1]
+                return (
+                    abs(
+                        offset_x * route_direction[1]
+                        - offset_y * route_direction[0]
+                    )
+                    / route_length
+                    * resolution_m
+                )
+
+        else:
+
+            def clearance(cell: tuple[int, int]) -> float:
+                return math.dist(cell, request_cell) * resolution_m
+
+        priority_owner_id = (
+            self._coordination_wait_owner_id or owner.priority_owner_id
+        )
+
+        def publish(
+            target_m: tuple[float, float] | None,
+            *,
+            reserved: bool = False,
+        ) -> None:
+            self._yielding_for = owner.source_vehicle_id
+            self._yield_requires_intent = True
+            self._yield_clear_ticks = 0
+            self._intent_target_m = target_m
+            self._intent_priority_owner_id = priority_owner_id
+            self._intent_reserved = reserved
+            self._coordination_wait_reason = "peer_vacate"
+            self._coordination_wait_owner_id = priority_owner_id
+
+        target = self._peer_vacate_path_m[0] if self._peer_vacate_path_m else None
+        if target is not None and math.dist((pose.x_m, pose.y_m), target) <= (
+            CORRIDOR_REJOIN_TOLERANCE_M
+        ):
+            self._peer_vacate_path_m = self._peer_vacate_path_m[1:]
+            target = (
+                self._peer_vacate_path_m[0]
+                if self._peer_vacate_path_m
+                else None
+            )
+
+        current_clearance_m = clearance(own.current_cell)
+        if current_clearance_m >= required_clearance_m - 1e-12:
+            if request_cell is None:
+                origin_cell = self._peer_vacate_origin_cell
+                assert origin_cell is not None
+                source_current_clear = (
+                    math.dist(owner.current_cell, origin_cell) * resolution_m
+                    > required_clearance_m + 1e-12
+                )
+                source_target_clear = (
+                    owner.target_cell is None
+                    or math.dist(owner.target_cell, origin_cell) * resolution_m
+                    > required_clearance_m + 1e-12
+                )
+                if (
+                    source_current_clear
+                    and source_target_clear
+                    and not transient_peer_blocked
+                    and route_blocker is None
+                ):
+                    clear_ticks = self._yield_clear_ticks + 1
+                    if clear_ticks >= PEER_YIELD_CLEAR_TICKS:
+                        self._clear_peer_vacate()
+                        self._yield_clear_ticks = 0
+                        return None
+                    self._invalidate_temporal_commit()
+                    publish(None)
+                    self._yield_clear_ticks = clear_ticks
+                    return 0.0, 0.0
+            self._invalidate_temporal_commit()
+            publish(None)
+            return 0.0, 0.0
+
+        if target is None and request_cell is None:
+            route_source = coordination_map or local_map
+            self._peer_vacate_path_m = self.navigation.coordination_vacate_path(
+                pose,
+                route_source,
+                required_clearance_m,
+            )
+            target = (
+                self._peer_vacate_path_m[0]
+                if self._peer_vacate_path_m
+                else None
+            )
+        elif target is None:
+            candidates = []
+            for detour_m in self.navigation.coordination_detours(pose, local_map):
+                detour_cell = _coordination_cell(anchor, detour_m, resolution_m)
+                clearance_m = clearance(detour_cell)
+                if clearance_m <= current_clearance_m + 1e-12:
+                    continue
+                candidates.append((-clearance_m, detour_cell, detour_m))
+            target = None if not candidates else min(candidates)[-1]
+        if target is None:
+            self._invalidate_temporal_commit()
+            publish(None)
+            return 0.0, 0.0
+        if not self._peer_vacate_path_m:
+            self._peer_vacate_path_m = (target,)
+
+        target_cell = _coordination_cell(anchor, target, resolution_m)
+        inherited_own = replace(
+            own,
+            target_cell=target_cell,
+            priority_owner_id=priority_owner_id,
+            reserved=False,
+        )
+        desired, _, scheduled_own, blocked = self._schedule_temporal_motion(
+            _intent_setpoint(target, pose, vehicle),
+            own=inherited_own,
+            vehicle=vehicle,
+            anchor=anchor,
+            pose=pose,
+            local_map=local_map,
+            now=now,
+            peers=peers,
+            peer_motion_intents=peer_motion_intents,
+            coordination_map=coordination_map,
+            spatial_path_override=(
+                own.current_cell,
+                *(
+                    tuple(
+                        _coordination_cell(anchor, point, resolution_m)
+                        for point in self._peer_vacate_path_m
+                    )
+                    if request_cell is None
+                    else (target_cell,)
+                ),
+            ),
+        )
+        publish(
+            None if blocked else target,
+            reserved=not blocked and scheduled_own.reserved,
+        )
+        return (0.0, 0.0) if blocked else desired
+
+    def _clear_peer_vacate(self) -> None:
+        self._peer_vacate_path_m = ()
+        self._peer_vacate_route_cells = ()
+        self._peer_vacate_origin_cell = None
+        self._peer_vacate_request_cell = None
+        self._peer_vacate_request_entered = False
+        if self._coordination_wait_reason == "peer_vacate":
+            self._yielding_for = None
+            self._yield_requires_intent = False
+            self._coordination_wait_reason = None
+            self._coordination_wait_owner_id = None
+
     def _schedule_temporal_motion(
         self,
         desired: tuple[float, float],
@@ -1386,6 +1867,7 @@ class RobotController:
         peers: dict[str, PeerVehicleState],
         peer_motion_intents: tuple[PeerMotionIntent, ...],
         coordination_map: ObservedGrid | None,
+        spatial_path_override: tuple[tuple[int, int], ...] | None = None,
     ) -> tuple[tuple[float, float], tuple[int, int] | None, PeerMotionIntent, bool]:
         current_cell, target_cell = own.current_cell, own.target_cell
         route_source = coordination_map or local_map
@@ -1395,12 +1877,16 @@ class RobotController:
             if callable(route_method)
             else None
         )
-        spatial_path = _global_coordination_path(
-            anchor,
-            local_path if isinstance(local_path, tuple) else (),
-            local_map.resolution_m,
-            current_cell,
-            target_cell,
+        spatial_path = (
+            _global_coordination_path(
+                anchor,
+                local_path if isinstance(local_path, tuple) else (),
+                local_map.resolution_m,
+                current_cell,
+                target_cell,
+            )
+            if spatial_path_override is None
+            else spatial_path_override
         )
         own_margin_s = _reservation_time_margin_s(vehicle)
         reservations = ReservationTable(
@@ -1456,7 +1942,7 @@ class RobotController:
             )
 
         plan = schedule(spatial_path)
-        if plan is None:
+        if plan is None and spatial_path_override is None:
             detours = getattr(self.navigation, "coordination_detours", None)
             choices = detours(pose, local_map) if callable(detours) else ()
             for detour_m in choices if isinstance(choices, tuple) else ():
@@ -1686,6 +2172,7 @@ class RobotController:
                 )
                 if self._corridor is not None:
                     self._invalidate_temporal_commit()
+                    self._clear_peer_vacate()
                 self._corridor_admission_confirmed = False
                 self._corridor_claim_ticks = 0
         if self._last_coordination_cell != current_cell:
@@ -2058,6 +2545,19 @@ class RobotController:
                     self._reservation_wait_ticks + 1,
                 )
                 return 0.0, 0.0
+            vacate = self._transient_peer_vacate(
+                own=own,
+                vehicle=vehicle,
+                anchor=anchor,
+                pose=pose,
+                local_map=local_map,
+                peers=peers,
+                peer_motion_intents=peer_motion_intents,
+                coordination_map=coordination_map,
+                now=now,
+            )
+            if vacate is not None:
+                return vacate
             desired, target_cell, own, temporal_blocked = (
                 self._schedule_temporal_motion(
                     desired,
@@ -2079,96 +2579,6 @@ class RobotController:
                 )
             self._coordination_wait_reason = None
             self._coordination_wait_owner_id = None
-            temporal_target_cell = target_cell
-        else:
-            temporal_target_cell = None
-        requesters = [
-            intent
-            for intent in peer_motion_intents
-            if intent.source_vehicle_id not in corridor_peer_ids
-            and intent.target_cell == current_cell
-            and intent.current_cell != current_cell
-        ]
-        inherited_from = None
-        inherited_own = inherit_motion_priority(
-            own,
-            tuple(requesters),
-            peer_motion_intents,
-        )
-        if inherited_own.priority_owner_id != own.priority_owner_id:
-            inherited_from = next(
-                (
-                    requester
-                    for requester in requesters
-                    if requester.priority_owner_id
-                    == inherited_own.priority_owner_id
-                ),
-                min(
-                    requesters,
-                    key=lambda requester: requester.source_vehicle_id,
-                ),
-            )
-            own = inherited_own
-            self._intent_priority_owner_id = own.priority_owner_id
-
-        swap_request = next(
-            (
-                requester
-                for requester in requesters
-                if target_cell is None or requester.current_cell == target_cell
-            ),
-            None,
-        )
-        if swap_request is not None:
-            unavailable = {
-                cell
-                for intent in peer_motion_intents
-                for cell in (intent.current_cell, intent.target_cell)
-                if cell is not None
-            }
-            for detour_m in self.navigation.coordination_detours(pose, local_map):
-                detour_cell = _coordination_cell(
-                    anchor,
-                    detour_m,
-                    local_map.resolution_m,
-                )
-                if detour_cell in unavailable:
-                    continue
-                motion_target = detour_m
-                target_cell = detour_cell
-                desired = _intent_setpoint(detour_m, pose, vehicle)
-                self._intent_target_m = detour_m
-                own = replace(own, target_cell=target_cell)
-                break
-
-        if self._corridor is None and target_cell != temporal_target_cell:
-            self._invalidate_temporal_commit()
-            desired, target_cell, own, temporal_blocked = (
-                self._schedule_temporal_motion(
-                    desired,
-                    own=own,
-                    vehicle=vehicle,
-                    anchor=anchor,
-                    pose=pose,
-                    local_map=local_map,
-                    now=now,
-                    peers=peers,
-                    peer_motion_intents=peer_motion_intents,
-                    coordination_map=coordination_map,
-                )
-            )
-            if temporal_blocked:
-                return self._hold_for_temporal_reservation(
-                    own,
-                    peer_motion_intents,
-                )
-
-        vacating_for = (
-            None
-            if inherited_from is None
-            or target_cell in {None, current_cell, inherited_from.current_cell}
-            else inherited_from.source_vehicle_id
-        )
 
         travel_limit_m = (
             None
@@ -2229,8 +2639,6 @@ class RobotController:
                 continue
             peer = peers.get(peer_intent.source_vehicle_id)
             if peer is None:
-                continue
-            if peer_intent.source_vehicle_id == vacating_for:
                 continue
             target_occupied = own.target_cell == peer_intent.current_cell
             cell_conflict = _motion_intents_conflict(own, peer_intent)
@@ -2317,6 +2725,7 @@ class RobotController:
         self._corridor_admission_confirmed = False
         self._corridor_claim_ticks = 0
         self._corridor_rejoin_target_m = None
+        self._clear_peer_vacate()
         self._coordination_wait_reason = None
         self._coordination_wait_owner_id = None
         self._known_coordination_peer_ids.clear()
