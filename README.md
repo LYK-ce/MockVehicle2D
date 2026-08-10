@@ -180,6 +180,19 @@ Coverage，以及 Goto/Patrol/Coverage 混合任务。每项任务仍归接收�
   -k four_vehicles_share_one_corridor
 ```
 
+四车协调能力 campaign 还覆盖嵌套会车湾的分阶段物理解、同时 Goto 及车辆声明反序，以及
+排队 T 路口的六阶段物理解：
+
+```bash
+.venv/bin/python -m pytest -p no:cacheprovider -q -m extended \
+  tests/test_coordination_capability_gaps.py \
+  -k 'nested_four_vehicle_chain or queued_t_junction'
+```
+
+当前 motion-intent v3 只能用 `target` 表达一格请求，无法向已经完成任务、因而不再发布
+target 的前方 blocker 指明“为哪辆车避让”。因此 T 路口这里只验证物理可行性；四车同时
+通过留给后续独立协议任务，不能视为当前能力。
+
 ## 多车共享世界
 
 `fleet` 入口在一个进程中运行唯一的确定性物理世界和 1～4 个隔离车辆节点。每个节点

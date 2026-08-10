@@ -3970,6 +3970,119 @@ class TestMotionCoordination(unittest.TestCase):
 
         self.assertIsNone(controller._yielding_for)
 
+    def test_implicit_vacate_releases_after_source_clear_without_an_escape_path(
+        self,
+    ) -> None:
+        anchor = AnchorSpec("spawn_c", 0.0, 0.0, 0.0)
+        local_map = ObservedGrid(anchor)
+        vehicle = Vehicle(0.5, 0.5, radius=0.1, now=0.0)
+        blocking = intent(
+            "vehicle_a",
+            current=(1, 0),
+            target=(2, 0),
+            wait_ticks=5,
+            reserved=True,
+        )
+        clear = intent(
+            "vehicle_a",
+            current=(8, 0),
+            target=(9, 0),
+            wait_ticks=5,
+            reserved=True,
+        )
+
+        def active_controller() -> tuple[RobotController, Mock]:
+            navigation = Mock(
+                transient_peer_blocked=True,
+                motion_target=None,
+                coordination_path_cells=Mock(
+                    return_value=((0, 0), (1, 0), (2, 0))
+                ),
+                coordination_vacate_path=Mock(return_value=()),
+                coordination_detours=Mock(return_value=()),
+            )
+            controller = RobotController(navigation)
+            self.assertEqual(
+                coordinate(controller, navigation, 1.0, blocking),
+                (0.0, 0.0),
+            )
+            self.assertEqual(controller._peer_vacate_origin_cell, (0, 0))
+            return controller, navigation
+
+        def coordinate(
+            controller: RobotController,
+            navigation: Mock,
+            now: float,
+            source: PeerMotionIntent | None,
+        ) -> tuple[float, float] | None:
+            return controller._transient_peer_vacate(
+                own=intent(
+                    "vehicle_c",
+                    current=(0, 0),
+                    target=(1, 0),
+                    wait_ticks=0,
+                ),
+                vehicle=vehicle,
+                anchor=anchor,
+                pose=PoseEstimate(
+                    anchor.anchor_id,
+                    0.5,
+                    0.5,
+                    0.0,
+                    (0.0, 0.0, 0.0),
+                    "nominal",
+                    now,
+                    round(now * 10),
+                ),
+                local_map=local_map,
+                peers=(
+                    {}
+                    if source is None
+                    else {
+                        source.source_vehicle_id: peer_state(
+                            source.source_vehicle_id,
+                            source.current_cell[0] + 0.5,
+                            source.current_cell[1] + 0.5,
+                            0.0,
+                        )
+                    }
+                ),
+                peer_motion_intents=(() if source is None else (source,)),
+                coordination_map=None,
+                now=now,
+            )
+
+        controller, navigation = active_controller()
+        navigation.transient_peer_blocked = False
+        for now in (1.1, 1.2):
+            self.assertEqual(
+                coordinate(controller, navigation, now, clear),
+                (0.0, 0.0),
+            )
+            self.assertIsNotNone(controller._peer_vacate_origin_cell)
+        self.assertIsNone(coordinate(controller, navigation, 1.3, clear))
+        self.assertIsNone(controller._peer_vacate_origin_cell)
+
+        for case_id, source, transient in (
+            ("missing-source", None, False),
+            ("route-overlap", blocking, False),
+            ("still-transient", clear, True),
+        ):
+            with self.subTest(case_id=case_id):
+                controller, navigation = active_controller()
+                navigation.transient_peer_blocked = transient
+                for tick in range(1, 5):
+                    self.assertEqual(
+                        coordinate(
+                            controller,
+                            navigation,
+                            2.0 + tick / 10,
+                            source,
+                        ),
+                        (0.0, 0.0),
+                    )
+                self.assertIsNotNone(controller._peer_vacate_origin_cell)
+
     def test_implicit_vacate_keeps_the_planner_route_axis(self) -> None:
         anchor = AnchorSpec("spawn_b", 0.0, 0.0, 0.0)
         local_map = ObservedGrid(anchor)

@@ -1746,34 +1746,34 @@ class RobotController:
             )
 
         current_clearance_m = clearance(own.current_cell)
+        if request_cell is None:
+            origin_cell = self._peer_vacate_origin_cell
+            assert origin_cell is not None
+            source_current_clear = (
+                math.dist(owner.current_cell, origin_cell) * resolution_m
+                > required_clearance_m + 1e-12
+            )
+            source_target_clear = (
+                owner.target_cell is None
+                or math.dist(owner.target_cell, origin_cell) * resolution_m
+                > required_clearance_m + 1e-12
+            )
+            if (
+                source_current_clear
+                and source_target_clear
+                and not transient_peer_blocked
+                and route_blocker is None
+            ):
+                clear_ticks = self._yield_clear_ticks + 1
+                if clear_ticks >= PEER_YIELD_CLEAR_TICKS:
+                    self._clear_peer_vacate()
+                    self._yield_clear_ticks = 0
+                    return None
+                self._invalidate_temporal_commit()
+                publish(None)
+                self._yield_clear_ticks = clear_ticks
+                return 0.0, 0.0
         if current_clearance_m >= required_clearance_m - 1e-12:
-            if request_cell is None:
-                origin_cell = self._peer_vacate_origin_cell
-                assert origin_cell is not None
-                source_current_clear = (
-                    math.dist(owner.current_cell, origin_cell) * resolution_m
-                    > required_clearance_m + 1e-12
-                )
-                source_target_clear = (
-                    owner.target_cell is None
-                    or math.dist(owner.target_cell, origin_cell) * resolution_m
-                    > required_clearance_m + 1e-12
-                )
-                if (
-                    source_current_clear
-                    and source_target_clear
-                    and not transient_peer_blocked
-                    and route_blocker is None
-                ):
-                    clear_ticks = self._yield_clear_ticks + 1
-                    if clear_ticks >= PEER_YIELD_CLEAR_TICKS:
-                        self._clear_peer_vacate()
-                        self._yield_clear_ticks = 0
-                        return None
-                    self._invalidate_temporal_commit()
-                    publish(None)
-                    self._yield_clear_ticks = clear_ticks
-                    return 0.0, 0.0
             self._invalidate_temporal_commit()
             publish(None)
             return 0.0, 0.0
