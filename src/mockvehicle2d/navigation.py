@@ -4,8 +4,9 @@ from __future__ import annotations
 
 from collections import deque
 import math
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Callable
 
+from mockvehicle2d.collision import _point_aabb_distance_squared
 from mockvehicle2d.local_state import (
     FORBIDDEN,
     FREE,
@@ -46,6 +47,82 @@ STRAIGHT_CORRIDOR_MAX_WIDTH_M = 3.0
 # scenario configuration only when a measured topology needs a wider search.
 COORDINATION_VACATE_RADIUS_M = 4.0
 SafeCandidate = tuple[tuple[float, float], tuple[int, int]]
+
+
+def _localization_limited_linear_speed(
+    linear_mps: float,
+    pose: PoseEstimate,
+) -> float:
+    return (
+        linear_mps * DEGRADED_LINEAR_SCALE
+        if pose.quality == "degraded"
+        else linear_mps
+    )
+
+
+def _point_segment_distance(
+    point: tuple[float, float],
+    start: tuple[float, float],
+    end: tuple[float, float],
+) -> float:
+    delta_x, delta_y = end[0] - start[0], end[1] - start[1]
+    length_squared = delta_x**2 + delta_y**2
+    if length_squared <= 1e-12:
+        return math.dist(point, start)
+    projection = max(
+        0.0,
+        min(
+            1.0,
+            (
+                (point[0] - start[0]) * delta_x
+                + (point[1] - start[1]) * delta_y
+            )
+            / length_squared,
+        ),
+    )
+    return math.dist(
+        point,
+        (
+            start[0] + projection * delta_x,
+            start[1] + projection * delta_y,
+        ),
+    )
+
+
+def _point_cell_distance(
+    point: tuple[float, float],
+    center: tuple[float, float],
+    cell_size_m: float,
+) -> float:
+    half_size_m = cell_size_m / 2
+    return math.sqrt(
+        _point_aabb_distance_squared(
+            *point,
+            center[0] - half_size_m,
+            center[1] - half_size_m,
+            center[0] + half_size_m,
+            center[1] + half_size_m,
+        )
+    )
+
+
+def _point_route_distance(
+    point: tuple[float, float],
+    route_cells: tuple[tuple[int, int], ...],
+    resolution_m: float,
+) -> float:
+    centers = tuple(
+        ((gx + 0.5) * resolution_m, (gy + 0.5) * resolution_m)
+        for gx, gy in route_cells
+    )
+    distances = [
+        _point_cell_distance(point, center, resolution_m) for center in centers
+    ]
+    distances.extend(
+        _point_segment_distance(point, start, end)
+        for start, end in zip(centers, centers[1:])
+    )
+    return min(distances, default=math.inf)
 
 
 class GotoController:
@@ -113,9 +190,14 @@ class GotoController:
         self,
         pose: PoseEstimate,
         local_map: ObservedGrid,
+        *,
+        allow_reached: bool = False,
     ) -> tuple[tuple[float, float], ...]:
         """Return a bounded, deterministic set of statically passable side steps."""
-        if self.status != "active" or self._planner is None:
+        if (
+            self.status != "active"
+            and not (allow_reached and self.status == "reached")
+        ) or self._planner is None:
             return ()
         current = self._pose_cell(pose, local_map)
         preferred = self._current_waypoint or self.goal or (pose.x_m, pose.y_m)
@@ -149,48 +231,72 @@ class GotoController:
         pose: PoseEstimate,
         local_map: ObservedGrid,
         required_clearance_m: float,
+        *,
+        clearance_at_m: Callable[[tuple[float, float]], float] | None = None,
+        allow_reached: bool = False,
     ) -> tuple[tuple[float, float], ...]:
         """Find one bounded, observed path to a passing place off the route."""
         if (
             not math.isfinite(required_clearance_m)
             or required_clearance_m <= 0
-            or self.status != "active"
+            or (
+                self.status != "active"
+                and not (allow_reached and self.status == "reached")
+            )
             or self._planner is None
         ):
             return ()
-        route = self._advance_coordination_path(pose, local_map)
-        if route is None or len(route) < 2:
-            return ()
-        origin = route[0]
-        direction = next(
-            (
-                (cell[0] - origin[0], cell[1] - origin[1])
-                for cell in route[1:]
-                if cell != origin
-            ),
-            None,
-        )
-        if direction is None:
-            return ()
-        direction_length = math.hypot(*direction)
         resolution_m = local_map.resolution_m
+        if clearance_at_m is None:
+            route = self._advance_coordination_path(pose, local_map)
+            if route is None or len(route) < 2:
+                return ()
+            origin_cell = route[0]
+            direction_cell = next(
+                (
+                    (
+                        cell[0] - origin_cell[0],
+                        cell[1] - origin_cell[1],
+                    )
+                    for cell in route[1:]
+                    if cell != origin_cell
+                ),
+                None,
+            )
+            if direction_cell is None:
+                return ()
+            origin_m = (
+                (origin_cell[0] + 0.5) * resolution_m,
+                (origin_cell[1] + 0.5) * resolution_m,
+            )
+            direction_m = (
+                direction_cell[0] * resolution_m,
+                direction_cell[1] * resolution_m,
+            )
+            direction_length_m = math.hypot(*direction_m)
+
+            def clearance_at_m(point_m: tuple[float, float]) -> float:
+                offset_x = point_m[0] - origin_m[0]
+                offset_y = point_m[1] - origin_m[1]
+                return abs(
+                    offset_x * direction_m[1]
+                    - offset_y * direction_m[0]
+                ) / direction_length_m
         radius_cells = COORDINATION_VACATE_RADIUS_M / resolution_m
         start = self._pose_cell(pose, local_map)
         pending = deque((start,))
         previous: dict[tuple[int, int], tuple[int, int] | None] = {start: None}
 
-        def clearance(cell: tuple[int, int]) -> float:
-            offset_x = cell[0] - origin[0]
-            offset_y = cell[1] - origin[1]
-            return (
-                abs(offset_x * direction[1] - offset_y * direction[0])
-                / direction_length
-                * resolution_m
-            )
-
         while pending:
             current = pending.popleft()
-            if current != start and clearance(current) >= required_clearance_m:
+            current_m = (
+                (current[0] + 0.5) * resolution_m,
+                (current[1] + 0.5) * resolution_m,
+            )
+            if (
+                current != start
+                and clearance_at_m(current_m) >= required_clearance_m
+            ):
                 cells = []
                 while current != start:
                     cells.append(current)
@@ -920,8 +1026,7 @@ class GotoController:
             if abs(heading_error) > self.turn_in_place_threshold_rad
             else min(max_linear_mps, target_distance)
         )
-        if pose is not None and pose.quality == "degraded":
-            linear_mps *= DEGRADED_LINEAR_SCALE
+        linear_mps = _localization_limited_linear_speed(linear_mps, pose)
         if (
             target_cell is not None
             and local_map.is_unknown(*target_cell)

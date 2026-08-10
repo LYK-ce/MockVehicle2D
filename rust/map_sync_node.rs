@@ -37,9 +37,10 @@ use tokio::{
 const SIDECAR_PROTOCOL: &str = "mockvehicle2d-map-sync-sidecar/1";
 const DELTA_PROTOCOL: &str = "mockvehicle2d-map-delta/1";
 const PEER_STATE_PROTOCOL: &str = "mockvehicle2d-peer-state/1";
-const MOTION_INTENT_PROTOCOL: &str = "mockvehicle2d-motion-intent/3";
+const MOTION_INTENT_PROTOCOL: &str = "mockvehicle2d-motion-intent/4";
 const MOTION_COMMIT_HORIZON_S: f64 = 0.8;
 const MAX_MESSAGE_BYTES: usize = 256 * 1024;
+const MAX_GRID_COORDINATE: i64 = 1_000_000;
 const MAX_PEERS: usize = 3;
 static IDENTITY_TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
@@ -448,6 +449,8 @@ fn payload_identity(payload: &Value) -> Result<(&str, &str, &str, u64), &'static
 fn validate_motion_intent_timing(
     payload: &serde_json::Map<String, Value>,
 ) -> Result<(), &'static str> {
+    let current_cell = valid_cell(payload.get("current_cell")).ok_or("current_cell is invalid")?;
+    validate_vacate_request(payload.get("vacate_request"), current_cell)?;
     let committed = payload
         .get("committed_until_offset_s")
         .and_then(Value::as_f64)
@@ -492,6 +495,57 @@ fn validate_motion_intent_timing(
         return Err("motion commit exceeds trajectory");
     }
     Ok(())
+}
+
+fn valid_cell(value: Option<&Value>) -> Option<(i64, i64)> {
+    let cell = value?.as_object()?;
+    if cell.len() != 2 {
+        return None;
+    }
+    let coordinate = |name| {
+        cell.get(name)
+            .and_then(Value::as_i64)
+            .filter(|value| (-MAX_GRID_COORDINATE..=MAX_GRID_COORDINATE).contains(value))
+    };
+    Some((coordinate("gx")?, coordinate("gy")?))
+}
+
+fn validate_vacate_request(
+    value: Option<&Value>,
+    current_cell: (i64, i64),
+) -> Result<(), &'static str> {
+    match value {
+        Some(Value::Null) => Ok(()),
+        Some(Value::Object(request)) => {
+            request
+                .get("vehicle_id")
+                .and_then(Value::as_str)
+                .filter(|vehicle_id| valid_identifier(vehicle_id))
+                .ok_or("vacate_request vehicle_id is invalid")?;
+            valid_cell(request.get("cell")).ok_or("vacate_request cell is invalid")?;
+            let route_cells = request
+                .get("route_cells")
+                .and_then(Value::as_array)
+                .ok_or("vacate_request route_cells is invalid")?
+                .iter()
+                .map(|cell| valid_cell(Some(cell)))
+                .collect::<Option<Vec<_>>>()
+                .ok_or("vacate_request route cell is invalid")?;
+            if request.len() != 3
+                || !(2..=64).contains(&route_cells.len())
+                || route_cells.first() != Some(&current_cell)
+                || route_cells.windows(2).any(|cells| {
+                    cells[0] == cells[1]
+                        || cells[0].0.abs_diff(cells[1].0) > 2
+                        || cells[0].1.abs_diff(cells[1].1) > 2
+                })
+            {
+                return Err("vacate_request must be an exact bounded object");
+            }
+            Ok(())
+        }
+        _ => Err("vacate_request must be null or an exact object"),
+    }
 }
 
 fn authorized_payload<'a>(
@@ -728,6 +782,23 @@ mod tests {
         directory
     }
 
+    fn motion_intent_v4(vacate_request: Value) -> Value {
+        serde_json::json!({
+            "protocol": MOTION_INTENT_PROTOCOL,
+            "session_id": "session_1",
+            "source_vehicle_id": "vehicle_1",
+            "sequence": 1,
+            "current_cell": {"gx": 0, "gy": 0},
+            "trajectory": [{
+                "cell": {"gx": 0, "gy": 0},
+                "enter_offset_s": 0.0,
+                "leave_offset_s": 4.0
+            }],
+            "committed_until_offset_s": 0.8,
+            "vacate_request": vacate_request
+        })
+    }
+
     #[test]
     fn identity_is_stable_and_unique() {
         let directory = private_tempdir();
@@ -895,6 +966,8 @@ mod tests {
                 "sequence": 1
             });
             if protocol == MOTION_INTENT_PROTOCOL {
+                payload["current_cell"] = serde_json::json!({"gx": 0, "gy": 0});
+                payload["vacate_request"] = Value::Null;
                 payload["trajectory"] = serde_json::json!([{
                     "cell": {"gx": 0, "gy": 0},
                     "enter_offset_s": 0.0,
@@ -912,12 +985,13 @@ mod tests {
     }
 
     #[test]
-    fn motion_intent_v3_rejects_teleport_and_commit_past_short_horizon() {
+    fn motion_intent_v4_rejects_teleport_and_commit_past_short_horizon() {
         let valid = serde_json::json!({
             "protocol": MOTION_INTENT_PROTOCOL,
             "session_id": "session_1",
             "source_vehicle_id": "vehicle_1",
             "sequence": 1,
+            "current_cell": {"gx": 0, "gy": 0},
             "trajectory": [
                 {
                     "cell": {"gx": 0, "gy": 0},
@@ -930,7 +1004,8 @@ mod tests {
                     "leave_offset_s": 4.0
                 }
             ],
-            "committed_until_offset_s": 0.8
+            "committed_until_offset_s": 0.8,
+            "vacate_request": null
         });
         assert!(payload_identity(&valid).is_ok());
 
@@ -951,5 +1026,134 @@ mod tests {
         assert!(payload_identity(&hold).is_err());
         hold["committed_until_offset_s"] = serde_json::json!(0.1);
         assert!(payload_identity(&hold).is_ok());
+    }
+
+    #[test]
+    fn motion_intent_v4_requires_vacate_request_field() {
+        assert_eq!(MOTION_INTENT_PROTOCOL, "mockvehicle2d-motion-intent/4");
+        let mut payload = motion_intent_v4(Value::Null);
+        assert!(payload_identity(&payload).is_ok());
+
+        let mut old = payload.clone();
+        old["protocol"] = serde_json::json!("mockvehicle2d-motion-intent/3");
+        assert!(payload_identity(&old).is_err());
+
+        payload.as_object_mut().unwrap().remove("vacate_request");
+        assert!(payload_identity(&payload).is_err());
+    }
+
+    #[test]
+    fn motion_intent_v4_vacate_request_has_exact_fields() {
+        let valid = motion_intent_v4(serde_json::json!({
+                "vehicle_id": "vehicle_2",
+                "cell": {"gx": 1, "gy": 0},
+                "route_cells": [
+                    {"gx": 0, "gy": 0},
+                    {"gx": 1, "gy": 0},
+                    {"gx": 3, "gy": 0}
+                ]
+        }));
+        assert!(payload_identity(&valid).is_ok());
+
+        let mut missing = valid.clone();
+        missing["vacate_request"]
+            .as_object_mut()
+            .unwrap()
+            .remove("cell");
+        assert!(payload_identity(&missing).is_err());
+
+        let mut missing_route = valid.clone();
+        missing_route["vacate_request"]
+            .as_object_mut()
+            .unwrap()
+            .remove("route_cells");
+        assert!(payload_identity(&missing_route).is_err());
+
+        let mut unexpected = valid.clone();
+        unexpected["vacate_request"]["extra"] = serde_json::json!(true);
+        assert!(payload_identity(&unexpected).is_err());
+    }
+
+    #[test]
+    fn motion_intent_v4_vacate_request_values_are_bounded() {
+        let malformed = [
+            serde_json::json!({
+                "vehicle_id": "invalid vehicle",
+                "cell": {"gx": 1, "gy": 0},
+                "route_cells": [{"gx": 0, "gy": 0}, {"gx": 1, "gy": 0}]
+            }),
+            serde_json::json!({
+                "vehicle_id": true,
+                "cell": {"gx": 1, "gy": 0},
+                "route_cells": [{"gx": 0, "gy": 0}, {"gx": 1, "gy": 0}]
+            }),
+            serde_json::json!({
+                "vehicle_id": "vehicle_2",
+                "cell": {"gx": true, "gy": 0},
+                "route_cells": [{"gx": 0, "gy": 0}, {"gx": 1, "gy": 0}]
+            }),
+            serde_json::json!({
+                "vehicle_id": "vehicle_2",
+                "cell": {"gx": 1_000_001, "gy": 0},
+                "route_cells": [{"gx": 0, "gy": 0}, {"gx": 1, "gy": 0}]
+            }),
+            serde_json::json!({
+                "vehicle_id": "vehicle_2",
+                "cell": {"gx": 1},
+                "route_cells": [{"gx": 0, "gy": 0}, {"gx": 1, "gy": 0}]
+            }),
+            serde_json::json!({
+                "vehicle_id": "vehicle_2",
+                "cell": {"gx": 1, "gy": 0, "extra": 0},
+                "route_cells": [{"gx": 0, "gy": 0}, {"gx": 1, "gy": 0}]
+            }),
+            serde_json::json!({
+                "vehicle_id": "vehicle_2",
+                "cell": {"gx": 1, "gy": 0},
+                "route_cells": [{"gx": 0, "gy": 0}, {"gx": true, "gy": 0}]
+            }),
+            serde_json::json!({
+                "vehicle_id": "vehicle_2",
+                "cell": {"gx": 1, "gy": 0},
+                "route_cells": [{"gx": 0, "gy": 0}, {"gx": 1_000_001, "gy": 0}]
+            }),
+        ];
+        for request in malformed {
+            assert!(payload_identity(&motion_intent_v4(request)).is_err());
+        }
+    }
+
+    #[test]
+    fn motion_intent_v4_vacate_route_is_a_bounded_contiguous_array() {
+        let request = |route_cells| {
+            motion_intent_v4(serde_json::json!({
+                "vehicle_id": "vehicle_2",
+                "cell": {"gx": 1, "gy": 0},
+                "route_cells": route_cells
+            }))
+        };
+        assert!(
+            payload_identity(&request(serde_json::json!([
+                {"gx": 0, "gy": 0},
+                {"gx": 0, "gy": 2}
+            ])))
+            .is_ok()
+        );
+
+        let too_long = (0..65)
+            .map(|gx| serde_json::json!({"gx": gx, "gy": 0}))
+            .collect::<Vec<_>>();
+        for route_cells in [
+            Value::Null,
+            serde_json::json!({}),
+            serde_json::json!([]),
+            serde_json::json!([{"gx": 0, "gy": 0}]),
+            Value::Array(too_long),
+            serde_json::json!([{"gx": 0, "gy": 0}, {"gx": 0, "gy": 0}]),
+            serde_json::json!([{"gx": 0, "gy": 0}, {"gx": 3, "gy": 0}]),
+            serde_json::json!([{"gx": 1, "gy": 0}, {"gx": 2, "gy": 0}]),
+        ] {
+            assert!(payload_identity(&request(route_cells)).is_err());
+        }
     }
 }

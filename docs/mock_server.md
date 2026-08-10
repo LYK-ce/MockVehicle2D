@@ -128,10 +128,12 @@ Auto 已为 Active 时重复 `resume` 也是幂等操作，不会重启 D* 搜�
 
 ### 多车局部协调
 
-多车节点通过 peer-state v1 发布 executed pose/velocity，通过 motion-intent v3 发布约
+多车节点通过 peer-state v1 发布 executed pose/velocity，通过 motion-intent v4 发布约
 `4 s` 的相对 cell 时间窗、等待/任务年龄、`0.8 s` 短 commit、goal hold 和可选的有向
-corridor descriptor。它们都来自车辆 odometry 和局部规划，不携带仿真真值；收到的 peer
-map evidence 也不会进入 OwnMap 或自主规划。接收端按 receipt time 重建 reservation，
+corridor descriptor。v4 还携带必需的 `vacate_request`：通常为 `null`；当高优先级车辆的
+OwnMap 路线被已完成任务的 Auto/Idle peer 截断时，可定向携带目标车辆、其 footprint cell
+及 `2..64` 格的 OwnMap 路线窗口。它们都来自车辆 odometry 和局部规划，不携带仿真真值；
+收到的 peer map evidence 也不会进入 OwnMap 或自主规划。接收端按 receipt time 重建 reservation，
 因此不要求车辆时钟同步。
 
 通用路径沿 OwnMap D* 空间候选运行 prioritized SIPP，覆盖 vertex、edge swap、同步几何
@@ -140,8 +142,8 @@ map evidence 也不会进入 OwnMap 或自主规划。接收端按 receipt time 
 token 才能表达跨车任务先后。占路链递归传播 owner 并只尝试一个邻格 detour。expected
 peer 的 state/intent 缺失、过期、同源 generation 不一致或 sidecar 未 ready 时新前缀
 fail-closed。相邻不同 cell 的时间窗必须有正 travel time，commit 上限严格为
-`min(0.8 s, trajectory 最后 leave_offset_s)`；
-LocalSafety 和同步物理碰撞仲裁仍是最终保障。OwnMap
+`min(0.8 s, trajectory 最后 leave_offset_s)`；LocalSafety 和同步物理碰撞仲裁仍是最终
+保障。OwnMap
 能够确认完全观测、直线且内宽不超过约 `3 m` 的瓶颈时，再对重叠 corridor 做去中心化
 选举和确认：模式外停车不受影响；进入前只允许一个 confirmed owner；出口侧反向队列仅
 front waiter 提前做可逆侧移，rear waiter 原地等待；ACK 后 owner 仍要等 front 的连续位姿
@@ -149,6 +151,10 @@ front waiter 提前做可逆侧移，rear waiter 原地等待；ACK 后 owner �
 后，车体与安全余量都清空才释放。租约结束后若 saved rejoin 段已被 live peer 占据，waiter
 从侧袋位置交回本地导航重规划。已归因 peer 暂时切断 D* 路径时任务保持 active；匿名动态
 遮挡只有一次有界 restart grace，持续或闪烁阻塞仍会终止为 `no_path`。
+
+收到定向请求的空闲车辆只通过真实 Goto、同一 SIPP 与 LocalSafety 侧移和返回，不创建
+内部 Mission。fresh 的显式 `vacate_request:null` 需要连续 3 tick 的 clear pose/trajectory
+才允许返回；请求缺失、过期、身份/generation 不一致时停车并保持 fail-closed。
 
 这不是中央调度器，也不声称实现完整 PIBT/MAPF。第一版 SIPP 只给一条 D* 候选和一个
 邻格 detour 排时，也没有独立网络 propose/ACK/commit 往返。当前走廊严格一次放行一辆车，

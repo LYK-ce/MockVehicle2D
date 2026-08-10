@@ -472,7 +472,7 @@ cell 状态：`0` 可通行、`1` 墙、`2` 无地面/落差。客户端用
 owner，`waiting` 的 `reason` 还可为 `corridor_election`、`corridor_lease`、
 `reservation_sync`（expected peer state/intent 不完整或同源 generation 不一致）或
 `space_time_reservation`
-（motion-intent v3 时间窗尚不可进入）。已知胜者通过 `priority_owner_vehicle_id` 指出；
+（motion-intent v4 时间窗尚不可进入）。已知胜者通过 `priority_owner_vehicle_id` 指出；
 同步等待可能为 `null`。该摘要只用于观察；客户端不得据此绕过 `RobotController` 或
 LocalSafety 下发运动。
 没有启用场景级 P2P 时，`p2p_map_sync` 为 `{"enabled":false}`。协同摘要仅供观察，

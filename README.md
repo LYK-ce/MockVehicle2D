@@ -106,7 +106,7 @@ velocity；默认线加速、线减速和角加速上限分别为 `1 m/s²`、`1
 时限时失败结束。`episode` 与 `serve`/`fleet` 使用相同的速度、加减速、半径和 watchdog
 CLI 参数。
 
-多车 Episode 不启动 localhost libp2p，而是把现有 peer-state v1 和 motion-intent v3
+多车 Episode 不启动 localhost libp2p，而是把现有 peer-state v1 和 motion-intent v4
 payload 经过 JSON 序列化及协议校验后，以固定 1 tick 延迟在进程内传递；序列、接收时间
 和 `0.35 s` 过期规则与实时 P2P 路径一致。启用了真实 `p2p` 配置的场景仍被拒绝，因为
 libp2p 墙钟调度和 map delta 传播不属于确定性 Episode。每辆车沿 OwnMap D* 路径发布
@@ -123,7 +123,7 @@ libp2p 墙钟调度和 map delta 传播不属于确定性 Episode。每辆车沿
 intent、确定性优先级和短执行前缀，并继续由下一格租约、物理碰撞仲裁与 LocalSafety
 兜底。peer state 或 intent 缺失/过期、sidecar 未 ready 或 generation 回退时保持停车。
 
-完全观测且内宽不超过约 `3 m` 的直线瓶颈还会使用 motion-intent v3 的有向 corridor
+完全观测且内宽不超过约 `3 m` 的直线瓶颈还会使用 motion-intent v4 的有向 corridor
 descriptor 做短租约仲裁。只有一个经对端确认的 owner 可以进入；与 owner 方向相反的
 失败者按距出口侧 entry 的纵向距离和 `vehicle_id` 选出唯一 front waiter，提前进入可逆
 侧向等待，同侧 rear waiter 原地排队。ACK 只确认 owner，不等于入口已安全；
@@ -189,9 +189,12 @@ Coverage，以及 Goto/Patrol/Coverage 混合任务。每项任务仍归接收�
   -k 'nested_four_vehicle_chain or queued_t_junction'
 ```
 
-当前 motion-intent v3 只能用 `target` 表达一格请求，无法向已经完成任务、因而不再发布
-target 的前方 blocker 指明“为哪辆车避让”。因此 T 路口这里只验证物理可行性；四车同时
-通过留给后续独立协议任务，不能视为当前能力。
+motion-intent v4 可由暂时无路但 OwnMap 仍有完整路线的请求车，向停在路线上的 Auto/Idle
+车辆发送定向 `vacate_request`。响应车通过真实 Goto、SIPP 和 LocalSafety 驶入安全侧位，
+请求车清空后再返回原位；发布的 target/trajectory 始终对应真实运动，也不产生额外 Mission
+事件。排队 T 路口
+已验证四车同时 Goto 在正序和反序声明下得到相同结果；分阶段物理解仍作为独立可行性
+oracle 保留。
 
 ## 多车共享世界
 
@@ -255,12 +258,12 @@ Gossipsub topic 为 `mockvehicle2d/<session_id>/fleet-sync/1`，payload 是严�
 resolution、sequence、消息大小和每个 cell。Python 与对应 sidecar 只通过运行目录中的
 Unix domain socket 交换有界 JSONL 消息，控制 tick 不等待该 socket。
 
-同一 fleet-sync topic 还承载严格的 `mockvehicle2d-motion-intent/3` JSON。它只描述由
+同一 fleet-sync topic 还承载严格的 `mockvehicle2d-motion-intent/4` JSON。它只描述由
 本车 odometry 与 OwnMap D* 路径生成的短时域计划，不携带仿真真值：
 
 ```json
 {
-  "protocol": "mockvehicle2d-motion-intent/3",
+  "protocol": "mockvehicle2d-motion-intent/4",
   "session_id": "four_vehicle_exploration",
   "source_vehicle_id": "mock_vehicle_01",
   "intent_generation": 1,
@@ -289,20 +292,37 @@ Unix domain socket 交换有界 JSONL 消息，控制 tick 不等待该 socket�
   "corridor": {
     "entry_cell": {"gx": 9, "gy": 10},
     "exit_cell": {"gx": 14, "gy": 10}
+  },
+  "vacate_request": {
+    "vehicle_id": "mock_vehicle_02",
+    "cell": {"gx": 11, "gy": 10},
+    "route_cells": [
+      {"gx": 9, "gy": 10},
+      {"gx": 10, "gy": 10},
+      {"gx": 11, "gy": 10},
+      {"gx": 12, "gy": 10}
+    ]
   }
 }
 ```
 
 接收端严格校验 intent/plan generation、sequence、global frame、resolution、cell 边界、
 最多 64 个且 `0..4 s` 的相对时间窗、优先级 owner 白名单、租约上限和有向 axis-aligned
-corridor。相邻不同 cell 必须满足 `next.enter > previous.leave`，零时长 teleport 被拒绝，
+corridor。`vacate_request` 是必需字段；无请求时为 `null`，否则必须精确包含受信远端
+`vehicle_id`、其当前 footprint 中的 `cell`，以及从本车 `current_cell` 开始、长度
+`2..64` 的 OwnMap 路线窗口。路线禁止连续重复，锚点旋转量化后相邻格的 Chebyshev 步长
+最多为 2。相邻 trajectory cell 必须满足 `next.enter > previous.leave`，零时长 teleport 被拒绝，
 单 cell hold 保留；commit 接受 `0..min(0.8 s, trajectory 最后 leave)`，任何更大值均拒绝。
-同一 plan generation 的任务、cell 序列和 goal-hold 必须完全相同；sender 在全部字段校验
-成功后才推进 generation，失败不会污染下一次合法计划。重复、乱序、超时或额外字段也均
-拒绝。相对时间以接收时刻重建，不要求不同车辆的 monotonic clock 同步；sender timestamp
-只用于同源防回退。
-没有走廊声明时 `corridor` 必须为 `null`。走廊只从车辆 OwnMap 上已完全观测的直线窄通道
-推导；peer evidence 和仿真真值不会参与检测。相反方向看到的部分 descriptor 会按重叠轴
+同一 plan generation 的任务、cell 序列、goal-hold 和 `vacate_request` 必须完全相同；
+sender 在全部字段校验成功后才推进 generation，失败不会污染下一次合法计划。重复、乱序、
+超时或额外字段也均拒绝。相对时间以接收时刻重建，不要求不同车辆的 monotonic clock
+同步；sender timestamp 只用于同源防回退。
+没有走廊声明时 `corridor` 必须为 `null`。请求方按路线有序进度保留或撤回
+`vacate_request`，避免 U/L 形路线仅按欧氏距离提前撤回。响应方只接受 fresh、同 generation、
+高优先级且指向自身 footprint 的请求；明确收到同 generation 的 fresh `null` 后，需要连续
+3 tick 的 clear peer pose/trajectory 才返回。缺包、TTL 过期、身份或 generation 不一致时
+冻结并保持 fail-closed，而不是把物理车辆视为已离开。走廊只从车辆 OwnMap 上已完全观测
+的直线窄通道推导；peer evidence 和仿真真值不会参与检测。相反方向看到的部分 descriptor 会按重叠轴
 匹配并单调扩展释放边界，进入前需要一轮 owner 声明/对端确认。
 
 当前走廊策略严格一次只放行一辆车，因此长走廊和深队列的吞吐近似线性增长。暂未实现

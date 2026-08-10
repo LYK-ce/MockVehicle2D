@@ -33,7 +33,7 @@ from mockvehicle2d.local_state import (
     PoseEstimate,
 )
 from mockvehicle2d.map_grid import WALL, MapGrid
-from mockvehicle2d.map_sync import PEER_STATE_TTL_S, P2PSettings
+from mockvehicle2d.map_sync import PEER_STATE_TTL_S, P2PSettings, VacateRequest
 from mockvehicle2d.scan import TMINI_SCAN_CONFIG
 from mockvehicle2d.safety import (
     AUTOMATIC_MINIMUM_CLEARANCE_M,
@@ -181,6 +181,11 @@ class TestFleetScenario(unittest.TestCase):
             False,
             0.0,
         )
+        controller.vacate_request = VacateRequest(
+            "vehicle_2",
+            (14, 5),
+            ((10, 10), (12, 8), (14, 6), (16, 5)),
+        )
         node.controller = controller
 
         node.control(
@@ -194,6 +199,31 @@ class TestFleetScenario(unittest.TestCase):
             controller.tick.call_args.kwargs["expected_peer_vehicle_ids"],
             ("vehicle_2",),
         )
+        payload = node.map_sync.prepare_motion_intent()
+        assert payload is not None
+        self.assertEqual(
+            payload["vacate_request"],
+            {
+                "vehicle_id": "vehicle_2",
+                "cell": {"gx": 14, "gy": 5},
+                "route_cells": [
+                    {"gx": 10, "gy": 10},
+                    {"gx": 12, "gy": 8},
+                    {"gx": 14, "gy": 6},
+                    {"gx": 16, "gy": 5},
+                ],
+            },
+        )
+        node.map_sync.publish_motion_intent_result(payload["sequence"], True)
+        controller.vacate_request = None
+        node.control(
+            fleet.world.vehicle("vehicle_1"),
+            fleet.world.sensor_grid("vehicle_1"),
+            fleet.world.now,
+        )
+        cleared = node.map_sync.prepare_motion_intent()
+        assert cleared is not None
+        self.assertIsNone(cleared["vacate_request"])
 
     def test_example_declares_four_unique_endpoints_and_spawns(self) -> None:
         loaded = FleetScenario.load(

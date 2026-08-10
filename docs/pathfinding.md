@@ -106,7 +106,7 @@ restart grace。单帧匿名遮挡消失后可恢复；持续或闪烁的匿名�
 上为未来约 `4 s` 构造 prioritized SIPP 时间表。无冲突时首步 departure 不被推迟；每次
 只提交/执行约 `0.8 s`，随后根据新的 odometry、D* 路径和 peer intent 滚动重算。
 
-motion-intent v3 的 trajectory 由相对 `enter_offset_s` / `leave_offset_s` 组成。接收端以本地
+motion-intent v4 的 trajectory 由相对 `enter_offset_s` / `leave_offset_s` 组成。接收端以本地
 receipt time 重建绝对区间，不比较不同车辆的 monotonic clock；intent generation、plan
 generation 和严格递增 sequence 防止重启、旧计划和乱序包回灌。plan generation 只在 cell
 序列、任务或 goal-hold 语义改变时增长，滚动重发的相对 offset 不会独自制造新代次。
@@ -136,15 +136,31 @@ chain 递归继承最高优先级，并尝试一个 D* 已确认可通行的邻�
 安全包络的 passing place，允许先沿路线绕过墙角再侧移；它不会穿过 Unknown/Occupied，
 也不会扩展成第二套全局规划器。选中的单条让行路径仍交给同一 SIPP 和 LocalSafety 执行。
 
-让行状态区分请求来源与继承的 priority owner。显式 current/target 请求在请求者真正进入
-所请求包络前不会因普通 Goto waypoint 恢复而消失；进入后，只有请求者 current 与 target
-都离开包络才释放。没有显式 cell 的瞬态请求使用 peer trajectory/goal reservation 与本车
-剩余 D* 路线的 cell/edge 冲突来归因实际 blocker，同时保留继承 owner；无法归因、peer
-证据失鲜或动态无路仍存在时保持 fail-closed。上述状态完全复用 motion-intent v3 现有字段，
-没有增加 ACK 或多候选路径协议。静止且没有任务/目标/预留的 peer 不会成为让行 owner；
-仅由车体膨胀包络与路线相交、但自身时序轨迹会离开的 peer 继续交给 SIPP 等待，不新建
-让行 session。priority root 也不会为已经继承该 root 的下游 blocker 新建或继续 implicit
-让行；检测到这一跳环时会在同一 tick 回到普通 reservation/SIPP 仲裁。
+motion-intent v4 还包含必需的 `vacate_request` 字段；无请求时为 `null`，否则精确包含
+`vehicle_id`、blocker footprint 所在的 `cell`，以及从请求车 `current_cell` 开始的
+`route_cells`。路线窗口由请求车 OwnMap-only D* 路径生成，长度限制为 `2..64`；连续格不能
+重复，锚点旋转量化后相邻格 Chebyshev 步长最多为 2。它是对单个已知车辆的短期请求，不是
+共享地图、集中任务分派或多候选路径协议。
+
+只有当前单条 D* 路线被可信 peer footprint 暂时截断、OwnMap 路线仍完整且请求车优先级更高
+时，才向停在该路线上的 Auto/Idle peer 发布请求。请求随有序路线进度向前裁剪；请求车越过
+blocker 后撤回，U/L 形路线不会因到路线终点的欧氏距离变小而提前撤回。目标车辆只在没有
+活动或排队 Mission、请求与 peer-state 同 generation 且都 fresh、请求 cell 与自身物理
+footprint 一致时响应。它复用真实 Goto、同一 SIPP 和 LocalSafety 驶到路线安全包络外，再
+返回保存的原位；发布的 motion target/trajectory 始终对应真实运动，也不产生 Mission
+事件。定位 lost、碰撞、safety stop、pause 或断联都会停车并保留 session。
+
+请求者明确发布同 generation 的 fresh `vacate_request:null` 后，响应车还要求连续 3 tick
+的 fresh pose/trajectory 均已离开请求包络，才开始返回；fresh 路线更新或 pause/resume 会
+重置该 debounce。消息缺失、TTL 过期、身份/generation 不一致或物理 cell 不一致时冻结并
+保持 fail-closed，不能把 lease 消失解释为车辆已经离开。证据活性只使用 MapSync 本地
+receipt time；peer payload 的墙钟 timestamp 仅用于同源防回退，不与模拟时钟比较。
+
+没有定向请求的活动 peer 仍使用 trajectory/goal reservation 与本车剩余 D* 路线的
+cell/edge 冲突归因 blocker，同时保留继承 owner；无法归因、peer 证据失鲜或动态无路仍
+存在时保持 fail-closed。仅由车体膨胀包络与路线相交、但自身时序轨迹会离开的 peer 继续
+交给 SIPP 等待，不新建让行 session。priority root 也不会为已经继承该 root 的下游 blocker
+新建或继续 implicit 让行；检测到这一跳环时会在同一 tick 回到普通 reservation/SIPP 仲裁。
 
 expected peer 存在时，sidecar 未 ready、任一 peer-state/intent 缺失、TTL 过期，或同一来源
 两类 topic 的 state/intent generation 不一致，都使新短前缀 fail-closed。SIPP 在固定 D*
@@ -162,7 +178,7 @@ commit 前缀收敛；并发首次提案仍保留下一格租约、同步物理�
 不声明 corridor，继续使用普通下一格和轨迹冲突协调。检测不会消费 peer evidence，也
 不会修改正在执行的 D* 路径。
 
-检测到走廊后，车辆通过 motion-intent v3 发布有向 entry/exit cell。重叠的反向部分描述
+检测到走廊后，车辆通过 motion-intent v4 发布有向 entry/exit cell。重叠的反向部分描述
 可匹配为同一资源；未提交的下一轮候选使用等待年龄，冲突的 live claim 则由继承 owner 和
 `vehicle_id` 给出所有节点一致的全序。winner 先发布
 tentative claim，只有所有可见竞争者回传同一 owner（或无竞争声明连续稳定）后才进入。

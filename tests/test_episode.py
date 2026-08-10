@@ -15,6 +15,7 @@ from mockvehicle2d.controller import (
     GotoMission,
     ModeAction,
     ModeCommand,
+    OpMode,
     PatrolMission,
 )
 from mockvehicle2d.episode import (
@@ -23,6 +24,7 @@ from mockvehicle2d.episode import (
     _DeterministicPeerStateExchange,
     _update_no_progress,
     _vehicle_has_unfinished_work,
+    _vehicles_stopped,
     run_episode,
 )
 from mockvehicle2d.fleet import (
@@ -172,6 +174,24 @@ def run_four_vehicle_quadrant_coverage(
 
 
 class TestEpisodeRunner(unittest.TestCase):
+    def test_zero_speed_idle_vacate_session_is_not_episode_stopped(self) -> None:
+        fleet = FleetRuntime.create(
+            scenario(),
+            grid=MapGrid.from_wall_set(20, 20, set()),
+        )
+        controller = fleet.nodes["vehicle_1"].controller
+        controller.mode = OpMode.AUTO
+        controller._idle_vacate_origin_pose = (5.0, 5.0, 0.0)
+
+        self.assertEqual(
+            fleet.world.vehicle("vehicle_1").target_velocities(),
+            (0.0, 0.0),
+        )
+        self.assertFalse(_vehicles_stopped(fleet, ("vehicle_1",)))
+
+        controller._clear_yield()
+        self.assertTrue(_vehicles_stopped(fleet, ("vehicle_1",)))
+
     def assert_four_vehicle_completed(
         self,
         result: EpisodeResult,

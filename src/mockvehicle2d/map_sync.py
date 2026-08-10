@@ -32,7 +32,7 @@ from mockvehicle2d.local_state import (
 SIDECAR_PROTOCOL = "mockvehicle2d-map-sync-sidecar/1"
 DELTA_PROTOCOL = "mockvehicle2d-map-delta/1"
 PEER_STATE_PROTOCOL = "mockvehicle2d-peer-state/1"
-MOTION_INTENT_PROTOCOL = "mockvehicle2d-motion-intent/3"
+MOTION_INTENT_PROTOCOL = "mockvehicle2d-motion-intent/4"
 MAX_DELTA_CELLS = 512
 MAX_MESSAGE_BYTES = 256 * 1024
 MAX_GRID_COORDINATE = 1_000_000
@@ -247,6 +247,15 @@ def _nonnegative_integer(value: object, name: str) -> int:
     return value
 
 
+def _valid_identifier(value: object) -> bool:
+    return (
+        isinstance(value, str)
+        and 0 < len(value) <= 128
+        and value.isascii()
+        and all(character.isalnum() or character in "_-." for character in value)
+    )
+
+
 @dataclass(frozen=True)
 class P2PSettings:
     sidecar_path: Path
@@ -404,6 +413,52 @@ class CorridorDescriptor:
 
 
 @dataclass(frozen=True)
+class VacateRequest:
+    vehicle_id: str
+    cell: tuple[int, int]
+    route_cells: tuple[tuple[int, int], ...]
+
+    def __post_init__(self) -> None:
+        if (
+            not _valid_identifier(self.vehicle_id)
+            or not isinstance(self.route_cells, tuple)
+            or not 2
+            <= len(self.route_cells)
+            <= MAX_MOTION_TRAJECTORY_CELLS
+            or any(
+                not isinstance(cell, tuple)
+                or len(cell) != 2
+                or any(
+                    type(value) is not int
+                    or abs(value) > MAX_GRID_COORDINATE
+                    for value in cell
+                )
+                for cell in (self.cell, *self.route_cells)
+            )
+            or any(
+                first == second
+                or max(
+                    abs(first[0] - second[0]),
+                    abs(first[1] - second[1]),
+                )
+                > 2
+                for first, second in zip(
+                    self.route_cells,
+                    self.route_cells[1:],
+                )
+            )
+        ):
+            raise ValueError("invalid vacate request")
+
+    def as_payload(self) -> dict[str, object]:
+        return {
+            "vehicle_id": self.vehicle_id,
+            "cell": _cell_payload(self.cell),
+            "route_cells": [_cell_payload(cell) for cell in self.route_cells],
+        }
+
+
+@dataclass(frozen=True)
 class PeerMotionIntent:
     """One short, leased grid move derived from a vehicle's odometry and planner."""
 
@@ -425,6 +480,7 @@ class PeerMotionIntent:
     committed_until_offset_s: float = 0.0
     goal_hold: bool = False
     safety_time_margin_s: float = 0.0
+    vacate_request: VacateRequest | None = None
     received_at_s: float | None = field(default=None, compare=False)
 
     @property
@@ -473,6 +529,11 @@ class PeerMotionIntent:
             "committed_until_offset_s": self.committed_until_offset_s,
             "goal_hold": self.goal_hold,
             "safety_time_margin_s": self.safety_time_margin_s,
+            "vacate_request": (
+                None
+                if self.vacate_request is None
+                else self.vacate_request.as_payload()
+            ),
             "corridor": (
                 None if self.corridor is None else self.corridor.as_payload()
             ),
@@ -690,6 +751,7 @@ class MapSyncState:
         committed_until_offset_s: float = MOTION_COMMIT_HORIZON_S,
         goal_hold: bool = False,
         safety_time_margin_s: float = 0.0,
+        vacate_request: VacateRequest | None = None,
     ) -> None:
         if not isinstance(pose, PoseEstimate) or pose.anchor_id != self.anchor.anchor_id:
             raise ValueError("motion intent pose must use the configured anchor")
@@ -728,6 +790,13 @@ class MapSyncState:
             or type(goal_hold) is not bool
             or not math.isfinite(safety_time_margin_s)
             or not 0.0 <= safety_time_margin_s <= MAX_RESERVATION_TIME_MARGIN_S
+            or (
+                vacate_request is not None
+                and (
+                    not isinstance(vacate_request, VacateRequest)
+                    or vacate_request.vehicle_id not in self._expected_peers
+                )
+            )
         ):
             raise ValueError("invalid motion intent priority or timestamp")
         global_x_m, global_y_m, _ = self.anchor.anchor_to_global(
@@ -736,6 +805,11 @@ class MapSyncState:
             pose.yaw_rad,
         )
         current_cell = self._global_cell(global_x_m, global_y_m)
+        if (
+            vacate_request is not None
+            and vacate_request.route_cells[0] != current_cell
+        ):
+            raise ValueError("vacate request route must start at current cell")
         target_cell = None
         if target_m is not None:
             target_x_m, target_y_m, _ = self.anchor.anchor_to_global(
@@ -765,6 +839,7 @@ class MapSyncState:
             task_sequence,
             tuple(item.cell for item in timed_trajectory),
             goal_hold,
+            vacate_request,
         )
         if plan_generation is None:
             if signature != self._local_plan_signature:
@@ -800,6 +875,7 @@ class MapSyncState:
             committed_until_offset_s,
             goal_hold,
             safety_time_margin_s,
+            vacate_request,
             timestamp_s,
         )
         (
@@ -1063,6 +1139,7 @@ class MapSyncState:
             intent.task_sequence,
             tuple(item.cell for item in intent.trajectory),
             intent.goal_hold,
+            intent.vacate_request,
         )
         if (
             intent.sequence <= self._peer_intent_sequence[source]
@@ -1114,6 +1191,7 @@ class MapSyncState:
                 "committed_until_offset_s",
                 "goal_hold",
                 "safety_time_margin_s",
+                "vacate_request",
                 "corridor",
             )
         )
@@ -1153,6 +1231,45 @@ class MapSyncState:
             if body["target_cell"] is None
             else self._validate_intent_cell(body["target_cell"], "target_cell")
         )
+        vacate_request_payload = body["vacate_request"]
+        vacate_request = None
+        if vacate_request_payload is not None:
+            request = _strict_object(
+                vacate_request_payload,
+                required=frozenset(
+                    ("vehicle_id", "cell", "route_cells")
+                ),
+                allowed=frozenset(
+                    ("vehicle_id", "cell", "route_cells")
+                ),
+                name="motion_intent.vacate_request",
+            )
+            request_vehicle_id = request["vehicle_id"]
+            if (
+                request_vehicle_id == source
+                or request_vehicle_id
+                not in {self.vehicle_id, *self._expected_peers}
+            ):
+                raise ValueError("vacate request target is not a known fleet vehicle")
+            route_cells_payload = request["route_cells"]
+            if not isinstance(route_cells_payload, list):
+                raise ValueError("vacate request route must be an array")
+            vacate_request = VacateRequest(
+                request_vehicle_id,
+                self._validate_intent_cell(
+                    request["cell"],
+                    "vacate_request.cell",
+                ),
+                tuple(
+                    self._validate_intent_cell(
+                        cell,
+                        "vacate_request.route_cells[]",
+                    )
+                    for cell in route_cells_payload
+                ),
+            )
+            if vacate_request.route_cells[0] != current_cell:
+                raise ValueError("vacate request route must start at current cell")
         trajectory_payload = body["trajectory"]
         if (
             not isinstance(trajectory_payload, list)
@@ -1293,6 +1410,7 @@ class MapSyncState:
             committed_until_offset_s,
             body["goal_hold"],
             safety_time_margin_s,
+            vacate_request,
         )
 
     @staticmethod

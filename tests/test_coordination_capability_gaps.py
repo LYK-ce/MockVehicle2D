@@ -273,6 +273,64 @@ class TestCoordinationCapabilityGaps(unittest.TestCase):
             positions[moving_vehicle_id] = (*destination, 0.0)
 
     @pytest.mark.extended
+    def test_queued_t_junction_completes_simultaneous_gotos(self) -> None:
+        starts = {
+            "vehicle_a": (4.5, 6.5, 0.0),
+            "vehicle_b": (18.5, 6.5, math.pi),
+            "vehicle_c": (11.5, 11.5, -math.pi / 2),
+            "vehicle_d": (11.5, 16.5, -math.pi / 2),
+        }
+        goals = {
+            "vehicle_a": starts["vehicle_b"][:2],
+            "vehicle_b": starts["vehicle_d"][:2],
+            "vehicle_c": starts["vehicle_a"][:2],
+            "vehicle_d": starts["vehicle_c"][:2],
+        }
+        results = tuple(
+            run_episode(
+                FleetScenario(
+                    "queued_t_junction_simultaneous_gotos",
+                    tuple(
+                        FleetVehicleSpec(
+                            vehicle_id,
+                            19090 + ord(vehicle_id[-1]) - ord("a"),
+                            f"{vehicle_id}_spawn",
+                            AnchorPose(*starts[vehicle_id]),
+                        )
+                        for vehicle_id in order
+                    ),
+                    100,
+                ),
+                {
+                    vehicle_id: (
+                        GotoMission(
+                            f"simultaneous-{vehicle_id}",
+                            "global_map",
+                            *goal,
+                            2,
+                        ),
+                    )
+                    for vehicle_id, goal in goals.items()
+                },
+                max_simulation_s=90.0,
+                grid=_queued_t_junction_grid(),
+                linear_speed=1.0,
+            )
+            for order in (tuple(starts), tuple(reversed(starts)))
+        )
+        for order, result in zip(("canonical", "reverse-order"), results):
+            self.assert_campaign_success(
+                f"queued-t-junction-simultaneous-gotos-{order}",
+                result,
+                max_no_progress_s=60.0,
+            )
+            self.assertTrue(
+                all(len(vehicle["missions"]) == 1 for vehicle in result.vehicles),
+                result.to_json(),
+            )
+        self.assertEqual(results[0].to_json(), results[1].to_json())
+
+    @pytest.mark.extended
     def test_nested_four_vehicle_chain_completes_simultaneous_gotos(self) -> None:
         starts = {
             "vehicle_a": (4.5, 5.5, 0.0),

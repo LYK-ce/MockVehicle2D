@@ -863,6 +863,7 @@ class RobotNode:
                 committed_until_offset_s=committed_until_offset_s,
                 goal_hold=goal_hold,
                 safety_time_margin_s=safety_time_margin_s,
+                vacate_request=self.controller.vacate_request,
             )
         self._pending_map_delta = None
         self._pending_advance = SafetyAdvanceResult()
