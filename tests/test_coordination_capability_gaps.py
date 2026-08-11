@@ -5,6 +5,7 @@ import unittest
 
 import pytest
 
+from mockvehicle2d.collision import is_swept_circle_passable
 from mockvehicle2d.controller import GotoMission
 from mockvehicle2d.episode import EpisodeResult, run_episode
 from mockvehicle2d.fleet import AnchorPose, FleetScenario, FleetVehicleSpec
@@ -90,6 +91,54 @@ def _queued_t_junction_grid() -> MapGrid:
     return MapGrid.from_wall_set(23, 23, walls)
 
 
+def _terminal_coordination_grid() -> MapGrid:
+    walls = {
+        (x, y)
+        for x in range(23)
+        for y in range(23)
+        if x in {0, 22} or y in {0, 22}
+    }
+    return MapGrid.from_wall_set(23, 23, walls)
+
+
+def _run_goal_episode(
+    starts: dict[str, tuple[float, float, float]],
+    goals: dict[str, tuple[float, float]],
+    order: tuple[str, ...],
+    *,
+    max_simulation_s: float,
+) -> EpisodeResult:
+    return run_episode(
+        FleetScenario(
+            "coordinated_goto_terminals",
+            tuple(
+                FleetVehicleSpec(
+                    vehicle_id,
+                    19090 + ord(vehicle_id[-1]) - ord("a"),
+                    f"{vehicle_id}_spawn",
+                    AnchorPose(*starts[vehicle_id]),
+                )
+                for vehicle_id in order
+            ),
+            100,
+        ),
+        {
+            vehicle_id: (
+                GotoMission(
+                    f"goto-terminal-{vehicle_id}",
+                    "global_map",
+                    *goals[vehicle_id],
+                    2,
+                ),
+            )
+            for vehicle_id in starts
+        },
+        max_simulation_s=max_simulation_s,
+        grid=_terminal_coordination_grid(),
+        linear_speed=1.0,
+    )
+
+
 class TestCoordinationCapabilityGaps(unittest.TestCase):
     def assert_safe_success(self, result: EpisodeResult) -> None:
         self.assertTrue(
@@ -127,6 +176,131 @@ class TestCoordinationCapabilityGaps(unittest.TestCase):
                 for vehicle in result.vehicles
             ),
             evidence,
+        )
+
+    def assert_static_terminal_witness(
+        self,
+        points: tuple[tuple[float, float], ...],
+    ) -> None:
+        grid = _terminal_coordination_grid()
+        self.assertTrue(
+            all(
+                is_swept_circle_passable(grid, *point, *point, 0.5)
+                for point in points
+            )
+        )
+        self.assertGreaterEqual(
+            min(
+                math.dist(first, second) - 1.0
+                for index, first in enumerate(points)
+                for second in points[index + 1 :]
+            ),
+            AUTOMATIC_MINIMUM_CLEARANCE_M,
+        )
+
+    def assert_goal_campaign(
+        self,
+        starts: dict[str, tuple[float, float, float]],
+        goals: dict[str, tuple[float, float]],
+        *,
+        max_simulation_s: float,
+        max_no_progress_s: float,
+    ) -> None:
+        results = []
+        for order in (tuple(starts), tuple(reversed(starts))):
+            result = _run_goal_episode(
+                starts,
+                goals,
+                order,
+                max_simulation_s=max_simulation_s,
+            )
+            self.assert_campaign_success(
+                "coordinated-goto-terminals",
+                result,
+                max_no_progress_s=max_no_progress_s,
+            )
+            self.assertTrue(
+                all(
+                    vehicle["final_safety"]["state"] == "clear"
+                    for vehicle in result.vehicles
+                ),
+                result.to_json(),
+            )
+            results.append(result)
+        self.assertEqual(results[0].to_json(), results[1].to_json())
+
+    def test_two_vehicles_settle_safely_at_one_goto_goal(self) -> None:
+        starts = {
+            "vehicle_a": (5.5, 11.5, 0.0),
+            "vehicle_b": (11.5, 17.5, -math.pi / 2),
+        }
+        goal = (11.5, 11.5)
+        # One exact stop plus one nearby stop is physically feasible.
+        self.assert_static_terminal_witness((goal, (10.2, 11.5)))
+
+        self.assert_goal_campaign(
+            starts,
+            {vehicle_id: goal for vehicle_id in starts},
+            max_simulation_s=60.0,
+            max_no_progress_s=30.0,
+        )
+
+    def test_two_vehicles_settle_safely_at_overlapping_goto_goals(self) -> None:
+        starts = {
+            "vehicle_a": (5.5, 11.5, 0.0),
+            "vehicle_b": (12.5, 17.5, -math.pi / 2),
+        }
+        goals = {
+            "vehicle_a": (11.0, 11.5),
+            "vehicle_b": (12.0, 11.5),
+        }
+        terminal_witness = {
+            "vehicle_a": (10.2, 11.5),
+            "vehicle_b": (12.8, 11.5),
+        }
+        self.assertLess(
+            math.dist(*goals.values()) - 1.0,
+            AUTOMATIC_MINIMUM_CLEARANCE_M,
+        )
+        # Exact safety envelopes conflict; these nearby stops do not.
+        self.assert_static_terminal_witness(tuple(terminal_witness.values()))
+        self.assertTrue(
+            all(
+                math.dist(goals[vehicle_id], point) - 0.5 <= 1.0
+                for vehicle_id, point in terminal_witness.items()
+            )
+        )
+        self.assert_goal_campaign(
+            starts,
+            goals,
+            max_simulation_s=60.0,
+            max_no_progress_s=30.0,
+        )
+
+    @pytest.mark.extended
+    def test_four_vehicles_settle_safely_at_one_goto_goal(self) -> None:
+        starts = {
+            "vehicle_a": (5.5, 11.5, 0.0),
+            "vehicle_b": (17.5, 11.5, math.pi),
+            "vehicle_c": (11.5, 5.5, math.pi / 2),
+            "vehicle_d": (11.5, 17.5, -math.pi / 2),
+        }
+        goal = (11.5, 11.5)
+        # One exact stop plus three nearby stops is physically feasible.
+        self.assert_static_terminal_witness(
+            (
+                goal,
+                (10.2, 11.5),
+                (12.8, 11.5),
+                (11.5, 12.8),
+            )
+        )
+
+        self.assert_goal_campaign(
+            starts,
+            {vehicle_id: goal for vehicle_id in starts},
+            max_simulation_s=90.0,
+            max_no_progress_s=60.0,
         )
 
     @pytest.mark.extended
