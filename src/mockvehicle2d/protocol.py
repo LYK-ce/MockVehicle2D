@@ -15,6 +15,7 @@ from mockvehicle2d.controller import (
     MAX_MISSION_SUBGOALS,
     ManualAction,
     ManualCommand,
+    MISSION_ID_PATTERN,
     Mission,
     ModeAction,
     ModeCommand,
@@ -215,6 +216,13 @@ def _parse_mission(payload: object, seq: int) -> Mission:
     if mission_type == "coverage" and "coordination_id" in payload:
         fields.add("coordination_id")
     _require_fields(payload, fields, seq, subject="mission")
+    coordination_id = None
+    if "coordination_id" in payload:
+        coordination_id = payload["coordination_id"]
+        if not isinstance(coordination_id, str) or not MISSION_ID_PATTERN.fullmatch(
+            coordination_id
+        ):
+            raise ProtocolError("invalid_mission", "invalid coordination_id", seq)
     mission_id = payload["mission_id"]
     frame_id = payload["frame_id"]
     if not isinstance(mission_id, str) or not isinstance(frame_id, str):
@@ -277,7 +285,7 @@ def _parse_mission(payload: object, seq: int) -> Mission:
             _coordinate(area["max_y_m"], "area.max_y_m", seq),
             _finite_number(payload["lane_spacing_m"], "lane_spacing_m", seq),
             seq,
-            payload.get("coordination_id"),
+            coordination_id,
         )
     except ProtocolError:
         raise

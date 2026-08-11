@@ -357,7 +357,7 @@ class TestControllerProtocol(unittest.TestCase):
             },
             "lane_spacing_m": 1,
         }
-        for coordination_id in ("", "a" * 65, "fleet/group", "车队", True, 1):
+        for coordination_id in (None, "", "a" * 65, "fleet/group", "车队", True, 1):
             with self.subTest(coordination_id=coordination_id):
                 mission["coordination_id"] = coordination_id
                 raw = json.dumps(
