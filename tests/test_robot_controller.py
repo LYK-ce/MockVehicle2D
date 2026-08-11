@@ -458,6 +458,99 @@ def case_controller_executes_only_its_grouped_coverage_partition() -> None:
     assert harness.events()[-1].as_dict(0.0)["goal"] == active["current_goal"]
 
 
+def case_grouped_patrol_rotates_the_full_route_by_vehicle_rank() -> None:
+    route = ((1.0, 1.0), (2.0, 1.0), (2.0, 2.0), (1.0, 2.0))
+    grouped = PatrolMission(
+        "grouped-patrol",
+        "global_map",
+        route,
+        2,
+        2,
+        "fleet-alpha",
+    )
+
+    assert grouped.effective_subgoals(
+        "vehicle_a",
+        ("vehicle_d", "vehicle_b", "vehicle_c", "vehicle_b"),
+    ) == route * 2
+    assert grouped.effective_subgoals(
+        "vehicle_b",
+        ("vehicle_a",),
+    ) == (route[2:] + route[:2]) * 2
+    assert grouped.effective_subgoals(
+        "vehicle_d",
+        ("vehicle_c", "vehicle_a", "vehicle_b"),
+    ) == (route[3:] + route[:3]) * 2
+    short = PatrolMission(
+        "short-grouped-patrol",
+        "global_map",
+        route[:2],
+        3,
+        2,
+        "fleet-alpha",
+    )
+    assert short.effective_subgoals(
+        "vehicle_c",
+        ("vehicle_d", "vehicle_b", "vehicle_a"),
+    ) == (route[1], route[0]) * 3
+    assert short.effective_subgoals(
+        "vehicle_d",
+        ("vehicle_a", "vehicle_b", "vehicle_c"),
+    ) == (route[1], route[0]) * 3
+    legacy = PatrolMission(
+        "legacy-patrol",
+        "global_map",
+        route,
+        2,
+        2,
+    )
+    assert legacy.effective_subgoals("vehicle_d", ("vehicle_a",)) == route * 2
+
+
+def case_controller_freezes_grouped_patrol_phase_across_pause_resume() -> None:
+    harness = Harness(capacity=1)
+    harness.mode(1, ModeAction.SWITCH_TO_AUTO)
+    harness.auto(
+        2,
+        AutoAction.PUSH,
+        (
+            PatrolMission(
+                "grouped-patrol",
+                "global_map",
+                ((11.0, 10.0), (12.0, 10.0), (13.0, 10.0), (14.0, 10.0)),
+                2,
+                2,
+                "fleet-alpha",
+            ),
+        ),
+    )
+
+    harness.tick(
+        0.0,
+        vehicle_id="vehicle_b",
+        expected_peer_vehicle_ids=("vehicle_d", "vehicle_a", "vehicle_c"),
+    )
+    before = harness.controller.snapshot()["active_mission"]
+    assert before["current_goal"] == {
+        "frame_id": "global_map",
+        "x_m": 12.0,
+        "y_m": 10.0,
+    }
+    assert before["subgoal_count"] == 8
+
+    harness.auto(3, AutoAction.PAUSE)
+    harness.auto(4, AutoAction.RESUME)
+    harness.tick(
+        0.1,
+        vehicle_id="vehicle_b",
+        expected_peer_vehicle_ids=(),
+    )
+
+    after = harness.controller.snapshot()["active_mission"]
+    assert after["current_goal"] == before["current_goal"]
+    assert after["subgoal_count"] == before["subgoal_count"]
+
+
 def case_patrol_progress_survives_pause_takeover_resume_and_cancel() -> None:
     harness = Harness(capacity=1)
     harness.mode(1, ModeAction.SWITCH_TO_AUTO)
@@ -861,6 +954,12 @@ class TestRobotController(unittest.TestCase):
     )
     test_grouped_coverage_execution = staticmethod(
         case_controller_executes_only_its_grouped_coverage_partition
+    )
+    test_grouped_patrol_phase = staticmethod(
+        case_grouped_patrol_rotates_the_full_route_by_vehicle_rank
+    )
+    test_grouped_patrol_freeze = staticmethod(
+        case_controller_freezes_grouped_patrol_phase_across_pause_resume
     )
     test_high_level_pause_resume_cancel = staticmethod(
         case_patrol_progress_survives_pause_takeover_resume_and_cancel

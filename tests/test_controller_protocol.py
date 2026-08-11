@@ -344,33 +344,78 @@ class TestControllerProtocol(unittest.TestCase):
         self.assertNotEqual(coordinated.fingerprint, legacy.fingerprint)
         self.assertNotIn("coordination_id", legacy.as_dict())
 
-    def test_coverage_rejects_invalid_coordination_ids(self) -> None:
-        mission = {
-            "mission_id": "coverage-grouped",
-            "type": "coverage",
-            "frame_id": "global_map",
-            "area": {
-                "min_x_m": 0,
-                "min_y_m": 0,
-                "max_x_m": 4,
-                "max_y_m": 2,
+    def test_patrol_accepts_an_optional_coordination_id(self) -> None:
+        coordinated = parse(
+            '{"type":"auto","seq":8,"action":"push","missions":['
+            '{"mission_id":"patrol-grouped","type":"patrol",'
+            '"frame_id":"global_map","waypoints":['
+            '{"x_m":1,"y_m":2},{"x_m":3,"y_m":4}],"cycles":2,'
+            '"coordination_id":"fleet.patrol:alpha"}]}'
+        ).missions[0]
+        legacy = PatrolMission(
+            "patrol-grouped",
+            "global_map",
+            ((1.0, 2.0), (3.0, 4.0)),
+            2,
+            8,
+        )
+
+        self.assertEqual(coordinated.coordination_id, "fleet.patrol:alpha")
+        self.assertEqual(
+            coordinated.as_dict()["coordination_id"],
+            "fleet.patrol:alpha",
+        )
+        self.assertNotEqual(coordinated.fingerprint, legacy.fingerprint)
+        self.assertNotIn("coordination_id", legacy.as_dict())
+
+    def test_grouped_missions_reject_invalid_coordination_ids(self) -> None:
+        missions = (
+            {
+                "mission_id": "coverage-grouped",
+                "type": "coverage",
+                "frame_id": "global_map",
+                "area": {
+                    "min_x_m": 0,
+                    "min_y_m": 0,
+                    "max_x_m": 4,
+                    "max_y_m": 2,
+                },
+                "lane_spacing_m": 1,
             },
-            "lane_spacing_m": 1,
-        }
-        for coordination_id in (None, "", "a" * 65, "fleet/group", "车队", True, 1):
-            with self.subTest(coordination_id=coordination_id):
-                mission["coordination_id"] = coordination_id
-                raw = json.dumps(
-                    {
-                        "type": "auto",
-                        "seq": 8,
-                        "action": "push",
-                        "missions": [mission],
-                    }
-                )
-                with self.assertRaises(ProtocolError) as caught:
-                    parse(raw)
-                self.assertEqual(caught.exception.code, "invalid_mission")
+            {
+                "mission_id": "patrol-grouped",
+                "type": "patrol",
+                "frame_id": "global_map",
+                "waypoints": [{"x_m": 1, "y_m": 2}],
+                "cycles": 1,
+            },
+        )
+        for mission in missions:
+            for coordination_id in (
+                None,
+                "",
+                "a" * 65,
+                "fleet/group",
+                "车队",
+                True,
+                1,
+            ):
+                with self.subTest(
+                    mission_type=mission["type"],
+                    coordination_id=coordination_id,
+                ):
+                    mission["coordination_id"] = coordination_id
+                    raw = json.dumps(
+                        {
+                            "type": "auto",
+                            "seq": 8,
+                            "action": "push",
+                            "missions": [mission],
+                        }
+                    )
+                    with self.assertRaises(ProtocolError) as caught:
+                        parse(raw)
+                    self.assertEqual(caught.exception.code, "invalid_mission")
 
     def test_rejects_invalid_or_oversized_high_level_missions_atomically(self) -> None:
         invalid_missions = [

@@ -213,7 +213,7 @@ def _parse_mission(payload: object, seq: int) -> Mission:
             "lane_spacing_m",
         },
     }[mission_type]
-    if mission_type == "coverage" and "coordination_id" in payload:
+    if mission_type in {"patrol", "coverage"} and "coordination_id" in payload:
         fields.add("coordination_id")
     _require_fields(payload, fields, seq, subject="mission")
     coordination_id = None
@@ -265,6 +265,7 @@ def _parse_mission(payload: object, seq: int) -> Mission:
                 tuple(parsed_waypoints),
                 payload["cycles"],
                 seq,
+                coordination_id,
             )
 
         area = payload["area"]

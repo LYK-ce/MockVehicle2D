@@ -849,6 +849,144 @@ class TestEpisodeRunner(unittest.TestCase):
             max_no_progress_s=45.0,
         )
 
+    def test_two_vehicles_phase_one_coordinated_patrol_route(self) -> None:
+        waypoints = ((7.0, 7.0), (11.0, 7.0), (11.0, 11.0), (7.0, 11.0))
+        specs = (
+            FleetVehicleSpec(
+                "vehicle_a",
+                19090,
+                "spawn_a",
+                AnchorPose(*waypoints[0], 0.0),
+            ),
+            FleetVehicleSpec(
+                "vehicle_b",
+                19091,
+                "spawn_b",
+                AnchorPose(*waypoints[2], math.pi),
+            ),
+        )
+        missions = {
+            vehicle_id: (
+                PatrolMission(
+                    f"patrol-{vehicle_id}",
+                    "global_map",
+                    waypoints,
+                    1,
+                    2,
+                    "fleet-alpha",
+                ),
+            )
+            for vehicle_id in ("vehicle_a", "vehicle_b")
+        }
+        self.assertEqual(
+            [
+                missions[vehicle_id][0].effective_subgoals(
+                    vehicle_id,
+                    tuple(sorted(set(missions) - {vehicle_id})),
+                )[0]
+                for vehicle_id in sorted(missions)
+            ],
+            [waypoints[0], waypoints[2]],
+        )
+
+        runs = tuple(
+            run_coverage_episode_with_truth(
+                FleetScenario("grouped_patrol", vehicles, 100),
+                missions,
+                max_simulation_s=70.0,
+                grid=MapGrid.from_wall_set(20, 20, set()),
+            )
+            for vehicles in (specs, tuple(reversed(specs)))
+        )
+
+        self.assertEqual(runs[0][0].to_json(), runs[1][0].to_json())
+        for result, _, fleet in runs:
+            self.assertTrue(result.success, result.as_dict())
+            self.assertGreaterEqual(
+                result.minimum_inter_vehicle_clearance_m,
+                AUTOMATIC_MINIMUM_CLEARANCE_M,
+            )
+            self.assertTrue(
+                all(
+                    not vehicle["collision_occurred"]
+                    and not vehicle["blocked"]
+                    and vehicle["missions"][0]["status"] == "reached"
+                    and vehicle["final_safety"]["state"] == "clear"
+                    for vehicle in result.vehicles
+                ),
+                result.as_dict(),
+            )
+            self.assertTrue(
+                all(
+                    node.controller.auto_state.value == "idle"
+                    and not node.controller.is_automatic_motion_active
+                    for node in fleet.nodes.values()
+                )
+            )
+
+    @pytest.mark.extended
+    def test_four_vehicles_phase_one_coordinated_patrol_route(self) -> None:
+        waypoints = ((8.0, 8.0), (12.0, 8.0), (12.0, 12.0), (8.0, 12.0))
+        yaws = (0.0, math.pi / 2, math.pi, -math.pi / 2)
+        vehicle_ids = ("vehicle_a", "vehicle_b", "vehicle_c", "vehicle_d")
+        specs = tuple(
+            FleetVehicleSpec(
+                vehicle_id,
+                19100 + index,
+                f"spawn_{vehicle_id[-1]}",
+                AnchorPose(*waypoints[index], yaws[index]),
+            )
+            for index, vehicle_id in enumerate(vehicle_ids)
+        )
+        missions = {
+            vehicle_id: (
+                PatrolMission(
+                    f"patrol-{vehicle_id}",
+                    "global_map",
+                    waypoints,
+                    3,
+                    2,
+                    "fleet-alpha",
+                ),
+            )
+            for vehicle_id in vehicle_ids
+        }
+        self.assertEqual(
+            [
+                missions[vehicle_id][0].effective_subgoals(
+                    vehicle_id,
+                    tuple(sorted(set(vehicle_ids) - {vehicle_id})),
+                )[0]
+                for vehicle_id in vehicle_ids
+            ],
+            list(waypoints),
+        )
+
+        results = tuple(
+            run_episode(
+                FleetScenario("grouped_patrol_four", vehicles, 100),
+                missions,
+                max_simulation_s=210.0,
+                grid=MapGrid.from_wall_set(20, 20, set()),
+                linear_speed=1.0,
+            )
+            for vehicles in (specs, tuple(reversed(specs)))
+        )
+
+        self.assertEqual(results[0].to_json(), results[1].to_json())
+        for result in results:
+            self.assert_four_vehicle_completed(
+                result,
+                ("patrol",) * 4,
+                max_no_progress_s=20.0,
+            )
+            self.assertTrue(
+                all(
+                    vehicle["final_safety"]["state"] == "clear"
+                    for vehicle in result.vehicles
+                )
+            )
+
     @pytest.mark.extended
     def test_four_vehicle_merge_patrol_extended_matrix(self) -> None:
         matrix = FleetScenario.load(

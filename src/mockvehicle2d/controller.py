@@ -125,6 +125,7 @@ class PatrolMission:
     waypoints: tuple[Goal, ...]
     cycles: int
     submitted_seq: int
+    coordination_id: str | None = None
     _subgoals: tuple[Goal, ...] = field(init=False, repr=False, compare=False)
 
     def __post_init__(self) -> None:
@@ -143,18 +144,29 @@ class PatrolMission:
             raise ValueError(
                 f"mission must generate at most {MAX_MISSION_SUBGOALS} subgoals"
             )
+        if self.coordination_id is not None and (
+            not isinstance(self.coordination_id, str)
+            or not MISSION_ID_PATTERN.fullmatch(self.coordination_id)
+        ):
+            raise ValueError("invalid coordination_id")
         object.__setattr__(self, "_subgoals", self.waypoints * self.cycles)
 
     @property
     def fingerprint(self) -> tuple[object, ...]:
-        return self.mission_type, self.frame_id, self.waypoints, self.cycles
+        return (
+            self.mission_type,
+            self.frame_id,
+            self.waypoints,
+            self.cycles,
+            self.coordination_id,
+        )
 
     @property
     def subgoals(self) -> tuple[Goal, ...]:
         return self._subgoals
 
     def as_dict(self) -> dict[str, object]:
-        return {
+        result: dict[str, object] = {
             "mission_id": self.mission_id,
             "type": self.mission_type,
             "frame_id": self.frame_id,
@@ -164,6 +176,21 @@ class PatrolMission:
             "cycles": self.cycles,
             "submitted_seq": self.submitted_seq,
         }
+        if self.coordination_id is not None:
+            result["coordination_id"] = self.coordination_id
+        return result
+
+    def effective_subgoals(
+        self,
+        vehicle_id: str,
+        expected_peer_vehicle_ids: tuple[str, ...],
+    ) -> tuple[Goal, ...]:
+        if self.coordination_id is None:
+            return self.subgoals
+        members = sorted({vehicle_id, *expected_peer_vehicle_ids})
+        start = members.index(vehicle_id) * len(self.waypoints) // len(members)
+        route = self.waypoints[start:] + self.waypoints[:start]
+        return route * self.cycles
 
 
 @dataclass(frozen=True)
@@ -3904,7 +3931,8 @@ class RobotController:
         if not self._active_subgoals:
             self._active_subgoals = (
                 mission.effective_subgoals(vehicle_id, expected_peer_vehicle_ids)
-                if isinstance(mission, CoverageMission) and vehicle_id is not None
+                if isinstance(mission, (PatrolMission, CoverageMission))
+                and vehicle_id is not None
                 else mission.subgoals
             )
         goal_x_m, goal_y_m = self._active_subgoals[self._subgoal_index]

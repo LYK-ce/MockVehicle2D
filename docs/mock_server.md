@@ -120,11 +120,12 @@ Auto `push` 只写入父任务队列。`goto` 直接提供一个目标；`patrol
 `GotoController` 返回期望速度，不直接控制车辆。中间子目标不成为独立任务，父任务的
 到达、阻断、暂停和取消通过 `mission_update` 明确发布。
 
-Coverage 不带 `coordination_id` 时保持单车完整区域语义。带该可选字段时，任务首次激活
-按排序后的 `{本车} + 固定 expected peer allowlist` 冻结成员，并沿原矩形长轴均分连续
-子矩形；每车仍使用同一个 Coverage 蛇形生成器和 `GotoController`。同组所有成员必须收到
-相同 ID、区域和间距。当前不支持部分下发、动态成员或运行中重分配，也不新增车队任务
-类型、P2P schema 或 motion-intent 版本。
+Patrol/Coverage 不带 `coordination_id` 时保持既有本车语义。带该可选字段时，任务首次
+激活按排序后的 `{本车} + 固定 expected peer allowlist` 冻结成员。Patrol 按成员 rank
+旋转原航点序列，每车仍执行全部航点和 `cycles`；Coverage 沿原矩形长轴均分连续子矩形，
+每车仍使用同一个 Coverage 蛇形生成器和 `GotoController`。同组所有成员必须收到相同 ID
+和任务参数。当前不支持部分下发、动态成员或运行中重分配，也不新增车队任务类型、P2P
+schema 或 motion-intent 版本。
 
 同一 `mission_id` 和完全相同任务定义可用新的 `seq` 安全重试；不会生成第二个任务。
 相同 ID 对应不同类型、航点、轮次、区域或间距会返回 `mission_id_conflict`。该记录在
