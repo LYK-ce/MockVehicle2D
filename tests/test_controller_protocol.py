@@ -317,6 +317,61 @@ class TestControllerProtocol(unittest.TestCase):
             ((0.0, 0.0), (0.0, 4.0), (2.0, 4.0), (2.0, 0.0)),
         )
 
+    def test_coverage_accepts_an_optional_coordination_id(self) -> None:
+        coordinated = parse(
+            '{"type":"auto","seq":8,"action":"push","missions":['
+            '{"mission_id":"coverage-grouped","type":"coverage",'
+            '"frame_id":"global_map","area":{"min_x_m":0,"min_y_m":0,'
+            '"max_x_m":4,"max_y_m":2},"lane_spacing_m":1,'
+            '"coordination_id":"fleet.coverage:alpha"}]}'
+        ).missions[0]
+        legacy = CoverageMission(
+            "coverage-grouped",
+            "global_map",
+            0.0,
+            0.0,
+            4.0,
+            2.0,
+            1.0,
+            8,
+        )
+
+        self.assertEqual(coordinated.coordination_id, "fleet.coverage:alpha")
+        self.assertEqual(
+            coordinated.as_dict()["coordination_id"],
+            "fleet.coverage:alpha",
+        )
+        self.assertNotEqual(coordinated.fingerprint, legacy.fingerprint)
+        self.assertNotIn("coordination_id", legacy.as_dict())
+
+    def test_coverage_rejects_invalid_coordination_ids(self) -> None:
+        mission = {
+            "mission_id": "coverage-grouped",
+            "type": "coverage",
+            "frame_id": "global_map",
+            "area": {
+                "min_x_m": 0,
+                "min_y_m": 0,
+                "max_x_m": 4,
+                "max_y_m": 2,
+            },
+            "lane_spacing_m": 1,
+        }
+        for coordination_id in ("", "a" * 65, "fleet/group", "车队", True, 1):
+            with self.subTest(coordination_id=coordination_id):
+                mission["coordination_id"] = coordination_id
+                raw = json.dumps(
+                    {
+                        "type": "auto",
+                        "seq": 8,
+                        "action": "push",
+                        "missions": [mission],
+                    }
+                )
+                with self.assertRaises(ProtocolError) as caught:
+                    parse(raw)
+                self.assertEqual(caught.exception.code, "invalid_mission")
+
     def test_rejects_invalid_or_oversized_high_level_missions_atomically(self) -> None:
         invalid_missions = [
             {
@@ -423,6 +478,23 @@ class TestControllerProtocol(unittest.TestCase):
                         "yaw_rad": 0,
                     },
                     "lane_spacing_m": 1,
+                },
+                "invalid_fields",
+            ),
+            (
+                {
+                    "mission_id": "coverage-coordination-extra",
+                    "type": "coverage",
+                    "frame_id": "global_map",
+                    "area": {
+                        "min_x_m": 0,
+                        "min_y_m": 0,
+                        "max_x_m": 1,
+                        "max_y_m": 1,
+                    },
+                    "lane_spacing_m": 1,
+                    "coordination_id": "fleet-alpha",
+                    "members": ["vehicle_1"],
                 },
                 "invalid_fields",
             ),

@@ -39,8 +39,11 @@ RobotController ─────────────────────�
 `pose` 与紧随其后的 `scan` 使用相同 `seq` 和 `timestamp_s`。
 
 每条 `goto`、`patrol` 或 `coverage` 命令只进入接收该命令的车辆控制器；这里没有车队任务
-分配器。多车协调只能临时改变期望速度、局部绕行点和路权等待，不会交换、重分配或静默
-取消任务，也不会改写 Patrol/Coverage 在本车展开的后续子目标。
+分配器。多车运动协调只临时改变期望速度、局部绕行点和路权等待，不会交换或静默取消
+任务。唯一的任务展开例外是显式设置 `coverage.coordination_id`：任务首次激活时，各车从
+排序后的 `{本车} + 固定 expected peer allowlist` 独立得到同一成员顺序，并沿原矩形长轴
+选择自己的连续子矩形。所有成员必须收到相同 ID、区域和间距；部分下发、动态成员与
+运行中重分配暂不支持。省略该字段时 Patrol/Coverage 的既有本车展开完全不变。
 
 ## D* Lite
 
@@ -102,9 +105,10 @@ restart grace。单帧匿名遮挡消失后可恢复；持续或闪烁的匿名�
 ### 滚动时域协同 Goto
 
 `goto`、`patrol` 和 `coverage` 不增加新的车队任务类型；后两者展开的每个子目标继续进入
-同一个 `GotoController`。控制器复用 OwnMap-only D* 路径作为空间候选，并在每个控制 tick
-上为未来约 `4 s` 构造 prioritized SIPP 时间表。无冲突时首步 departure 不被推迟；每次
-只提交/执行约 `0.8 s`，随后根据新的 odometry、D* 路径和 peer intent 滚动重算。
+同一个 `GotoController`。可选的 grouped Coverage 只在本地确定性选择连续子矩形，不增加
+P2P schema 或 motion-intent 版本。控制器复用 OwnMap-only D* 路径作为空间候选，并在每个
+控制 tick 上为未来约 `4 s` 构造 prioritized SIPP 时间表。无冲突时首步 departure 不被
+推迟；每次只提交/执行约 `0.8 s`，随后根据新的 odometry、D* 路径和 peer intent 滚动重算。
 
 motion-intent v4 的 trajectory 由相对 `enter_offset_s` / `leave_offset_s` 组成。接收端以本地
 receipt time 重建绝对区间，不比较不同车辆的 monotonic clock；intent generation、plan

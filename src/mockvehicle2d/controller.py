@@ -177,6 +177,7 @@ class CoverageMission:
     max_y_m: float
     lane_spacing_m: float
     submitted_seq: int
+    coordination_id: str | None = None
     _subgoals: tuple[Goal, ...] = field(init=False, repr=False, compare=False)
 
     def __post_init__(self) -> None:
@@ -195,7 +196,22 @@ class CoverageMission:
             or self.lane_spacing_m <= 0
         ):
             raise ValueError("lane_spacing_m must be finite and positive")
-        object.__setattr__(self, "_subgoals", self._coverage_subgoals())
+        if self.coordination_id is not None and (
+            not isinstance(self.coordination_id, str)
+            or not MISSION_ID_PATTERN.fullmatch(self.coordination_id)
+        ):
+            raise ValueError("invalid coordination_id")
+        object.__setattr__(
+            self,
+            "_subgoals",
+            _coverage_subgoals(
+                self.min_x_m,
+                self.min_y_m,
+                self.max_x_m,
+                self.max_y_m,
+                self.lane_spacing_m,
+            ),
+        )
 
     @property
     def fingerprint(self) -> tuple[object, ...]:
@@ -207,6 +223,7 @@ class CoverageMission:
             self.max_x_m,
             self.max_y_m,
             self.lane_spacing_m,
+            self.coordination_id,
         )
 
     @property
@@ -214,7 +231,7 @@ class CoverageMission:
         return self._subgoals
 
     def as_dict(self) -> dict[str, object]:
-        return {
+        result: dict[str, object] = {
             "mission_id": self.mission_id,
             "type": self.mission_type,
             "frame_id": self.frame_id,
@@ -227,33 +244,75 @@ class CoverageMission:
             "lane_spacing_m": self.lane_spacing_m,
             "submitted_seq": self.submitted_seq,
         }
+        if self.coordination_id is not None:
+            result["coordination_id"] = self.coordination_id
+        return result
 
-    def _coverage_subgoals(self) -> tuple[Goal, ...]:
+    def effective_subgoals(
+        self,
+        vehicle_id: str,
+        expected_peer_vehicle_ids: tuple[str, ...],
+    ) -> tuple[Goal, ...]:
+        if self.coordination_id is None:
+            return self.subgoals
+        # ponytail: the configured allowlist is the fixed group; add intent
+        # membership only when partial or dynamic task delivery is required.
+        members = sorted({vehicle_id, *expected_peer_vehicle_ids})
+        member_index = members.index(vehicle_id)
         width = self.max_x_m - self.min_x_m
         height = self.max_y_m - self.min_y_m
-        along_x = width >= height
-        short_span = height if along_x else width
-        ratio = short_span / self.lane_spacing_m
-        max_segments = MAX_MISSION_SUBGOALS // 2 - 1
-        if not math.isfinite(ratio) or ratio > max_segments:
-            raise ValueError(
-                f"mission must generate at most {MAX_MISSION_SUBGOALS} subgoals"
+        if width >= height:
+            segment = width / len(members)
+            min_x_m = self.min_x_m + member_index * segment
+            max_x_m = (
+                self.max_x_m
+                if member_index + 1 == len(members)
+                else min_x_m + segment
             )
-        segments = max(1, math.ceil(ratio))
-        goals: list[Goal] = []
-        for index in range(segments + 1):
-            lane = (
-                (self.max_y_m if along_x else self.max_x_m)
-                if index == segments
-                else (self.min_y_m if along_x else self.min_x_m)
-                + index * self.lane_spacing_m
+            bounds = min_x_m, self.min_y_m, max_x_m, self.max_y_m
+        else:
+            segment = height / len(members)
+            min_y_m = self.min_y_m + member_index * segment
+            max_y_m = (
+                self.max_y_m
+                if member_index + 1 == len(members)
+                else min_y_m + segment
             )
-            if along_x:
-                endpoints = ((self.min_x_m, lane), (self.max_x_m, lane))
-            else:
-                endpoints = ((lane, self.min_y_m), (lane, self.max_y_m))
-            goals.extend(endpoints if index % 2 == 0 else reversed(endpoints))
-        return tuple(goals)
+            bounds = self.min_x_m, min_y_m, self.max_x_m, max_y_m
+        return _coverage_subgoals(*bounds, self.lane_spacing_m)
+
+
+def _coverage_subgoals(
+    min_x_m: float,
+    min_y_m: float,
+    max_x_m: float,
+    max_y_m: float,
+    lane_spacing_m: float,
+) -> tuple[Goal, ...]:
+    width = max_x_m - min_x_m
+    height = max_y_m - min_y_m
+    along_x = width >= height
+    short_span = height if along_x else width
+    ratio = short_span / lane_spacing_m
+    max_segments = MAX_MISSION_SUBGOALS // 2 - 1
+    if not math.isfinite(ratio) or ratio > max_segments:
+        raise ValueError(
+            f"mission must generate at most {MAX_MISSION_SUBGOALS} subgoals"
+        )
+    segments = max(1, math.ceil(ratio))
+    goals: list[Goal] = []
+    for index in range(segments + 1):
+        lane = (
+            (max_y_m if along_x else max_x_m)
+            if index == segments
+            else (min_y_m if along_x else min_x_m) + index * lane_spacing_m
+        )
+        if along_x:
+            endpoints = ((min_x_m, lane), (max_x_m, lane))
+        else:
+            endpoints = ((lane, min_y_m), (lane, max_y_m))
+        goals.extend(endpoints if index % 2 == 0 else reversed(endpoints))
+    return tuple(goals)
 
 
 Mission = GotoMission | PatrolMission | CoverageMission
@@ -1024,9 +1083,11 @@ class ControllerEvent:
     reason: str | None = None
     detail: str | None = None
     navigation: dict[str, object] | None = None
+    effective_subgoals: tuple[Goal, ...] | None = None
 
     def as_dict(self, timestamp: float) -> dict[str, object]:
-        goal_x_m, goal_y_m = self.mission.subgoals[self.subgoal_index]
+        subgoals = self.effective_subgoals or self.mission.subgoals
+        goal_x_m, goal_y_m = subgoals[self.subgoal_index]
         message: dict[str, object] = {
             "type": "mission_update",
             "event_seq": self.event_seq,
@@ -1037,7 +1098,7 @@ class ControllerEvent:
             "submitted_seq": self.mission.submitted_seq,
             "status": self.status,
             "subgoal_index": self.subgoal_index,
-            "subgoal_count": len(self.mission.subgoals),
+            "subgoal_count": len(subgoals),
             "goal": {
                 "frame_id": self.mission.frame_id,
                 "x_m": goal_x_m,
@@ -1087,6 +1148,7 @@ class RobotController:
         self._manual_deadline: float | None = None
         self._needs_start = False
         self._subgoal_index = 0
+        self._active_subgoals: tuple[Goal, ...] = ()
         self._deferred_edge_cell: tuple[int, int] | None = None
         self._yielding_for: str | None = None
         self._yield_requires_intent = False
@@ -1324,7 +1386,14 @@ class RobotController:
             return
 
         if self._needs_start:
-            self._start_or_resume(anchor, pose, local_map, vehicle.radius)
+            self._start_or_resume(
+                anchor,
+                pose,
+                local_map,
+                vehicle.radius,
+                vehicle_id=vehicle_id,
+                expected_peer_vehicle_ids=expected_peer_vehicle_ids,
+            )
         if self.auto_state is not AutoState.ACTIVE or self.active_mission is None:
             vehicle.stop()
             return
@@ -2715,11 +2784,11 @@ class RobotController:
                 if self.active_mission is None
                 else (
                     math.floor(
-                        self.active_mission.subgoals[self._subgoal_index][0]
+                        self._active_subgoals[self._subgoal_index][0]
                         / local_map.resolution_m
                     ),
                     math.floor(
-                        self.active_mission.subgoals[self._subgoal_index][1]
+                        self._active_subgoals[self._subgoal_index][1]
                         / local_map.resolution_m
                     ),
                 )
@@ -3818,6 +3887,8 @@ class RobotController:
         vehicle_radius_m: float,
         *,
         emit_event: bool = True,
+        vehicle_id: str | None = None,
+        expected_peer_vehicle_ids: tuple[str, ...] = (),
     ) -> None:
         self._needs_start = False
         self._deferred_edge_cell = None
@@ -3830,7 +3901,13 @@ class RobotController:
             self._subgoal_index = 0
             self._active_task_age_ticks = 0
         mission = self.active_mission
-        goal_x_m, goal_y_m = mission.subgoals[self._subgoal_index]
+        if not self._active_subgoals:
+            self._active_subgoals = (
+                mission.effective_subgoals(vehicle_id, expected_peer_vehicle_ids)
+                if isinstance(mission, CoverageMission) and vehicle_id is not None
+                else mission.subgoals
+            )
+        goal_x_m, goal_y_m = self._active_subgoals[self._subgoal_index]
         local_x_m, local_y_m, _ = anchor.global_to_anchor(
             goal_x_m, goal_y_m
         )
@@ -3860,7 +3937,7 @@ class RobotController:
 
     def _advance_subgoal(self, vehicle: Vehicle) -> bool:
         assert self.active_mission is not None
-        if self._subgoal_index + 1 >= len(self.active_mission.subgoals):
+        if self._subgoal_index + 1 >= len(self._active_subgoals):
             return False
         vehicle.stop()
         self._subgoal_index += 1
@@ -3899,6 +3976,7 @@ class RobotController:
             self.navigation.snapshot(),
         )
         self.active_mission = None
+        self._active_subgoals = ()
         self._subgoal_index = 0
         self._needs_start = bool(self._pending)
         self.auto_state = (
@@ -3949,6 +4027,7 @@ class RobotController:
         for mission in missions:
             self._emit(mission, "cancelled", reason)
         self.active_mission = None
+        self._active_subgoals = ()
         self._subgoal_index = 0
         self._pending.clear()
         self.auto_state = AutoState.IDLE
@@ -3972,17 +4051,22 @@ class RobotController:
                 reason,
                 detail,
                 navigation,
+                (
+                    self._active_subgoals
+                    if mission is self.active_mission and self._active_subgoals
+                    else None
+                ),
             )
         )
 
     def _active_mission_snapshot(self) -> dict[str, object]:
         assert self.active_mission is not None
         mission = self.active_mission
-        goal_x_m, goal_y_m = mission.subgoals[self._subgoal_index]
+        goal_x_m, goal_y_m = self._active_subgoals[self._subgoal_index]
         return {
             **mission.as_dict(),
             "subgoal_index": self._subgoal_index,
-            "subgoal_count": len(mission.subgoals),
+            "subgoal_count": len(self._active_subgoals),
             "current_goal": {
                 "frame_id": mission.frame_id,
                 "x_m": goal_x_m,

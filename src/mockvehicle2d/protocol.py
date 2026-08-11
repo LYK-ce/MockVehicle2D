@@ -212,6 +212,8 @@ def _parse_mission(payload: object, seq: int) -> Mission:
             "lane_spacing_m",
         },
     }[mission_type]
+    if mission_type == "coverage" and "coordination_id" in payload:
+        fields.add("coordination_id")
     _require_fields(payload, fields, seq, subject="mission")
     mission_id = payload["mission_id"]
     frame_id = payload["frame_id"]
@@ -275,6 +277,7 @@ def _parse_mission(payload: object, seq: int) -> Mission:
             _coordinate(area["max_y_m"], "area.max_y_m", seq),
             _finite_number(payload["lane_spacing_m"], "lane_spacing_m", seq),
             seq,
+            payload.get("coordination_id"),
         )
     except ProtocolError:
         raise

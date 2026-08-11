@@ -1,6 +1,7 @@
 """Headless fixed-tick episode execution."""
 
 import json
+import math
 from pathlib import Path
 import sys
 import unittest
@@ -35,6 +36,7 @@ from mockvehicle2d.fleet import (
 )
 from mockvehicle2d.map_grid import MapGrid
 from mockvehicle2d.map_sync import P2PSettings
+from mockvehicle2d.protocol import parse_command
 from mockvehicle2d.safety import AUTOMATIC_MINIMUM_CLEARANCE_M
 
 
@@ -173,6 +175,76 @@ def run_four_vehicle_quadrant_coverage(
     )
 
 
+def grouped_coverage_missions(
+    vehicle_ids,
+    area,
+    *,
+    lane_spacing_m=2.0,
+    coordination_id="fleet-alpha",
+):
+    min_x_m, min_y_m, max_x_m, max_y_m = area
+    missions = {}
+    for vehicle_id in vehicle_ids:
+        command = parse_command(
+            json.dumps(
+                {
+                    "type": "auto",
+                    "seq": 2,
+                    "action": "push",
+                    "missions": [
+                        {
+                            "mission_id": f"coverage-{vehicle_id}",
+                            "type": "coverage",
+                            "frame_id": "global_map",
+                            "area": {
+                                "min_x_m": min_x_m,
+                                "min_y_m": min_y_m,
+                                "max_x_m": max_x_m,
+                                "max_y_m": max_y_m,
+                            },
+                            "lane_spacing_m": lane_spacing_m,
+                            "coordination_id": coordination_id,
+                        }
+                    ],
+                }
+            ),
+            linear_limit_mps=1.0,
+            angular_limit_rps=math.pi,
+            mission_batch_limit=16,
+        )
+        missions[vehicle_id] = (command.missions[0],)
+    return missions
+
+
+def run_coverage_episode_with_truth(
+    scenario,
+    missions,
+    *,
+    max_simulation_s,
+    grid,
+):
+    truth = {vehicle_id: [] for vehicle_id in missions}
+    observed_fleet = []
+    real_tick = FleetRuntime.tick
+
+    def record_truth(fleet, timestamp):
+        result = real_tick(fleet, timestamp)
+        observed_fleet[:] = [fleet]
+        for vehicle_id, pose in fleet.world.truth_snapshot().items():
+            truth[vehicle_id].append(pose[:2])
+        return result
+
+    with patch.object(FleetRuntime, "tick", new=record_truth):
+        result = run_episode(
+            scenario,
+            missions,
+            max_simulation_s=max_simulation_s,
+            grid=grid,
+            linear_speed=1.0,
+        )
+    return result, truth, observed_fleet[0]
+
+
 class TestEpisodeRunner(unittest.TestCase):
     def test_zero_speed_idle_vacate_session_is_not_episode_stopped(self) -> None:
         fleet = FleetRuntime.create(
@@ -225,6 +297,61 @@ class TestEpisodeRunner(unittest.TestCase):
             ),
             result.as_dict(),
         )
+
+    def assert_grouped_coverage_completed(
+        self,
+        outcome,
+        routes,
+        partition_bounds,
+        *,
+        axis,
+    ) -> None:
+        result, truth, fleet = outcome
+        self.assertTrue(result.success, result.as_dict())
+        self.assertGreaterEqual(
+            result.minimum_inter_vehicle_clearance_m,
+            AUTOMATIC_MINIMUM_CLEARANCE_M,
+        )
+        self.assertTrue(
+            all(
+                not vehicle["collision_occurred"]
+                and not vehicle["blocked"]
+                and vehicle["missions"][0]["status"] == "reached"
+                and vehicle["final_safety"]["state"] == "clear"
+                for vehicle in result.vehicles
+            ),
+            result.as_dict(),
+        )
+        self.assertTrue(
+            all(
+                node.controller.auto_state.value == "idle"
+                and not node.controller.is_automatic_motion_active
+                for node in fleet.nodes.values()
+            )
+        )
+
+        endpoint_owners = {}
+        for vehicle_id, route in routes.items():
+            for endpoint in set(route):
+                endpoint_owners.setdefault(endpoint, set()).add(vehicle_id)
+        for endpoint, owners in endpoint_owners.items():
+            self.assertLessEqual(
+                min(
+                    math.dist(point, endpoint)
+                    for vehicle_id in owners
+                    for point in truth[vehicle_id]
+                ),
+                0.6,
+            )
+
+        vehicle_ids = sorted(routes)
+        for index, vehicle_id in enumerate(vehicle_ids):
+            coordinates = [point[axis] for point in truth[vehicle_id]]
+            lower, upper = partition_bounds[vehicle_id]
+            if index:
+                self.assertGreaterEqual(min(coordinates), lower - 0.75)
+            if index + 1 < len(vehicle_ids):
+                self.assertLessEqual(max(coordinates), upper + 0.75)
 
     def test_completion_is_stable_across_realtime_factors(self) -> None:
         results = [
@@ -821,6 +948,200 @@ class TestEpisodeRunner(unittest.TestCase):
             ("coverage",) * 4,
             max_no_progress_s=45.0,
         )
+
+    def test_two_vehicles_partition_one_coordinated_coverage_area(self) -> None:
+        specs = (
+            FleetVehicleSpec(
+                "vehicle_a",
+                19090,
+                "spawn_a",
+                AnchorPose(3.0, 3.0, 0.0),
+            ),
+            FleetVehicleSpec(
+                "vehicle_b",
+                19091,
+                "spawn_b",
+                AnchorPose(13.0, 3.0, math.pi),
+            ),
+        )
+        area = 4.0, 3.0, 12.0, 7.0
+        missions = grouped_coverage_missions(
+            ("vehicle_a", "vehicle_b"),
+            area,
+        )
+        expected_routes = {
+            "vehicle_a": (
+                (4.0, 3.0),
+                (8.0, 3.0),
+                (8.0, 5.0),
+                (4.0, 5.0),
+                (4.0, 7.0),
+                (8.0, 7.0),
+            ),
+            "vehicle_b": (
+                (8.0, 3.0),
+                (12.0, 3.0),
+                (12.0, 5.0),
+                (8.0, 5.0),
+                (8.0, 7.0),
+                (12.0, 7.0),
+            ),
+        }
+        for vehicle_id, (mission,) in missions.items():
+            self.assertEqual(
+                mission.effective_subgoals(
+                    vehicle_id,
+                    tuple(sorted(set(missions) - {vehicle_id})),
+                ),
+                expected_routes[vehicle_id],
+            )
+        runs = tuple(
+            run_coverage_episode_with_truth(
+                FleetScenario("grouped_coverage", vehicles, 100),
+                missions,
+                max_simulation_s=120.0,
+                grid=MapGrid.from_wall_set(20, 12, set()),
+            )
+            for vehicles in (specs, tuple(reversed(specs)))
+        )
+
+        self.assertEqual(runs[0][0].to_json(), runs[1][0].to_json())
+        partition_bounds = {
+            "vehicle_a": (4.0, 8.0),
+            "vehicle_b": (8.0, 12.0),
+        }
+        for outcome in runs:
+            self.assert_grouped_coverage_completed(
+                outcome,
+                expected_routes,
+                partition_bounds,
+                axis=0,
+            )
+
+    @pytest.mark.extended
+    def test_four_vehicles_partition_one_coordinated_coverage_area(self) -> None:
+        vehicle_ids = ("vehicle_a", "vehicle_b", "vehicle_c", "vehicle_d")
+        specs = tuple(
+            FleetVehicleSpec(
+                vehicle_id,
+                19100 + index,
+                f"spawn_{vehicle_id[-1]}",
+                AnchorPose(2.0 + 4.0 * index, 3.0, math.pi / 2),
+            )
+            for index, vehicle_id in enumerate(vehicle_ids)
+        )
+        area = 2.0, 4.0, 18.0, 8.0
+        missions = grouped_coverage_missions(vehicle_ids, area)
+        expected_routes = {}
+        partition_bounds = {}
+        for index, vehicle_id in enumerate(vehicle_ids):
+            min_x_m = 2.0 + 4.0 * index
+            max_x_m = min_x_m + 4.0
+            partition_bounds[vehicle_id] = min_x_m, max_x_m
+            expected_routes[vehicle_id] = (
+                (min_x_m, 4.0),
+                (max_x_m, 4.0),
+                (max_x_m, 6.0),
+                (min_x_m, 6.0),
+                (min_x_m, 8.0),
+                (max_x_m, 8.0),
+            )
+            self.assertEqual(
+                missions[vehicle_id][0].effective_subgoals(
+                    vehicle_id,
+                    tuple(sorted(set(vehicle_ids) - {vehicle_id})),
+                ),
+                expected_routes[vehicle_id],
+            )
+        ordered_bounds = [partition_bounds[vehicle_id] for vehicle_id in vehicle_ids]
+        self.assertEqual(ordered_bounds[0][0], area[0])
+        self.assertEqual(ordered_bounds[-1][1], area[2])
+        self.assertTrue(
+            all(
+                first[1] == second[0]
+                for first, second in zip(ordered_bounds, ordered_bounds[1:])
+            )
+        )
+
+        canonical = run_coverage_episode_with_truth(
+            FleetScenario("grouped_coverage_four", specs, 100),
+            missions,
+            max_simulation_s=120.0,
+            grid=MapGrid.from_wall_set(22, 12, set()),
+        )
+        reversed_declaration = run_coverage_episode_with_truth(
+            FleetScenario(
+                "grouped_coverage_four",
+                tuple(reversed(specs)),
+                100,
+            ),
+            missions,
+            max_simulation_s=120.0,
+            grid=MapGrid.from_wall_set(22, 12, set()),
+        )
+
+        self.assertEqual(canonical[0].to_json(), reversed_declaration[0].to_json())
+        for outcome in (canonical, reversed_declaration):
+            self.assert_grouped_coverage_completed(
+                outcome,
+                expected_routes,
+                partition_bounds,
+                axis=0,
+            )
+
+    def test_single_vehicle_legacy_coverage_keeps_the_full_area(self) -> None:
+        command = parse_command(
+            json.dumps(
+                {
+                    "type": "auto",
+                    "seq": 2,
+                    "action": "push",
+                    "missions": [
+                        {
+                            "mission_id": "legacy-coverage",
+                            "type": "coverage",
+                            "frame_id": "global_map",
+                            "area": {
+                                "min_x_m": 5.0,
+                                "min_y_m": 5.0,
+                                "max_x_m": 7.0,
+                                "max_y_m": 6.0,
+                            },
+                            "lane_spacing_m": 1.0,
+                        }
+                    ],
+                }
+            ),
+            linear_limit_mps=1.0,
+            angular_limit_rps=math.pi,
+            mission_batch_limit=16,
+        )
+        coverage = command.missions[0]
+
+        self.assertNotIn("coordination_id", coverage.as_dict())
+        self.assertEqual(
+            coverage.effective_subgoals("vehicle_1", ()),
+            (
+                (5.0, 5.0),
+                (7.0, 5.0),
+                (7.0, 6.0),
+                (5.0, 6.0),
+            ),
+        )
+
+        result = run_episode(
+            scenario(),
+            {"vehicle_1": (coverage,)},
+            max_simulation_s=30.0,
+            grid=MapGrid.from_wall_set(20, 20, set()),
+            linear_speed=1.0,
+        )
+
+        self.assertTrue(result.success, result.as_dict())
+        self.assertFalse(result.vehicles[0]["collision_occurred"])
+        self.assertFalse(result.vehicles[0]["blocked"])
+        self.assertEqual(result.vehicles[0]["missions"][0]["status"], "reached")
+        self.assertEqual(result.vehicles[0]["final_safety"]["state"], "clear")
 
     @pytest.mark.extended
     def test_four_vehicle_quadrant_coverage_extended_matrix(self) -> None:

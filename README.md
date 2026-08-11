@@ -155,8 +155,12 @@ Runner 明确拒绝启用真实 P2P 的场景，因为 localhost libp2p 调度�
 1/2/4 车互不冲突 Goto、四车循环换位、相邻 Goto 终点、终点车辆挡路绕行、重复共享
 路口 Patrol、对向合流 Patrol、互不相交 Patrol、相邻静态条带 Coverage、共享入口四象限
 Coverage，以及 Goto/Patrol/Coverage 混合任务。每项任务仍归接收命令的原车，协调只影响
-执行期运动。Coverage 分区由测试输入静态分配，接缝小于一个 `0.5 m` 本地网格；它不引入
-中央地图，也不把 peer evidence 写入 OwnMap。
+执行期运动。Coverage 默认仍由输入静态分配；可选 `coordination_id` 允许同一固定车队把
+相同矩形确定性分区：任务首次激活时冻结 `self + expected peer allowlist`，按排序后的
+`vehicle_id` 沿原矩形长轴均分连续子矩形，每车仍用原蛇形 Coverage 和 Cooperative Goto。
+同组所有成员必须收到相同的 `coordination_id`、区域和间距；当前不支持部分下发、动态成员
+或运行中重分配。该能力不增加中央任务分配器、共享地图或新的 P2P/motion-intent schema，
+也不把 peer evidence 写入 OwnMap。
 
 ```bash
 .venv/bin/python -m pytest -p no:cacheprovider -q tests/test_episode.py \
@@ -345,7 +349,7 @@ sender 在全部字段校验成功后才推进 generation，失败不会污染�
 {"type":"auto","seq":6,"action":"push","missions":[
   {"mission_id":"goto-001","type":"goto","frame_id":"global_map","x_m":20.0,"y_m":30.0},
   {"mission_id":"patrol-001","type":"patrol","frame_id":"global_map","waypoints":[{"x_m":20.0,"y_m":30.0},{"x_m":24.0,"y_m":30.0}],"cycles":2},
-  {"mission_id":"coverage-001","type":"coverage","frame_id":"global_map","area":{"min_x_m":20.0,"min_y_m":20.0,"max_x_m":30.0,"max_y_m":25.0},"lane_spacing_m":1.0}
+  {"mission_id":"coverage-001","type":"coverage","frame_id":"global_map","area":{"min_x_m":20.0,"min_y_m":20.0,"max_x_m":30.0,"max_y_m":25.0},"lane_spacing_m":1.0,"coordination_id":"fleet-coverage-001"}
 ]}
 {"type":"auto","seq":7,"action":"pause"}
 {"type":"auto","seq":8,"action":"resume"}
@@ -367,6 +371,8 @@ sender 在全部字段校验成功后才推进 generation，失败不会污染�
 - `patrol` 按给定航点执行有限轮次；`coverage` 从矩形左下角开始，沿长边生成蛇形
   路线。二者都复用现有 `goto` 导航，每个父任务最多生成 1024 个子目标且只占一个
   队列位置。
+- `coverage.coordination_id` 可省略；省略时保持单车完整区域语义。设置时，固定 expected
+  车队按排序后的 `vehicle_id` 沿区域长轴分片；所有成员必须收到相同 ID、区域与间距。
 - Auto 已在执行时重复 `resume` 是无副作用操作，不会停车或重启规划。
 - `mission_id` 在 Server 进程生命周期内是永久幂等键。相同 ID 和完全相同任务定义的
   重试不会重复入队；相同 ID 携带不同定义会被拒绝。进程重启后该内存状态会清空。

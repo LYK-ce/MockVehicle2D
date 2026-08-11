@@ -74,6 +74,12 @@ from mockvehicle2d.scan import LaserPoint
 from mockvehicle2d.vehicle import Vehicle
 
 
+def inject_active_goto(controller, mission_id, x_m, y_m):
+    mission = GotoMission(mission_id, "global_map", x_m, y_m, 1)
+    controller.active_mission = mission
+    controller._active_subgoals = mission.subgoals
+
+
 def intent(
     vehicle_id: str,
     *,
@@ -208,13 +214,7 @@ def parked_idle_request_once(
         coordination_path_cells=Mock(return_value=route),
     )
     controller = RobotController(navigation)
-    controller.active_mission = GotoMission(
-        f"goto-{own_vehicle_id}",
-        "global_map",
-        4.5,
-        0.5,
-        1,
-    )
+    inject_active_goto(controller, f"goto-{own_vehicle_id}", 4.5, 0.5)
     controller.mode = OpMode.AUTO
     controller.auto_state = AutoState.ACTIVE
     desired = coordinate_parked_idle_blocker(
@@ -369,7 +369,9 @@ def idle_vacate_tick(
     controller = RobotController(navigation)
     controller.mode = mode
     controller.auto_state = auto_state
-    controller.active_mission = active_mission
+    if active_mission is not None:
+        controller.active_mission = active_mission
+        controller._active_subgoals = active_mission.subgoals
     if pending_mission is not None:
         controller._pending.append(pending_mission)
     vehicle = Vehicle(2.5, 0.5, yaw=pose_yaw_rad, now=now)
@@ -1908,13 +1910,7 @@ class TestMotionCoordination(unittest.TestCase):
         controller = RobotController(navigation)
         controller.mode = OpMode.AUTO
         controller.auto_state = AutoState.ACTIVE
-        controller.active_mission = GotoMission(
-            "corridor",
-            "global_map",
-            16.0,
-            0.5,
-            1,
-        )
+        inject_active_goto(controller, "corridor", 16.0, 0.5)
         controller._corridor = CorridorDescriptor((10, 1), (30, 1))
         controller._intent_priority_owner_id = "vehicle_1"
         vehicle = Vehicle(4.5, 0.5, now=1.0)
@@ -2029,13 +2025,7 @@ class TestMotionCoordination(unittest.TestCase):
 
         controller.mode = OpMode.AUTO
         controller.auto_state = AutoState.ACTIVE
-        controller.active_mission = GotoMission(
-            "corridor",
-            "global_map",
-            16.0,
-            0.5,
-            1,
-        )
+        inject_active_goto(controller, "corridor", 16.0, 0.5)
         staged_pose = PoseEstimate(
             anchor.anchor_id,
             4.5,
@@ -2493,13 +2483,7 @@ class TestMotionCoordination(unittest.TestCase):
         controller = RobotController(navigation)
         controller.mode = OpMode.AUTO
         controller.auto_state = AutoState.ACTIVE
-        controller.active_mission = GotoMission(
-            "corridor",
-            "global_map",
-            16.0,
-            0.5,
-            1,
-        )
+        inject_active_goto(controller, "corridor", 16.0, 0.5)
         controller._corridor = CorridorDescriptor((5, 0), (10, 0))
         controller._corridor_reserved = True
         controller._corridor_admission_confirmed = True
@@ -2934,13 +2918,7 @@ class TestMotionCoordination(unittest.TestCase):
         controller = RobotController(navigation)
         controller.mode = OpMode.AUTO
         controller.auto_state = AutoState.ACTIVE
-        controller.active_mission = GotoMission(
-            "blocked",
-            "global_map",
-            10.0,
-            0.5,
-            1,
-        )
+        inject_active_goto(controller, "blocked", 10.0, 0.5)
         vehicle = Vehicle(0.5, 0.5, now=0.0)
 
         controller.tick(
@@ -4023,13 +4001,7 @@ class TestMotionCoordination(unittest.TestCase):
             ),
         )
         controller = RobotController(navigation)
-        controller.active_mission = GotoMission(
-            "goto-vehicle_a",
-            "global_map",
-            4.5,
-            0.5,
-            1,
-        )
+        inject_active_goto(controller, "goto-vehicle_a", 4.5, 0.5)
         controller.mode = OpMode.AUTO
         controller.auto_state = AutoState.ACTIVE
         controller._corridor = CorridorDescriptor((0, 0), (4, 0))
@@ -4086,9 +4058,7 @@ class TestMotionCoordination(unittest.TestCase):
             coordination_path_cells=Mock(return_value=local_route),
         )
         controller = RobotController(navigation)
-        controller.active_mission = GotoMission(
-            "rotated-goto", "global_map", 4.0, 0.0, 1
-        )
+        inject_active_goto(controller, "rotated-goto", 4.0, 0.0)
         controller.mode = OpMode.AUTO
         controller.auto_state = AutoState.ACTIVE
         pose = PoseEstimate(
@@ -5605,13 +5575,7 @@ class TestMotionCoordination(unittest.TestCase):
         controller = RobotController(navigation)
         controller.mode = OpMode.AUTO
         controller.auto_state = AutoState.ACTIVE
-        controller.active_mission = GotoMission(
-            "completed",
-            "global_map",
-            2.5,
-            0.5,
-            1,
-        )
+        inject_active_goto(controller, "completed", 2.5, 0.5)
         controller._corridor = CorridorDescriptor((2, 0), (6, 0))
         vehicle = Vehicle(2.5, 0.5, now=1.0)
         safety = LocalSafetyRuntime()
