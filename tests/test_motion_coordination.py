@@ -3457,6 +3457,110 @@ class TestMotionCoordination(unittest.TestCase):
             "space_time_reservation",
         )
 
+    def test_validated_future_trajectory_holds_before_peer_reaches_path(
+        self,
+    ) -> None:
+        source, receiver, source_pose = motion_sync_states()
+        own_anchor = receiver.anchor
+        peer_pose = replace(
+            source_pose,
+            x_m=1.5,
+            y_m=-1.5,
+            yaw_rad=math.pi / 2,
+        )
+        source.record_vehicle_state(
+            peer_pose,
+            radius_m=0.2,
+            linear_mps=0.0,
+            omega_rps=0.0,
+        )
+        source.record_motion_intent(
+            peer_pose,
+            target_m=(1.5, -0.5),
+            wait_ticks=0,
+            priority_owner_id="vehicle_1",
+            reserved=True,
+            timestamp_s=1.0,
+            trajectory=(
+                TimedCell((1, -2), 0.0, 0.0),
+                TimedCell((1, -1), 0.5, 0.6),
+                TimedCell((1, 0), 1.0, 4.0),
+            ),
+        )
+        state_payload = source.prepare_peer_state()
+        intent_payload = source.prepare_motion_intent()
+        assert state_payload is not None and intent_payload is not None
+        self.assertTrue(
+            receiver.receive_transport("peer_1", "vehicle_1", state_payload)
+        )
+        self.assertTrue(
+            receiver.receive_transport("peer_1", "vehicle_1", intent_payload)
+        )
+        peer_state_value = receiver.peer_vehicle_states()[0]
+        peer_intent = receiver.peer_motion_intents()[0]
+        path = ((0, 0), (1, 0), (2, 0))
+        self.assertGreater(
+            _point_route_distance(
+                (peer_state_value.global_x_m, peer_state_value.global_y_m),
+                path,
+                1.0,
+            ),
+            0.2 + 0.2 + AUTOMATIC_MINIMUM_CLEARANCE_M,
+        )
+        self.assertEqual(peer_intent.timed_trajectory[-1].cell, path[1])
+
+        def tick(peer_intents: tuple[PeerMotionIntent, ...]):
+            navigation = Mock(
+                status="active",
+                static_no_path_probe_pending=False,
+                motion_target=(1.5, 0.5),
+                coordination_corridor=Mock(return_value=None),
+                coordination_path_cells=Mock(return_value=path),
+                coordination_detours=Mock(return_value=()),
+                update=Mock(return_value=(0.5, 0.0)),
+            )
+            controller = RobotController(navigation)
+            controller.mode = OpMode.AUTO
+            controller.auto_state = AutoState.ACTIVE
+            inject_active_goto(controller, "cross", 2.5, 0.5)
+            local_map = ObservedGrid(own_anchor)
+            vehicle = Vehicle(0.5, 0.5, radius=0.2, now=1.0)
+            controller.tick(
+                vehicle=vehicle,
+                grid=MapGrid.from_wall_set(4, 4, set()),
+                safety=LocalSafetyRuntime(),
+                anchor=own_anchor,
+                pose=PoseEstimate(
+                    own_anchor.anchor_id,
+                    0.5,
+                    0.5,
+                    0.0,
+                    (0.0, 0.0, 0.0),
+                    "nominal",
+                    1.0,
+                    1,
+                ),
+                local_map=local_map,
+                map_delta=None,
+                advance_result=SafetyAdvanceResult(),
+                now=1.0,
+                safety_scan_points=(),
+                vehicle_id="vehicle_2",
+                peer_states=(peer_state_value,),
+                peer_motion_intents=peer_intents,
+            )
+            return (
+                vehicle.target_velocities(),
+                controller.snapshot()["coordination"]["reason"],
+            )
+
+        self.assertEqual(tick(()), ((0.5, 0.0), None))
+        with_intent = tick((peer_intent,))
+        self.assertEqual(
+            with_intent,
+            ((0.0, 0.0), "space_time_reservation"),
+        )
+
     def test_inherited_detour_is_rescheduled_before_intent_publish(self) -> None:
         anchor = AnchorSpec("spawn_1", 0.0, 0.0, 0.0)
         pose = PoseEstimate(
