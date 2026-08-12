@@ -173,8 +173,11 @@ expected peer 存在时，sidecar 未 ready、任一 peer-state/intent 缺失、
 落在同一安全区间，edge 或终点冲突可选择后续区间并从可行前驱重排。第一版没有额外的
 网络 propose/ACK/commit 往返：它依赖上一 tick 的全员 fresh intent、确定性优先级和短
 commit 前缀收敛；并发首次提案仍保留下一格租约、同步物理碰撞仲裁、LiDAR 与 LocalSafety
-作为最终保障。当前 SIPP 只给一条 D* 空间候选和一条有界 passing-place detour 排时，不
-搜索多条空间路径，也不是 CBS/PBS、联合最优 MAPF 或完整 PIBT 回溯。
+作为最终保障。当前 SIPP 每次只给一条 D* 空间候选和一条有界 passing-place detour 排时，
+不搜索多条空间路径，也不是 CBS/PBS、联合最优 MAPF 或完整 PIBT 回溯。这里的“单候选”只
+限定单次 SIPP 输入：fresh peer footprint 仍会进入瞬态规划图，D* 因此可以在下一次滚动规划
+改走另一条已观测分支；停驻 peer 和持续占用短分支的 active Patrol 都已验证可安全绕行。
+尚未实现的是在 peer 物理占据发生前，仅根据未来 reservation 同时比较多条空间路径。
 
 ### 直线窄走廊租约
 
@@ -298,8 +301,9 @@ cell_path = a_star_search(
 - 局部地图和 D* Lite 状态只在进程内存中；重连保留，进程重启丢失。
 - 控制连接断开会停车并暂停活动 `goto`；重连后需显式 `resume`。
 - 暂无路径平滑、运动学轨迹优化和动态目标速度预测。
-- prioritized SIPP 只调度一条 D* 空间候选和一个邻格 detour；尚无多候选时空搜索、完整
-  PIBT backtracking、CBS/PBS oracle 或显式网络 propose/ACK/commit。
+- prioritized SIPP 每轮只调度一条 D* 空间候选和一个邻格 detour；当前 peer footprint 可让
+  D* 在后续滚动规划换分支，但尚无基于未来 reservation 的多候选比较、完整 PIBT
+  backtracking、CBS/PBS oracle 或显式网络 propose/ACK/commit。
 - 窄走廊只识别已完全观测的直线 `<=3 m` 类别，且严格单车通行；未实现 ready-owner
   skipping 或同向批处理。
 - Unknown 的无回波 Free 更新沿用当前模拟约定，接入真实 Tmini 前必须校准。

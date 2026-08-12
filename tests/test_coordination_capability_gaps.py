@@ -2,13 +2,19 @@
 
 import math
 import unittest
+from unittest.mock import patch
 
 import pytest
 
 from mockvehicle2d.collision import is_swept_circle_passable
-from mockvehicle2d.controller import GotoMission
+from mockvehicle2d.controller import GotoMission, PatrolMission
 from mockvehicle2d.episode import EpisodeResult, run_episode
-from mockvehicle2d.fleet import AnchorPose, FleetScenario, FleetVehicleSpec
+from mockvehicle2d.fleet import (
+    AnchorPose,
+    FleetRuntime,
+    FleetScenario,
+    FleetVehicleSpec,
+)
 from mockvehicle2d.map_grid import MapGrid
 from mockvehicle2d.safety import AUTOMATIC_MINIMUM_CLEARANCE_M
 
@@ -603,6 +609,108 @@ class TestCoordinationCapabilityGaps(unittest.TestCase):
         )
 
         self.assert_safe_success(joint)
+
+    @pytest.mark.extended
+    def test_goto_reaches_via_other_fork_while_peer_patrols_short_route(
+        self,
+    ) -> None:
+        traveller = FleetVehicleSpec(
+            "traveller",
+            19091,
+            "traveller_spawn",
+            AnchorPose(4.5, 7.5, 0.0),
+        )
+        upper_route = run_episode(
+            FleetScenario("fork_upper_route_oracle", (traveller,), 100),
+            {
+                "traveller": (
+                    GotoMission("upper-fork", "global_map", 10.5, 11.5, 2),
+                    GotoMission("cross-fork", "global_map", 16.5, 7.5, 3),
+                ),
+            },
+            max_simulation_s=50.0,
+            grid=_fork_grid(),
+            linear_speed=1.0,
+        )
+        self.assertTrue(upper_route.success, upper_route.to_json())
+
+        patrol = FleetVehicleSpec(
+            "patrol",
+            19090,
+            "patrol_spawn",
+            AnchorPose(9.5, 3.5, 0.0),
+        )
+        original_tick = FleetRuntime.tick
+        results = []
+        traces = []
+        for specs in ((patrol, traveller), (traveller, patrol)):
+            trace = []
+
+            def recording_tick(runtime: FleetRuntime, timestamp: float) -> None:
+                original_tick(runtime, timestamp)
+                trace.append(runtime.world.truth_snapshot()["traveller"])
+
+            with patch.object(FleetRuntime, "tick", recording_tick):
+                result = run_episode(
+                    FleetScenario("fork_active_short_route", specs, 100),
+                    {
+                        "patrol": (
+                            PatrolMission(
+                                "hold-short-fork",
+                                "global_map",
+                                ((9.5, 3.5), (11.5, 3.5)),
+                                30,
+                                2,
+                            ),
+                        ),
+                        "traveller": (
+                            GotoMission(
+                                "cross-fork",
+                                "global_map",
+                                16.5,
+                                7.5,
+                                2,
+                            ),
+                        ),
+                    },
+                    max_simulation_s=40.0,
+                    grid=_fork_grid(),
+                    linear_speed=1.0,
+                )
+            results.append(result)
+            traces.append(tuple(trace))
+            vehicles = {
+                vehicle["vehicle_id"]: vehicle for vehicle in result.vehicles
+            }
+            self.assertEqual(result.termination_reason, "timeout", result.to_json())
+            self.assertEqual(
+                vehicles["traveller"]["missions"][0]["status"],
+                "reached",
+                result.to_json(),
+            )
+            self.assertEqual(
+                vehicles["patrol"]["missions"][0]["status"],
+                "active",
+                result.to_json(),
+            )
+            self.assertTrue(
+                all(
+                    not vehicle["collision_occurred"] and not vehicle["blocked"]
+                    for vehicle in result.vehicles
+                ),
+                result.to_json(),
+            )
+            self.assertGreaterEqual(
+                result.minimum_inter_vehicle_clearance_m,
+                AUTOMATIC_MINIMUM_CLEARANCE_M,
+                result.to_json(),
+            )
+            self.assertTrue(
+                any(x_m > 13.0 and y_m > 10.0 for x_m, y_m, _ in trace),
+                result.to_json(),
+            )
+        self.assertEqual(results[0].to_json(), results[1].to_json())
+        self.assertEqual(traces[0], traces[1])
 
     def test_passing_bay_is_reachable_and_leaves_the_main_lane_clear(self) -> None:
         grid = _passing_bay_grid()
