@@ -39,8 +39,12 @@ RobotController ─────────────────────�
 `pose` 与紧随其后的 `scan` 使用相同 `seq` 和 `timestamp_s`。
 
 每条 `goto`、`patrol` 或 `coverage` 命令只进入接收该命令的车辆控制器；这里没有车队任务
-分配器。多车协调只能临时改变期望速度、局部绕行点和路权等待，不会交换、重分配或静默
-取消任务，也不会改写 Patrol/Coverage 在本车展开的后续子目标。
+分配器。多车运动协调只临时改变期望速度、局部绕行点和路权等待，不会交换或静默取消
+任务。显式设置 Patrol/Coverage 的可选 `coordination_id` 时，任务首次激活从排序后的
+`{本车} + 固定 expected peer allowlist` 冻结成员顺序。Patrol 按成员 rank 均匀旋转起始
+航点，但每车仍完整执行原路线和全部轮次；Coverage 沿原矩形长轴选择连续子矩形。
+所有成员必须收到相同 ID 和任务参数；部分下发、动态成员与运行中重分配暂不支持。
+省略该字段时既有本车展开完全不变。
 
 ## D* Lite
 
@@ -102,11 +106,12 @@ restart grace。单帧匿名遮挡消失后可恢复；持续或闪烁的匿名�
 ### 滚动时域协同 Goto
 
 `goto`、`patrol` 和 `coverage` 不增加新的车队任务类型；后两者展开的每个子目标继续进入
-同一个 `GotoController`。控制器复用 OwnMap-only D* 路径作为空间候选，并在每个控制 tick
-上为未来约 `4 s` 构造 prioritized SIPP 时间表。无冲突时首步 departure 不被推迟；每次
-只提交/执行约 `0.8 s`，随后根据新的 odometry、D* 路径和 peer intent 滚动重算。
+同一个 `GotoController`。可选的 grouped Coverage 只在本地确定性选择连续子矩形，不增加
+P2P schema 或 motion-intent 版本。控制器复用 OwnMap-only D* 路径作为空间候选，并在每个
+控制 tick 上为未来约 `4 s` 构造 prioritized SIPP 时间表。无冲突时首步 departure 不被
+推迟；每次只提交/执行约 `0.8 s`，随后根据新的 odometry、D* 路径和 peer intent 滚动重算。
 
-motion-intent v3 的 trajectory 由相对 `enter_offset_s` / `leave_offset_s` 组成。接收端以本地
+motion-intent v4 的 trajectory 由相对 `enter_offset_s` / `leave_offset_s` 组成。接收端以本地
 receipt time 重建绝对区间，不比较不同车辆的 monotonic clock；intent generation、plan
 generation 和严格递增 sequence 防止重启、旧计划和乱序包回灌。plan generation 只在 cell
 序列、任务或 goal-hold 语义改变时增长，滚动重发的相对 offset 不会独自制造新代次。
@@ -136,15 +141,31 @@ chain 递归继承最高优先级，并尝试一个 D* 已确认可通行的邻�
 安全包络的 passing place，允许先沿路线绕过墙角再侧移；它不会穿过 Unknown/Occupied，
 也不会扩展成第二套全局规划器。选中的单条让行路径仍交给同一 SIPP 和 LocalSafety 执行。
 
-让行状态区分请求来源与继承的 priority owner。显式 current/target 请求在请求者真正进入
-所请求包络前不会因普通 Goto waypoint 恢复而消失；进入后，只有请求者 current 与 target
-都离开包络才释放。没有显式 cell 的瞬态请求使用 peer trajectory/goal reservation 与本车
-剩余 D* 路线的 cell/edge 冲突来归因实际 blocker，同时保留继承 owner；无法归因、peer
-证据失鲜或动态无路仍存在时保持 fail-closed。上述状态完全复用 motion-intent v3 现有字段，
-没有增加 ACK 或多候选路径协议。静止且没有任务/目标/预留的 peer 不会成为让行 owner；
-仅由车体膨胀包络与路线相交、但自身时序轨迹会离开的 peer 继续交给 SIPP 等待，不新建
-让行 session。priority root 也不会为已经继承该 root 的下游 blocker 新建或继续 implicit
-让行；检测到这一跳环时会在同一 tick 回到普通 reservation/SIPP 仲裁。
+motion-intent v4 还包含必需的 `vacate_request` 字段；无请求时为 `null`，否则精确包含
+`vehicle_id`、blocker footprint 所在的 `cell`，以及从请求车 `current_cell` 开始的
+`route_cells`。路线窗口由请求车 OwnMap-only D* 路径生成，长度限制为 `2..64`；连续格不能
+重复，锚点旋转量化后相邻格 Chebyshev 步长最多为 2。它是对单个已知车辆的短期请求，不是
+共享地图、集中任务分派或多候选路径协议。
+
+只有当前单条 D* 路线被可信 peer footprint 暂时截断、OwnMap 路线仍完整且请求车优先级更高
+时，才向停在该路线上的 Auto/Idle peer 发布请求。请求随有序路线进度向前裁剪；请求车越过
+blocker 后撤回，U/L 形路线不会因到路线终点的欧氏距离变小而提前撤回。目标车辆只在没有
+活动或排队 Mission、请求与 peer-state 同 generation 且都 fresh、请求 cell 与自身物理
+footprint 一致时响应。它复用真实 Goto、同一 SIPP 和 LocalSafety 驶到路线安全包络外，再
+返回保存的原位；发布的 motion target/trajectory 始终对应真实运动，也不产生 Mission
+事件。定位 lost、碰撞、safety stop、pause 或断联都会停车并保留 session。
+
+请求者明确发布同 generation 的 fresh `vacate_request:null` 后，响应车还要求连续 3 tick
+的 fresh pose/trajectory 均已离开请求包络，才开始返回；fresh 路线更新或 pause/resume 会
+重置该 debounce。消息缺失、TTL 过期、身份/generation 不一致或物理 cell 不一致时冻结并
+保持 fail-closed，不能把 lease 消失解释为车辆已经离开。证据活性只使用 MapSync 本地
+receipt time；peer payload 的墙钟 timestamp 仅用于同源防回退，不与模拟时钟比较。
+
+没有定向请求的活动 peer 仍使用 trajectory/goal reservation 与本车剩余 D* 路线的
+cell/edge 冲突归因 blocker，同时保留继承 owner；无法归因、peer 证据失鲜或动态无路仍
+存在时保持 fail-closed。仅由车体膨胀包络与路线相交、但自身时序轨迹会离开的 peer 继续
+交给 SIPP 等待，不新建让行 session。priority root 也不会为已经继承该 root 的下游 blocker
+新建或继续 implicit 让行；检测到这一跳环时会在同一 tick 回到普通 reservation/SIPP 仲裁。
 
 expected peer 存在时，sidecar 未 ready、任一 peer-state/intent 缺失、TTL 过期，或同一来源
 两类 topic 的 state/intent generation 不一致，都使新短前缀 fail-closed。SIPP 在固定 D*
@@ -152,8 +173,11 @@ expected peer 存在时，sidecar 未 ready、任一 peer-state/intent 缺失、
 落在同一安全区间，edge 或终点冲突可选择后续区间并从可行前驱重排。第一版没有额外的
 网络 propose/ACK/commit 往返：它依赖上一 tick 的全员 fresh intent、确定性优先级和短
 commit 前缀收敛；并发首次提案仍保留下一格租约、同步物理碰撞仲裁、LiDAR 与 LocalSafety
-作为最终保障。当前 SIPP 只给一条 D* 空间候选和一条有界 passing-place detour 排时，不
-搜索多条空间路径，也不是 CBS/PBS、联合最优 MAPF 或完整 PIBT 回溯。
+作为最终保障。当前 SIPP 每次只给一条 D* 空间候选和一条有界 passing-place detour 排时，
+不搜索多条空间路径，也不是 CBS/PBS、联合最优 MAPF 或完整 PIBT 回溯。这里的“单候选”只
+限定单次 SIPP 输入：fresh peer footprint 仍会进入瞬态规划图，D* 因此可以在下一次滚动规划
+改走另一条已观测分支；停驻 peer 和持续占用短分支的 active Patrol 都已验证可安全绕行。
+尚未实现的是在 peer 物理占据发生前，仅根据未来 reservation 同时比较多条空间路径。
 
 ### 直线窄走廊租约
 
@@ -162,7 +186,7 @@ commit 前缀收敛；并发首次提案仍保留下一格租约、同步物理�
 不声明 corridor，继续使用普通下一格和轨迹冲突协调。检测不会消费 peer evidence，也
 不会修改正在执行的 D* 路径。
 
-检测到走廊后，车辆通过 motion-intent v3 发布有向 entry/exit cell。重叠的反向部分描述
+检测到走廊后，车辆通过 motion-intent v4 发布有向 entry/exit cell。重叠的反向部分描述
 可匹配为同一资源；未提交的下一轮候选使用等待年龄，冲突的 live claim 则由继承 owner 和
 `vehicle_id` 给出所有节点一致的全序。winner 先发布
 tentative claim，只有所有可见竞争者回传同一 owner（或无竞争声明连续稳定）后才进入。
@@ -277,8 +301,9 @@ cell_path = a_star_search(
 - 局部地图和 D* Lite 状态只在进程内存中；重连保留，进程重启丢失。
 - 控制连接断开会停车并暂停活动 `goto`；重连后需显式 `resume`。
 - 暂无路径平滑、运动学轨迹优化和动态目标速度预测。
-- prioritized SIPP 只调度一条 D* 空间候选和一个邻格 detour；尚无多候选时空搜索、完整
-  PIBT backtracking、CBS/PBS oracle 或显式网络 propose/ACK/commit。
+- prioritized SIPP 每轮只调度一条 D* 空间候选和一个邻格 detour；当前 peer footprint 可让
+  D* 在后续滚动规划换分支，但尚无基于未来 reservation 的多候选比较、完整 PIBT
+  backtracking、CBS/PBS oracle 或显式网络 propose/ACK/commit。
 - 窄走廊只识别已完全观测的直线 `<=3 m` 类别，且严格单车通行；未实现 ready-owner
   skipping 或同向批处理。
 - Unknown 的无回波 Free 更新沿用当前模拟约定，接入真实 Tmini 前必须校准。

@@ -120,6 +120,13 @@ Auto `push` 只写入父任务队列。`goto` 直接提供一个目标；`patrol
 `GotoController` 返回期望速度，不直接控制车辆。中间子目标不成为独立任务，父任务的
 到达、阻断、暂停和取消通过 `mission_update` 明确发布。
 
+Patrol/Coverage 不带 `coordination_id` 时保持既有本车语义。带该可选字段时，任务首次
+激活按排序后的 `{本车} + 固定 expected peer allowlist` 冻结成员。Patrol 按成员 rank
+旋转原航点序列，每车仍执行全部航点和 `cycles`；Coverage 沿原矩形长轴均分连续子矩形，
+每车仍使用同一个 Coverage 蛇形生成器和 `GotoController`。同组所有成员必须收到相同 ID
+和任务参数。当前不支持部分下发、动态成员或运行中重分配，也不新增车队任务类型、P2P
+schema 或 motion-intent 版本。
+
 同一 `mission_id` 和完全相同任务定义可用新的 `seq` 安全重试；不会生成第二个任务。
 相同 ID 对应不同类型、航点、轮次、区域或间距会返回 `mission_id_conflict`。该记录在
 Server 进程生命周期内永久保留，不会因任务数量增加而静默淘汰；进程重启会清空，
@@ -128,10 +135,12 @@ Auto 已为 Active 时重复 `resume` 也是幂等操作，不会重启 D* 搜�
 
 ### 多车局部协调
 
-多车节点通过 peer-state v1 发布 executed pose/velocity，通过 motion-intent v3 发布约
+多车节点通过 peer-state v1 发布 executed pose/velocity，通过 motion-intent v4 发布约
 `4 s` 的相对 cell 时间窗、等待/任务年龄、`0.8 s` 短 commit、goal hold 和可选的有向
-corridor descriptor。它们都来自车辆 odometry 和局部规划，不携带仿真真值；收到的 peer
-map evidence 也不会进入 OwnMap 或自主规划。接收端按 receipt time 重建 reservation，
+corridor descriptor。v4 还携带必需的 `vacate_request`：通常为 `null`；当高优先级车辆的
+OwnMap 路线被已完成任务的 Auto/Idle peer 截断时，可定向携带目标车辆、其 footprint cell
+及 `2..64` 格的 OwnMap 路线窗口。它们都来自车辆 odometry 和局部规划，不携带仿真真值；
+收到的 peer map evidence 也不会进入 OwnMap 或自主规划。接收端按 receipt time 重建 reservation，
 因此不要求车辆时钟同步。
 
 通用路径沿 OwnMap D* 空间候选运行 prioritized SIPP，覆盖 vertex、edge swap、同步几何
@@ -140,8 +149,8 @@ map evidence 也不会进入 OwnMap 或自主规划。接收端按 receipt time 
 token 才能表达跨车任务先后。占路链递归传播 owner 并只尝试一个邻格 detour。expected
 peer 的 state/intent 缺失、过期、同源 generation 不一致或 sidecar 未 ready 时新前缀
 fail-closed。相邻不同 cell 的时间窗必须有正 travel time，commit 上限严格为
-`min(0.8 s, trajectory 最后 leave_offset_s)`；
-LocalSafety 和同步物理碰撞仲裁仍是最终保障。OwnMap
+`min(0.8 s, trajectory 最后 leave_offset_s)`；LocalSafety 和同步物理碰撞仲裁仍是最终
+保障。OwnMap
 能够确认完全观测、直线且内宽不超过约 `3 m` 的瓶颈时，再对重叠 corridor 做去中心化
 选举和确认：模式外停车不受影响；进入前只允许一个 confirmed owner；出口侧反向队列仅
 front waiter 提前做可逆侧移，rear waiter 原地等待；ACK 后 owner 仍要等 front 的连续位姿
@@ -149,6 +158,10 @@ front waiter 提前做可逆侧移，rear waiter 原地等待；ACK 后 owner �
 后，车体与安全余量都清空才释放。租约结束后若 saved rejoin 段已被 live peer 占据，waiter
 从侧袋位置交回本地导航重规划。已归因 peer 暂时切断 D* 路径时任务保持 active；匿名动态
 遮挡只有一次有界 restart grace，持续或闪烁阻塞仍会终止为 `no_path`。
+
+收到定向请求的空闲车辆只通过真实 Goto、同一 SIPP 与 LocalSafety 侧移和返回，不创建
+内部 Mission。fresh 的显式 `vacate_request:null` 需要连续 3 tick 的 clear pose/trajectory
+才允许返回；请求缺失、过期、身份/generation 不一致时停车并保持 fail-closed。
 
 这不是中央调度器，也不声称实现完整 PIBT/MAPF。第一版 SIPP 只给一条 D* 候选和一个
 邻格 detour 排时，也没有独立网络 propose/ACK/commit 往返。当前走廊严格一次放行一辆车，

@@ -117,7 +117,8 @@ Auto → Manual 暂停并保留任务。Manual → Auto 若有保留任务仍停
         {"x_m": 24.0, "y_m": 35.0},
         {"x_m": 28.0, "y_m": 35.0}
       ],
-      "cycles": 2
+      "cycles": 2,
+      "coordination_id": "fleet-patrol-001"
     },
     {
       "mission_id": "coverage-001",
@@ -129,7 +130,8 @@ Auto → Manual 暂停并保留任务。Manual → Auto 若有保留任务仍停
         "max_x_m": 20.0,
         "max_y_m": 15.0
       },
-      "lane_spacing_m": 1.0
+      "lane_spacing_m": 1.0,
+      "coordination_id": "fleet-coverage-001"
     }
   ]
 }
@@ -138,9 +140,19 @@ Auto → Manual 暂停并保留任务。Manual → Auto 若有保留任务仍停
 仅在 `auto` 模式有效。支持：
 
 - `goto`：单个 `x_m/y_m` 目标；
-- `patrol`：按 `waypoints` 顺序执行正整数次 `cycles`；
+- `patrol`：按 `waypoints` 顺序执行正整数次 `cycles`；可选 `coordination_id` 使用与
+  `mission_id` 相同的 1–64 字符格式，省略时保持原路线；
 - `coverage`：覆盖有效矩形 `area`。从 `(min_x_m,min_y_m)` 开始，沿矩形长边往返，
-  相邻横道间距为正数 `lane_spacing_m`；短边不能整除间距时仍包含末端边界。
+  相邻横道间距为正数 `lane_spacing_m`；短边不能整除间距时仍包含末端边界。可选
+  `coordination_id` 使用与 `mission_id` 相同的 1–64 字符格式；省略时每辆车执行完整区域。
+
+设置 Patrol/Coverage 的 `coordination_id` 时，任务首次激活会冻结按 `vehicle_id` 排序的
+`{本车} + expected peer allowlist`。Patrol 的起始索引为
+`floor(member_rank * waypoint_count / member_count)`，循环旋转航点后仍完整执行全部航点和
+`cycles`；成员多于航点时允许确定性重复起点。Coverage 沿原区域长轴获得连续子矩形，
+继续使用相同蛇形路线和 Cooperative Goto。同组全部固定成员必须收到相同的
+`coordination_id` 和任务参数；当前不支持只向部分 expected peer 下发、动态加入/退出或
+运行中重分配。该字段不创建新的车队任务类型，也不更改 P2P 或 motion-intent v4 schema。
 
 三类任务都使用 `global_map`。`mission_id` 为 1–64 个 ASCII 字母、数字、点、
 下划线、冒号或连字符。所有坐标必须有限且绝对值不超过 `1,000,000 m`。
@@ -472,7 +484,7 @@ cell 状态：`0` 可通行、`1` 墙、`2` 无地面/落差。客户端用
 owner，`waiting` 的 `reason` 还可为 `corridor_election`、`corridor_lease`、
 `reservation_sync`（expected peer state/intent 不完整或同源 generation 不一致）或
 `space_time_reservation`
-（motion-intent v3 时间窗尚不可进入）。已知胜者通过 `priority_owner_vehicle_id` 指出；
+（motion-intent v4 时间窗尚不可进入）。已知胜者通过 `priority_owner_vehicle_id` 指出；
 同步等待可能为 `null`。该摘要只用于观察；客户端不得据此绕过 `RobotController` 或
 LocalSafety 下发运动。
 没有启用场景级 P2P 时，`p2p_map_sync` 为 `{"enabled":false}`。协同摘要仅供观察，

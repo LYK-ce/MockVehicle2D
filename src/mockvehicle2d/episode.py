@@ -430,6 +430,7 @@ def _vehicles_stopped(
     return all(
         fleet.world.vehicle(vehicle_id).target_velocities() == (0.0, 0.0)
         and fleet.world.vehicle(vehicle_id).body_velocities() == (0.0, 0.0)
+        and not fleet.nodes[vehicle_id].controller.is_automatic_motion_active
         for vehicle_id in vehicle_ids
     )
 
