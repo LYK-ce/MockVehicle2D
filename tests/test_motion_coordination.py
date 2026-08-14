@@ -705,6 +705,53 @@ class TestMotionCoordination(unittest.TestCase):
             )
         )
 
+    def test_corridor_width_follows_vehicle_safety_envelope(self) -> None:
+        anchor = AnchorSpec("dynamic-corridor-width", 0.0, 0.0, 0.0)
+        local_map = ObservedGrid(anchor, resolution_m=0.5)
+        path = [(gx, 0) for gx in range(1, 9)]
+        local_map._cells.update(
+            {
+                (gx, gy): FREE
+                for gx in range(9)
+                for gy in range(-3, 5)
+            }
+        )
+        local_map._cells.update(
+            {
+                (gx, gy): OCCUPIED
+                for gx in range(1, 9)
+                for gy in (-3, 4)
+            }
+        )
+        pose = PoseEstimate(
+            anchor.anchor_id,
+            0.5,
+            0.25,
+            0.0,
+            (0.0, 0.0, 0.0),
+            "nominal",
+            1.0,
+            1,
+        )
+        navigation = GotoController()
+        navigation.status = "active"
+        navigation._planner = Mock()
+
+        with patch.object(
+            navigation,
+            "_advance_coordination_path",
+            return_value=path,
+        ):
+            navigation._vehicle_radius_m = 0.25
+            self.assertIsNone(
+                navigation.coordination_corridor(pose, local_map)
+            )
+            navigation._vehicle_radius_m = 0.5
+            self.assertEqual(
+                navigation.coordination_corridor(pose, local_map),
+                ((1, 0), (8, 0)),
+            )
+
     def test_vacate_path_can_look_past_a_wall_corner(self) -> None:
         anchor = AnchorSpec("vacate-corner", 0.0, 0.0, 0.0)
         local_map = ObservedGrid(anchor)
