@@ -151,8 +151,10 @@ peer 的 state/intent 缺失、过期、同源 generation 不一致或 sidecar �
 fail-closed。相邻不同 cell 的时间窗必须有正 travel time，commit 上限严格为
 `min(0.8 s, trajectory 最后 leave_offset_s)`；LocalSafety 和同步物理碰撞仲裁仍是最终
 保障。OwnMap
-能够确认完全观测、直线且内宽不超过约 `3 m` 的瓶颈时，再对重叠 corridor 做去中心化
-选举和确认：模式外停车不受影响；进入前只允许一个 confirmed owner；出口侧反向队列仅
+能够确认完全观测、直线且内宽不超过同规格双车安全会车所需最小内宽 `4r + 3c` 时，
+再对重叠 corridor 做去中心化选举和确认；`r` 是车体半径，`c` 是 `0.3 m` 自动安全余量，
+观测边界保留一格量化补偿。模式外停车不受影响；进入前只允许一个 confirmed owner；
+出口侧反向队列仅
 front waiter 提前做可逆侧移，rear waiter 原地等待；ACK 后 owner 仍要等 front 的连续位姿
 和剩余侧移段离开两车 footprint 与 `0.3 m` 安全包络，才可跨 entry。owner 通过远端边界
 后，车体与安全余量都清空才释放。租约结束后若 saved rejoin 段已被 live peer 占据，waiter

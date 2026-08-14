@@ -123,8 +123,10 @@ libp2p 墙钟调度和 map delta 传播不属于确定性 Episode。每辆车沿
 intent、确定性优先级和短执行前缀，并继续由下一格租约、物理碰撞仲裁与 LocalSafety
 兜底。peer state 或 intent 缺失/过期、sidecar 未 ready 或 generation 回退时保持停车。
 
-完全观测且内宽不超过约 `3 m` 的直线瓶颈还会使用 motion-intent v4 的有向 corridor
-descriptor 做短租约仲裁。只有一个经对端确认的 owner 可以进入；与 owner 方向相反的
+完全观测且内宽不超过同规格双车安全会车所需最小内宽 `4r + 3c` 的直线瓶颈还会使用
+motion-intent v4 的有向 corridor descriptor 做短租约仲裁；`r` 是车体半径，`c` 是
+`0.3 m` 自动安全余量，观测边界保留一格量化补偿。只有一个经对端确认的 owner 可以
+进入；与 owner 方向相反的
 失败者按距出口侧 entry 的纵向距离和 `vehicle_id` 选出唯一 front waiter，提前进入可逆
 侧向等待，同侧 rear waiter 原地排队。ACK 只确认 owner，不等于入口已安全；
 front waiter 的连续位姿和剩余侧移段未离开 `2r + 0.3 m` 包络前，owner 只能接近入口并在

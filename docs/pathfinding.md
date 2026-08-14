@@ -182,9 +182,11 @@ commit 前缀收敛；并发首次提案仍保留下一格租约、同步物理�
 ### 直线窄走廊租约
 
 `GotoController` 还用独立、只读的 OwnMap D* 路径检查前方是否存在完全观测、直线且内宽
-不超过约 `3 m` 的瓶颈。弯曲、分支、过宽、观测不完整或无法在有界规划额度内确认的通道
-不声明 corridor，继续使用普通下一格和轨迹冲突协调。检测不会消费 peer evidence，也
-不会修改正在执行的 D* 路径。
+不超过同规格双车安全会车所需最小内宽 `4r + 3c` 的瓶颈；`r` 是车体半径，`c` 是
+`0.3 m` 自动安全余量，分别覆盖两侧墙间隙和车间间隙。观测到的墙面边界保留一格量化
+补偿。弯曲、分支、过宽、观测不完整或无法在有界规划额度内确认的通道不声明 corridor，
+继续使用普通下一格和轨迹冲突协调。检测不会消费 peer evidence，也不会修改正在执行的
+D* 路径。
 
 检测到走廊后，车辆通过 motion-intent v4 发布有向 entry/exit cell。重叠的反向部分描述
 可匹配为同一资源；未提交的下一轮候选使用等待年龄，冲突的 live claim 则由继承 owner 和
@@ -304,8 +306,8 @@ cell_path = a_star_search(
 - prioritized SIPP 每轮只调度一条 D* 空间候选和一个邻格 detour；当前 peer footprint 可让
   D* 在后续滚动规划换分支，但尚无基于未来 reservation 的多候选比较、完整 PIBT
   backtracking、CBS/PBS oracle 或显式网络 propose/ACK/commit。
-- 窄走廊只识别已完全观测的直线 `<=3 m` 类别，且严格单车通行；未实现 ready-owner
-  skipping 或同向批处理。
+- 窄走廊只识别已完全观测、内宽不超过 `4r + 3c` 双车安全会车包络的直线类别，且严格
+  单车通行；未实现 ready-owner skipping 或同向批处理。
 - Unknown 的无回波 Free 更新沿用当前模拟约定，接入真实 Tmini 前必须校准。
 - 水平 Tmini 无法发现落差；模拟器使用独立下视安全输入。
 - 暂无回环、全局优化和中央地图同步。

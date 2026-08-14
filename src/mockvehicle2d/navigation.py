@@ -40,13 +40,15 @@ NEARBY_SAFE_BODY_DISTANCE_M = 1.0
 PLANNING_EXPANSIONS_PER_UPDATE = 256
 CANDIDATE_INSPECTIONS_PER_UPDATE = 256
 MAX_CANDIDATE_INSPECTIONS_PER_MISSION = 256
-# ponytail: the first lease topology is the requested straight 3 m class;
-# promote this to scenario configuration or SIPP when more widths/shapes matter.
-STRAIGHT_CORRIDOR_MAX_WIDTH_M = 3.0
 # ponytail: four metres covers the simulator's local passing bays; promote to
 # scenario configuration only when a measured topology needs a wider search.
 COORDINATION_VACATE_RADIUS_M = 4.0
 SafeCandidate = tuple[tuple[float, float], tuple[int, int]]
+
+
+def _minimum_safe_passing_width_m(vehicle_radius_m: float) -> float:
+    # Wall clearance + two diameters + inter-vehicle clearance + wall clearance.
+    return 4 * vehicle_radius_m + 3 * AUTOMATIC_MINIMUM_CLEARANCE_M
 
 
 def _localization_limited_linear_speed(
@@ -359,9 +361,13 @@ class GotoController:
             return None
 
         resolution_m = local_map.resolution_m
-        max_probe_cells = (
-            math.ceil(STRAIGHT_CORRIDOR_MAX_WIDTH_M / resolution_m) + 1
+        minimum_safe_passing_width_m = _minimum_safe_passing_width_m(
+            self._vehicle_radius_m
         )
+        minimum_cells = math.ceil(
+            minimum_safe_passing_width_m / resolution_m
+        )
+        max_probe_cells = minimum_cells + 1
 
         def bounded_cross_section(
             cell: tuple[int, int],
@@ -388,7 +394,7 @@ class GotoController:
             # A range hit occupies the cell beyond a wall face, so the two
             # inner faces can quantize one cell wider than the physical gap.
             if free_width_m > (
-                STRAIGHT_CORRIDOR_MAX_WIDTH_M + resolution_m + 1e-12
+                (minimum_cells + 1) * resolution_m + 1e-12
             ):
                 return None
             return wall_offsets[0], wall_offsets[1]
@@ -408,12 +414,9 @@ class GotoController:
                 for sign, offset in zip((-1, 1), wall_offsets)
             )
 
-        # ponytail: only straight <=3 m bottlenecks are claimed; use SIPP or
-        # a topology graph when curved, branching or partially observed channels matter.
+        # ponytail: only straight bottlenecks are claimed; use SIPP or a
+        # topology graph when curved, branching or partially observed channels matter.
         index = 0
-        minimum_cells = math.ceil(
-            STRAIGHT_CORRIDOR_MAX_WIDTH_M / resolution_m
-        )
         while index + 1 < len(path):
             current = path[index]
             following = path[index + 1]
@@ -502,7 +505,9 @@ class GotoController:
                 local_map,
                 vehicle_radius_m=self._vehicle_radius_m,
                 hard_clearance_m=AUTOMATIC_MINIMUM_CLEARANCE_M,
-                bounds_margin_m=STRAIGHT_CORRIDOR_MAX_WIDTH_M,
+                bounds_margin_m=_minimum_safe_passing_width_m(
+                    self._vehicle_radius_m
+                ),
             )
             self._coordination_map = local_map
             self._coordination_request = None
